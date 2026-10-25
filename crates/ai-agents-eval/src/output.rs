@@ -63,16 +63,46 @@ fn render_summary(result: &EvalResult) -> String {
         for scenario in &result.scenarios {
             for attempt in &scenario.attempts {
                 for turn in &attempt.turns {
-                    if let Some(task) = &turn.task {
+                    for (operation, task) in turn
+                        .task
+                        .iter()
+                        .map(|task| (turn.index.to_string(), task))
+                        .chain(turn.interactions.iter().filter_map(|interaction| {
+                            interaction.task.as_ref().map(|task| {
+                                (
+                                    format!("{}:control:{}", turn.index, interaction.index),
+                                    task,
+                                )
+                            })
+                        }))
+                    {
                         out.push_str(&format!(
                             "| `{}` | {} | {} | {:?} | {} | {} |\n",
                             scenario.id,
                             attempt.attempt,
-                            turn.index,
+                            operation,
                             task.display.summary.status,
                             task.display.summary.revision,
                             task.events_complete
                         ));
+                    }
+                    for interaction in turn
+                        .interactions
+                        .iter()
+                        .filter(|interaction| interaction.task.is_none())
+                    {
+                        if let Some(outcome) = &interaction.outcome {
+                            out.push_str(&format!(
+                                "| `{}` | {} | {}:control:{}:ack | {:?} | {} | {} |\n",
+                                scenario.id,
+                                attempt.attempt,
+                                turn.index,
+                                interaction.index,
+                                outcome.status,
+                                outcome.revision,
+                                interaction.events_complete
+                            ));
+                        }
                     }
                 }
             }
@@ -234,6 +264,7 @@ mod tests {
                 attempts: vec![AttemptResult {
                     attempt: 0,
                     turns: vec![TurnResult {
+                        interactions: Vec::new(),
                         task: None,
                         index: 0,
                         input: RedactedString::redacted("[redacted]"),

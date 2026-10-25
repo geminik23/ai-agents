@@ -1,0 +1,24 @@
+name: Task Policy Denial Precedes Approval
+agent: ../../../yaml/autonomy/approval_task.yaml
+# Flow: requested off-policy host -> automatic denial -> no human override and no external effect.
+# The HTTP body is also fixture-backed, so an incorrect authorization cannot open a socket in this test.
+settings: {timeout_per_turn_ms: 10000, retries: 0}
+fixtures:
+  llm:
+    mode: mock
+    responses: ['{"tool":"http","arguments":{"method":"GET","url":"https://blocked.example.test/task"}}', The denied request did not execute.]
+  tools:
+    http: {success: true, output: {status: 200}}
+  approvals: {default: {outcome: reject, reason: Unexpected approval request.}}
+scenarios:
+  - id: policy-denial-cannot-be-converted-to-success
+    steps:
+      - !task
+        operation: {action: run, objective: Fetch the fixture resource.}
+        assert:
+          all:
+            - not: {task: {status: completed}}
+            - task: {counters: {path: tool_attempts, eq: 0}}
+            - tool_called: {id: http, count: 1}
+            - tool_called: {id: http, count: 1, executed: false, success: false}
+            - approval_not_requested: true

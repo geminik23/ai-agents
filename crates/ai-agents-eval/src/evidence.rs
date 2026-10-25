@@ -350,7 +350,7 @@ impl LlmRequestEvidence {
 }
 
 /// Full assertion-time evidence collected after a turn.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TurnEvidence {
     /// Exact host observations are never serialized with reports or cassettes.
     #[serde(skip)]

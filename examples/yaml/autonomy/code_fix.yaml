@@ -5,16 +5,20 @@ description: "Scoped code work with command and diagnostics completion evidence"
 # Development task example. The mocked suite replaces command/diagnostics hosts and isolates mutation fixtures.
 # Real use requires authorized workspace paths and a diagnostics host; this configuration is not an OS sandbox.
 # Flow: discover/read -> propose or apply scoped fix -> validate command and diagnostics -> complete only with fresh passing checks.
+# Usage (offline): sh examples/eval/mocked/run_mocked_evals.sh --category autonomy
+# Customize authorized paths and exact validation argv first; the fixture does not execute cargo or access your project files.
 system_prompt: Inspect relevant source before mutation, fix only the requested issue, and use validation evidence rather than completion claims.
 llm: {provider: openai, model: gpt-5.4-mini}
 tools: [glob, grep, file_read, file_edit, patch, diagnostics, command, git_status, git_diff, todo]
+# Empty write grants refuse mutation until the attempt overlay or host supplies paths; empty read filters do not deny all reads.
+# The suite adds its attempt workspace as a read allowlist; application hosts should explicitly narrow reads as needed.
 tool_security:
   enabled: true
   fail_closed: true
   tools:
     grep: {read_paths: [], allow_without_confirmation: true}
     file_read: {read_paths: [], allow_without_confirmation: true}
-    file_edit: {read_paths: [], write_paths: [], allow_without_confirmation: true}
+    file_edit: {read_paths: [], write_paths: [], require_read_before_write: true, allow_without_confirmation: true}
     diagnostics: {read_paths: [], allow_without_confirmation: true}
     command:
       allow_without_confirmation: true
@@ -27,8 +31,9 @@ tool_security:
       env_passthrough: []
 autonomy:
   enabled: true
-  max_turns: 8
-  max_llm_calls: 20
+  max_turns: 8  # Bound work cycles; resolved default: 30.
+  max_llm_calls: 20  # All managed model calls share this limit; resolved default: 60.
+  # These controller checks use the same executor as model tools; their source is task, not llm.
   validation:
     checks:
       - id: tests
@@ -38,5 +43,9 @@ autonomy:
         adapter: builtin.diagnostics
         config: {path: '{{ eval.workspace }}', severity: error}
   completion: {all: [{validator_passed: tests}, {validator_passed: diagnostics}]}
+  profiles:
+    freshness:
+      # A first passing validation is not enough; require the actual applied edit plus fresh validation.
+      completion: {all: [{validator_passed: tests}, {validator_passed: diagnostics}, {tool_called: {id: file_edit, executed: true, success: true}}]}
 # A validation result predating a later mutation is not eligible completion evidence.
 # eval.workspace is an eval-generated token, not a general runtime template; application hosts must supply their authorized workspace.

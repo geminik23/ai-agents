@@ -40,7 +40,6 @@ use crate::{EvalError, Result};
 struct EvalRecordHooks {
     tool_log: RecordingToolLog,
     approval_log: RecordingApprovalLog,
-    llm_log: RecordingLlmLog,
 }
 
 #[derive(Clone, Default)]
@@ -70,6 +69,100 @@ impl RecordingLlmLog {
             .get(start..)
             .unwrap_or_default()
             .to_vec()
+    }
+}
+
+// Transparent instrumentation preserves native requests, configured choices and every installed admission/pricing capability.
+struct RecordingProvider {
+    inner: Arc<dyn ai_agents_core::LLMProvider>,
+    log: RecordingLlmLog,
+}
+#[async_trait]
+impl ai_agents_core::LLMProvider for RecordingProvider {
+    async fn complete(
+        &self,
+        messages: &[ai_agents_core::ChatMessage],
+        config: Option<&ai_agents_core::LLMConfig>,
+    ) -> std::result::Result<ai_agents_core::LLMResponse, ai_agents_core::LLMError> {
+        self.log.push_messages(messages);
+        self.inner.complete(messages, config).await
+    }
+    async fn complete_with_tools(
+        &self,
+        messages: &[ai_agents_core::ChatMessage],
+        config: Option<&ai_agents_core::LLMConfig>,
+        request: &ai_agents_core::LLMToolRequest,
+    ) -> std::result::Result<ai_agents_core::LLMResponse, ai_agents_core::LLMError> {
+        self.log.push_messages(messages);
+        self.inner
+            .complete_with_tools(messages, config, request)
+            .await
+    }
+    async fn complete_stream(
+        &self,
+        messages: &[ai_agents_core::ChatMessage],
+        config: Option<&ai_agents_core::LLMConfig>,
+    ) -> std::result::Result<
+        Box<
+            dyn futures::Stream<
+                    Item = std::result::Result<ai_agents_core::LLMChunk, ai_agents_core::LLMError>,
+                > + Unpin
+                + Send,
+        >,
+        ai_agents_core::LLMError,
+    > {
+        self.log.push_messages(messages);
+        self.inner.complete_stream(messages, config).await
+    }
+    fn provider_name(&self) -> &str {
+        self.inner.provider_name()
+    }
+    fn supports(&self, feature: ai_agents_core::LLMFeature) -> bool {
+        self.inner.supports(feature)
+    }
+    fn configured_tool_choice(&self) -> Option<ai_agents_core::ToolChoice> {
+        self.inner.configured_tool_choice()
+    }
+    fn supports_tool_choice(&self, choice: &ai_agents_core::ToolChoice) -> bool {
+        self.inner.supports_tool_choice(choice)
+    }
+    fn is_terminal_error(&self, error: &ai_agents_core::LLMError) -> bool {
+        self.inner.is_terminal_error(error)
+    }
+    fn manages_invocation_admission(&self) -> bool {
+        self.inner.manages_invocation_admission()
+    }
+    fn priced_capability_identity(&self) -> Option<String> {
+        self.inner.priced_capability_identity()
+    }
+    fn request_cost_bound(
+        &self,
+        request: &ai_agents_core::autonomy::ProviderRequest<'_>,
+    ) -> std::result::Result<
+        Option<ai_agents_core::autonomy::ProviderCostBound>,
+        ai_agents_core::LLMError,
+    > {
+        self.inner.request_cost_bound(request)
+    }
+    fn settle_request_cost(
+        &self,
+        bound: &ai_agents_core::autonomy::ProviderCostBound,
+        response: &ai_agents_core::LLMResponse,
+    ) -> std::result::Result<
+        Option<ai_agents_core::autonomy::ProviderCostSettlement>,
+        ai_agents_core::LLMError,
+    > {
+        self.inner.settle_request_cost(bound, response)
+    }
+    fn settle_stream_request_cost(
+        &self,
+        bound: &ai_agents_core::autonomy::ProviderCostBound,
+        usage: Option<&ai_agents_core::TokenUsage>,
+    ) -> std::result::Result<
+        Option<ai_agents_core::autonomy::ProviderCostSettlement>,
+        ai_agents_core::LLMError,
+    > {
+        self.inner.settle_stream_request_cost(bound, usage)
     }
 }
 
@@ -108,10 +201,6 @@ impl AgentHooks for EvalRecordHooks {
     // Recording is caller-owned in-memory work with no hidden provider calls or detached effects.
     fn task_providers(&self) -> Option<Vec<Arc<dyn ai_agents_core::LLMProvider>>> {
         Some(Vec::new())
-    }
-
-    async fn on_llm_start(&self, messages: &[ai_agents_core::ChatMessage]) {
-        self.llm_log.push_messages(messages);
     }
 
     async fn on_tool_execution_record(&self, record: &ai_agents_core::ToolExecutionRecord) {
@@ -194,6 +283,7 @@ struct AttemptState {
     partial: Mutex<Vec<TurnResult>>,
     initializing: Arc<std::sync::atomic::AtomicBool>,
     cleanup_uncertain: Arc<std::sync::atomic::AtomicBool>,
+    interactions: crate::interactions::Interactions,
 }
 impl AttemptState {
     fn push(&self, turns: &mut Vec<TurnResult>, result: TurnResult) {
@@ -204,10 +294,39 @@ impl AttemptState {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = turns.clone();
     }
     fn partial(&self) -> Vec<TurnResult> {
-        self.partial
+        let mut turns = self
+            .partial
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
+            .clone();
+        let state = self.interactions.lock();
+        let interactions = state.results[state.reported..].to_vec();
+        if !interactions.is_empty() {
+            turns.push(TurnResult {
+                index: turns.len(),
+                input: crate::redaction::RedactedString::redacted("[interrupted foreground]"),
+                response: crate::redaction::RedactedString::plain(""),
+                response_present: false,
+                runtime_error: Some(crate::redaction::RedactedString::redacted(
+                    "foreground did not acknowledge a result",
+                )),
+                state: None,
+                metadata: None,
+                task: None,
+                assertion_results: interactions
+                    .iter()
+                    .flat_map(|i| i.assertion_results.clone())
+                    .collect(),
+                interactions,
+                evidence: Default::default(),
+                latency_ms: state
+                    .foreground_started
+                    .map(|start| start.elapsed().as_millis() as u64)
+                    .unwrap_or_default(),
+                observability_span_id: None,
+            });
+        }
+        turns
     }
 }
 
@@ -391,7 +510,7 @@ impl EvalRunner {
         let observability = final_observability_report(&results);
 
         Ok(EvalResult {
-            schema_version: 2,
+            schema_version: 3,
             suite: self.suite.name.clone(),
             agent: agent_path.display().to_string(),
             total,
@@ -565,6 +684,7 @@ impl EvalRunner {
                 partial: Default::default(),
                 initializing: Default::default(),
                 cleanup_uncertain: Default::default(),
+                interactions: Arc::new(parking_lot::Mutex::new(Default::default())),
             };
             let attempt_future = self.run_attempt(
                 agent_path,
@@ -712,6 +832,9 @@ impl EvalRunner {
         let mut tasks = crate::task::TaskContext::with_session(state.session.clone());
         let workspace_hold = attempt_context.hold_for_tasks();
         tasks.workspace_hold = Some(workspace_hold.clone());
+        tasks.interactions = state.interactions.clone();
+        tasks.interactions.lock().plan = scenario.interactions.clone();
+        tasks.redact_interactions = self.suite.settings.redact_outputs;
         tasks.deadline = state.deadline;
         tasks.initializing = Some(state.initializing.clone());
         tasks.cleanup_uncertain = Some(state.cleanup_uncertain.clone());
@@ -859,7 +982,10 @@ impl EvalRunner {
                     tasks.cleanup().await?;
                     let deadline = tasks.deadline;
                     let session = tasks.session.clone();
+                    let interactions = tasks.interactions.clone();
                     tasks = crate::task::TaskContext::with_session(session);
+                    tasks.interactions = interactions;
+                    tasks.redact_interactions = self.suite.settings.redact_outputs;
                     tasks.deadline = deadline;
                     tasks.cleanup_uncertain = Some(state.cleanup_uncertain.clone());
                     tasks.workspace_hold = Some(workspace_hold.clone());
@@ -931,6 +1057,16 @@ impl EvalRunner {
             }
         }
 
+        let interactions_complete = {
+            let interactions = tasks.interactions.lock();
+            interactions.claimed.len() == scenario.interactions.len()
+                && interactions.error.is_none()
+        };
+        if !interactions_complete && status.is_passed() {
+            status = ScenarioStatus::Failed {
+                reason: "not all declared participant interactions were consumed".into(),
+            };
+        }
         match tasks.cleanup().await {
             Ok(()) => workspace_hold.store(false, std::sync::atomic::Ordering::Release),
             Err(_) => status = ScenarioStatus::Error {
@@ -983,6 +1119,13 @@ impl EvalRunner {
         let llm_fixture = attempt_context.interpolate_llm_fixture(&self.suite.fixtures.llm)?;
         let provider_configs = budget_provider_configs(&spec);
         let (mut llm_registry, _judge_llm) = build_llm_registry(&spec, &llm_fixture, base_dir)?;
+        // Capture actual dispatch, including scripted skills and validation, after any enclosing budget has admitted it.
+        llm_registry = llm_registry.map_providers(|_, provider| {
+            Arc::new(RecordingProvider {
+                inner: provider,
+                log: llm_log.clone(),
+            })
+        });
         if let Some(budget) = budget {
             llm_registry =
                 llm_registry.map_providers(|alias, provider| {
@@ -996,6 +1139,7 @@ impl EvalRunner {
                     budget.wrap(provider, config)
                 });
         }
+
         // Tool fixture values are typed JSON; LLM content keeps its dedicated JSON-aware interpolation path.
         let mut tool_fixtures = self.suite.fixtures.clone();
         tool_fixtures.llm = Default::default();
@@ -1015,7 +1159,6 @@ impl EvalRunner {
             .hooks(Arc::new(EvalRecordHooks {
                 tool_log,
                 approval_log,
-                llm_log,
             }));
         let builder = if let Some(host) = &self.host {
             host.configure(builder, attempt_context)?
@@ -1119,7 +1262,15 @@ impl EvalRunner {
         Ok(Some(CostEstimator::new(config.cost)))
     }
 
-    async fn run_turn(&self, params: RunTurnParams<'_>) -> Result<TurnExecution> {
+    // A turn can enter deep retained tool/validator execution; erase its polling frame without starting or detaching work.
+    fn run_turn<'a>(
+        &'a self,
+        params: RunTurnParams<'a>,
+    ) -> futures::future::BoxFuture<'a, Result<TurnExecution>> {
+        Box::pin(self.run_turn_inner(params))
+    }
+
+    async fn run_turn_inner(&self, params: RunTurnParams<'_>) -> Result<TurnExecution> {
         let RunTurnParams {
             agent,
             tasks,
@@ -1153,6 +1304,11 @@ impl EvalRunner {
         }
         tasks.events.clear();
         tasks.events_complete = true;
+        let interaction_start = {
+            let mut state = tasks.interactions.lock();
+            state.foreground_started = Some(start);
+            state.results.len()
+        };
         let mut task_result = None;
         let mut operation = if timeout_ms == 0 {
             TurnOperation::error("scenario deadline reached before task admission".into())
@@ -1192,20 +1348,27 @@ impl EvalRunner {
                     }
                 }
             };
+            let foreground_runtime = agent as *const RuntimeAgent as usize;
             match crate::task::drive(
                 &tasks.session,
-                work,
+                crate::interactions::service(
+                    &tasks.session,
+                    work,
+                    tasks.interactions.clone(),
+                    self.suite.settings.redact_outputs,
+                    foreground_runtime,
+                ),
                 TokioInstant::now() + Duration::from_millis(timeout_ms),
             )
             .await
             {
-                Ok((mut operation, deadline_error)) => {
+                Ok((Ok(mut operation), deadline_error)) => {
                     if let Some(reason) = deadline_error {
                         operation.runtime_error.get_or_insert(reason);
                     }
                     operation
                 }
-                Err(error) => TurnOperation::error(error.to_string()),
+                Ok((Err(error), _)) | Err(error) => TurnOperation::error(error.to_string()),
             }
         };
         if let Err(error) = agent.flush_background_tasks().await
@@ -1347,6 +1510,20 @@ impl EvalRunner {
             (None, Some(error)) => Some(error.clone()),
             (None, None) => None,
         };
+        let interactions = {
+            let mut state = tasks.interactions.lock();
+            state.reported = state.results.len();
+            state.results[interaction_start..].to_vec()
+        };
+        for interaction in &interactions {
+            assertion_results.extend(interaction.assertion_results.iter().cloned().map(
+                |mut detail| {
+                    detail.assertion =
+                        format!("interaction.{}.{}", interaction.index, detail.assertion);
+                    detail
+                },
+            ));
+        }
         if self.suite.settings.redact_outputs {
             redact_assertion_details(&mut assertion_results);
         }
@@ -1385,6 +1562,7 @@ impl EvalRunner {
                         .and_then(|metadata| serde_json::to_value(metadata).ok())
                 },
                 task: task_report,
+                interactions,
                 evidence,
                 assertion_results,
                 latency_ms,
@@ -1738,7 +1916,13 @@ fn final_observability_report(
         .iter()
         .flat_map(|scenario| &scenario.attempts)
         .flat_map(|attempt| &attempt.turns)
-        .filter_map(|turn| turn.evidence.observability.as_ref())
+        .flat_map(|turn| {
+            turn.evidence.observability.iter().chain(
+                turn.interactions
+                    .iter()
+                    .filter_map(|interaction| interaction.evidence.observability.as_ref()),
+            )
+        })
         .collect();
     if observations.is_empty() {
         return None;
@@ -2689,7 +2873,8 @@ llm:
         let gate = Arc::new(tokio::sync::Semaphore::new(0));
         let mut pending = Box::pin(CONSTRUCTION_GATE.scope(gate.clone(), build));
         assert!(futures::poll!(pending.as_mut()).is_pending());
-        assert_eq!(Arc::strong_count(&llm_log.records), 2);
+        // The pending builder and actual provider recorder both retain the log until construction is dropped.
+        assert_eq!(Arc::strong_count(&llm_log.records), 3);
         assert_eq!(Arc::strong_count(&approval_log.records), 2);
         assert_eq!(
             Arc::strong_count(&gate),

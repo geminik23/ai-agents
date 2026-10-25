@@ -1,0 +1,21 @@
+name: Tool Free Stagnation
+agent: ../../../yaml/autonomy/tool_free_analysis.yaml
+# Repeated low judge scores do not manufacture advancement from more tokens or rewritten answers.
+# Flow: draft -> unchanged quality -> bounded stagnation -> truthful incomplete result.
+settings: {timeout_per_turn_ms: 10000, retries: 0}
+fixtures:
+  llm:
+    mode: mock
+    responses_by_alias:
+      main: [Unverified draft.]
+      judge: ['{"overall_score":0.2}']
+scenarios:
+  - id: unchanged-quality-stops-without-tools-or-budget-refill
+    steps:
+      - !task
+        operation: {action: run, objective: Produce a useful verified analysis.}
+        assert:
+          all:
+            - task: {status: incomplete, stop_reason: no_progress, checks: [{id: quality, outcome: fail}], events_include: [progress_observed, intervention_selected], event_result_parity: true}
+            - tool_not_called: todo
+            - tool_not_called: command

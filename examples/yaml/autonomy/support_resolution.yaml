@@ -4,13 +4,17 @@ description: "State-owned support work completed by host ticket evidence"
 
 # Rust installs the ticket integration; the offline example uses isolated records, never a real customer system.
 # Flow: user input -> support task -> clarification/approval if needed -> verified resolution or escalation.
+# Usage (offline): cargo run --manifest-path examples/Cargo.toml -p example-custom-llm --bin task-domain-host
+# The same task_domain::install_domain registration is used by task-domain-evals; no fixture-only completion predicate is installed.
+# Customize actual ticket/incident integration and delivery first. A long human pause does not refill active allowance.
 system_prompt: Resolve the ticket or create a real escalation record; do not claim a ticket changed before executing the tool.
 llm: {provider: openai, model: gpt-5.4-mini}
 tools: [domain, ask_user]
 autonomy:
-  max_turns: 8
-  max_llm_calls: 20
+  max_turns: 8  # Inherited state work-cycle allowance; resolved default: 30.
+  max_llm_calls: 20  # State and nested work share admitted calls; resolved default: 60.
   hitl: {on_approval_required: pause_run, on_user_question: pause_run}
+# Only the enabled support state promotes ordinary input; top-level defaults alone start no task.
 states:
   initial: support
   states:

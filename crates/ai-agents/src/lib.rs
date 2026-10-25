@@ -79,7 +79,8 @@
 //! | `full-storage` | All storage backends (`sqlite` + `redis-storage`) |
 //! | `full` | All optional features enabled |
 
-/// Development autonomy primitives and restricted standalone execution; complete YAML task execution remains unavailable.
+/// Development task execution, scoped YAML entry, foreground hosting and explicit prepared recovery.
+/// These APIs are unreleased; default production restart hosting and arbitrary in-flight restoration remain unavailable.
 /// Explicit safe-pause reconstruction uses installed host bindings and never consumes the pending response or takes over abandoned Running work.
 /// The host must authenticate restoration review separately before using the newly advertised pending request and revision.
 /// Opted-in persistence uses with_restore_host and restore_on_start; startup never consumes a pending decision or adopts an abandoned owner.

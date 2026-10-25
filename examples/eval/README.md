@@ -36,7 +36,7 @@ Most suites declare their own `agent:` path, so `--agent` is optional unless you
 
 ## Development task suites
 
-`mocked/autonomy/` exercises typed task operations, automatic state/skill entry, retained decisions, shared composition, domain evidence and isolated real file effects. The current foundation is development-only, not the published 1.1.1 contract or full task-evaluation acceptance.
+`mocked/autonomy/` exercises typed task operations, automatic state/skill entry, retained decisions, shared composition, domain evidence and isolated real file effects. These APIs are development-only, not the published 1.1.1 contract. Sequential task steps and scenario foreground controls consume the same runtime controller; they do not install production restart hosting.
 
 ```sh
 sh examples/eval/mocked/run_mocked_evals.sh --category autonomy
@@ -50,7 +50,11 @@ cargo run --manifest-path examples/Cargo.toml -p example-custom-llm --bin task-d
 
 Other autonomy suites use the standard CLI. `fixtures.files` initializes bounded relative files in the attempt workspace without overwriting existing effects; exact generated tokens can also appear in typed agent and tool-fixture values. Profiles requiring domain adapters cannot be made executable merely by loading their IDs. Mocked providers do not mock command/network/tool effects: keep their fixtures and workspace policy intact.
 
-Development reports use schema 2 and separate scenario success from acknowledged task status. Task observations are bounded and redacted; exact evidence remains assertion-only. Suite observability aggregates observed event prefixes, and task metrics do not double-count cumulative resume snapshots. Unacknowledged cleanup retains files and prevents automatic retries, so do not treat every error as proof that an attempt directory can be removed. Full fields, actions, migration and limitations are in `website/content/docs/evaluation.md`.
+Development reports use schema 3 and separate scenario success from acknowledged task status. Task observations are bounded and redacted; exact evidence remains assertion-only. Suite observability aggregates observed event prefixes, and task metrics do not double-count cumulative resume snapshots. Unacknowledged cleanup retains files and prevents automatic retries, so do not treat every error as proof that an attempt directory can be removed. Full fields, actions, migration and limitations are in `website/content/docs/evaluation.md`.
+
+Scenario `interactions` service exact typed decisions for actual independent child tasks while an ordinary parent is still pending. See `independent_research_mocked.yaml`; coordinating task children instead use their original outer pending request. The result keeps parent and child-control evidence separate, retains completed control evidence after an interrupted parent, and rejects ambiguous targets or unavailable assertion sources. Other suites cover objective/capacity/stop/cancel, reviewed replanning, current-cycle progress at exact capacity, unrelated state exit, command failure, unavailable capability refusal and mutation followed by fresh validation.
+
+For your own domain executable, reuse your application's registration in `EvalHost::configure` and preserve the supplied provider budget, hooks and workspace policies. The runtime-only `task_domain.rs` and its two host consumers demonstrate that split; a new domain does not require a new marker, core gate or driver. See `website/content/docs/task-autonomy.md`.
 
 ## Attempt-local fixtures
 

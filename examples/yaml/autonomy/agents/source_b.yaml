@@ -3,6 +3,9 @@ version: "1.0.0"
 description: "A second admitted research participant"
 
 # Both children share the coordinating task ledger but retain their own runtime and pending request identities.
+# Usage: load through composed_research.yaml and its no-key suite.
+# Flow: admitted child request -> optional exact question -> finding -> parent aggregation.
+# Customize this specialist's source integration; do not add a second autonomous owner or independent allowance.
 system_prompt: Give an independent concise source finding; ask the host if an explicit decision is needed.
 llm: {provider: openai, model: gpt-5.4-mini}
 tools: [ask_user]

@@ -77,6 +77,31 @@ A step also accepts positive `timeout_ms` and `expect_error` as a substring or a
 
 Resume response `kind` is `continue`, `answer` with JSON `value`, `approval` with an `ApprovalResult` `decision`, `question_timeout`, or `external` with `event_id`, optional `target_revision` and JSON `payload`. An `ask_user` answer uses that tool's `QuestionResponse` shape; a controller/clarification answer uses the runtime's corresponding JSON value. The runtime validates the actual pending kind, choices, original deadlines, current policy and implementation binding. A `continue` response is not approval or an answer to an unrelated question.
 
+### Foreground participant controls
+
+Ordinary parents can await independently hosted automatic child tasks. A following sequential `!task` step cannot answer a question while that parent is still pending. Use scenario-level `interactions` for those controls; use sequential `!task` for the foreground task's own returned pauses and coordinating child requests.
+
+```yaml
+scenarios:
+  - id: independent-findings
+    interactions:
+      - agent: IndependentA
+        pending_kind: user_question
+        operation: {action: resume, response: {kind: answer, value: Continue the finding.}}
+        assert: {task: {status: completed, counters: {path: llm_attempts, eq: 2}}}
+    turns:
+      - input: Research both findings.
+        assert: {response_contains: verified}
+```
+
+This is a fragment; `independent_research_mocked.yaml` contains the complete two-child fixture, source definitions and shared provider budget. The script chooses only actual configured participants in the current `TaskHostSession`, using the runtime's configured agent name and typed pending category. It never constructs a controller from that name. Ambiguous matching participants fail closed. Catalogue/publication changes invalidate an old discovery result. The exact live runner, whole run key, public ACK revision and pending request are captured before control admission; the runtime still validates current authority and original bounds.
+
+Each entry requires `agent`, `pending_kind`, and a retained `operation` (`resume`, `cancel`, `stop`, `objective` or `limits`). At most 256 entries are accepted per scenario, with scenario isolation. Matching entries are consumed once in declaration order for each available participant; independent controls are polled concurrently, without prescribing child scheduling. Every declared entry must be consumed. The parent, ongoing controls and asynchronous prompt discovery continue polling together. Parent completion or confirmed endpoint closure prohibits new scripted decisions; timeout cancellation also retires publicly paused children rather than assuming they are running.
+
+A successful control requires a nonempty `assert`. Participant assertions support `task`, response text, executor tool records, current state/context, and their `all`/`any`/`not` composition. Hook-level approval/LLM-request, orchestration and external judge assertions belong on the foreground turn; unavailable child logs cannot prove their absence. For a deliberately rejected control, use `expect_error` and omit `assert`. Error text matching checks only the actual operation error, never a later capture failure. A later entry may answer a still-usable original request after a wrong-kind rejection; this is not automatic retry of an uncertain effect.
+
+Per-control results appear in the turn's separate `interactions` array, never as replacements for its response or primary task. Each contains its script index, bounded safe task snapshot when available, separate operation/capture errors, category-only events, completeness and assertions. A bounded `outcome` retains the acknowledged status/revision/counters with a hashed whole run key even if later display/inspection fails; this preserves measured observations without inventing capture success or cleanup. An operation error does not fabricate an acknowledged result from the preceding pause. Completed controls survive parent timeout, including acknowledged outcomes retained before awaited evidence capture; an interrupted foreground row has no manufactured response or task completion. Exact outcomes, factual partial executor records and event data remain non-serializing host evidence. Metrics de-duplicate distinct run keys and revisions across controls and ordinary task steps. Task-owned children keep their original coordinating ledger; independent task ledgers are not forcibly combined, while the scenario provider budget still covers shared configured aliases.
+
 ### Task assertions and evidence scope
 
 | `assert.task` field | Meaning |
@@ -106,15 +131,17 @@ Timeouts keep polling actual admitted task work while requesting cancellation th
 
 Rust `EvalHost::configure` installs domain tools/adapters before construction freezes them. Implementations must preserve declared budgets, caller-owned instrumentation and actual managed bindings, and must not hide provider work or detach effects. Pure `validate` callbacks must not construct providers. Optional asynchronous `prepare` can supply an actual prepared SDK runner/result to a fresh, explicitly configured host; it does not install default production reconstruction or certify clock continuity. Its result is revision-checked, and reconstruction review remains a separate typed step. The controlled SQLite producer/consumer regression exercises this explicit SDK boundary, not general OS restart support.
 
-The sequential step foundation supports ordinary root state/skill entry and task-owned coordinating composition. It does not yet certify every independently hosted child-question interleaving, strategy/fault combination or production restart environment. Mocked LLMs alone do not isolate tools or storage, and eval host code remains trusted integration code, not an OS sandbox.
+Sequential steps support returned foreground pauses and task-owned coordinating composition; typed foreground interactions service independent child questions while their ordinary parent is pending. Neither mechanism restores arbitrary parent call stacks or certifies production restart environments. Mocked LLMs alone do not isolate tools or storage, and eval host code remains trusted integration code, not an OS sandbox.
 
 ### Development report and Rust migration
 
-Development reports now use `schema_version: 2`. Per-operation `task` contains a bounded redacted display, category-only event list and up to 64 validation summaries with hashed check IDs, outcome and observed identity. Exact inspection, prompts, checkpoint/native data and validator metrics stay assertion-only; task path details also hide dynamic map keys. Markdown/JUnit task observations are separate from scenario status. Truncation is explicit and never cuts the exact runtime result.
+Development reports now use `schema_version: 3`. Per-operation `task` contains a bounded redacted display, category-only event list and up to 64 validation summaries with hashed check IDs, outcome and observed identity. Exact inspection, prompts, checkpoint/native data and validator metrics stay assertion-only; task path details also hide dynamic map keys. Markdown/JUnit task observations are separate from scenario status. Truncation is explicit and never cuts the exact runtime result.
 
 Suite observability now aggregates de-duplicated retained post-cursor events across observed turns/attempts, rather than returning only the last report. It is measured observed data, not proof of complete billing or execution authority; dropped/conflicting observations remain explicit. `observed_task_*` metrics use the latest observed revision per distinct run and do not sum cumulative resume snapshots twice or imply later cleanup state.
 
-Affected Rust literals include `Assertion.task`, `TurnEvidence.task`, `TurnResult.task`, `TurnObservabilityEvidence.events`, and `FixturesConfig.files`; use constructors/defaults where available. `ScenarioStep` adds `Task`, `ToolExecutionSource` adds `Task`, and observation `EventType` adds `TaskLifecycle`; update exhaustive matches. Task/controller records no longer silently use the `llm` source label. Existing JSONL compatibility rows remain chat-only: explicit `task` or `steps` fields now reject instead of being ignored, while unrelated legacy compatibility fields remain tolerated. YAML remains strict. See [task inspection and eval hosts](@/docs/rust-api.md#task-evaluation-inspection-development-only).
+Schema 3 adds `Scenario.interactions` and `TurnResult.interactions`; initialize them with empty vectors when migrating older Rust literals. `TaskInteractionResult` separates operation errors, capture errors and acknowledged task snapshots. Actual provider-boundary request capture now includes scripted skill and validator calls rather than only ordinary chat hook notifications; rejected pre-dispatch budget requests are not dispatched provider records. Exact captured requests remain assertion-only. Configuration checks validate the new script without constructing providers.
+
+Affected earlier Rust literals include `Assertion.task`, `TurnEvidence.task`, `TurnResult.task`, `TurnObservabilityEvidence.events`, and `FixturesConfig.files`; use constructors/defaults where available. `ScenarioStep` adds `Task`, `ToolExecutionSource` adds `Task`, and observation `EventType` adds `TaskLifecycle`; update exhaustive matches. Controller validation records use the `task` source label. Model-requested tools still use `llm` even while admitted inside a task; task ownership does not rewrite invocation origin. Existing JSONL compatibility rows remain chat-only: explicit `task` or `steps` fields now reject instead of being ignored, while unrelated legacy compatibility fields remain tolerated. YAML remains strict. See [task inspection and eval hosts](@/docs/rust-api.md#task-evaluation-inspection-development-only).
 
 ## Hierarchical alias fixtures (1.1)
 
@@ -553,7 +580,7 @@ fixtures:
 
 The overlay adds only the generated workspace to the listed existing policies. It does not disable fail-closed behavior, blocked paths, confirmation, or unrelated policy rules.
 
-The runner owns the temporary attempt workspace and removes it after completion, failure, or cancellation.
+The runner owns the temporary attempt workspace and removes it after acknowledged cleanup following completion, failure, or cancellation. Uncertain task cleanup retains it and prevents retry/reset; an error, timeout or missing local owner is not proof that removal is safe.
 
 Use `web_fetch_transport` to execute the real `web_fetch` implementation through exact-URL in-memory routes without opening a socket:
 
@@ -1174,7 +1201,7 @@ response metadata is omitted from JSON and JSONL
 
 Set `settings.redact_outputs: false` only for trusted local debugging.
 
-The development checkout emits machine-readable `schema_version: 2`; published 1.1.1 reports use schema 1. See the development migration notes above before changing report consumers.
+The development checkout emits machine-readable `schema_version: 3`; published 1.1.1 reports use schema 1. See the development migration notes above before changing report consumers.
 
 ---
 

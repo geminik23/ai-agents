@@ -65,6 +65,8 @@ fn development_automatic_task_hosting_surface_compiles() {
         let _: ai_agents::eval::TaskAssertion = Default::default();
         let _: Option<ai_agents::eval::TaskStep> = None;
         let _: Option<ai_agents::eval::TaskReport> = None;
+        let _: Option<ai_agents::eval::interactions::TaskInteraction> = None;
+        let _: Option<ai_agents::eval::interactions::TaskInteractionResult> = None;
     }
     fn store_only(store: &dyn ai_agents::TaskRunStore) {
         eval_types();

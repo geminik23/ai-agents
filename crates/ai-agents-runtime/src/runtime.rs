@@ -1897,10 +1897,11 @@ impl RuntimeAgent {
     }
 
     /// Renders one accepted objective from immutable invocation data before the run owns or mutates the runtime.
+    /// Input aliases share the accepted invocation value, so an explicitly invoked profile can reuse an automatic scope's objective template.
     pub(crate) fn render_autonomy_objective(&self, template: &str, input: &str) -> Result<String> {
         let mut environment = minijinja::Environment::new();
         environment.set_undefined_behavior(minijinja::UndefinedBehavior::Strict);
-        environment.render_str(template, serde_json::json!({"input":input,"objective":input,"context":self.context_manager.get_all(),"state":self.current_state()})).map_err(|error| AgentError::TemplateError(error.to_string()))
+        environment.render_str(template, serde_json::json!({"input":input,"user_input":input,"objective":input,"context":self.context_manager.get_all(),"state":self.current_state()})).map_err(|error| AgentError::TemplateError(error.to_string()))
     }
 
     /// Captures actual maintenance, storage and callback providers without replacing frozen handles or granting new effects.

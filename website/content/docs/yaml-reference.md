@@ -20,6 +20,80 @@ Fixed framework-owned objects reject unknown fields. Misspelled top-level and ne
 
 The development tree accepts typed `autonomy` profiles, named validation/progress adapters and enabled automatic state/selected-skill entry. These are not the published 1.1.1 contract. The standard builder installs retained embedded hosting for enabled declarations; development task commands, the plain REPL and task-aware TUI now consume the same controller. A development typed task-evaluation/report foundation is available; complete task-evaluation acceptance remains unfinished. See [development task evaluation](@/docs/evaluation.md#development-task-evaluation-foundation). Top-level `autonomy` configures defaults/profiles rather than automatically replacing every ordinary chat. See [automatic state and skill tasks](@/docs/rust-api.md#automatic-state-and-skill-tasks-development-only) for host lifetime, exact results and explicit resume.
 
+### Profile fields, defaults and merging
+
+For an executable walkthrough, start with [task autonomy from configuration to evaluation](@/docs/task-autonomy.md). Common behavior is YAML-configured; Rust installs providers, tools, domain meaning, actual authority and any requested ceilings. A name in YAML installs none of those capabilities.
+
+Top-level `autonomy` contains flat default profile fields, optional `default_profile`, and a `profiles` map of the same fields. State/skill `autonomy` adds a `profile` selector and inline profile overrides. Profile selection is explicit invocation selection, then the scoped selector, then `default_profile`. Merge order is built-in defaults → top-level defaults → selected profile → state/skill settings → per-run Rust overrides. Numeric resolution then intersects host ceilings; it is not admission or a grant.
+
+| Profile field | Type / resolved default | Contract |
+|---|---|---|
+| `enabled` | boolean / `false` | Opt-in; a profile declaration or YAML load does not execute a task |
+| `mode` | enum / `until_complete` when enabled | `disabled`, `until_complete`, `state_until_exit`, `skill_until_complete`; incompatible invocation scopes reject |
+| `objective`, `objective_template` | optional nonempty strings | Mutually exclusive; automatic scopes combine/resolve accepted input, while explicit invocation supplies its accepted objective; templates support accepted `input`, `user_input`, `objective`, current `context` and `state` |
+| `execution.strategy` | enum / scope-dependent | `skill` for skill scope, otherwise `lifecycle` with stages, otherwise `model_led`; incompatible explicit combinations reject |
+| `max_turns` | positive integer / `30` | Work-cycle allowance, not an invoice or a tool counter |
+| `max_active_time_seconds` | positive integer / `900` | Cumulative active allowance; safe human wait does not refill or consume active work allowance |
+| `max_wall_time_seconds` | optional positive integer / absent unless host-bounded | Whole-run expiry keeps advancing during safe waits |
+| `max_llm_calls`, `max_tool_calls`, `max_command_calls` | positive integers / `60`, `120`, `10` | Pre-execution shared admission includes managed auxiliary/child work; command attempts also consume applicable tool admission |
+| `max_cost_usd` | optional quoted positive decimal / absent | At most six decimal places; requires an actual host ceiling and bounded priced providers, not merely cost telemetry |
+| `max_declared_write_paths` | optional positive integer / absent | Requires an actual host ceiling and implementation-bound target footprints; not a filesystem sandbox |
+| `supervision.stage_changes`, `.plan_changes` | `inherit` or `require_approval` / inherited | Review cannot skip required work, expand authority or relax gates |
+| `lifecycle` | stage list / absent | Ordered stages; empty list explicitly replaces an inherited list |
+| `validation` | validation mapping / absent | Ordered managed checks and optional built-in shortcuts, described below |
+| `completion` | one gate tree / absent | Only eligible Pass can prove completion; required validation and scope rules still apply |
+| `progress` | progress mapping / built-in evidence observer | Optional domain signals or canonical todo integration, not model self-report |
+| `premature_finish` | policy / `continue` | `action: continue | ask_user | summarize_and_stop | fail`; `max_continuations` defaults to the effective turn allowance; optional custom `prompt` supplies controller guidance |
+| `on_limit` | policy / `summarize_and_stop` | `action: summarize_and_stop | fail | ask_user | pause_run`; summaries are deterministic, not unbudgeted model calls |
+| `hitl` | interaction policies / existing review contract | `on_approval_required` and `on_user_question`: `pause_run | reject | auto_if_policy | ask_each_time`; none overrides automatic denial or invents an answer |
+| `persistence` | optional mapping / no automatic restart preparation | See flags and host prerequisites below; a journal alone is not reconstruction authority |
+
+Omitted and null optional profile fields inherit; null is not a general reset operator. Explicit `false` and empty lists are preserved. Completion trees and configured lists replace rather than concatenate. Ordinary nested policy leaves merge; changing a progress adapter binding replaces its associated version/configuration instead of silently inheriting another adapter's config. Setting `objective` replaces an inherited template and vice versa. Gate `eq: null` is different: it is an explicit equality operand.
+
+### Validation, stages and progress
+
+`validation.checks` is a replacement list of named checks. Each entry has required `id` and `adapter`, `contract_version` (default `1`), `required` (default `true`), `schedule` (`each_cycle` by default, or `stage_end`/`completion`), optional positive `timeout_seconds`, and adapter-specific `config` (default `{}`). IDs are unique in the effective profile, including stage-owned checks. `stage_end` requires a stage owner. Unknown names, versions, dependencies or capabilities reject rather than becoming successful skipped checks.
+
+Built-in adapter configuration is strict:
+
+| Adapter | `config` fields | Evidence contract |
+|---|---|---|
+| `builtin.command` | required `command`; optional `cwd`, `host_binding`; `expected_exit: 0` | Exact authorized command result; approved replacement argv/cwd/env cannot validate the original command |
+| `builtin.diagnostics` | optional `path`, `severity`, `host_binding`; severity is `error`, `warning`, `info`, `hint` or `all` | Available, complete, fresh observations; no host capability is a preflight refusal, not an empty diagnostic result |
+| `builtin.judge` | required nonempty `criteria`; optional `llm`, `pass_threshold` | Managed semantic quality; declared alias and all calls share actual admission |
+| `builtin.evidence` | required `assertion` path matcher; optional upstream `validator` | Pure current context or eligible upstream metrics; no ambient I/O |
+| `builtin.artifact` | required `path`; optional `host_binding` | Authorized `file_info` observation; existence alone does not validate content |
+| Custom named adapter | installed implementation's validated config | Versioned pure callback returning results, managed observation requests or a typed external wait |
+
+The optional validation shortcuts are `required`, `commands: [string]`, `diagnostics: {enabled, fail_on_error}` and `judge: {enabled, llm, pass_threshold, criteria}`. They do not create separate executors. Prefer named checks when referring to exact IDs, schedules and dependencies.
+
+Each lifecycle stage has required `id`; optional `instruction`, `completion`, `commands`, `validation`, `suggested_tools`, `required_before_tools`, `retry_on_failure`, `on_failure_stage`, and `max_fix_cycles`. Stages are required by default. Suggested tools do not grant them; required-before-tool constraints are enforced. Repair targets must name an existing earlier stage and their cycle allowance is bounded. A passing task gate cannot skip required validation/review stages. This is ordered lifecycle control, not a DAG language.
+
+`progress` supports `adapter` (default `builtin.evidence`), `contract_version` (default `1`), adapter `config`, optional canonical `todo_tool`, `require_todos`, `require_active_todo`, `enforce_for_tools`, `auto_create_todo_prompt`, and positive `max_open_todos`. Todos are not required when these policies/gates do not request them. Built-in evidence signals select `id`, upstream `validator`, typed `path` and comparison such as `increase` or `change`. High-water marks and bounded observed fingerprints prevent duplicate/oscillating observations from becoming new progress.
+
+`progress.stagnation` is opt-in. Its `max_cycles_without_progress` defaults to `3`, `action` to `stop`, `max_replans` to `0`, and `on_exhausted` to `stop`. Actions are `continue | replan | ask_user | stop | fail`; exhaustion cannot request another replan. Questions need an explicit unavailable policy. Replanning never resets counters, objective, authority or required gates. `premature_finish.on_unavailable` and `on_limit.on_unavailable` use `stop | fail` and default to `stop`.
+
+An enabled `persistence` section defaults `enabled: true`, `save_after_each_step: true`, `resume_on_start: false`. `enabled: false` conflicts with either other flag set to true. Step snapshots do not replace mandatory admission/effect/pause/terminal journals. Preparation/reconstruction requires an explicitly installed compatible host and actual bindings/clock continuity; default production CLI restart remains unavailable.
+
+### Completion gate operands
+
+A gate node has exactly one operator; trees are bounded to depth 32 and 256 nodes. `all`/`any` require nonempty lists, and `not` wraps one gate. Missing, stale, partial or unavailable evidence remains Unknown under negation; it does not become a successful negative fact.
+
+| Operator | Operand |
+|---|---|
+| `todos_done`, `validation_passed`, `response_not_empty` | boolean; positive validation requires actual declared required checks, not an empty set |
+| `todo_count_gte` | integer |
+| `state`, `validator_passed`, `response_contains`, `artifact_exists` | nonempty string |
+| `state_in`, `response_contains_any` | nonempty string list |
+| `context_path`, `progress_path`, `observability` | required `path`; optional `eq` (including explicit null), `gt`, `gte`, `lt`, `lte`, `exists` |
+| `tool_called` | required canonical `id`; optional `count`, `count_gte`, `executed`, `success` matching one eligible factual record |
+| `command_exit` | required `command` and integer `code` |
+| `diagnostics_clear` | required `severity` |
+| `judge` | nonempty `criteria`, optional `llm` and `pass_threshold` |
+| `all`, `any`, `not` | nested gates |
+
+For example, `completion: {all: [{validator_passed: schema}, {artifact_exists: "report://current"}]}` requires a current schema result and an actual artifact observation. A custom host validator supplies the domain meaning without adding a gate variant. Runtime completion gates and eval assertions have related spelling but **different schemas**; eval's `assert.task.checks` inspects acknowledged check outcomes and is not a runtime `completion` gate.
+
 Within a development `validation.checks` entry, `max_evaluation_rounds` is an optional positive integer up to 32 (default 32), and `max_observations_per_round` is an optional positive integer up to 16 (default 16). They bound callback reentry and observation batches respectively and are intersected with host ceilings. A named binding's `contract_version` defaults to 1, not the newest registered version. Custom adapter configuration is schema-validated by its installed host implementation; YAML selects authority bindings but cannot create them. Validation check IDs beginning with `runtime.` are reserved for framework journals and reject before execution; rename affected development IDs and their gate/progress references.
 
 ```yaml
@@ -3413,6 +3487,7 @@ fixtures:
 |-------|------|---------|-------------|
 | `context` | object | `{}` | Runtime context applied after `context_file` |
 | `context_file` | path? | `null` | JSON context file resolved relative to the suite file |
+| `files` | map | `{}` | At most 256 relative UTF-8 files / 8 MiB, materialized inside the attempt without overwriting an existing effect |
 | `tools` | map | `{}` | Mock tool outputs keyed by tool ID |
 | `llm.mode` | enum | `real` | `real`, `mock`, `replay`, or `record` |
 | `llm.responses` | list | `[]` | Ordered mock responses for `mock` mode |
@@ -3499,7 +3574,8 @@ scenarios:
 | `skip` | bool/string | `false` | Skip the scenario. A string value is treated as the skip reason and appears in reports. |
 | `env` | map | `{}` | Serial-only process environment overlay for one scenario attempt. Values are restored after the attempt. Parallel suites that use `env` are rejected. |
 | `turns` | list | `[]` | Direct conversation turns. Each turn uses the same runtime unless `isolation: turn` is configured. |
-| `steps` | list | `[]` | Advanced sequence with run/reset/save/load/context/actor steps. Use this for persistence, actor switching, or multi-session checks. |
+| `steps` | list | `[]` | Advanced sequence with `!task`, run/reset/save/load/context/actor steps; task operations require scenario isolation. Use this for persistence, actor switching, or multi-session checks. |
+| `interactions` | list | `[]` | Up to 256 typed controls for actual independent child participants while an ordinary parent is pending; see [foreground participant controls](@/docs/evaluation.md#foreground-participant-controls) |
 | `turn.input` | `string` | required | User input for a turn |
 | `turn.actor` | `string?` | `null` | Actor override for a single turn |
 | `turn.context` | object | `null` | Turn-level context overlay |
@@ -3691,7 +3767,7 @@ Judge fields:
 | File | Purpose |
 |------|---------|
 | `summary.md` | Human-readable pass/fail summary |
-| `summary.json` | Machine-readable result with `schema_version: 1` |
+| `summary.json` | Machine-readable result: published 1.1.1 uses `schema_version: 1`; the development checkout uses `schema_version: 3` |
 | `per_scenario.jsonl` | One scenario result per line |
 | `failures.md` | Failure-focused report |
 | `junit.xml` | Optional CI report when `--junit` is used |

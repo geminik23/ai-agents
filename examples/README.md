@@ -596,6 +596,11 @@ Development-only task profiles use the existing controller, not a coding-specifi
 | `skill_task.yaml` | Automatic selected-skill entry with one-time scripted preparation and retained continuation |
 | `state_task.yaml` | State-scope exit with an explicit post-exit gate, without unrelated destination work |
 | `approval_task.yaml` | Exact task approval/rejection; its mocked suite replaces approved HTTP output and opens no socket |
+| `controlled_analysis.yaml` | Tool-free objective/limit revisions, explicit Continue, stop/cancel and bounded reviewed replanning |
+| `unrelated_exit.yaml` | Negative state-scope control: movement into an unrelated destination is incomplete, not success |
+| `independent_research.yaml` | Ordinary parent with two independent state-task questions serviced while its original future is pending |
+| `agents/independent_a.yaml` | First independently hosted researcher; selected through actual session participation, not a label-derived runner |
+| `agents/independent_b.yaml` | Second independently hosted researcher with a distinct inherited provider alias |
 | `composed_research.yaml` | Concurrent child findings, one coordinating question, no completed-prefix replay and an exact shared four-call cap |
 | `agents/source_a.yaml` | Ordinary research participant A; inherits the coordinating owner in the composed profile, not a separate task host |
 | `agents/source_b.yaml` | Ordinary research participant B; inherits the coordinating owner in the composed profile, not a separate task host |
@@ -606,6 +611,8 @@ From the repository root:
 sh examples/eval/mocked/run_mocked_evals.sh --category autonomy
 cargo run --manifest-path examples/Cargo.toml -p example-custom-llm --bin task-domain-evals -- examples/eval/mocked/autonomy/research_mocked.yaml target/eval/research
 ```
+
+`rust/custom-llm/src/task_domain.rs` is shared by the embedded `task-domain-host` and `task-domain-evals`; customize its real record integration and pure predicates without modifying the controller, core gates or eval helper. Follow `website/content/docs/task-autonomy.md` for configuration, typed delivery, evidence interpretation and your own host executable.
 
 The helper's fixed host marker selects that Rust application only where adapters/ceilings are required; it still uses the same `EvalRunner`. Top-level autonomy defaults/profile loading does not turn every ordinary input into a task. Explicit invocations start task profiles, while the state/skill examples declare automatic scoped entry. `{{ eval.workspace }}` in file/command profiles is a generated eval token: replace it with the application's authorized path outside the eval harness. Keep attempt-local file fixtures and command/HTTP/approval fixtures intact. Compile/build-only validation does not prove live model quality or production restart support.
 
@@ -730,6 +737,7 @@ Custom LLM provider examples - from implementing `LLMProvider` from scratch to m
 | `multi-provider` | Multi-provider routing with `MultiLLMRouter` - expensive model for users, cheap model for internal tasks |
 | `task-events` | Development-only offline task lifecycle events, retained question and explicit resume; no API key or tools |
 | `automatic-tasks` | Development-only YAML state/skill automatic task entry, safe events and explicit host resume through the same controller; offline with no tools or API key |
+| `task-domain-host` | Offline embedded support round trip with actual ticket evidence and the same runtime-only domain installation as eval |
 | `task-domain-evals` | Explicit Rust validator/progress/tool integration for the same development EvalRunner; isolated business state and default-redacted reports, no provider keys |
 
 Note: For a zero-code YAML alternative, see `yaml/basic/openai_compatible.yaml` which uses the built-in `provider: openai-compatible` with `base_url` - no custom Rust code needed.

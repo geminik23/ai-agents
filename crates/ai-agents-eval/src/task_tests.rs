@@ -293,7 +293,7 @@ async fn task_report_metrics_deduplicate_resume_and_observe_both_operations() {
     )
     .await;
     assert_eq!(result.passed, 1, "{:#?}", result.scenarios);
-    assert_eq!(result.schema_version, 2);
+    assert_eq!(result.schema_version, 3);
     assert_eq!(result.metrics.observed_task_runs, 1);
     assert_eq!(result.metrics.observed_task_llm_attempts, 2);
     let report = result.observability.as_ref().unwrap();

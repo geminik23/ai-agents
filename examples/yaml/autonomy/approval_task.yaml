@@ -5,11 +5,20 @@ description: "A retained tool approval with current policy reauthorization"
 # Run the mocked HITL task suite: approved HTTP output is fixture-backed and no socket is opened.
 # Normal application hosts must provide appropriate HTTP policy and human delivery; approval never overrides policy denial.
 # Flow: proposed HTTP request -> retained approval -> exact host decision -> shared executor -> acknowledged result.
+# Usage (offline): sh examples/eval/mocked/run_mocked_evals.sh --category autonomy
+# Customize HTTP grants/policy and the authenticated delivery endpoint before replacing the fixture transport.
 system_prompt: Perform only the requested approved operation and report its actual result.
 llm: {provider: openai, model: gpt-5.4-mini}
 tools: [http]
+# Domain policy is checked again after modified approval arguments; a human cannot authorize another host.
+tool_security:
+  enabled: true
+  fail_closed: true
+  tools:
+    http: {allowed_domains: [api.example.test], allow_without_confirmation: true}
+# Tool review and task pausing are different layers: this review requires a human, and autonomy retains that exact request.
 hitl:
-  default_timeout_seconds: 120
+  default_timeout_seconds: 120  # Human response bound; it does not extend the task's original expiry.
   on_timeout: reject
   tools:
     http:
@@ -17,7 +26,7 @@ hitl:
       approval_message: 'Approve {{ method }} request to {{ url }}?'
 autonomy:
   enabled: true
-  max_turns: 4
-  max_llm_calls: 8
+  max_turns: 4  # Work-cycle allowance; resolved default: 30.
+  max_llm_calls: 8  # Admitted model-call allowance; resolved default: 60.
   hitl: {on_approval_required: pause_run}
   completion: {tool_called: {id: http, count: 1, executed: true, success: true}}

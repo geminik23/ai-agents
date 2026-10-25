@@ -13,7 +13,93 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 
-const AGENT: &str = "name: PreparedEval\nsystem_prompt: Produce a verified report.\ntools: []\nautonomy:\n  enabled: true\n  max_turns: 4\n  max_llm_calls: 4\n  max_active_time_seconds: 60\n  max_wall_time_seconds: 3600\n  completion: {response_contains: verified report}\n  premature_finish: {action: ask_user, on_unavailable: stop}\n";
+const AGENT: &str = "name: PreparedEval\nsystem_prompt: Produce a verified report.\ntools: [ticket]\nautonomy:\n  enabled: true\n  max_turns: 4\n  max_llm_calls: 4\n  max_active_time_seconds: 60\n  max_wall_time_seconds: 3600\n  validation: {checks: [{id: ticket, adapter: host.ticket, config: {}}]}\n  completion: {validator_passed: ticket}\n  premature_finish: {action: ask_user, on_unavailable: stop}\n";
+// The application record is durable independently of the task journal; a provider's success claim cannot resolve it.
+struct Ticket {
+    path: PathBuf,
+    status: Mutex<String>,
+}
+#[async_trait]
+impl ai_agents_core::Tool for Ticket {
+    fn id(&self) -> &str {
+        "ticket"
+    }
+    fn name(&self) -> &str {
+        "Disposable ticket"
+    }
+    fn description(&self) -> &str {
+        "Resolve the isolated ticket record"
+    }
+    fn input_schema(&self) -> Value {
+        json!({"type":"object","properties":{"resolve":{"type":"boolean"}},"required":["resolve"],"additionalProperties":false})
+    }
+    async fn execute(
+        &self,
+        args: Value,
+        _: ai_agents_core::ToolExecutionContext,
+    ) -> ai_agents_core::ToolResult {
+        if args["resolve"] != true {
+            return ai_agents_core::ToolResult::error("invalid ticket action");
+        }
+        if std::fs::write(&self.path, "resolved").is_err() {
+            return ai_agents_core::ToolResult::error("ticket write failed");
+        }
+        *self.status.lock().unwrap() = "resolved".into();
+        ai_agents_core::ToolResult::ok("resolved")
+    }
+}
+struct TicketValidator {
+    descriptor: AdapterDescriptor,
+    ticket: Arc<Ticket>,
+}
+impl AutonomyValidator for TicketValidator {
+    fn descriptor(&self) -> &AdapterDescriptor {
+        &self.descriptor
+    }
+    fn validate_config(&self, config: &Value) -> ai_agents_core::Result<()> {
+        if config.as_object().is_none_or(|object| !object.is_empty()) {
+            return Err(ai_agents_core::AgentError::Config(
+                "ticket config must be empty".into(),
+            ));
+        }
+        Ok(())
+    }
+    fn evaluate(&self, _: &ValidationInput<'_>) -> ai_agents_core::Result<ValidationDecision> {
+        Ok(ValidationDecision::Complete {
+            outcome: if *self.ticket.status.lock().unwrap() == "resolved" {
+                GateOutcome::Pass
+            } else {
+                GateOutcome::Fail
+            },
+            reason: "actual_ticket_state".into(),
+            metrics: json!({}),
+            evidence_refs: vec![],
+        })
+    }
+}
+fn install_ticket(
+    builder: AgentBuilder,
+    directory: &std::path::Path,
+) -> ai_agents_core::Result<AgentBuilder> {
+    let path = directory.join("ticket.txt");
+    let status = std::fs::read_to_string(&path)
+        .map_err(|error| ai_agents_core::AgentError::Config(error.to_string()))?;
+    let ticket = Arc::new(Ticket {
+        path,
+        status: Mutex::new(status),
+    });
+    let mut extensions = AutonomyExtensions::builtins();
+    extensions.register_validator(Arc::new(TicketValidator {
+        descriptor: AdapterDescriptor {
+            id: "host.ticket".into(),
+            contract_version: 1,
+            ..Default::default()
+        },
+        ticket: ticket.clone(),
+    }))?;
+    Ok(builder.tool(ticket).autonomy_extensions(extensions))
+}
+
 struct Queue {
     replies: Mutex<VecDeque<String>>,
     calls: AtomicUsize,
@@ -165,7 +251,10 @@ impl crate::EvalHost for Consumer {
         let mut registry = ai_agents_llm::LLMRegistry::new();
         registry.register("default", self.queue.clone());
         registry.set_default("default");
-        Ok(builder.llm_registry(registry))
+        Ok(install_ticket(
+            builder.llm_registry(registry),
+            &self.directory,
+        )?)
     }
     async fn prepare(
         &self,
@@ -193,7 +282,13 @@ impl crate::EvalHost for Consumer {
             TaskRestoreRequest {
                 run_id: receipt["id"].as_str().unwrap().into(),
                 expected_revision: receipt["revision"].as_u64().unwrap(),
-                config_identity: "prepared-fixture.v1".into(),
+                config_identity: if std::env::var("AI_AGENTS_EVAL_PREPARED_CASE").as_deref()
+                    == Ok("incompatible")
+                {
+                    "wrong-fixture.v1".into()
+                } else {
+                    "prepared-fixture.v1".into()
+                },
                 config: spec.autonomy,
                 ceilings: Default::default(),
             },
@@ -202,6 +297,10 @@ impl crate::EvalHost for Consumer {
         )
         .await?;
         assert_eq!(self.queue.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            std::fs::read_to_string(self.directory.join("ticket.txt"))?,
+            "open"
+        );
         assert_eq!(result.run.counters.llm_attempts, 1);
         assert_eq!(
             serde_json::to_value(result.run.clocks.expires_at)?,
@@ -213,9 +312,17 @@ impl crate::EvalHost for Consumer {
 
 #[test]
 fn prepared_process_result_is_evaluated_after_fresh_review_without_replaying_prefix() {
+    for case in ["complete", "reject", "incompatible"] {
+        prepared_case(case);
+    }
+}
+
+// Each disposition gets an independently produced safe pause; terminal work is never copied or replayed for another case.
+fn prepared_case(case: &str) {
     let directory = std::env::temp_dir().join(format!("eval-prepared-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&directory).unwrap();
     std::fs::write(directory.join("agent.yaml"), AGENT).unwrap();
+    std::fs::write(directory.join("ticket.txt"), "open").unwrap();
     std::fs::write(directory.join("suite.yaml"),r#"
 name: Prepared Support Continuation
 agent: agent.yaml
@@ -234,9 +341,30 @@ scenarios:
         operation: {action: resume, response: {kind: answer, value: continue}}
         assert:
           all:
-            - task: {status: completed, same_run: true, counters: {path: llm_attempts, eq: 2}, event_result_parity: true}
+            - task: {status: completed, same_run: true, counters: {path: llm_attempts, eq: 3}, checks: [{id: ticket, outcome: pass}], event_result_parity: true}
             - response_contains: verified report
+            - tool_called: {id: ticket, source_in: [llm], count: 1, executed: true, success: true}
 "#).unwrap();
+    if case == "reject" {
+        std::fs::write(directory.join("suite.yaml"), r#"
+name: Rejected Prepared Support
+agent: agent.yaml
+settings: {retries: 0, timeout_per_scenario_ms: 20000}
+fixtures: {llm: {mode: mock}}
+scenarios:
+  - id: fresh-review-rejection-never-resolves-the-ticket
+    steps:
+      - !task
+        operation: {action: inspect}
+        assert: {task: {status: paused, counters: {path: llm_attempts, eq: 1}}}
+      - !task
+        operation: {action: restoration_review, decision: {status: rejected, reason: Do not reconstruct semantic work.}}
+        assert:
+          all:
+            - task: {status: cancelled, same_run: true, counters: {path: llm_attempts, eq: 1}}
+            - tool_not_called: ticket
+"#).unwrap();
+    }
     for phase in ["producer", "consumer"] {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
@@ -245,6 +373,7 @@ scenarios:
                 "--ignored",
                 "--nocapture",
             ])
+            .env("AI_AGENTS_EVAL_PREPARED_CASE", case)
             .env("AI_AGENTS_EVAL_PREPARED_PHASE", phase)
             .env("AI_AGENTS_EVAL_PREPARED_DIRECTORY", &directory)
             .output()
@@ -258,8 +387,19 @@ scenarios:
     let result: Value =
         serde_json::from_slice(&std::fs::read(directory.join("report/summary.json")).unwrap())
             .unwrap();
-    assert_eq!(result["passed"], 1);
-    assert_eq!(result["metrics"]["observed_task_runs"], 1);
+    assert_eq!(result["passed"], if case == "incompatible" { 0 } else { 1 });
+    assert_eq!(
+        result["metrics"]["observed_task_runs"],
+        if case == "incompatible" { 0 } else { 1 }
+    );
+    assert_eq!(
+        std::fs::read_to_string(directory.join("ticket.txt")).unwrap(),
+        if case == "complete" {
+            "resolved"
+        } else {
+            "open"
+        }
+    );
     std::fs::remove_dir_all(directory).unwrap();
 }
 
@@ -269,15 +409,23 @@ async fn prepared_process_worker() {
     let phase = std::env::var("AI_AGENTS_EVAL_PREPARED_PHASE").unwrap();
     let directory = PathBuf::from(std::env::var_os("AI_AGENTS_EVAL_PREPARED_DIRECTORY").unwrap());
     if phase == "producer" {
-        let queue = Queue::new(&["draft", "verified report"]);
+        let queue = Queue::new(&[
+            "draft",
+            "{\"tool\":\"ticket\",\"arguments\":{\"resolve\":true}}",
+            "verified report",
+        ]);
         let agent = Arc::new(
-            AgentBuilder::from_yaml_file(directory.join("agent.yaml"))
-                .unwrap()
-                .llm(queue.clone())
-                .auto_configure_features()
-                .unwrap()
-                .build()
-                .unwrap(),
+            install_ticket(
+                AgentBuilder::from_yaml_file(directory.join("agent.yaml"))
+                    .unwrap()
+                    .llm(queue.clone()),
+                &directory,
+            )
+            .unwrap()
+            .auto_configure_features()
+            .unwrap()
+            .build()
+            .unwrap(),
         );
         let host = RestoreHost::new();
         host.register(&agent, &queue);
@@ -327,8 +475,45 @@ async fn prepared_process_worker() {
             .unwrap()
             .with_host(host);
         let result = runner.run().await.unwrap();
-        assert_eq!(result.passed, 1, "{:#?}", result.scenarios);
-        assert_eq!(queue.calls.load(Ordering::SeqCst), 1);
+        let details: Vec<_> = result
+            .scenarios
+            .iter()
+            .flat_map(|s| &s.attempts)
+            .flat_map(|a| &a.turns)
+            .map(|t| {
+                (
+                    t.assertion_results
+                        .iter()
+                        .filter(|a| !a.passed)
+                        .map(|a| a.assertion.as_str())
+                        .collect::<Vec<_>>(),
+                    t.evidence
+                        .task
+                        .as_ref()
+                        .map(|e| (&e.inspection.run.status, &e.inspection.run.counters)),
+                    t.evidence.tool_executions.clone(),
+                )
+            })
+            .collect();
+        let case = std::env::var("AI_AGENTS_EVAL_PREPARED_CASE").unwrap();
+        assert_eq!(
+            result.passed,
+            if case == "incompatible" { 0 } else { 1 },
+            "{details:?}"
+        );
+        assert_eq!(result.failed, if case == "incompatible" { 1 } else { 0 });
+        assert_eq!(
+            queue.calls.load(Ordering::SeqCst),
+            if case == "complete" { 2 } else { 0 }
+        );
+        assert_eq!(
+            std::fs::read_to_string(directory.join("ticket.txt")).unwrap(),
+            if case == "complete" {
+                "resolved"
+            } else {
+                "open"
+            }
+        );
         crate::write_outputs(&result, &directory.join("report"), true).unwrap();
     }
 }

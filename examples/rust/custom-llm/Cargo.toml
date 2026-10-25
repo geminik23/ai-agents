@@ -40,3 +40,7 @@ path = "src/automatic_tasks.rs"
 [[bin]]
 name = "task-domain-evals"
 path = "src/task_domain_evals.rs"
+
+[[bin]]
+name = "task-domain-host"
+path = "src/task_domain_host.rs"

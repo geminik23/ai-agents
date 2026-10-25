@@ -153,6 +153,21 @@ impl EvalSuite {
                 )));
             }
             scenario.budget.validate(&scenario.id)?;
+            if scenario.interactions.len() > 256 {
+                return Err(EvalError::Config(
+                    "at most 256 task interactions per scenario".into(),
+                ));
+            }
+            if !scenario.interactions.is_empty()
+                && self.settings.isolation != IsolationMode::Scenario
+            {
+                return Err(EvalError::Config(
+                    "task interactions require scenario isolation".into(),
+                ));
+            }
+            for (index, script) in scenario.interactions.iter().enumerate() {
+                crate::interactions::validate(script, index)?;
+            }
             for (turn_index, turn) in scenario.turns.iter().enumerate() {
                 validate_turn_assertion(turn, &scenario.id, &format!("turns[{turn_index}]"))?;
             }
@@ -287,6 +302,9 @@ pub struct Scenario {
     /// Turns executed by this scenario or step.
     #[serde(default)]
     pub turns: Vec<Turn>,
+    /// Typed controls for independently hosted participants while a foreground turn is pending.
+    #[serde(default)]
+    pub interactions: Vec<crate::interactions::TaskInteraction>,
     /// Advanced steps executed after direct turns.
     #[serde(default)]
     pub steps: Vec<ScenarioStep>,
@@ -641,6 +659,8 @@ pub struct TurnResult {
     /// Safe task projection; exact task and validator data remain assertion-only.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub task: Option<crate::task::TaskReport>,
+    /// Separate participant results do not replace the parent's response or task result.
+    pub interactions: Vec<crate::interactions::TaskInteractionResult>,
     /// Full assertion-time evidence for this turn.
     #[serde(skip_serializing)]
     pub evidence: TurnEvidence,
@@ -698,6 +718,7 @@ mod tests {
                     timeout_ms: None,
                     assertions: None,
                 }],
+                interactions: Vec::new(),
                 steps: Vec::new(),
             }],
         }

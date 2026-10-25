@@ -1,4 +1,5 @@
-//! Development autonomy primitives and guarded standalone execution; full task integration remains unfinished.
+//! Development task controller, scoped entry, foreground hosting and explicit prepared recovery.
+//! Runtime execution is shared across consumers; production restart hosting and arbitrary in-flight restoration are not installed.
 
 #[cfg(test)]
 mod ad_maintenance_fault_tests;
@@ -54,6 +55,8 @@ pub(crate) mod suspension;
 mod suspension_tests;
 pub use suspension::TaskResumeInput;
 pub(crate) use suspension::{TaskBatchState, TaskLoopState, scope_task_batch, scope_task_request};
+#[cfg(test)]
+mod objective_template_tests;
 #[cfg(test)]
 mod runner_additional_tests;
 #[cfg(test)]

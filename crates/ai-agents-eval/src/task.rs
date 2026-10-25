@@ -306,6 +306,8 @@ pub(crate) struct TaskContext {
     pub deadline: Option<tokio::time::Instant>,
     pub workspace_hold: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     pub last: Option<TaskRunResult>,
+    pub interactions: crate::interactions::Interactions,
+    pub redact_interactions: bool,
     pub events: Vec<TaskRunEvent>,
     pub events_complete: bool,
 }
@@ -319,6 +321,8 @@ impl Default for TaskContext {
             deadline: None,
             workspace_hold: None,
             last: None,
+            interactions: std::sync::Arc::new(parking_lot::Mutex::new(Default::default())),
+            redact_interactions: true,
             events: Vec::new(),
             events_complete: true,
         }
@@ -413,6 +417,9 @@ impl TaskContext {
             step.operation.operation(self.last.as_ref())?
         };
         let session = self.session.clone();
+        let interactions = self.interactions.clone();
+        let redact = self.redact_interactions;
+        let foreground_runtime = agent as *const RuntimeAgent as usize;
         let mut stream = runner.stream_operation(operation, Default::default())?;
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
         let work = async {
@@ -428,11 +435,17 @@ impl TaskContext {
         };
         let (result, deadline_error) = drive(
             &session,
-            session.scope_runner(runner.clone(), work),
+            crate::interactions::service(
+                &session,
+                session.scope_runner(runner.clone(), work),
+                interactions,
+                redact,
+                foreground_runtime,
+            ),
             deadline,
         )
         .await?;
-        Ok((result?, deadline_error))
+        Ok((result??, deadline_error))
     }
 
     pub(crate) async fn capture(
@@ -585,19 +598,29 @@ pub(crate) async fn drain_after_cancel_error<F: std::future::Future>(
 }
 
 // Serial cancellation follows actual admitted handles while the owning foreground future keeps polling.
-async fn cancel_running(session: &TaskHostSession) -> Result<()> {
+pub(crate) async fn cancel_running(session: &TaskHostSession) -> Result<()> {
     let mut requested = std::collections::BTreeSet::new();
     loop {
         for run in session.runs() {
-            if run.execution_admitted()
-                && !requested.contains(&run.key.run_id)
-                && run
-                    .runner
-                    .request_running_cancel(&run.key.run_id)
-                    .await?
-                    .is_some()
+            if !run.execution_admitted() || requested.contains(&run.key.run_id) {
+                continue;
+            }
+            if run
+                .runner
+                .request_running_cancel(&run.key.run_id)
+                .await?
+                .is_some()
             {
                 requested.insert(run.key.run_id);
+            } else if let Some(revision) = run.published_revision() {
+                // A child can already be publicly paused while its ordinary parent is still awaiting completion.
+                let display = run.runner.task_display(&run.key.run_id).await?;
+                if display.summary.status == TaskRunStatus::Paused
+                    && display.summary.revision == revision
+                {
+                    run.runner.cancel_paused(&run.key.run_id, revision).await?;
+                    requested.insert(run.key.run_id);
+                }
             }
         }
         tokio::time::sleep(std::time::Duration::from_millis(1)).await;

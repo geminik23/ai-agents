@@ -1,0 +1,28 @@
+name: Task Command Validation Failure
+agent: ../../../yaml/autonomy/code_fix.yaml
+# Only the command host is replaced; policy, shared executor admission and typed validation still run.
+# Flow: candidate answer -> nonzero fixture command -> failed check -> no successful completion.
+# There is no shell process, network request or source mutation in this scenario.
+settings: {timeout_per_turn_ms: 10000, retries: 0}
+fixtures:
+  workspace_policy:
+    read_tools: [diagnostics]
+  llm: {mode: mock, responses: [The task is complete.]}
+  commands:
+    available: true
+    entries:
+      - argv: [cargo, test]
+        response: {success: false, exit_code: 1, termination: exited, stdout: '', stderr: fixture test failure, combined_output: fixture test failure, truncated: false, timed_out: false, cwd: '{{ eval.workspace }}', argv_redacted: [cargo, test]}
+  diagnostics: {available: true, items: []}
+scenarios:
+  - id: nonzero-command-cannot-establish-task-completion
+    steps:
+      - !task
+        operation: {action: run, objective: Verify the requested change.}
+        assert:
+          all:
+            - not: {task: {status: completed}}
+            - task: {checks: [{id: tests, outcome: fail}], event_result_parity: true}
+            - tool_called: {id: command, source_in: [task], count_gte: 1, executed: true, result_path: {path: exit_code, eq: 1}}
+            - tool_not_called: file_edit
+            - tool_not_called: patch
