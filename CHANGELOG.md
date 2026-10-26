@@ -108,6 +108,11 @@
 - Interrupted turns: dropping a pending state re-dispatch no longer leaves later messages and response hooks attached to the abandoned turn
 - Shared model providers: concurrent requests retain their own prompt and model settings through dispatch and stream opening, including extra fallback settings and exact configuration cache matching
 
+## 1.1.2 - 2026-10-11
+
+### Fixed
+- Redis cleanup: preserve snapshots changed after expiry inspection and count only sessions actually deleted
+
 ## 1.1.1 - 2026-10-05
 
 ### Fixed
