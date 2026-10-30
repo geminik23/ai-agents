@@ -16,7 +16,9 @@ use ai_agents_core::{
 
 use crate::generate_schema;
 use crate::security::path::PathPolicyResolver;
-use crate::types::{FileVersionEvidence, FileVersionStore, file_version_evidence};
+use crate::types::{
+    FileVersionEvidence, FileVersionStore, file_version_evidence, truncate_head_tail,
+};
 
 const DEFAULT_MAX_OUTPUT_CHARS: usize = 20_000;
 const DEFAULT_MAX_REPLACEMENTS: usize = 20;
@@ -146,7 +148,7 @@ struct PatchInput {
     allow_delete: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct MutationOutput {
     path: Option<String>,
     dry_run: bool,
@@ -167,6 +169,7 @@ struct MutationOutput {
 
 #[derive(Debug, Default)]
 struct MutationPolicySnapshot {
+    read_paths: Vec<String>,
     write_paths: Vec<String>,
     allowed_paths: Vec<String>,
     blocked_paths: Vec<String>,
@@ -185,6 +188,7 @@ impl MutationPolicySnapshot {
             .unwrap_or("dry_run_only")
             .to_string();
         let mut snapshot = Self {
+            read_paths: strings_at(value, "read_paths"),
             write_paths: strings_at(value, "write_paths"),
             allowed_paths: strings_at(value, "allowed_paths"),
             blocked_paths: strings_at(value, "blocked_paths"),
@@ -195,6 +199,7 @@ impl MutationPolicySnapshot {
             allow_without_confirmation: bool_at(value, "allow_without_confirmation"),
         };
         if let Some(paths) = value.get("paths") {
+            snapshot.read_paths.extend(strings_at(paths, "allow"));
             snapshot.write_paths.extend(strings_at(paths, "allow"));
             snapshot.blocked_paths.extend(strings_at(paths, "deny"));
         }
@@ -440,8 +445,10 @@ impl Tool for FileEditTool {
             Ok(content) => content,
             Err(error) => return ToolResult::error(format!("Read error: {}", error)),
         };
-        let matches: Vec<_> = original.match_indices(&input.old_text).collect();
-        if matches.is_empty() {
+        let show_file_context = edit_context_is_readable(&path, &policy);
+        let mut matches = original.match_indices(&input.old_text);
+        let first_match = matches.next();
+        if first_match.is_none() {
             let output = MutationOutput {
                 path: Some(input.path),
                 dry_run: input.dry_run,
@@ -454,26 +461,46 @@ impl Tool for FileEditTool {
                 overwritten: false,
                 truncated: false,
                 approval_required: false,
-                diff_summary: "old_text was not found".to_string(),
+                diff_summary: "old_text was not found; re-read the file and use exact text"
+                    .to_string(),
                 changed_paths: Vec::new(),
                 version: None,
-                near_matches: near_matches(&original, &input.old_text),
-            };
-            return match serde_json::to_string(&output) {
-                Ok(json) => ToolResult {
-                    success: false,
-                    output: json,
-                    metadata: None,
+                near_matches: if show_file_context {
+                    near_matches(&original, &input.old_text)
+                } else {
+                    Vec::new()
                 },
-                Err(error) => ToolResult::error(format!("Serialization error: {}", error)),
             };
+            return file_edit_result(output, false, ctx.limits.max_output_chars);
         }
-        if matches.len() > 1 && !input.replace_all {
-            return ToolResult::error(
-                "old_text appears multiple times; set replace_all to true to replace all occurrences",
-            );
+        if !input.replace_all
+            && let Some(second) = matches.next()
+        {
+            let locations = if show_file_context {
+                let offsets = [
+                    first_match.map(|(offset, _)| offset),
+                    Some(second.0),
+                    matches.next().map(|(offset, _)| offset),
+                ];
+                let lines: Vec<_> = offsets
+                    .into_iter()
+                    .flatten()
+                    .map(|offset| {
+                        original[..offset]
+                            .bytes()
+                            .filter(|byte| *byte == b'\n')
+                            .count()
+                            + 1
+                    })
+                    .collect();
+                format!(" at lines {lines:?}")
+            } else {
+                String::new()
+            };
+            return ToolResult::error(format!(
+                "old_text appears multiple times{locations}; re-read the file or set replace_all to true to replace all occurrences"
+            ));
         }
-        let replacements = if input.replace_all { matches.len() } else { 1 };
         let max_replacements = input
             .max_replacements
             .unwrap_or(DEFAULT_MAX_REPLACEMENTS)
@@ -482,6 +509,12 @@ impl Tool for FileEditTool {
                     .max_replacements
                     .unwrap_or(DEFAULT_MAX_REPLACEMENTS),
             );
+        // Stop after one more than the permitted count instead of retaining every match in a large file.
+        let replacements = if input.replace_all {
+            1 + matches.take(max_replacements).count()
+        } else {
+            1
+        };
         if replacements > max_replacements {
             return ToolResult::error("replacement count exceeds configured max_replacements");
         }
@@ -499,7 +532,31 @@ impl Tool for FileEditTool {
         if exceeds(ctx.limits.max_changed_lines, changed_lines) {
             return ToolResult::error("edit exceeds configured max_changed_lines");
         }
-        let diff_summary = preview_diff(&original, &edited, DEFAULT_MAX_OUTPUT_CHARS);
+        // A completed write needs room for an explicit effect receipt; never mutate when the configured output cannot carry it.
+        let minimum_receipt = serde_json::json!({"mutation_performed": true, "truncated": true})
+            .to_string()
+            .chars()
+            .count();
+        if !input.dry_run
+            && ctx
+                .limits
+                .max_output_chars
+                .is_some_and(|limit| limit < minimum_receipt)
+        {
+            return ToolResult::error("edit not applied: output limit cannot report the effect");
+        }
+        let (diff_summary, diff_truncated) = if show_file_context {
+            preview_diff(
+                &original,
+                &edited,
+                &input.old_text,
+                &input.new_text,
+                replacements,
+                DEFAULT_MAX_OUTPUT_CHARS,
+            )
+        } else {
+            preview_requested_edit(&input.old_text, &input.new_text, replacements)
+        };
         let version = if input.dry_run {
             None
         } else {
@@ -514,23 +571,27 @@ impl Tool for FileEditTool {
                 Err(_) => None,
             }
         };
-        json_result(&MutationOutput {
-            path: Some(input.path.clone()),
-            dry_run: input.dry_run,
-            mutation_performed: !input.dry_run,
-            changed_files: 1,
-            changed_lines,
-            replacements,
-            bytes_written: if input.dry_run { 0 } else { edited.len() },
-            created: false,
-            overwritten: !input.dry_run,
-            truncated: diff_summary.chars().count() >= DEFAULT_MAX_OUTPUT_CHARS,
-            approval_required: !input.dry_run && policy.approval_required(),
-            diff_summary,
-            changed_paths: vec![input.path],
-            version,
-            near_matches: Vec::new(),
-        })
+        file_edit_result(
+            MutationOutput {
+                path: Some(input.path.clone()),
+                dry_run: input.dry_run,
+                mutation_performed: !input.dry_run,
+                changed_files: 1,
+                changed_lines,
+                replacements,
+                bytes_written: if input.dry_run { 0 } else { edited.len() },
+                created: false,
+                overwritten: !input.dry_run,
+                truncated: diff_truncated,
+                approval_required: !input.dry_run && policy.approval_required(),
+                diff_summary,
+                changed_paths: vec![input.path],
+                version,
+                near_matches: Vec::new(),
+            },
+            true,
+            ctx.limits.max_output_chars,
+        )
     }
 }
 
@@ -1266,6 +1327,21 @@ fn ensure_write_allowed(
     Ok(())
 }
 
+// File-edit context is model-visible data; a write-only grant must not become authority to read neighboring file content.
+fn edit_context_is_readable(path: &Path, policy: &MutationPolicySnapshot) -> bool {
+    let Ok(resolver) = mutation_path_resolver() else {
+        return false;
+    };
+    for root in policy.read_paths.iter().chain(policy.allowed_paths.iter()) {
+        match resolver.is_allowed(path, Path::new(root)) {
+            Ok(true) => return true,
+            Ok(false) => {}
+            Err(_) => return false,
+        }
+    }
+    false
+}
+
 fn ensure_not_write_root(path: &Path, policy: &MutationPolicySnapshot) -> Result<(), String> {
     let resolver = mutation_path_resolver()?;
     for root in policy.write_paths.iter().chain(policy.allowed_paths.iter()) {
@@ -1342,45 +1418,296 @@ fn changed_line_count(before: &str, after: &str) -> usize {
         + before_lines.len().abs_diff(after_lines.len())
 }
 
-fn preview_diff(before: &str, after: &str, max_chars: usize) -> String {
-    let before_lines: Vec<_> = before.lines().collect();
-    let after_lines: Vec<_> = after.lines().collect();
+// A write grant permits reporting requested text, not disclosing unrelated file content or line locations.
+fn preview_requested_edit(old_text: &str, new_text: &str, replacements: usize) -> (String, bool) {
     let mut output = String::new();
-    for (index, (left, right)) in before_lines.iter().zip(after_lines.iter()).enumerate() {
-        if left != right {
-            output.push_str(&format!(
-                "-{}:{}\n+{}:{}\n",
-                index + 1,
-                left,
-                index + 1,
-                right
-            ));
-        }
-        if output.chars().count() >= max_chars {
-            return output.chars().take(max_chars).collect();
-        }
-    }
-    if before_lines.len() != after_lines.len() {
-        output.push_str(&format!(
-            "line count changed from {} to {}\n",
-            before_lines.len(),
-            after_lines.len()
-        ));
-    }
-    output.chars().take(max_chars).collect()
+    let mut used = 0;
+    let header = format!(
+        "{replacements} exact replacement(s); file context requires an explicit read path.\nRequested old text: "
+    );
+    let complete = [
+        header.as_str(),
+        old_text,
+        "\nRequested new text: ",
+        new_text,
+    ]
+    .into_iter()
+    .all(|part| append_bounded(&mut output, &mut used, DEFAULT_MAX_OUTPUT_CHARS, part));
+    finish_diff_preview(output, !complete, DEFAULT_MAX_OUTPUT_CHARS)
 }
 
-fn near_matches(content: &str, needle: &str) -> Vec<String> {
-    let prefix: String = needle.chars().take(16).collect();
-    if prefix.is_empty() {
-        return Vec::new();
+// Show the actual changed lines within exact replacement windows; display must not change admission's line accounting.
+fn preview_diff(
+    before: &str,
+    after: &str,
+    old_text: &str,
+    new_text: &str,
+    replacements: usize,
+    max_chars: usize,
+) -> (String, bool) {
+    const MAX_DIFF_LINES: usize = 1_000;
+    const MAX_DIFF_CELLS: usize = 250_000;
+    let mut windows: Vec<(usize, usize, usize, usize)> = Vec::new();
+    let mut old_cursor = 0;
+    let mut new_cursor = 0;
+    for (old_start, _) in before.match_indices(old_text).take(replacements) {
+        let new_start = new_cursor + (old_start - old_cursor);
+        let old_end = old_start + old_text.len();
+        let new_end = new_start + new_text.len();
+        let old_boundary = old_end > 0 && before.as_bytes()[old_end - 1] == b'\n';
+        let new_boundary = new_end > 0 && after.as_bytes()[new_end - 1] == b'\n';
+        // Joining or splitting lines changes the following line even if the replacement ends at a newline.
+        let old_window_end = if old_boundary && !new_boundary {
+            next_line_end(before, old_end)
+        } else {
+            line_end(before, old_end)
+        };
+        let new_window_end = if new_boundary && !old_boundary {
+            next_line_end(after, new_end)
+        } else {
+            line_end(after, new_end)
+        };
+        let window = (
+            line_start(before, old_start),
+            old_window_end,
+            line_start(after, new_start),
+            new_window_end,
+        );
+        if let Some(last) = windows.last_mut()
+            && window.0 <= last.1
+            && window.2 <= last.3
+        {
+            last.1 = last.1.max(window.1);
+            last.3 = last.3.max(window.3);
+        } else {
+            windows.push(window);
+        }
+        old_cursor = old_end;
+        new_cursor = new_end;
     }
-    content
-        .lines()
-        .filter(|line| line.contains(&prefix))
-        .take(3)
-        .map(str::to_string)
-        .collect()
+
+    let mut output = String::new();
+    let mut used = 0;
+    let mut truncated = false;
+    for (old_start, old_end, new_start, new_end) in windows {
+        let old_lines: Vec<_> = before[old_start..old_end]
+            .split_inclusive('\n')
+            .take(MAX_DIFF_LINES + 1)
+            .collect();
+        let new_lines: Vec<_> = after[new_start..new_end]
+            .split_inclusive('\n')
+            .take(MAX_DIFF_LINES + 1)
+            .collect();
+        let columns = new_lines.len() + 1;
+        let cells = (old_lines.len() + 1).saturating_mul(columns);
+        if old_lines.len() > MAX_DIFF_LINES
+            || new_lines.len() > MAX_DIFF_LINES
+            || cells > MAX_DIFF_CELLS
+        {
+            append_bounded(
+                &mut output,
+                &mut used,
+                max_chars,
+                "Detailed diff omitted because the changed region exceeds preview limits. Re-read the file or use git_diff.\n",
+            );
+            truncated = true;
+            break;
+        }
+        let mut common = vec![0u32; cells];
+        for old_index in (0..old_lines.len()).rev() {
+            for new_index in (0..new_lines.len()).rev() {
+                let index = old_index * columns + new_index;
+                common[index] = if old_lines[old_index] == new_lines[new_index] {
+                    common[(old_index + 1) * columns + new_index + 1] + 1
+                } else {
+                    common[(old_index + 1) * columns + new_index]
+                        .max(common[old_index * columns + new_index + 1])
+                };
+            }
+        }
+        let old_number = before[..old_start]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count()
+            + 1;
+        let new_number = after[..new_start]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count()
+            + 1;
+        let (mut old_index, mut new_index) = (0, 0);
+        while old_index < old_lines.len() || new_index < new_lines.len() {
+            if old_index < old_lines.len()
+                && new_index < new_lines.len()
+                && old_lines[old_index] == new_lines[new_index]
+            {
+                old_index += 1;
+                new_index += 1;
+                continue;
+            }
+            let remove = new_index == new_lines.len()
+                || (old_index < old_lines.len()
+                    && common[(old_index + 1) * columns + new_index]
+                        >= common[old_index * columns + new_index + 1]);
+            let complete = if remove {
+                let complete = append_diff_line(
+                    &mut output,
+                    &mut used,
+                    max_chars,
+                    '-',
+                    old_number + old_index,
+                    old_lines[old_index],
+                );
+                old_index += 1;
+                complete
+            } else {
+                let complete = append_diff_line(
+                    &mut output,
+                    &mut used,
+                    max_chars,
+                    '+',
+                    new_number + new_index,
+                    new_lines[new_index],
+                );
+                new_index += 1;
+                complete
+            };
+            if !complete {
+                truncated = true;
+                break;
+            }
+        }
+        if truncated {
+            break;
+        }
+    }
+    finish_diff_preview(output, truncated, max_chars)
+}
+
+// A preview limit is explicit evidence of incomplete display, not proof that a write was reverted.
+fn finish_diff_preview(mut output: String, truncated: bool, max_chars: usize) -> (String, bool) {
+    if truncated {
+        const MARKER: &str = "\n...[diff truncated]...\n";
+        let marker_len = MARKER.chars().count();
+        if marker_len <= max_chars {
+            output = output.chars().take(max_chars - marker_len).collect();
+            output.push_str(MARKER);
+        }
+    }
+    (output, truncated)
+}
+
+fn line_start(text: &str, offset: usize) -> usize {
+    text[..offset].rfind('\n').map_or(0, |index| index + 1)
+}
+
+fn line_end(text: &str, offset: usize) -> usize {
+    if offset > 0 && text.as_bytes()[offset - 1] == b'\n' {
+        offset
+    } else {
+        next_line_end(text, offset)
+    }
+}
+
+fn next_line_end(text: &str, offset: usize) -> usize {
+    text[offset..]
+        .find('\n')
+        .map_or(text.len(), |index| offset + index + 1)
+}
+
+fn append_bounded(output: &mut String, used: &mut usize, limit: usize, text: &str) -> bool {
+    for character in text.chars() {
+        if *used == limit {
+            return false;
+        }
+        output.push(character);
+        *used += 1;
+    }
+    true
+}
+
+fn append_diff_line(
+    output: &mut String,
+    used: &mut usize,
+    limit: usize,
+    sign: char,
+    line_number: usize,
+    line: &str,
+) -> bool {
+    let (content, ending) = if let Some(content) = line.strip_suffix("\r\n") {
+        (content, " [CRLF]\n")
+    } else if let Some(content) = line.strip_suffix('\n') {
+        (content, "\n")
+    } else {
+        (line, " [no newline]\n")
+    };
+    let prefix = format!("{sign}{line_number}:\"");
+    if !append_bounded(output, used, limit, &prefix) {
+        return false;
+    }
+    for character in content.chars() {
+        let escaped = match character {
+            '"' => Some("\\\"".to_string()),
+            '\\' => Some("\\\\".to_string()),
+            '\t' => Some("\\t".to_string()),
+            '\r' => Some("\\r".to_string()),
+            value if value.is_control() => Some(format!("\\u{:04x}", value as u32)),
+            _ => None,
+        };
+        let mut buffer = [0u8; 4];
+        let text = escaped
+            .as_deref()
+            .unwrap_or_else(|| character.encode_utf8(&mut buffer));
+        if !append_bounded(output, used, limit, text) {
+            return false;
+        }
+    }
+    append_bounded(output, used, limit, "\"") && append_bounded(output, used, limit, ending)
+}
+
+// Candidate context comes only from the already authorized target and is advisory, never a fuzzy write target.
+fn near_matches(content: &str, needle: &str) -> Vec<String> {
+    const MAX_SEARCH_LINES: usize = 5_000;
+    const MAX_MATCH_LINE_CHARS: usize = 256;
+    const MAX_CONTEXT_CHARS: usize = 80;
+    let mut anchors = Vec::new();
+    for line in needle.lines().take(8) {
+        let chars: Vec<_> = line.trim().chars().take(128).collect();
+        if chars.len() < 3 {
+            continue;
+        }
+        let width = (chars.len() / 2).clamp(3, 16).min(chars.len());
+        anchors.push(chars[..width].iter().collect::<String>());
+        anchors.push(chars[chars.len() - width..].iter().collect::<String>());
+    }
+    let snippet = |line: &str, offset: usize| {
+        let prefix_chars = line[..offset].chars().count();
+        let skip = prefix_chars.saturating_sub(30);
+        let mut characters = line.chars().skip(skip);
+        let mut text: String = characters.by_ref().take(MAX_CONTEXT_CHARS).collect();
+        if skip > 0 {
+            text.insert_str(0, "...");
+        }
+        if characters.next().is_some() {
+            text.push_str("...");
+        }
+        text
+    };
+    let mut matches = Vec::new();
+    for (index, line) in content.lines().take(MAX_SEARCH_LINES).enumerate() {
+        let bounded_line: String = line.chars().take(MAX_MATCH_LINE_CHARS).collect();
+        if let Some(offset) = anchors
+            .iter()
+            .filter_map(|anchor| bounded_line.find(anchor))
+            .min()
+        {
+            matches.push(format!("line {}: {}", index + 1, snippet(line, offset)));
+            if matches.len() == 3 {
+                break;
+            }
+        }
+    }
+    matches
 }
 
 fn parse_unified_diff(input: &str) -> Result<Vec<PatchFile>, String> {
@@ -1573,6 +1900,216 @@ fn mutation_path_resolver() -> Result<PathPolicyResolver, String> {
 
 fn exceeds(limit: Option<usize>, value: usize) -> bool {
     limit.is_some_and(|limit| value > limit)
+}
+
+// Bound the complete serialized edit result so the shared executor can retain its reason and advisory context when the fixed fields fit.
+fn file_edit_result(mut output: MutationOutput, success: bool, limit: Option<usize>) -> ToolResult {
+    let original_hints = output.near_matches.clone();
+    let json = match serialize_bounded_file_edit(&mut output, success, limit) {
+        Ok(json) => json,
+        Err(error) => return ToolResult::error(format!("Serialization error: {}", error)),
+    };
+    if let Some(limit) = limit {
+        let projected = match file_edit_model_output_len(&json, success) {
+            Ok(projected) => projected,
+            Err(error) => return ToolResult::error(format!("Serialization error: {}", error)),
+        };
+        if projected > limit {
+            if !success {
+                match compact_file_edit_failure(&output, &original_hints, limit) {
+                    Ok(Some(compact)) => {
+                        return ToolResult {
+                            success: false,
+                            output: compact,
+                            metadata: None,
+                        };
+                    }
+                    Ok(None) => {
+                        for reason in [
+                            "file edit failed; re-read the file (output limit)",
+                            "edit failed; re-read",
+                            "edit failed",
+                        ] {
+                            if file_edit_model_output_len(reason, false)
+                                .is_ok_and(|length| length <= limit)
+                            {
+                                return ToolResult::error(reason);
+                            }
+                        }
+                        let marker = "{\"truncated\":true}";
+                        if marker.chars().count() <= limit {
+                            return ToolResult::error(marker);
+                        }
+                        return ToolResult::error(
+                            "file edit failed; output limit prevents details",
+                        );
+                    }
+                    Err(error) => {
+                        return ToolResult::error(format!("Serialization error: {}", error));
+                    }
+                }
+            }
+            let minimal = serde_json::json!({
+                "dry_run": output.dry_run,
+                "mutation_performed": output.mutation_performed,
+                "truncated": true
+            })
+            .to_string();
+            if minimal.chars().count() <= limit {
+                return ToolResult::ok(minimal);
+            }
+            let effect_only = serde_json::json!({
+                "mutation_performed": output.mutation_performed,
+                "truncated": true
+            })
+            .to_string();
+            if effect_only.chars().count() <= limit {
+                return ToolResult::ok(effect_only);
+            }
+        }
+    }
+    ToolResult {
+        success,
+        output: json,
+        metadata: None,
+    }
+}
+
+// A partial failure envelope preserves the reason and authorized hints without pretending omitted effect fields are complete.
+fn compact_file_edit_failure(
+    output: &MutationOutput,
+    hints: &[String],
+    limit: usize,
+) -> Result<Option<String>, serde_json::Error> {
+    let mut compact = serde_json::json!({
+        "mutation_performed": false,
+        "truncated": true,
+        "diff_summary": output.diff_summary,
+        "near_matches": []
+    });
+    let mut best = serde_json::to_string(&compact)?;
+    if file_edit_model_output_len(&best, false)? > limit {
+        return Ok(None);
+    }
+    let max = hints
+        .iter()
+        .map(|hint| hint.chars().count())
+        .max()
+        .unwrap_or(0);
+    let mut low = 0;
+    let mut high = max.saturating_add(1);
+    while low < high {
+        let middle = low + (high - low) / 2;
+        compact["near_matches"] = Value::Array(
+            hints
+                .iter()
+                .map(|hint| hint.chars().take(middle).collect::<String>())
+                .filter(|hint| !hint.is_empty())
+                .map(Value::String)
+                .collect(),
+        );
+        let candidate = serde_json::to_string(&compact)?;
+        if file_edit_model_output_len(&candidate, false)? <= limit {
+            best = candidate;
+            low = middle + 1;
+        } else {
+            high = middle;
+        }
+    }
+    Ok(Some(best))
+}
+
+// Reserve the existing runtime error wrapper as well as its escaped reason within the model-facing limit.
+fn file_edit_model_output_len(output: &str, success: bool) -> Result<usize, serde_json::Error> {
+    if success {
+        return Ok(output.chars().count());
+    }
+    let wrapper = serde_json::json!({
+        "success": false,
+        "error": {
+            "kind": "tool_error",
+            "reason": output,
+            "retryable": false,
+            "requires_user_action": false
+        }
+    });
+    Ok("Error: Tool error: ".len() + serde_json::to_string(&wrapper)?.chars().count())
+}
+
+// Preserve failure reasons and stable effect fields; only display text and nearby hints may be shortened.
+fn serialize_bounded_file_edit(
+    output: &mut MutationOutput,
+    success: bool,
+    limit: Option<usize>,
+) -> Result<String, serde_json::Error> {
+    let full = serde_json::to_string(output)?;
+    let Some(limit) = limit else {
+        return Ok(full);
+    };
+    if file_edit_model_output_len(&full, success)? <= limit {
+        return Ok(full);
+    }
+    let producer_truncated = output.truncated;
+    if output.near_matches.is_empty() && (!success || output.diff_summary.is_empty()) {
+        return Ok(full);
+    }
+    output.truncated = true;
+    let diff = std::mem::take(&mut output.diff_summary);
+    let hints = std::mem::take(&mut output.near_matches);
+    if !success {
+        output.diff_summary = diff.clone();
+    }
+    let mut best = serde_json::to_string(output)?;
+    if file_edit_model_output_len(&best, success)? > limit {
+        return Ok(best);
+    }
+    let max = hints
+        .iter()
+        .map(|hint| hint.chars().count())
+        .chain(success.then(|| diff.chars().count()))
+        .max()
+        .unwrap_or(0);
+    let mut low = 0;
+    let mut high = max.saturating_add(1);
+    while low < high {
+        let middle = low + (high - low) / 2;
+        if success {
+            output.diff_summary = truncate_head_tail(&diff, middle).0;
+        }
+        output.near_matches = hints
+            .iter()
+            .map(|hint| hint.chars().take(middle).collect::<String>())
+            .filter(|hint| !hint.is_empty())
+            .collect();
+        let candidate = serde_json::to_string(output)?;
+        if file_edit_model_output_len(&candidate, success)? <= limit {
+            best = candidate;
+            low = middle + 1;
+        } else {
+            high = middle;
+        }
+    }
+    if !producer_truncated {
+        let original: Value = serde_json::from_str(&full)?;
+        let candidate: Value = serde_json::from_str(&best)?;
+        if original["diff_summary"] == candidate["diff_summary"]
+            && original["near_matches"] == candidate["near_matches"]
+        {
+            let mut reduced: MutationOutput = serde_json::from_str(&best)?;
+            if success && !reduced.diff_summary.is_empty() {
+                let length = reduced.diff_summary.chars().count();
+                reduced.diff_summary = truncate_head_tail(&reduced.diff_summary, length - 1).0;
+            } else if let Some(hint) = reduced.near_matches.last_mut() {
+                let length = hint.chars().count();
+                *hint = hint.chars().take(length.saturating_sub(1)).collect();
+                reduced.near_matches.retain(|hint| !hint.is_empty());
+            } else {
+                return Ok(full);
+            }
+            return serde_json::to_string(&reduced);
+        }
+    }
+    Ok(best)
 }
 
 fn json_result<T: Serialize>(output: &T) -> ToolResult {
@@ -2627,6 +3164,7 @@ mod tests {
     fn mutation_context(tool_id: &str, root: &Path) -> ToolExecutionContext {
         let mut context = ToolExecutionContext::test(tool_id);
         context.policy_snapshot = serde_json::json!({
+            "read_paths": [root.to_string_lossy()],
             "write_paths": [root.to_string_lossy()],
             "overwrite_existing": true,
             "create_parent_dirs": true,
@@ -2678,7 +3216,548 @@ mod tests {
             .await;
         assert!(!result.success);
         let output: Value = serde_json::from_str(&result.output).unwrap();
-        assert_eq!(output["diff_summary"], "old_text was not found");
+        assert!(
+            output["diff_summary"]
+                .as_str()
+                .unwrap()
+                .contains("old_text was not found")
+        );
+        assert!(output["diff_summary"].as_str().unwrap().contains("re-read"));
+    }
+
+    #[tokio::test]
+    async fn output_and_edit_regression_missing_text_has_bounded_context_without_mutation() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.txt");
+        let before = "before\nStatus: draft\nafter\n";
+        fs::write(&path, before).unwrap();
+        let result = FileEditTool::new()
+            .execute(
+                serde_json::json!({
+                    "path": path.to_string_lossy(),
+                    "old_text": "Status: ready",
+                    "new_text": "Status: reviewed",
+                    "dry_run": false
+                }),
+                mutation_context("file_edit", dir.path()),
+            )
+            .await;
+        assert!(!result.success);
+        assert_eq!(fs::read_to_string(&path).unwrap(), before);
+        let output = result_json(&result);
+        let hints = output["near_matches"].as_array().unwrap();
+        assert!(!hints.is_empty());
+        let hints = hints
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(hints.contains("Status: draft"));
+        assert!(hints.contains('2'));
+        assert!(hints.chars().count() <= 1_000);
+    }
+
+    #[tokio::test]
+    async fn output_and_edit_regression_diff_reports_insert_delete_and_end_of_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.txt");
+        let tool = FileEditTool::new();
+        for (before, old, new, expected, unexpected) in [
+            (
+                "one\nkeep\nlast\n",
+                "one\n",
+                "one\ninserted\n",
+                "+2:\"inserted\"",
+                "-2:\"keep\"",
+            ),
+            (
+                "one\nremove\nkeep\n",
+                "remove\n",
+                "",
+                "-2:\"remove\"",
+                "+2:\"keep\"",
+            ),
+            (
+                "keep\n",
+                "keep\n",
+                "keep\nlast\n",
+                "+2:\"last\"",
+                "-1:\"keep\"",
+            ),
+        ] {
+            fs::write(&path, before).unwrap();
+            let result = tool
+                .execute(
+                    serde_json::json!({
+                        "path": path.to_string_lossy(),
+                        "old_text": old,
+                        "new_text": new,
+                        "dry_run": true
+                    }),
+                    mutation_context("file_edit", dir.path()),
+                )
+                .await;
+            assert!(result.success, "{}", result.output);
+            let output = result_json(&result);
+            let diff = output["diff_summary"].as_str().unwrap();
+            assert!(diff.contains(expected), "{diff:?}");
+            assert!(!diff.contains(unexpected), "{diff:?}");
+            assert_eq!(fs::read_to_string(&path).unwrap(), before);
+        }
+    }
+
+    #[tokio::test]
+    async fn output_and_edit_regression_edit_results_fit_the_effective_output_limit() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("bounded.txt");
+        let before = (0..6)
+            .map(|i| format!("Status: draft {i} {}\n", "\\\"".repeat(80)))
+            .collect::<String>();
+        fs::write(&path, &before).unwrap();
+        let mut context = mutation_context("file_edit", dir.path());
+        context.limits.max_output_chars = Some(512);
+        let result = FileEditTool::new()
+            .execute(
+                serde_json::json!({
+                    "path": path.to_string_lossy(),
+                    "old_text": "Status: ready",
+                    "new_text": "Status: reviewed",
+                    "dry_run": true
+                }),
+                context,
+            )
+            .await;
+        assert!(!result.success);
+        assert!(result.output.chars().count() <= 512);
+        let model_error = serde_json::json!({
+            "success": false,
+            "error": {
+                "kind": "tool_error",
+                "reason": result.output,
+                "retryable": false,
+                "requires_user_action": false
+            }
+        })
+        .to_string();
+        assert!("Error: Tool error: ".len() + model_error.chars().count() <= 512);
+        let output = result_json(&result);
+        assert_eq!(output["truncated"], true);
+        assert!(output["diff_summary"].as_str().unwrap().contains("re-read"));
+        assert!(
+            output["near_matches"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|hint| {
+                    hint.as_str()
+                        .is_some_and(|hint| hint.contains("Status: draft"))
+                })
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn output_and_edit_regression_one_character_over_limit_remains_valid_json() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("edit.txt");
+        fs::write(&path, "a\n").unwrap();
+        let tool = FileEditTool::new();
+        let args = serde_json::json!({"path":path.to_string_lossy(),"old_text":"a","new_text":"b","dry_run":true});
+        let original = tool
+            .execute(args.clone(), mutation_context("file_edit", dir.path()))
+            .await;
+        assert!(original.success);
+        let cap = original.output.chars().count() - 1;
+        let mut context = mutation_context("file_edit", dir.path());
+        context.limits.max_output_chars = Some(cap);
+        let bounded = tool.execute(args, context).await;
+        assert!(bounded.success);
+        assert!(bounded.output.chars().count() <= cap);
+        let output = result_json(&bounded);
+        assert_eq!(output["mutation_performed"], false);
+        assert_eq!(output["truncated"], true);
+        assert_ne!(
+            output["diff_summary"],
+            result_json(&original)["diff_summary"]
+        );
+    }
+
+    #[tokio::test]
+    async fn output_and_edit_regression_small_limit_reports_actual_write() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("edit.txt");
+        fs::write(&path, "before\n").unwrap();
+        let mut context = mutation_context("file_edit", dir.path());
+        context.limits.max_output_chars = Some(48);
+        let result = FileEditTool::new()
+            .execute(
+                serde_json::json!({"path":path.to_string_lossy(),"old_text":"before","new_text":"after","dry_run":false}),
+                context,
+            )
+            .await;
+        assert!(result.success);
+        assert!(result.output.chars().count() <= 48);
+        let output = result_json(&result);
+        assert_eq!(output["mutation_performed"], true);
+        assert_eq!(output["truncated"], true);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "after\n");
+    }
+
+    #[tokio::test]
+    async fn output_and_edit_regression_small_error_limit_bounds_model_payload() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("edit.txt");
+        fs::write(&path, "a\n").unwrap();
+        let mut context = mutation_context("file_edit", dir.path());
+        context.policy_snapshot["read_paths"] = serde_json::json!([]);
+        context.limits.max_output_chars = Some(180);
+        let result = FileEditTool::new()
+            .execute(
+                serde_json::json!({"path":path.to_string_lossy(),"old_text":"absent","new_text":"x","dry_run":true}),
+                context,
+            )
+            .await;
+        assert!(!result.success);
+        let model_error = serde_json::json!({
+            "success": false,
+            "error": {"kind":"tool_error","reason":result.output,"retryable":false,"requires_user_action":false}
+        })
+        .to_string();
+        assert!("Error: Tool error: ".len() + model_error.chars().count() <= 180);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "a\n");
+    }
+
+    #[tokio::test]
+    async fn output_and_edit_regression_diff_preserves_crlf_and_repeated_edits() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("unicode.txt");
+        let before = "\u{feff}첫줄\r\n항목=old\r\n중간\r\n항목=old";
+        fs::write(&path, before).unwrap();
+        let result = FileEditTool::new()
+            .execute(
+                serde_json::json!({
+                    "path": path.to_string_lossy(),
+                    "old_text": "항목=old",
+                    "new_text": "항목=new",
+                    "replace_all": true,
+                    "dry_run": false
+                }),
+                mutation_context("file_edit", dir.path()),
+            )
+            .await;
+        assert!(result.success, "{}", result.output);
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            before.replace("항목=old", "항목=new")
+        );
+        let output = result_json(&result);
+        let diff = output["diff_summary"].as_str().unwrap();
+        assert!(diff.contains("-2:\"항목=old\" [CRLF]"));
+        assert!(diff.contains("+2:\"항목=new\" [CRLF]"));
+        assert!(diff.contains("-4:\"항목=old\" [no newline]"));
+        assert!(diff.contains("+4:\"항목=new\" [no newline]"));
+        assert!(!diff.contains("중간"));
+        assert_eq!(output["replacements"], 2);
+    }
+
+    #[tokio::test]
+    async fn output_and_edit_regression_write_only_does_not_disclose_file_context() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("private.txt");
+        let before = "Status: private-fixture-value\n";
+        fs::write(&path, before).unwrap();
+        let mut context = ToolExecutionContext::test("file_edit");
+        context.policy_snapshot = serde_json::json!({
+            "write_paths": [dir.path().to_string_lossy()],
+            "allow_without_confirmation": true
+        });
+        let tool = FileEditTool::new();
+        let missing = tool
+            .execute(
+                serde_json::json!({"path": path.to_string_lossy(), "old_text": "Status: ready", "new_text": "Status: done", "dry_run": true}),
+                context.clone(),
+            )
+            .await;
+        assert!(!missing.success);
+        assert!(!missing.output.contains("private-fixture-value"));
+        assert!(
+            result_json(&missing)["near_matches"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        let preview = tool
+            .execute(
+                serde_json::json!({"path": path.to_string_lossy(), "old_text": "Status", "new_text": "State", "dry_run": true}),
+                context,
+            )
+            .await;
+        assert!(preview.success);
+        assert!(!preview.output.contains("private-fixture-value"));
+        assert!(preview.output.contains("Requested old text"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn output_and_edit_regression_diff_handles_joined_split_and_unchanged_lines() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("lines.txt");
+        let tool = FileEditTool::new();
+        for (before, old, new, expected, unexpected) in [
+            (
+                "a\nb",
+                "\n",
+                "",
+                vec!["-1:\"a\"", "-2:\"b\"", "+1:\"ab\""],
+                vec![],
+            ),
+            (
+                "ab",
+                "a",
+                "a\n",
+                vec!["-1:\"ab\"", "+1:\"a\"", "+2:\"b\""],
+                vec![],
+            ),
+            (
+                "a\nkeep\nb\n",
+                "a\nkeep\nb\n",
+                "x\nkeep\ny\n",
+                vec!["-1:\"a\"", "-3:\"b\"", "+1:\"x\"", "+3:\"y\""],
+                vec!["-2:\"keep\"", "+2:\"keep\""],
+            ),
+        ] {
+            fs::write(&path, before).unwrap();
+            let result = tool
+                .execute(
+                    serde_json::json!({"path": path.to_string_lossy(), "old_text": old, "new_text": new, "dry_run": true}),
+                    mutation_context("file_edit", dir.path()),
+                )
+                .await;
+            assert!(result.success, "{}", result.output);
+            let output = result_json(&result);
+            let diff = output["diff_summary"].as_str().unwrap();
+            for expected in expected {
+                assert!(diff.contains(expected), "missing {expected:?}: {diff:?}");
+            }
+            for unexpected in unexpected {
+                assert!(
+                    !diff.contains(unexpected),
+                    "unexpected {unexpected:?}: {diff:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn output_and_edit_regression_diff_preserves_all_unchanged_lines() {
+        fn lines(text: &str) -> Vec<&str> {
+            text.split_inclusive('\n').collect()
+        }
+        for before in ["a\nb", "a\nb\n", "ab\nc", "a\n\nb", "a\r\nb", "ab", ""] {
+            let mut ranges = Vec::new();
+            for start in 0..before.len() {
+                for end in start + 1..=before.len() {
+                    let old = &before[start..end];
+                    if before.match_indices(old).count() == 1 {
+                        ranges.push(old);
+                    }
+                }
+            }
+            if before.is_empty() {
+                ranges.push("");
+            }
+            for old in ranges {
+                for new in ["", "x", "\n", "x\n", "\nx"] {
+                    if old == new {
+                        continue;
+                    }
+                    let after = before.replacen(old, new, 1);
+                    let (diff, truncated) = preview_diff(before, &after, old, new, 1, 20_000);
+                    assert!(!truncated);
+                    assert!(
+                        !diff.is_empty(),
+                        "before={before:?}, old={old:?}, new={new:?}"
+                    );
+                    let original = lines(before);
+                    let edited = lines(&after);
+                    let mut removed = HashSet::new();
+                    let mut added = HashSet::new();
+                    for row in diff.lines() {
+                        let sign = row.chars().next().unwrap();
+                        let (number, encoded) = row[1..].split_once(':').unwrap();
+                        let number: usize = number.parse().unwrap();
+                        let (encoded, ending) =
+                            if let Some(encoded) = encoded.strip_suffix(" [CRLF]") {
+                                (encoded, "\r\n")
+                            } else if let Some(encoded) = encoded.strip_suffix(" [no newline]") {
+                                (encoded, "")
+                            } else {
+                                (encoded, "\n")
+                            };
+                        let decoded: String = serde_json::from_str(encoded).unwrap();
+                        let rendered = format!("{decoded}{ending}");
+                        match sign {
+                            '-' => {
+                                assert!(removed.insert(number));
+                                assert_eq!(original[number - 1], rendered);
+                            }
+                            '+' => {
+                                assert!(added.insert(number));
+                                assert_eq!(edited[number - 1], rendered);
+                            }
+                            _ => panic!("invalid diff line: {row}"),
+                        }
+                    }
+                    let kept_old: Vec<_> = original
+                        .iter()
+                        .enumerate()
+                        .filter(|(index, _)| !removed.contains(&(index + 1)))
+                        .map(|(_, line)| *line)
+                        .collect();
+                    let kept_new: Vec<_> = edited
+                        .iter()
+                        .enumerate()
+                        .filter(|(index, _)| !added.contains(&(index + 1)))
+                        .map(|(_, line)| *line)
+                        .collect();
+                    assert_eq!(
+                        kept_old, kept_new,
+                        "before={before:?}, old={old:?}, new={new:?}, diff={diff:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn output_and_edit_regression_diff_distinguishes_literal_line_ending_markers() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("markers.txt");
+        fs::write(&path, "a [CRLF]\n").unwrap();
+        let result = FileEditTool::new()
+            .execute(
+                serde_json::json!({"path": path.to_string_lossy(), "old_text": " [CRLF]\n", "new_text": "\r\n", "dry_run": true}),
+                mutation_context("file_edit", dir.path()),
+            )
+            .await;
+        assert!(result.success, "{}", result.output);
+        let output = result_json(&result);
+        let diff = output["diff_summary"].as_str().unwrap();
+        assert!(diff.contains("-1:\"a [CRLF]\""), "{diff}");
+        assert!(diff.contains("+1:\"a\" [CRLF]"), "{diff}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn output_and_edit_regression_unresolvable_read_root_fails_closed() {
+        use std::os::unix::fs::symlink;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("private.txt");
+        fs::write(&path, "Status: private-fixture-value\n").unwrap();
+        let dangling = dir.path().join("dangling");
+        symlink(dir.path().join("missing"), &dangling).unwrap();
+        let mut context = mutation_context("file_edit", dir.path());
+        context.policy_snapshot["read_paths"] =
+            serde_json::json!([dangling.to_string_lossy(), dir.path().to_string_lossy()]);
+        let result = FileEditTool::new()
+            .execute(
+                serde_json::json!({"path": path.to_string_lossy(), "old_text": "Status: ready", "new_text": "Status: done", "dry_run": true}),
+                context,
+            )
+            .await;
+        assert!(!result.success);
+        assert!(!result.output.contains("private-fixture-value"));
+        assert!(
+            result_json(&result)["near_matches"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn output_and_edit_regression_fixed_fields_do_not_falsely_claim_preview_truncation() {
+        let mut output = MutationOutput {
+            path: Some("a".repeat(200)),
+            dry_run: true,
+            mutation_performed: false,
+            changed_files: 0,
+            changed_lines: 0,
+            replacements: 0,
+            bytes_written: 0,
+            created: false,
+            overwritten: false,
+            truncated: false,
+            approval_required: false,
+            diff_summary: "old_text was not found; re-read the file and use exact text".into(),
+            changed_paths: Vec::new(),
+            version: None,
+            near_matches: Vec::new(),
+        };
+        let full = serde_json::to_string(&output).unwrap();
+        let cap = full.chars().count() - 1;
+        let result = serialize_bounded_file_edit(&mut output, false, Some(cap)).unwrap();
+        assert_eq!(result, full);
+        assert!(!output.truncated);
+    }
+
+    #[tokio::test]
+    async fn output_and_edit_regression_empty_text_keeps_replacement_limit() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("large.txt");
+        let before = "한".repeat(50_000);
+        fs::write(&path, &before).unwrap();
+        let result = FileEditTool::new()
+            .execute(
+                serde_json::json!({"path":path.to_string_lossy(),"old_text":"","new_text":"x","replace_all":true,"max_replacements":3,"dry_run":false}),
+                mutation_context("file_edit", dir.path()),
+            )
+            .await;
+        assert!(!result.success);
+        assert!(result.output.contains("max_replacements"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn output_and_edit_regression_large_diff_is_explicitly_incomplete() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("large.txt");
+        let before = (0..501).map(|n| format!("old-{n}\n")).collect::<String>();
+        let after = (0..501).map(|n| format!("new-{n}\n")).collect::<String>();
+        fs::write(&path, &before).unwrap();
+        let result = FileEditTool::new()
+            .execute(
+                serde_json::json!({"path": path.to_string_lossy(), "old_text": before, "new_text": after, "dry_run": true}),
+                mutation_context("file_edit", dir.path()),
+            )
+            .await;
+        assert!(result.success, "{}", result.output);
+        let output = result_json(&result);
+        assert_eq!(output["truncated"], true);
+        assert!(output["diff_summary"].as_str().unwrap().contains("omitted"));
+    }
+
+    #[tokio::test]
+    async fn output_and_edit_regression_stale_read_cannot_mutate_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("stale.txt");
+        let before = "status=old\n";
+        fs::write(&path, before).unwrap();
+        let versions = FileVersionStore::default();
+        versions.record(file_version_evidence(&path, before.as_bytes()).unwrap());
+        let changed = "external change\nstatus=old\n";
+        fs::write(&path, changed).unwrap();
+        let mut context = mutation_context("file_edit", dir.path());
+        context.policy_snapshot["require_read_before_write"] = Value::Bool(true);
+        let result = FileEditTool::with_version_store(versions)
+            .execute(
+                serde_json::json!({"path": path.to_string_lossy(), "old_text": "status=old", "new_text": "status=new", "dry_run": false}),
+                context,
+            )
+            .await;
+        assert!(!result.success);
+        assert!(result.output.contains("must not change before write"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), changed);
     }
 
     #[tokio::test]

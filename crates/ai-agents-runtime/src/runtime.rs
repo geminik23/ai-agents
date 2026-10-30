@@ -6706,6 +6706,7 @@ impl RuntimeAgent {
     /// Executes retry sub-attempts inside one logical executor request while assigning every new invocation a fresh deadline.
     /// A settled retained-message result consumes no new attempt and continues from its captured retry index.
     /// Known returned but ineligible effects stay factual and cannot trigger a retry or fallback.
+    /// Tool failure details can contain authorized file text and are not copied into retry logs.
     ///
     /// Hooks and `ToolExecutionRecord` finalization remain request-level and occur once after this retry loop returns.
     async fn run_tool_with_retries(
@@ -6750,7 +6751,7 @@ impl RuntimeAgent {
                 return Ok((result, timed_out, cancelled, invoked, eligible));
             }
             attempts += 1;
-            warn!(tool = %canonical_id, attempt = attempts, error = %result.output, "Retrying failed tool call");
+            warn!(tool = %canonical_id, attempt = attempts, "Retrying failed tool call");
         }
     }
 
@@ -6870,6 +6871,7 @@ impl RuntimeAgent {
     // The retained hop keeps its original start hook and timing while fresh attempts still reauthorize and consume admission.
     // Original retained response bindings restrict preparation even if current approval gates disappear; known non-invocation still publishes ordinary denial records.
     // Task question rejection is recorded before invocation and never manufactures an answer or consumes a tool slot.
+    // Tool arguments can contain source text and remain private when passed through aliases or fallback requests.
     async fn execute_tool_record_scoped(
         &self,
         request: ToolExecutionRequest,
@@ -6908,7 +6910,7 @@ impl RuntimeAgent {
             .and_then(|cursor| cursor.started_at)
             .unwrap_or_else(chrono::Utc::now);
         let start = Instant::now();
-        info!(tool = %request.requested_name, args = %request.arguments, "Executing tool");
+        info!(tool = %request.requested_name, "Executing tool");
 
         if self.runtime_control.emergency_deny.load(Ordering::SeqCst) {
             let record = self.record_from_parts(
@@ -10718,6 +10720,7 @@ OVERALL: PASS/FAIL"#,
     }
 
     /// Execute a list of state actions (tool calls, skill invocations, context updates, LLM prompts).
+    /// Tool and skill failures may carry authorized file text and must not expose it in action logs.
     async fn execute_state_actions(&self, actions: &[StateAction]) {
         for (action_index, action) in actions.iter().enumerate() {
             match action {
@@ -10747,10 +10750,10 @@ OVERALL: PASS/FAIL"#,
                             );
                         }
                         Ok(record) => {
-                            warn!(tool = %record.canonical_id, error = %record.output, "State action: tool failed");
+                            warn!(tool = %record.canonical_id, "State action: tool failed");
                         }
-                        Err(e) => {
-                            warn!(tool = %tool, error = %e, "State action: tool failed")
+                        Err(_) => {
+                            warn!(tool = %tool, "State action: tool failed")
                         }
                     }
                 }
@@ -10762,8 +10765,8 @@ OVERALL: PASS/FAIL"#,
                                 .await
                             {
                                 Ok(_) => debug!(skill = %skill, "State action: skill executed"),
-                                Err(e) => {
-                                    warn!(skill = %skill, error = %e, "State action: skill failed")
+                                Err(_) => {
+                                    warn!(skill = %skill, "State action: skill failed")
                                 }
                             }
                         } else {

@@ -38,6 +38,8 @@ tool_security:
       read_paths: [./examples/fixtures/tool_examples]
       blocked_paths: [./target, ./.git]
     file_edit:
+      # Authorize the same read root for nearby mismatch hints and complete line previews.
+      read_paths: [./examples/fixtures/tool_examples]
       write_paths: [./examples/fixtures/tool_examples]
       blocked_paths: [./target, ./.git]
       require_read_before_write: true

@@ -37,6 +37,7 @@ pub async fn pipeline(
 
 /// Saved stage cursor selection belongs only to the framework parent entry, not to callbacks invoking a nested public pipeline.
 /// A task-scoped SDK pipeline pins unstarted registered stages across earlier turns and awaited hooks.
+/// Tool and skill failures can contain authorized source text and are not copied into pipeline logs.
 async fn pipeline_dispatch(
     registry: &AgentRegistry,
     input: &str,
@@ -241,7 +242,11 @@ async fn pipeline_dispatch(
             }
             Err(error @ AgentError::TaskSuspended(_)) => return Err(error),
             Err(e) => {
-                warn!(stage = i, agent = %agent_id, error = %e, "Pipeline stage failed");
+                if matches!(&e, AgentError::Tool(_) | AgentError::Skill(_)) {
+                    warn!(stage = i, agent = %agent_id, "Pipeline stage failed");
+                } else {
+                    warn!(stage = i, agent = %agent_id, error = %e, "Pipeline stage failed");
+                }
                 stage_outputs.push(StageOutput {
                     agent_id: agent_id.clone(),
                     output: format!("Error: {}", e),

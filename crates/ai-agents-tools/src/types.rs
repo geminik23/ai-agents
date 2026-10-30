@@ -4,7 +4,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::Digest;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -767,13 +767,13 @@ pub struct CommandResponse {
     pub exit_code: Option<i32>,
     /// Termination reason: exited, timeout, cancelled, unavailable, or error.
     pub termination: String,
-    /// Captured stdout after truncation.
+    /// Captured stdout, preserving bounded beginning and ending text when truncated.
     #[serde(default)]
     pub stdout: String,
-    /// Captured stderr after truncation.
+    /// Captured stderr, preserving bounded beginning and ending text when truncated.
     #[serde(default)]
     pub stderr: String,
-    /// Captured stdout and stderr after truncation.
+    /// Captured stdout followed by stderr, not their chronological interleaving.
     #[serde(default)]
     pub combined_output: String,
     /// True when output was truncated.
@@ -983,24 +983,24 @@ impl CommandRunner for ProcessCommandRunner {
                 };
             }
         };
-        let output_byte_cap = max_output_chars.saturating_mul(4).max(1);
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
-        let stdout_task = tokio::spawn(read_pipe_bounded(stdout, output_byte_cap));
-        let stderr_task = tokio::spawn(read_pipe_bounded(stderr, output_byte_cap));
+        let stdout_task = tokio::spawn(read_pipe_bounded(stdout, max_output_chars));
+        let stderr_task = tokio::spawn(read_pipe_bounded(stderr, max_output_chars));
         let status = tokio::time::timeout(Duration::from_millis(timeout_ms), child.wait()).await;
         match status {
             Ok(Ok(status)) => {
-                let (stdout, stdout_truncated) = stdout_task.await.unwrap_or_default();
-                let (stderr, stderr_truncated) = stderr_task.await.unwrap_or_default();
-                command_output_response(
-                    status,
-                    stdout,
-                    stderr,
-                    stdout_truncated || stderr_truncated,
-                    request,
-                    max_output_chars,
-                )
+                let stdout = stdout_task.await.unwrap_or_else(|_| {
+                    let mut captured = BoundedProcessOutput::new(max_output_chars);
+                    captured.read_failed = true;
+                    captured
+                });
+                let stderr = stderr_task.await.unwrap_or_else(|_| {
+                    let mut captured = BoundedProcessOutput::new(max_output_chars);
+                    captured.read_failed = true;
+                    captured
+                });
+                command_output_response(status, stdout, stderr, request, max_output_chars)
             }
             Ok(Err(error)) => CommandResponse {
                 success: false,
@@ -1022,6 +1022,7 @@ impl CommandRunner for ProcessCommandRunner {
                     termination: "timeout".to_string(),
                     stderr: message.clone(),
                     combined_output: message,
+                    truncated: true,
                     timed_out: true,
                     cwd: request.cwd,
                     argv_redacted: redact_argv(&request.argv),
@@ -1035,74 +1036,198 @@ impl CommandRunner for ProcessCommandRunner {
 /// Shared slot used by `command` to find the active host runner.
 pub type CommandRunnerSlot = Arc<RwLock<Arc<dyn CommandRunner>>>;
 
-async fn read_pipe_bounded<R>(pipe: Option<R>, max_bytes: usize) -> (Vec<u8>, bool)
+// Retain both ends while draining the entire pipe; the configured character bound does not grow with process output.
+struct BoundedProcessOutput {
+    head: String,
+    tail: VecDeque<char>,
+    count: usize,
+    limit: usize,
+    read_failed: bool,
+}
+
+impl BoundedProcessOutput {
+    fn new(limit: usize) -> Self {
+        Self {
+            head: String::new(),
+            tail: VecDeque::new(),
+            count: 0,
+            limit,
+            read_failed: false,
+        }
+    }
+
+    fn push(&mut self, character: char) {
+        if self.count < self.limit {
+            self.head.push(character);
+        }
+        if self.limit > 0 {
+            if self.tail.len() == self.limit {
+                self.tail.pop_front();
+            }
+            self.tail.push_back(character);
+        }
+        self.count = self.count.saturating_add(1);
+    }
+
+    fn tail_string(&self) -> String {
+        self.tail.iter().collect()
+    }
+
+    fn render(&self) -> (String, bool) {
+        render_head_tail(&self.head, &self.tail_string(), self.count, self.limit)
+    }
+}
+
+const OUTPUT_TRUNCATION_MARKER: &str = "\n...[truncated]...\n";
+
+// Preserve the original string when it fits and reserve space for the marker within the same character limit.
+fn render_head_tail(head: &str, tail: &str, count: usize, max_chars: usize) -> (String, bool) {
+    if count <= max_chars {
+        return (head.to_string(), false);
+    }
+    let marker_chars = OUTPUT_TRUNCATION_MARKER.chars().count();
+    const MIN_ERROR_TAIL_CHARS: usize = 32;
+    if max_chars <= marker_chars + MIN_ERROR_TAIL_CHARS {
+        let mut suffix: Vec<_> = tail.chars().rev().take(max_chars).collect();
+        suffix.reverse();
+        return (suffix.into_iter().collect(), true);
+    }
+    let available = max_chars - marker_chars;
+    let tail_count = available.div_ceil(2).max(MIN_ERROR_TAIL_CHARS);
+    let head_count = available - tail_count;
+    let mut suffix: Vec<_> = tail.chars().rev().take(tail_count).collect();
+    suffix.reverse();
+    let mut output: String = head.chars().take(head_count).collect();
+    output.push_str(OUTPUT_TRUNCATION_MARKER);
+    output.extend(suffix);
+    (output, true)
+}
+
+// Serialized envelopes carry their own truncation flag, so shortening them needs no additional marker or non-monotonic escape cost.
+pub(crate) fn truncate_head_tail(value: &str, max_chars: usize) -> (String, bool) {
+    if value.chars().count() <= max_chars {
+        return (value.to_string(), false);
+    }
+    let head_count = max_chars / 2;
+    let tail_count = max_chars - head_count;
+    let mut suffix: Vec<_> = value.chars().rev().take(tail_count).collect();
+    suffix.reverse();
+    let mut output: String = value.chars().take(head_count).collect();
+    output.extend(suffix);
+    (output, true)
+}
+
+// Decode incrementally so a UTF-8 character split across reads is not replaced merely because it crossed a pipe boundary.
+fn decode_process_output(output: &mut BoundedProcessOutput, pending: &mut Vec<u8>, finished: bool) {
+    let mut consumed = 0;
+    while consumed < pending.len() {
+        match std::str::from_utf8(&pending[consumed..]) {
+            Ok(text) => {
+                for character in text.chars() {
+                    output.push(character);
+                }
+                consumed = pending.len();
+            }
+            Err(error) => {
+                let valid_end = consumed + error.valid_up_to();
+                let valid = std::str::from_utf8(&pending[consumed..valid_end])
+                    .expect("UTF-8 decoder returned an invalid prefix");
+                for character in valid.chars() {
+                    output.push(character);
+                }
+                consumed = valid_end;
+                match error.error_len() {
+                    Some(length) => {
+                        output.push('\u{fffd}');
+                        consumed += length;
+                    }
+                    None => break,
+                }
+            }
+        }
+    }
+    pending.drain(..consumed);
+    if finished {
+        for character in String::from_utf8_lossy(pending).chars() {
+            output.push(character);
+        }
+        pending.clear();
+    }
+}
+
+async fn read_pipe_bounded<R>(pipe: Option<R>, max_chars: usize) -> BoundedProcessOutput
 where
     R: tokio::io::AsyncRead + Unpin,
 {
+    let mut output = BoundedProcessOutput::new(max_chars);
     let Some(mut pipe) = pipe else {
-        return (Vec::new(), false);
+        return output;
     };
-    let mut output = Vec::new();
-    let mut truncated = false;
-    let mut buffer = vec![0u8; 8192];
+    let mut pending = Vec::new();
+    let mut buffer = [0u8; 8192];
     loop {
         let read = match pipe.read(&mut buffer).await {
             Ok(0) => break,
             Ok(read) => read,
-            Err(_) => break,
+            Err(_) => {
+                output.read_failed = true;
+                break;
+            }
         };
-        let remaining = max_bytes.saturating_sub(output.len());
-        if remaining > 0 {
-            output.extend_from_slice(&buffer[..read.min(remaining)]);
-        }
-        if read > remaining {
-            truncated = true;
-        }
+        pending.extend_from_slice(&buffer[..read]);
+        decode_process_output(&mut output, &mut pending, false);
     }
-    (output, truncated)
+    decode_process_output(&mut output, &mut pending, true);
+    output
 }
 
 fn command_output_response(
     status: std::process::ExitStatus,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
-    pre_truncated: bool,
+    stdout: BoundedProcessOutput,
+    stderr: BoundedProcessOutput,
     request: CommandRequest,
     max_output_chars: usize,
 ) -> CommandResponse {
-    let stdout = String::from_utf8_lossy(&stdout).to_string();
-    let stderr = String::from_utf8_lossy(&stderr).to_string();
-    let combined = if stderr.is_empty() {
-        stdout.clone()
-    } else if stdout.is_empty() {
-        stderr.clone()
+    let separator = if stdout.count > 0 && stderr.count > 0 {
+        "\n"
     } else {
-        format!("{}\n{}", stdout, stderr)
+        ""
     };
-    let (stdout, stdout_truncated) = truncate_chars(stdout, max_output_chars);
-    let (stderr, stderr_truncated) = truncate_chars(stderr, max_output_chars);
-    let (combined_output, combined_truncated) = truncate_chars(combined, max_output_chars);
+    // Combined output preserves the existing stdout-then-stderr order, not the time order of pipe writes.
+    let combined_head = format!("{}{}{}", stdout.head, separator, stderr.head);
+    let combined_tail = format!(
+        "{}{}{}",
+        stdout.tail_string(),
+        separator,
+        stderr.tail_string()
+    );
+    let combined_count = stdout
+        .count
+        .saturating_add(stderr.count)
+        .saturating_add(separator.len());
+    let (combined_output, combined_truncated) = render_head_tail(
+        &combined_head,
+        &combined_tail,
+        combined_count,
+        max_output_chars,
+    );
+    let (stdout_text, stdout_truncated) = stdout.render();
+    let (stderr_text, stderr_truncated) = stderr.render();
     CommandResponse {
         success: status.success(),
         exit_code: status.code(),
         termination: "exited".to_string(),
-        stdout,
-        stderr,
+        stdout: stdout_text,
+        stderr: stderr_text,
         combined_output,
-        truncated: pre_truncated || stdout_truncated || stderr_truncated || combined_truncated,
+        truncated: stdout.read_failed
+            || stderr.read_failed
+            || stdout_truncated
+            || stderr_truncated
+            || combined_truncated,
         timed_out: false,
         cwd: request.cwd,
         argv_redacted: redact_argv(&request.argv),
-    }
-}
-
-fn truncate_chars(value: String, max_chars: usize) -> (String, bool) {
-    let mut chars = value.chars();
-    let truncated: String = chars.by_ref().take(max_chars).collect();
-    if chars.next().is_some() {
-        (truncated, true)
-    } else {
-        (value, false)
     }
 }
 
@@ -1354,6 +1479,138 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "subprocess helper"]
+    fn output_and_edit_regression_process_output_helper() {
+        if std::env::var("AI_AGENTS_PROCESS_OUTPUT_HELPER").as_deref() != Ok("1") {
+            return;
+        }
+        use std::io::Write;
+        let mut stdout = std::io::stdout().lock();
+        let mut stderr = std::io::stderr().lock();
+        write!(stdout, "START-OUT {} END-OUT", "가".repeat(4_000)).unwrap();
+        write!(stderr, "START-ERR {} 끝-오류", "z".repeat(12_000)).unwrap();
+        stdout.flush().unwrap();
+        stderr.flush().unwrap();
+        // Exit the helper before the test harness appends its own summary to stdout.
+        let code = if std::env::var("AI_AGENTS_PROCESS_OUTPUT_FAIL").as_deref() == Ok("1") {
+            1
+        } else {
+            0
+        };
+        std::process::exit(code);
+    }
+
+    #[tokio::test]
+    async fn output_and_edit_regression_process_runner_keeps_head_and_error_tail() {
+        let executable = std::env::current_exe().unwrap();
+        let request = CommandRequest {
+            argv: vec![
+                executable.to_string_lossy().into_owned(),
+                "types::tests::output_and_edit_regression_process_output_helper".to_string(),
+                "--exact".to_string(),
+                "--ignored".to_string(),
+                "--nocapture".to_string(),
+            ],
+            env: HashMap::from([
+                ("AI_AGENTS_PROCESS_OUTPUT_HELPER".into(), "1".into()),
+                ("AI_AGENTS_PROCESS_OUTPUT_FAIL".into(), "1".into()),
+            ]),
+            timeout_ms: Some(5_000),
+            max_output_chars: Some(160),
+            ..CommandRequest::default()
+        };
+        let response = ProcessCommandRunner
+            .run_command(
+                request,
+                ai_agents_core::ToolExecutionContext::test("command"),
+            )
+            .await;
+
+        assert_eq!(response.termination, "exited");
+        assert_eq!(response.exit_code, Some(1));
+        assert!(!response.success);
+        assert!(response.truncated);
+        assert!(response.stdout.contains("START-OUT"));
+        assert!(response.stdout.contains("END-OUT"));
+        assert!(response.stderr.contains("START-ERR"));
+        assert!(response.stderr.contains("끝-오류"));
+        assert!(response.combined_output.contains("끝-오류"));
+        for value in [
+            &response.stdout,
+            &response.stderr,
+            &response.combined_output,
+        ] {
+            assert!(value.chars().count() <= 160);
+            assert!(!value.contains('\u{fffd}'));
+        }
+    }
+
+    #[test]
+    fn output_and_edit_regression_small_cap_keeps_the_final_error() {
+        let text = format!("{}FINAL-ERROR", "x".repeat(100));
+        let (output, truncated) = render_head_tail(&text, &text, text.chars().count(), 20);
+        assert!(truncated);
+        assert!(output.contains("FINAL-ERROR"));
+        assert!(output.chars().count() <= 20);
+    }
+
+    #[tokio::test]
+    async fn output_and_edit_regression_split_utf8_and_tiny_output_limits() {
+        use tokio::io::AsyncWriteExt;
+        let text = "A가🦀BéZ";
+        for limit in [0, 1, 5, 6, 20] {
+            let (reader, mut writer) = tokio::io::duplex(1);
+            let bytes = text.as_bytes().to_vec();
+            let sending = tokio::spawn(async move {
+                for byte in bytes {
+                    writer.write_all(&[byte]).await.unwrap();
+                }
+            });
+            let captured = read_pipe_bounded(Some(reader), limit).await;
+            sending.await.unwrap();
+            let (output, truncated) = captured.render();
+            assert_eq!(truncated, text.chars().count() > limit);
+            assert!(output.chars().count() <= limit);
+            assert!(!output.contains('\u{fffd}'));
+            if text.chars().count() <= limit {
+                assert_eq!(output, text);
+            } else if limit > 0 {
+                assert!(output.ends_with('Z'));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn output_and_edit_regression_invalid_utf8_and_zero_limit_still_drain() {
+        use tokio::io::AsyncWriteExt;
+        let bytes = vec![b'a', 0xff, 0xf0, 0x9f];
+        let (reader, mut writer) = tokio::io::duplex(1);
+        let sent = bytes.clone();
+        let sending = tokio::spawn(async move {
+            for byte in sent {
+                writer.write_all(&[byte]).await.unwrap();
+            }
+        });
+        let captured = read_pipe_bounded(Some(reader), 20).await;
+        sending.await.unwrap();
+        assert_eq!(captured.render().0, String::from_utf8_lossy(&bytes));
+        assert!(!captured.render().1);
+
+        let (reader, mut writer) = tokio::io::duplex(1);
+        let sending = tokio::spawn(async move {
+            writer.write_all(&vec![b'x'; 10_000]).await.unwrap();
+        });
+        let captured =
+            tokio::time::timeout(Duration::from_secs(5), read_pipe_bounded(Some(reader), 0))
+                .await
+                .expect("the complete pipe must be drained");
+        sending.await.unwrap();
+        let (output, truncated) = captured.render();
+        assert!(output.is_empty());
+        assert!(truncated);
+    }
+
+    #[test]
     fn process_command_runner_timeout_helper() {
         if std::env::var("AI_AGENTS_PROCESS_TIMEOUT_HELPER").as_deref() != Ok("1") {
             return;
@@ -1408,6 +1665,10 @@ mod tests {
 
         assert_eq!(response.termination, "timeout");
         assert!(response.timed_out);
+        assert!(
+            response.truncated,
+            "timeout abandons any partially captured output"
+        );
         assert!(started_path.exists());
         assert!(!completed_path.exists());
         tokio::time::sleep(Duration::from_secs(2)).await;

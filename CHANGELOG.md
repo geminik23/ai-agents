@@ -62,6 +62,9 @@
 - Rust configuration compatibility: typed autonomy fields, validation driver bounds and objective-bound todo identities require affected struct literals to be updated; these development additions are not the published stable API
 
 ### Fixed
+- Command output: preserve bounded error tails and structured exit results when command logs exceed output limits
+- File editing: show accurate authorized previews and mismatch hints, and refuse writes when the effect cannot be reported
+- Default agent logging: omit message, response, tool argument and tool or skill failure text while preserving trusted hook records
 - Task objective templates: explicit invocation accepts the same accepted-input aliases as automatic scope templates without mutable-context shadowing
 - Evaluation request evidence: actual provider dispatch captures scripted skill and validation calls while preserving native requests, budgets and capability bindings
 - Evaluation custody: task timeouts drain original work, retain files and stop retries after uncertain cleanup, while missing or truncated evidence cannot pass through negation

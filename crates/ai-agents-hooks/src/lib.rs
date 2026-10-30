@@ -10,20 +10,6 @@ use ai_agents_llm::{ChatMessage, LLMResponse};
 use ai_agents_memory::{MemoryBudgetEvent, MemoryCompressEvent, MemoryEvictEvent};
 use ai_agents_tools::ToolResult;
 
-fn preview_text(text: &str, max_chars: usize) -> String {
-    if max_chars == 0 {
-        return String::new();
-    }
-
-    let mut chars = text.chars();
-    let preview: String = chars.by_ref().take(max_chars).collect();
-    if chars.next().is_some() {
-        format!("{}...", preview)
-    } else {
-        text.to_string()
-    }
-}
-
 /// Observes agent behavior and shared tool-executor request lifecycles.
 ///
 /// Tool lifecycle hooks describe logical executor requests, not individual retry invocations. A request can finalize without a start callback or without invoking the tool implementation, while an error propagated before record construction may have no completion callback. A fallback starts only after the failed original request releases its resources and completes its own lifecycle. Whether `Tool::execute` was invoked is authoritative only in [`ToolExecutionRecord::executed`].
@@ -206,8 +192,11 @@ impl AgentHooks for LoggingHooks {
     }
 
     async fn on_message_received(&self, message: &str) {
-        let preview = preview_text(message, 100);
-        info!("{} Message received: {}", self.prefix, preview);
+        info!(
+            "{} Message received ({} characters)",
+            self.prefix,
+            message.chars().count()
+        );
     }
 
     async fn on_llm_start(&self, messages: &[ChatMessage]) {
@@ -225,8 +214,8 @@ impl AgentHooks for LoggingHooks {
         );
     }
 
-    async fn on_tool_start(&self, tool: &str, args: &Value) {
-        debug!("{} Tool {} starting with args: {}", self.prefix, tool, args);
+    async fn on_tool_start(&self, tool: &str, _args: &Value) {
+        debug!("{} Tool {} starting", self.prefix, tool);
     }
 
     async fn on_tool_complete(&self, tool: &str, result: &ToolResult, duration_ms: u64) {
@@ -236,10 +225,7 @@ impl AgentHooks for LoggingHooks {
                 self.prefix, tool, duration_ms
             );
         } else {
-            warn!(
-                "{} Tool {} failed in {}ms: {}",
-                self.prefix, tool, duration_ms, result.output
-            );
+            warn!("{} Tool {} failed in {}ms", self.prefix, tool, duration_ms);
         }
     }
 
@@ -251,12 +237,19 @@ impl AgentHooks for LoggingHooks {
     }
 
     async fn on_error(&self, err: &AgentError) {
-        error!("{} Error: {}", self.prefix, err);
+        if matches!(err, AgentError::Tool(_) | AgentError::Skill(_)) {
+            error!("{} Tool or skill error (details omitted)", self.prefix);
+        } else {
+            error!("{} Error: {}", self.prefix, err);
+        }
     }
 
     async fn on_response(&self, response: &AgentResponse) {
-        let preview = preview_text(&response.content, 100);
-        debug!("{} Response: {}", self.prefix, preview);
+        debug!(
+            "{} Response received ({} characters)",
+            self.prefix,
+            response.content.chars().count()
+        );
     }
 
     async fn on_approval_requested(&self, request: &ApprovalRequest) {
@@ -336,10 +329,12 @@ impl AgentHooks for LoggingHooks {
     }
 
     async fn on_group_chat_round(&self, round: u32, speaker: &str, content: &str) {
-        let preview = preview_text(content, 80);
         debug!(
-            "{} Group chat round {}: {} said: {}",
-            self.prefix, round, speaker, preview
+            "{} Group chat round {}: {} responded ({} characters)",
+            self.prefix,
+            round,
+            speaker,
+            content.chars().count()
         );
     }
 
@@ -854,12 +849,11 @@ mod tests {
         hooks.on_llm_start(&[ChatMessage::user("hello")]).await;
     }
 
-    #[test]
-    fn test_preview_text_handles_unicode_boundaries() {
-        let text = "제 이름은 Jay이고 가족관계 관련해서 계약서 내용을 확인하고 싶어서";
-        let preview = preview_text(text, 34);
-        assert!(preview.ends_with("..."));
-        assert!(preview.starts_with("제 이름은 Jay"));
+    #[tokio::test]
+    async fn test_logging_hooks_handles_unicode_without_preview() {
+        let hooks = LoggingHooks::new();
+        hooks.on_message_received("한글🙂").await;
+        hooks.on_response(&AgentResponse::new("한글🙂")).await;
     }
 
     #[tokio::test]

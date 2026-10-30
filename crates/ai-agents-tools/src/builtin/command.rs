@@ -11,7 +11,7 @@ use ai_agents_core::{
 };
 
 use crate::generate_schema;
-use crate::types::{CommandRequest, CommandResponse, CommandRunnerSlot};
+use crate::types::{CommandRequest, CommandResponse, CommandRunnerSlot, truncate_head_tail};
 
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_MAX_OUTPUT_CHARS: usize = 20_000;
@@ -163,8 +163,9 @@ impl Tool for CommandTool {
         let cwd = request.cwd.clone().unwrap_or_else(|| ".".into());
         let argv = request.argv.clone();
         let reason = request.reason.clone();
+        let output_limit = ctx.limits.max_output_chars;
         let response = runner.run_command(request, ctx).await;
-        command_response_to_result(response, cwd, argv, reason)
+        command_response_to_result(response, cwd, argv, reason, output_limit)
     }
 }
 
@@ -268,8 +269,9 @@ fn command_response_to_result(
     cwd: String,
     argv: Vec<String>,
     reason: Option<String>,
+    output_limit: Option<usize>,
 ) -> ToolResult {
-    let output = CommandToolOutput {
+    let mut output = CommandToolOutput {
         success: response.success,
         exit_code: response.exit_code,
         termination: response.termination,
@@ -286,7 +288,7 @@ fn command_response_to_result(
         },
         reason,
     };
-    let json = match serde_json::to_string(&output) {
+    let json = match serialize_bounded_command_output(&mut output, output_limit) {
         Ok(json) => json,
         Err(error) => return ToolResult::error(format!("Serialization error: {}", error)),
     };
@@ -303,6 +305,135 @@ fn command_response_to_result(
     );
     metadata.insert("argv".to_string(), serde_json::json!(output.argv));
     ToolResult::ok_with_metadata(json, metadata)
+}
+
+// Keep machine-readable exit status and the actual final log text inside the executor limit whenever the fixed envelope fits.
+fn serialize_bounded_command_output(
+    output: &mut CommandToolOutput,
+    limit: Option<usize>,
+) -> Result<String, serde_json::Error> {
+    let Some(limit) = limit else {
+        return serde_json::to_string(output);
+    };
+    for value in [
+        &mut output.stdout,
+        &mut output.stderr,
+        &mut output.combined_output,
+    ] {
+        let (bounded, truncated) = truncate_head_tail(value, limit);
+        *value = bounded;
+        output.truncated |= truncated;
+    }
+    let full = serde_json::to_string(output)?;
+    if full.chars().count() <= limit {
+        return Ok(full);
+    }
+
+    let stdout = std::mem::take(&mut output.stdout);
+    let stderr = std::mem::take(&mut output.stderr);
+    let combined = std::mem::take(&mut output.combined_output);
+    if stdout.is_empty() && stderr.is_empty() && combined.is_empty() {
+        return Ok(full);
+    }
+    let producer_truncated = output.truncated;
+    output.truncated = true;
+    let base = serde_json::to_string(output)?;
+    // A limit smaller than the fixed fields cannot carry a valid envelope; the executor retains its existing truncation signal.
+    if base.chars().count() > limit {
+        return Ok(base);
+    }
+    let mut remaining = limit - base.chars().count();
+    let stderr_cost = serialized_string_content_len(&stderr)?;
+    let stderr_budget = if stderr_cost <= remaining {
+        stderr_cost
+    } else {
+        remaining.div_ceil(2)
+    };
+    let (mut bounded_stderr, cost) = fit_command_output_field(&stderr, stderr_budget, true)?;
+    remaining -= cost;
+    let combined_cost = serialized_string_content_len(&combined)?;
+    let combined_budget = if combined_cost <= remaining {
+        combined_cost
+    } else if stderr.is_empty() && combined == stdout {
+        remaining
+    } else {
+        remaining.div_ceil(2)
+    };
+    let (mut bounded_combined, cost) = fit_command_output_field(&combined, combined_budget, true)?;
+    remaining -= cost;
+    let (bounded_stdout, cost) = fit_command_output_field(&stdout, remaining, false)?;
+    remaining -= cost;
+
+    // Unused space from short fields is returned to the error tail before the combined preview.
+    let (expanded_stderr, cost) = fit_command_output_field(
+        &stderr,
+        serialized_string_content_len(&bounded_stderr)? + remaining,
+        true,
+    )?;
+    remaining -= cost - serialized_string_content_len(&bounded_stderr)?;
+    bounded_stderr = expanded_stderr;
+    let (expanded_combined, _) = fit_command_output_field(
+        &combined,
+        serialized_string_content_len(&bounded_combined)? + remaining,
+        true,
+    )?;
+    bounded_combined = expanded_combined;
+    output.stdout = bounded_stdout;
+    output.stderr = bounded_stderr;
+    output.combined_output = bounded_combined;
+
+    // A shorter boolean spelling must not claim truncation when every original log is still present.
+    if !producer_truncated
+        && output.stdout == stdout
+        && output.stderr == stderr
+        && output.combined_output == combined
+    {
+        let field = if !output.stdout.is_empty() {
+            &mut output.stdout
+        } else if !output.combined_output.is_empty() {
+            &mut output.combined_output
+        } else {
+            &mut output.stderr
+        };
+        *field = truncate_head_tail(field, field.chars().count() - 1).0;
+    }
+    serde_json::to_string(output)
+}
+
+// JSON escape costs count toward the existing output cap, including control characters and Unicode.
+fn serialized_string_content_len(value: &str) -> Result<usize, serde_json::Error> {
+    Ok(serde_json::to_string(value)?.chars().count() - 2)
+}
+
+// Marker-free head/tail lengths grow monotonically, so binary search cannot skip a fitting escaped value.
+fn fit_command_output_field(
+    value: &str,
+    budget: usize,
+    prefer_tail: bool,
+) -> Result<(String, usize), serde_json::Error> {
+    let mut low = 0usize;
+    let mut high = value.chars().count().saturating_add(1);
+    let mut best = String::new();
+    let mut best_cost = 0;
+    while low < high {
+        let middle = low + (high - low) / 2;
+        let candidate = if prefer_tail {
+            let mut suffix: Vec<_> = value.chars().rev().take(middle).collect();
+            suffix.reverse();
+            suffix.into_iter().collect()
+        } else {
+            truncate_head_tail(value, middle).0
+        };
+        let cost = serialized_string_content_len(&candidate)?;
+        if cost <= budget {
+            best = candidate;
+            best_cost = cost;
+            low = middle + 1;
+        } else {
+            high = middle;
+        }
+    }
+    Ok((best, best_cost))
 }
 
 fn redact_argv(argv: &[String]) -> Vec<String> {
@@ -369,6 +500,158 @@ mod tests {
     use crate::types::{CommandResponse, StaticCommandRunner};
     use parking_lot::RwLock;
     use std::sync::Arc;
+
+    #[tokio::test]
+    async fn output_and_edit_regression_command_envelope_fits_and_keeps_error_tail() {
+        let argv = vec!["cargo".to_string(), "check".to_string()];
+        let stdout = format!("start {} end", "한글\\\"".repeat(300));
+        let stderr = format!("warnings {} FINAL-ERROR", "x".repeat(2_000));
+        let mut responses = HashMap::new();
+        responses.insert(
+            argv.clone(),
+            CommandResponse {
+                success: false,
+                exit_code: Some(1),
+                termination: "exited".into(),
+                stdout: stdout.clone(),
+                stderr: stderr.clone(),
+                combined_output: format!("{stdout}\n{stderr}"),
+                ..CommandResponse::default()
+            },
+        );
+        let runner = Arc::new(RwLock::new(
+            Arc::new(StaticCommandRunner::new(responses)) as Arc<_>
+        ));
+        let mut context = ToolExecutionContext::test("command");
+        context.limits.max_output_chars = Some(512);
+        let result = CommandTool::new(runner)
+            .execute(serde_json::json!({"argv": argv}), context)
+            .await;
+
+        assert!(
+            result.success,
+            "a nonzero exit is a successfully observed tool result"
+        );
+        assert!(result.output.chars().count() <= 512);
+        let output: Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(output["success"], false);
+        assert_eq!(output["exit_code"], 1);
+        assert_eq!(output["termination"], "exited");
+        assert_eq!(output["truncated"], true);
+        assert!(
+            output["combined_output"]
+                .as_str()
+                .unwrap()
+                .contains("FINAL-ERROR")
+        );
+    }
+
+    #[test]
+    fn output_and_edit_regression_preserves_a_short_error_before_duplicate_output() {
+        let output = CommandToolOutput {
+            success: false,
+            exit_code: Some(1),
+            termination: "exited".into(),
+            stdout: "x".repeat(100),
+            stderr: "fatal: boom".into(),
+            combined_output: format!("{}fatal: boom", "x".repeat(100)),
+            truncated: false,
+            timed_out: false,
+            cwd: ".".into(),
+            argv: vec!["test".into()],
+            reason: None,
+        };
+        let mut empty = CommandToolOutput {
+            stdout: String::new(),
+            stderr: String::new(),
+            combined_output: String::new(),
+            truncated: true,
+            ..output
+        };
+        let base = serde_json::to_string(&empty).unwrap().chars().count();
+        empty.stdout = "x".repeat(100);
+        empty.stderr = "fatal: boom".into();
+        empty.combined_output = format!("{}fatal: boom", "x".repeat(100));
+        empty.truncated = false;
+        let json = serialize_bounded_command_output(&mut empty, Some(base + 15)).unwrap();
+        let parsed: Value = serde_json::from_str(&json).unwrap();
+        assert!(json.chars().count() <= base + 15);
+        assert_eq!(parsed["stderr"], "fatal: boom");
+        assert_eq!(parsed["truncated"], true);
+    }
+
+    #[test]
+    fn output_and_edit_regression_keeps_a_long_final_error_in_the_combined_field() {
+        let error = "ERROR-01234567890123456789012345";
+        let text = format!("{}{error}", "x".repeat(200));
+        let output = CommandToolOutput {
+            success: false,
+            exit_code: Some(1),
+            termination: "exited".into(),
+            stdout: text.clone(),
+            stderr: String::new(),
+            combined_output: text,
+            truncated: false,
+            timed_out: false,
+            cwd: ".".into(),
+            argv: vec!["test".into()],
+            reason: None,
+        };
+        let mut base = CommandToolOutput {
+            stdout: String::new(),
+            combined_output: String::new(),
+            truncated: true,
+            ..output
+        };
+        let limit = serde_json::to_string(&base).unwrap().chars().count() + 60;
+        base.stdout = format!("{}{error}", "x".repeat(200));
+        base.combined_output = base.stdout.clone();
+        base.truncated = false;
+        let json = serialize_bounded_command_output(&mut base, Some(limit)).unwrap();
+        assert!(json.chars().count() <= limit);
+        let result: Value = serde_json::from_str(&json).unwrap();
+        assert!(result["combined_output"].as_str().unwrap().ends_with(error));
+    }
+
+    #[test]
+    fn output_and_edit_regression_empty_logs_do_not_claim_truncation() {
+        let mut output = CommandToolOutput {
+            success: true,
+            exit_code: Some(0),
+            termination: "exited".into(),
+            stdout: String::new(),
+            stderr: String::new(),
+            combined_output: String::new(),
+            truncated: false,
+            timed_out: false,
+            cwd: "a".repeat(100),
+            argv: vec!["test".into()],
+            reason: None,
+        };
+        let full_length = serde_json::to_string(&output).unwrap().chars().count();
+        let json = serialize_bounded_command_output(&mut output, Some(full_length - 1)).unwrap();
+        assert!(json.chars().count() > full_length - 1);
+        assert!(!output.truncated);
+        assert_eq!(
+            serde_json::from_str::<Value>(&json).unwrap()["truncated"],
+            false
+        );
+    }
+
+    #[test]
+    fn output_and_edit_regression_escaped_output_search_uses_available_budget() {
+        let value = format!("{}{}E", "x".repeat(100), "\0".repeat(19));
+        for budget in 0..100 {
+            let (actual, cost) = fit_command_output_field(&value, budget, false).unwrap();
+            assert!(cost <= budget);
+            for size in 0..=value.chars().count() {
+                let candidate = truncate_head_tail(&value, size).0;
+                if serialized_string_content_len(&candidate).unwrap() <= budget {
+                    assert!(actual.chars().count() >= candidate.chars().count());
+                }
+            }
+        }
+    }
 
     #[tokio::test]
     async fn static_runner_executes_allowed_argv() {

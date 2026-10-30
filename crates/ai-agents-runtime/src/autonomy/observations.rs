@@ -6,7 +6,7 @@ use serde_json::Value;
 
 impl EvaluationEvidence {
     /// Uses acknowledged executor records and attempt identity, never a requested operation relabeled with a replacement's result.
-    /// Changed command operands retain their actual record but cannot prove the original fixed validation.
+    /// Changed command operands or conflicting host-reported exit fields cannot prove the original fixed validation.
     pub fn collect_validation(&mut self, state: &ValidationDriverState) -> Result<()> {
         if !state.publication_acknowledged() {
             return Err(AgentError::Persistence(
@@ -53,6 +53,7 @@ impl EvaluationEvidence {
                                 .clone(),
                             complete: super::evidence::executed(record)
                                 && !record.output_truncated
+                                && super::builtins::command_output_consistent(&output)
                                 && command_operands_match(arguments, &record.executed_arguments),
                             value: CommandObservation {
                                 check_id: state.check_id.clone(),

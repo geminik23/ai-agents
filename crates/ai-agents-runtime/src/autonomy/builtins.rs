@@ -68,6 +68,25 @@ impl BuiltinValidator {
         }
     }
 }
+// Conflicting host-reported process fields cannot turn an otherwise eligible command record into completion proof.
+pub(super) fn command_output_consistent(output: &Value) -> bool {
+    let timeout_consistent = output
+        .get("timed_out")
+        .is_none_or(|value| value.as_bool() == Some(false));
+    let success_consistent = match output.get("success") {
+        None => true,
+        Some(value) => match (
+            value.as_bool(),
+            output.get("exit_code").and_then(Value::as_i64),
+        ) {
+            (Some(success), Some(code)) => success == (code == 0),
+            (Some(_), None) => true,
+            _ => false,
+        },
+    };
+    timeout_consistent && success_consistent
+}
+
 impl AutonomyValidator for BuiltinValidator {
     /// Implementations cannot change identity after registry binding.
     fn descriptor(&self) -> &AdapterDescriptor {
@@ -120,6 +139,7 @@ impl AutonomyValidator for BuiltinValidator {
         Ok(())
     }
     /// Denied, unavailable, partial and stale observations cannot become passing validation.
+    /// A truncated command envelope remains incomplete and cannot establish whether the original response was valid.
     fn evaluate(&self, input: &ValidationInput<'_>) -> Result<ValidationDecision> {
         self.validate_config(input.config)?;
         let complete = |outcome, metrics| ValidationDecision::Complete {
@@ -191,7 +211,13 @@ impl AutonomyValidator for BuiltinValidator {
                     }
                     let config: CommandConfig = serde_json::from_value(input.config.clone())?;
                     let output: Value = serde_json::from_str(&record.output).map_err(|_| {
-                        AgentError::Config("malformed command observation output".into())
+                        if record.output_truncated {
+                            AgentError::Config(
+                                "command observation exceeded the output limit; original result validity is unknown".into(),
+                            )
+                        } else {
+                            AgentError::Config("malformed command observation output".into())
+                        }
                     })?;
                     let code = output.get("exit_code").and_then(Value::as_i64);
                     let unchanged = record
@@ -210,6 +236,7 @@ impl AutonomyValidator for BuiltinValidator {
                             .get("env")
                             .is_none_or(|v| v.as_object().is_some_and(serde_json::Map::is_empty));
                     let eligible = unchanged
+                        && command_output_consistent(&output)
                         && super::evidence::executed(record)
                         && record.canonical_id == "command"
                         && output.get("termination").and_then(Value::as_str) == Some("exited")
