@@ -79,6 +79,56 @@
 //! | `full-storage` | All storage backends (`sqlite` + `redis-storage`) |
 //! | `full` | All optional features enabled |
 
+/// Development task execution, scoped YAML entry, foreground hosting and explicit prepared recovery.
+/// These APIs are unreleased; default production restart hosting and arbitrary in-flight restoration remain unavailable.
+/// Explicit safe-pause reconstruction uses installed host bindings and never consumes the pending response or takes over abandoned Running work.
+/// The host must authenticate restoration review separately before using the newly advertised pending request and revision.
+/// Opted-in persistence uses with_restore_host and restore_on_start; startup never consumes a pending decision or adopts an abandoned owner.
+/// Explicit reviewed recovery preserves interrupted usage and uncertain commitments; restore_cancelled reconstructs only for typed cleanup.
+///
+/// ```no_run
+/// use ai_agents::autonomy::{AutonomyRunner, TaskRestoreHost, TaskRestoreRequest, TaskRunResult, TaskRunStore};
+/// use std::sync::Arc;
+///
+/// async fn reconstruct(
+///     request: TaskRestoreRequest,
+///     store: Arc<dyn TaskRunStore>,
+///     host: Arc<dyn TaskRestoreHost>,
+/// ) -> ai_agents::Result<(AutonomyRunner, TaskRunResult)> {
+///     // The request must identify an explicitly prepared safe pause, not a guessed latest run.
+///     let (runner, paused) = AutonomyRunner::restore_paused(request, store, host).await?;
+///     let _review = runner.restoration_review(&paused.run.key.run_id).await?;
+///     // Deliver this review to the authenticated host; do not treat reconstruction as an approval.
+///     Ok((runner, paused))
+/// }
+/// ```
+///
+/// Managed actor maintenance and speculative alternatives reuse the same live owner and invocation ledger.
+/// Custom callbacks and storage consumers opt in with their actual captured provider handles; an empty list certifies no hidden model work, not an execution grant.
+/// Root/child entry settles earlier ordinary maintenance before ownership; spawned callbacks preserve child attribution and optional failure policy.
+/// Managed providers, tools, resumed messages and maintenance recheck continuing result eligibility across settlement acknowledgement.
+/// Actual effects and consumed attempts remain recorded; late results cannot supply completion credit and unknown cleanup remains protected.
+/// Reserved runtimes reject actor deletion and ordinary session rebinding; set_session_metadata now returns an ownership-aware Result.
+/// Reviewed branch observations follow actual adoption and state commit; they neither grant effects nor supply completion credit from discarded content.
+///
+/// ```
+/// use ai_agents::{AgentHooks, LLMProvider};
+/// use std::sync::Arc;
+///
+/// struct CallerOwnedAudit;
+/// impl AgentHooks for CallerOwnedAudit {
+///     fn task_providers(&self) -> Option<Vec<Arc<dyn LLMProvider>>> {
+///         // This implementation uses only the trait's no-op callbacks and has no model or detached work.
+///         Some(Vec::new())
+///     }
+/// }
+/// let hooks: Arc<dyn AgentHooks> = Arc::new(CallerOwnedAudit);
+/// assert!(hooks.task_providers().unwrap().is_empty());
+/// ```
+pub mod autonomy {
+    pub use ai_agents_runtime::autonomy::*;
+}
+
 pub mod agent {
     pub use ai_agents_runtime::{
         Agent, AgentBuilder, AgentInfo, AgentResponse, AgentStreamEvent, AwaitBeforeNextTurn,
@@ -127,16 +177,18 @@ pub mod hooks {
 pub mod llm {
     pub use ai_agents_core::{
         ChatMessage, FinishReason, LLMCapability, LLMChunk, LLMConfig, LLMError, LLMFeature,
-        LLMProvider, LLMResponse, LLMToolDefinition, LLMToolRequest, NativeCallBinding,
-        NativeProviderState, NativeProviderTarget, Role, TaskContext, TokenUsage, ToolChoice,
-        ToolSelection,
+        LLMProvider, LLMResponse, LLMToolDefinition, LLMToolRequest, MessageProvenance,
+        NativeCallBinding, NativeProviderState, NativeProviderTarget, Role, TaskContext,
+        TokenUsage, ToolChoice, ToolSelection,
     };
     pub use ai_agents_llm::LLMRegistry;
     pub use ai_agents_llm::multi::MultiLLMRouter;
     pub use ai_agents_llm::routing::*;
 
     pub mod providers {
-        pub use ai_agents_llm::providers::{ProviderBuilder, ProviderType, UnifiedLLMProvider};
+        pub use ai_agents_llm::providers::{
+            DeclaredPricing, ProviderBuilder, ProviderType, UnifiedLLMProvider,
+        };
     }
 }
 
@@ -218,7 +270,8 @@ pub mod persistence {
     #[cfg(feature = "sqlite")]
     pub use ai_agents_storage::SqliteStorage;
     pub use ai_agents_storage::{
-        FileStorage, SessionInfo, SessionMetadata, SessionOrderBy, SessionQuery,
+        FileStorage, InMemoryTaskStorage, SessionInfo, SessionMetadata, SessionOrderBy,
+        SessionQuery,
     };
     #[cfg(feature = "redis-storage")]
     pub use ai_agents_storage::{RedisSessionMeta, RedisStorage};
@@ -536,6 +589,18 @@ pub use agent::{
     StreamingConfig, StreamingDraftResult, StreamingOptimizationPolicy, TurnActorContext,
     TurnBranchScheduler, TurnOptimizationContext,
 };
+pub use autonomy::{
+    AutomaticTaskOptions, AutonomyConfig, AutonomyExtensions, AutonomyHostCeilings, AutonomyMode,
+    AutonomyOverride, AutonomyProfile, AutonomyScope, AutonomyValidator, CancellationDisposition,
+    CancellationOutcome, CompletionGate, CompletionGateEvaluator, EffectiveAutonomyProfile,
+    EvaluationScope, GateOutcome, HostControlAction, MAX_TASK_DISPLAY_BYTES, ProgressAdapter,
+    RunTodoAdapter, ScopedTaskRunStore, TaskCheckpointPayload, TaskEventCursor, TaskHostDetails,
+    TaskHostInteraction, TaskHostPrompt, TaskHostRun, TaskHostScope, TaskHostSession, TaskRun,
+    TaskRunDisplay, TaskRunEvent, TaskRunEventKind, TaskRunInspection, TaskRunKey, TaskRunMutation,
+    TaskRunResult, TaskRunSnapshot, TaskRunStatus, TaskRunStorageError, TaskRunStore,
+    TaskRunStream, TaskRuntimeCheckpoint, TaskStreamConfig, TaskStreamOperation,
+    TaskValidationJournal, ValidationDriverState,
+};
 pub use error::{AgentError, Result};
 pub use memory::{
     CompactingMemory, CompactingMemoryConfig, CompressResult, CompressionEvent,
@@ -558,10 +623,13 @@ pub use tools::{
     TextTool, Tool, ToolRegistry, ToolResult, create_builtin_registry,
 };
 
-pub use llm::providers::{ProviderType, ProviderType as LLMProviderType, UnifiedLLMProvider};
+pub use llm::providers::{
+    DeclaredPricing, ProviderType, ProviderType as LLMProviderType, UnifiedLLMProvider,
+};
 pub use llm::{
     ChatMessage, LLMProvider, LLMRegistry, LLMResponse, LLMToolDefinition, LLMToolRequest,
-    MultiLLMRouter, NativeCallBinding, NativeProviderState, NativeProviderTarget, Role, ToolChoice,
+    MessageProvenance, MultiLLMRouter, NativeCallBinding, NativeProviderState,
+    NativeProviderTarget, Role, ToolChoice,
 };
 pub use llm::{LLMRole, LLMSelectionSource, ResolvedRoleLLM, RouterRolesConfig, RouterSelector};
 

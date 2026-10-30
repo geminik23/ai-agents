@@ -3,6 +3,9 @@ mod command;
 mod datetime;
 mod echo;
 mod file;
+#[cfg(test)]
+#[path = "../footprint_tests.rs"]
+mod footprint_tests;
 mod fs_mutation;
 mod fs_readonly;
 mod git;

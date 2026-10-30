@@ -81,6 +81,16 @@ struct DiffOutput {
 
 #[async_trait]
 impl Tool for DateTimeTool {
+    fn declared_write_footprint(
+        &self,
+        _: &Value,
+        _: &ai_agents_core::ToolExecutionContext,
+        _: usize,
+    ) -> ai_agents_core::Result<Option<ai_agents_core::autonomy::ToolWriteFootprint>> {
+        Ok(Some(ai_agents_core::autonomy::ToolWriteFootprint::empty(
+            "builtin.datetime.v1",
+        )))
+    }
     fn id(&self) -> &str {
         "datetime"
     }

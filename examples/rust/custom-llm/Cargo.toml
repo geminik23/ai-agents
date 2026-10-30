@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 ai-agents = { workspace = true }
 ai-agents-cli = { workspace = true }
+ai-agents-eval = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
@@ -27,3 +28,19 @@ path = "src/openai_compatible.rs"
 [[bin]]
 name = "multi-provider"
 path = "src/multi_provider.rs"
+
+[[bin]]
+name = "task-events"
+path = "src/task_events.rs"
+
+[[bin]]
+name = "automatic-tasks"
+path = "src/automatic_tasks.rs"
+
+[[bin]]
+name = "task-domain-evals"
+path = "src/task_domain_evals.rs"
+
+[[bin]]
+name = "task-domain-host"
+path = "src/task_domain_host.rs"

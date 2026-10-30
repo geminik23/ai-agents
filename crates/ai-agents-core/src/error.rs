@@ -53,11 +53,18 @@ pub enum AgentError {
     #[error("HITL rejected: {0}")]
     HITLRejected(String),
 
+    /// Internal task control transfer; it must not be published as a failed tool result.
+    #[error("Task suspended: {0}")]
+    TaskSuspended(String),
+
     #[error("Persistence error: {0}")]
     Persistence(String),
 
     #[error("Storage capability is not supported: {0}")]
     UnsupportedStorageCapability(StorageCapability),
+
+    #[error("Task run storage error: {0}")]
+    TaskRunStorage(crate::autonomy::TaskRunStorageError),
 
     #[error("Memory budget exceeded: used {used} tokens, budget {budget} tokens")]
     MemoryBudgetExceeded { used: u32, budget: u32 },

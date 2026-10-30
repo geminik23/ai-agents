@@ -1,0 +1,30 @@
+name: OperationsTask
+version: "1.0.0"
+description: "Required remediation, verification and review with truthful escalation"
+
+# Rust installs health/incident adapters; the fixture host has no network, shell or production-service access.
+# Flow: remediate -> verify health or actual escalation -> required review -> completion.
+# Usage (offline): sh examples/eval/mocked/run_mocked_evals.sh --category autonomy
+# Customize the stage instructions and actual health/escalation adapters first; a claimed incident is not a stored incident.
+system_prompt: Attempt the authorized remediation; if health cannot recover, create an escalation record and explain the remaining outage.
+llm: {provider: openai, model: gpt-5.4-mini}
+tools: [domain]
+autonomy:
+  enabled: true
+  execution: {strategy: lifecycle}
+  max_turns: 8  # Work-cycle allowance; resolved default: 30.
+  max_llm_calls: 20  # Shared managed-call allowance; resolved default: 60.
+  # Stages are required by default. Passing an alternative completion gate cannot skip verification or review.
+  lifecycle: [{id: remediate}, {id: verify}, {id: review}]
+  validation:
+    checks:
+      - id: health
+        adapter: host.records
+        required: false  # Alternative evidence; checks are required by default.
+        config: {domain: health}
+      - id: records
+        adapter: host.records
+        required: false  # A real escalation is an independent acceptable outcome.
+        config: {domain: operations}
+  completion: {any: [{validator_passed: health}, {validator_passed: records}]}
+# A failed health check plus a real escalation can be an intended success; it must not skip the review stage.

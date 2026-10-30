@@ -1,0 +1,510 @@
+/// Live child reservations and durable child outcomes share the coordinating run's admission and cleanup boundary.
+use super::*;
+use ai_agents_core::{AgentError, AgentResponse, Result};
+use serde_json::{Value, json};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+};
+
+tokio::task_local! { static CHILD_REQUIRED: bool; static CHILD_OPERATION: String; }
+
+/// Partial-failure policy is captured by the framework call site, not by a model-supplied source label.
+pub(crate) async fn scope_child_requirement<F: std::future::Future>(
+    required: bool,
+    future: F,
+) -> F::Output {
+    CHILD_REQUIRED.scope(required, future).await
+}
+
+/// Dependency outcomes are mandatory unless an existing composition policy explicitly tolerates failure.
+pub(crate) fn child_required() -> bool {
+    current_child_requirement().unwrap_or(true)
+}
+
+/// An explicit dispatcher policy takes precedence over a context captured before that dispatcher selected the child.
+pub(crate) fn current_child_requirement() -> Option<bool> {
+    CHILD_REQUIRED.try_with(|required| *required).ok()
+}
+
+/// Attribution scopes keep native call IDs unchanged while distinguishing identical IDs in different child operations.
+pub(crate) async fn scope_child_operation<F: std::future::Future>(
+    operation: String,
+    future: F,
+) -> F::Output {
+    CHILD_OPERATION.scope(operation, future).await
+}
+
+/// The execution-local operation identity is evidence attribution, not a serialized permission.
+pub(crate) fn current_child_operation() -> Option<String> {
+    CHILD_OPERATION.try_with(Clone::clone).ok()
+}
+
+struct Participant {
+    owner: Arc<RunOwner>,
+    slot: boundary::RunOwnerSlot,
+}
+
+#[derive(Default)]
+pub(crate) struct Participants {
+    members: parking_lot::Mutex<Vec<Participant>>,
+    active: AtomicUsize,
+    uncertain: AtomicBool,
+    next_operation: parking_lot::Mutex<std::collections::BTreeMap<String, u64>>,
+    changed: tokio::sync::Notify,
+}
+
+impl Participants {
+    /// Only the exact live gate capability is an admitted participant; serialized child IDs never authorize entry.
+    pub(crate) fn owner_for(&self, gate: &crate::runtime::RootTurnGate) -> Option<Arc<RunOwner>> {
+        self.members
+            .lock()
+            .iter()
+            .find(|member| Arc::ptr_eq(&member.owner.gate, gate))
+            .map(|member| member.owner.clone())
+    }
+
+    /// Keeps child ownership across coordinating turns instead of exposing an inter-turn mutation gap.
+    pub(crate) fn owns(&self, owner: &Arc<RunOwner>) -> bool {
+        self.members
+            .lock()
+            .iter()
+            .any(|member| Arc::ptr_eq(&member.owner, owner))
+    }
+
+    /// Enrollment is called under the shared admission mutex and the child's local gate.
+    pub(crate) fn enroll(&self, owner: Arc<RunOwner>, slot: boundary::RunOwnerSlot) -> Result<()> {
+        let mut members = self.members.lock();
+        if let Some(member) = members
+            .iter()
+            .find(|member| Arc::ptr_eq(&member.owner.gate, &owner.gate))
+        {
+            if !Arc::ptr_eq(&member.owner, &owner) {
+                return Err(AgentError::Other("child owner mismatch".into()));
+            }
+        } else {
+            if members.len() >= MAX_TASK_CHECKPOINT_RECORDS {
+                return Err(TaskRunStorageError::CheckpointTooLarge.into());
+            }
+            members.push(Participant {
+                owner: owner.clone(),
+                slot: slot.clone(),
+            });
+        }
+        *slot.write() = Some(owner);
+        self.active.fetch_add(1, Ordering::AcqRel);
+        Ok(())
+    }
+
+    /// Reconstruction installs already quiescent members without inventing an active lease or a new invocation.
+    pub(crate) fn restore_member(
+        &self,
+        owner: Arc<RunOwner>,
+        slot: boundary::RunOwnerSlot,
+    ) -> Result<()> {
+        if self.active.load(Ordering::Acquire) != 0 || self.uncertain.load(Ordering::Acquire) {
+            return Err(TaskRunStorageError::Owned.into());
+        }
+        let mut members = self.members.lock();
+        if members
+            .iter()
+            .any(|member| Arc::ptr_eq(&member.owner.gate, &owner.gate))
+        {
+            return Err(TaskRunStorageError::Conflict.into());
+        }
+        if slot
+            .read()
+            .as_ref()
+            .is_none_or(|current| !Arc::ptr_eq(current, &owner))
+        {
+            return Err(TaskRunStorageError::Owned.into());
+        }
+        members.push(Participant { owner, slot });
+        Ok(())
+    }
+
+    /// An unstarted staged node retires only its temporary membership after its actual owner slot is cleared under the node gate.
+    pub(crate) fn retire_reconstructed_member(&self, owner: &Arc<RunOwner>) -> Result<()> {
+        let mut members = self.members.lock();
+        let member = members
+            .iter()
+            .find(|member| Arc::ptr_eq(&member.owner, owner))
+            .ok_or(TaskRunStorageError::InvalidCheckpoint)?;
+        if member.slot.read().is_some() {
+            return Err(TaskRunStorageError::Owned.into());
+        }
+        members.retain(|member| !Arc::ptr_eq(&member.owner, owner));
+        Ok(())
+    }
+
+    /// Preserves incoming-operation high-water marks independently of historical child result ordering.
+    pub(crate) fn restore_ordinals(
+        &self,
+        ordinals: std::collections::BTreeMap<String, u64>,
+    ) -> Result<()> {
+        if !self.next_operation.lock().is_empty() || ordinals.len() > MAX_TASK_CHECKPOINT_RECORDS {
+            return Err(TaskRunStorageError::InvalidCheckpoint.into());
+        }
+        *self.next_operation.lock() = ordinals;
+        Ok(())
+    }
+
+    /// Capture reads exact allocation state only after all admitted child leases have settled or safely parked.
+    pub(crate) fn capture_ordinals(&self) -> Result<std::collections::BTreeMap<String, u64>> {
+        if self.unsettled() {
+            return Err(TaskRunStorageError::NotResumable.into());
+        }
+        Ok(self.next_operation.lock().clone())
+    }
+
+    /// A missing child result or unacknowledged child cleanup prevents a truthful successful terminal checkpoint.
+    pub(crate) fn unsettled(&self) -> bool {
+        self.active.load(Ordering::Acquire) != 0 || self.uncertain.load(Ordering::Acquire)
+    }
+
+    /// Operation IDs distinguish repeated legitimate requests to one runtime without overwriting completed results.
+    pub(crate) fn next_operation(&self, runtime_id: &str, cycle: u64) -> String {
+        let mut cursors = self.next_operation.lock();
+        let ordinal = cursors
+            .entry(json!({"runtime":runtime_id,"cycle":cycle}).to_string())
+            .or_default();
+        let id = json!({"runtime":runtime_id,"cycle":cycle,"ordinal":*ordinal}).to_string();
+        *ordinal += 1;
+        id
+    }
+
+    /// An acknowledged host reconciliation cannot release still-polled child leases.
+    pub(crate) fn acknowledge_reconciliation(&self) -> Result<()> {
+        if self.active.load(Ordering::Acquire) != 0 {
+            return Err(AgentError::Other("child work has not stopped".into()));
+        }
+        self.uncertain.store(false, Ordering::Release);
+        Ok(())
+    }
+
+    /// Release follows acknowledgement and quiescence; each retired member is forgotten before awaiting another gate.
+    /// Interrupted cleanup can retry without touching a newer owner of an already released runtime, while foreign live members remain protected.
+    /// Uncertain owners remain reserved until an explicit host reconciliation.
+    pub(crate) async fn release(&self) -> Result<()> {
+        if self.unsettled() {
+            return Err(AgentError::Other(
+                "child work is not acknowledged quiescent".into(),
+            ));
+        }
+        let members: Vec<_> = self
+            .members
+            .lock()
+            .iter()
+            .map(|member| (member.owner.clone(), member.slot.clone()))
+            .collect();
+        for (owner, slot) in members {
+            let _gate = owner.gate.lock().await;
+            let mut members = self.members.lock();
+            if !members
+                .iter()
+                .any(|member| Arc::ptr_eq(&member.owner, &owner))
+            {
+                continue;
+            }
+            let mut current = slot.write();
+            if current
+                .as_ref()
+                .is_some_and(|active| !Arc::ptr_eq(active, &owner))
+            {
+                return Err(AgentError::Other("child release owner mismatch".into()));
+            }
+            *current = None;
+            members.retain(|member| !Arc::ptr_eq(&member.owner, &owner));
+        }
+        Ok(())
+    }
+}
+
+pub(crate) struct ChildLease {
+    execution: Arc<RunExecution>,
+    acknowledged: bool,
+}
+
+impl ChildLease {
+    /// Starts only after enrollment succeeds; cancellation cannot release an unrecorded dispatched child.
+    pub(crate) fn new(execution: &Arc<RunExecution>) -> Self {
+        Self {
+            execution: execution.clone(),
+            acknowledged: false,
+        }
+    }
+
+    /// A parked child retains its owner while only an acknowledged exact safe checkpoint retires the active lease.
+    pub(crate) fn acknowledge_park(&mut self) {
+        self.acknowledged = true;
+    }
+
+    /// A durable child outcome must be acknowledged before the child ceases to be owned in-flight work.
+    pub(crate) fn acknowledge(&mut self) {
+        self.acknowledged = true;
+    }
+}
+
+impl Drop for ChildLease {
+    /// Drop cannot checkpoint; stop new work and retain every child reservation until explicit recovery.
+    fn drop(&mut self) {
+        if !self.acknowledged {
+            self.execution
+                .participants
+                .uncertain
+                .store(true, Ordering::Release);
+            self.execution.stop("uncertain_child");
+        }
+        self.execution
+            .participants
+            .active
+            .fetch_sub(1, Ordering::AcqRel);
+        self.execution.participants.changed.notify_waiters();
+    }
+}
+
+impl RunExecution {
+    /// Child operations use the coordinator cycle and a runtime-local ordinal; concurrent different children do not reorder identities.
+    pub(crate) fn next_child_operation(&self, runtime_id: &str) -> String {
+        self.participants
+            .next_operation(runtime_id, self.current_cycle())
+    }
+
+    /// Completed child results are reusable only for the same input and runtime binding, never by a free-form child ID alone.
+    pub(crate) async fn cached_child(
+        &self,
+        operation: &str,
+        input: &str,
+        runtime_id: &str,
+    ) -> Result<Option<Result<AgentResponse>>> {
+        let _serial = self.serial.lock().await;
+        let snapshot = self.load_owned_locked(&_serial).await?;
+        let payload: TaskCheckpointPayload = serde_json::from_value(snapshot.payload)?;
+        let Some(child) = payload
+            .children
+            .iter()
+            .find(|child| child.child_id == operation)
+        else {
+            return Ok(None);
+        };
+        let binding = payload
+            .adapters
+            .iter()
+            .find(|binding| binding.id == format!("child-operation:{operation}"))
+            .ok_or(TaskRunStorageError::InvalidCheckpoint)?;
+        if binding.config != json!({"input":input,"runtime_id":runtime_id}) {
+            return Err(AgentError::Config("child operation binding changed".into()));
+        }
+        let Some(result) = &child.result else {
+            return Err(AgentError::Other(
+                "child operation requires recovery, not replay".into(),
+            ));
+        };
+        if let Some(response) = result.get("response") {
+            return Ok(Some(Ok(serde_json::from_value(response.clone())?)));
+        }
+        Ok(Some(Err(AgentError::Other(
+            result
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("child failed")
+                .into(),
+        ))))
+    }
+
+    /// Child setup cannot race terminal transition or barrier closure, including after waiting for a shared runtime gate.
+    /// A denied not-started child has no lease or dispatched effect; already admitted children retain their settlement path.
+    pub(crate) async fn enroll_child(
+        self: &Arc<Self>,
+        owner: Arc<RunOwner>,
+        slot: boundary::RunOwnerSlot,
+        operation: Option<&str>,
+    ) -> Result<ChildLease> {
+        let _serial = self.serial.lock().await;
+        let snapshot = self.load_owned_locked(&_serial).await?;
+        let payload: TaskCheckpointPayload = serde_json::from_value(snapshot.payload)?;
+        self.check(&payload)?;
+        if let Some(parent) = super::composition::composition_admission_denial() {
+            return Err(AgentError::TaskSuspended(parent));
+        }
+        if let Some(operation) = operation {
+            self.targets
+                .enroll(operation, owner, slot, &self.participants)?;
+        } else {
+            self.participants.enroll(owner, slot)?;
+        }
+        Ok(ChildLease::new(self))
+    }
+
+    /// Binds actor attribution to one invocation rather than conflating a pipeline sender with the long-lived runtime owner.
+    pub(crate) async fn bind_child_actor(
+        &self,
+        operation: &str,
+        actor: &Option<crate::TurnActorContext>,
+    ) -> Result<()> {
+        let state = serde_json::to_value(actor)?;
+        self.update(|payload| {
+            let id = format!("child-actor:{operation}");
+            if let Some(adapter) = payload.adapters.iter().find(|adapter| adapter.id == id) {
+                if adapter.state != state {
+                    return Err(TaskRunStorageError::InvalidCheckpoint.into());
+                }
+            } else {
+                payload.adapters.push(TaskAdapterCheckpoint {
+                    id,
+                    adapter: "runtime.child_actor".into(),
+                    contract_version: 1,
+                    config: json!({"operation":operation}),
+                    state,
+                });
+            }
+            Ok(())
+        })
+        .await?;
+        Ok(())
+    }
+
+    /// Resume requires the exact invocation actor; older checkpoints retain their owner-level equality check.
+    pub(crate) async fn verify_child_actor(
+        &self,
+        operation: &str,
+        actor: &Option<crate::TurnActorContext>,
+    ) -> Result<bool> {
+        let snapshot = self.load_owned().await?;
+        let payload: TaskCheckpointPayload = serde_json::from_value(snapshot.payload)?;
+        let Some(adapter) = payload
+            .adapters
+            .iter()
+            .find(|adapter| adapter.id == format!("child-actor:{operation}"))
+        else {
+            return Ok(false);
+        };
+        if adapter.adapter != "runtime.child_actor"
+            || adapter.contract_version != 1
+            || adapter.config != json!({"operation":operation})
+            || adapter.state != serde_json::to_value(actor)?
+        {
+            return Err(AgentError::Config(
+                "child invocation actor binding changed".into(),
+            ));
+        }
+        Ok(true)
+    }
+
+    /// Stores the exact child runtime before its first effect, then an immutable result after its local turn settles.
+    /// An acknowledged settled outcome retires its declared dispatch even on optional failure; uncertain work retains its recovery protection.
+    pub(crate) async fn checkpoint_child(
+        &self,
+        operation: &str,
+        runtime: TaskRuntimeCheckpoint,
+        input: &str,
+        outcome: Option<&Result<AgentResponse>>,
+    ) -> Result<()> {
+        let runtime_id = runtime.snapshot.agent_id.clone();
+        let result = outcome.map(|outcome| match outcome {
+            Ok(response) => json!({"response":response}),
+            Err(error) => json!({"error":error.to_string()}),
+        });
+        self.update(|payload| {
+            if let Some(child) = payload
+                .children
+                .iter_mut()
+                .find(|child| child.child_id == operation)
+            {
+                if child.result.is_some() {
+                    return Err(TaskRunStorageError::Conflict.into());
+                }
+                if let Some(pending) = child.pending.take()
+                    && !payload.consumed_request_ids.contains(&pending.id)
+                {
+                    payload.consumed_request_ids.push(pending.id);
+                }
+                child.runtime = runtime;
+                child.result = result;
+            } else {
+                if outcome.is_some() {
+                    return Err(TaskRunStorageError::InvalidCheckpoint.into());
+                }
+                payload.adapters.push(TaskAdapterCheckpoint {
+                    id: format!("child-operation:{operation}"),
+                    adapter: "runtime.child".into(),
+                    contract_version: 1,
+                    config: json!({"input":input,"runtime_id":runtime.snapshot.agent_id}),
+                    state: Value::Null,
+                });
+                payload.children.push(TaskChildCheckpoint {
+                    child_id: operation.into(),
+                    parent_run_id: self.run_id.clone(),
+                    config_identity: format!(
+                        "{}:{}",
+                        payload.config_identity, runtime.snapshot.agent_id
+                    ),
+                    runtime,
+                    pending: None,
+                    result: None,
+                });
+            }
+            Ok(())
+        })
+        .await?;
+        if outcome.is_some() && self.stop_reason().is_none() {
+            let mut frames = self.delegate_frames.lock();
+            if frames
+                .get(&runtime_id)
+                .is_some_and(|frame| frame.parent_operation.as_deref() == Some(operation))
+            {
+                frames.remove(&runtime_id);
+            }
+        }
+        Ok(())
+    }
+
+    /// Waits for owned detached work before observations; deadline/cancellation never claims that unknown child work stopped.
+    pub(crate) async fn await_children(&self) -> Result<()> {
+        loop {
+            let notified = self.participants.changed.notified();
+            if self.participants.active.load(Ordering::Acquire) == 0 {
+                return Ok(());
+            }
+            if ai_agents_core::autonomy::InvocationAdmission::execution_stopped(self) {
+                self.participants.uncertain.store(true, Ordering::Release);
+                return Err(AgentError::Other("child work requires recovery".into()));
+            }
+            tokio::select! { _ = notified => {}, _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {} }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A dropped release may have already freed one slot; retry must not inspect or clear its newer owner.
+    #[tokio::test]
+    async fn co_completion_partial_release_retries_without_touching_new_owner() {
+        let members = Participants::default();
+        let first =
+            RunOwner::new("old".into(), Arc::new(tokio::sync::Mutex::new(())), None).unwrap();
+        let second =
+            RunOwner::new("old".into(), Arc::new(tokio::sync::Mutex::new(())), None).unwrap();
+        let first_slot = Arc::new(parking_lot::RwLock::new(None));
+        let second_slot = Arc::new(parking_lot::RwLock::new(None));
+        members.enroll(first.clone(), first_slot.clone()).unwrap();
+        members.enroll(second.clone(), second_slot.clone()).unwrap();
+        members.active.store(0, Ordering::Release);
+        let blocked = second.gate.lock().await;
+        let mut release = Box::pin(members.release());
+        assert!(futures::poll!(release.as_mut()).is_pending());
+        assert!(first_slot.read().is_none());
+        assert!(second_slot.read().is_some());
+        drop(release);
+        let newer = RunOwner::new("new".into(), first.gate.clone(), None).unwrap();
+        *first_slot.write() = Some(newer.clone());
+        drop(blocked);
+        members.release().await.unwrap();
+        assert!(Arc::ptr_eq(first_slot.read().as_ref().unwrap(), &newer));
+        assert!(second_slot.read().is_none());
+        assert!(members.members.lock().is_empty());
+        members.release().await.unwrap();
+    }
+}

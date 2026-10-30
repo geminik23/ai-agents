@@ -1,0 +1,29 @@
+name: ControlledAnalysis
+version: "1.0.0"
+description: "Tool-free host objective, capacity and termination controls"
+
+# Use this pattern when an authenticated host may revise objectives or resource limits at a safe pause.
+# Usage (offline): sh examples/eval/mocked/run_mocked_evals.sh --category autonomy
+# Flow: draft -> retained guidance or capacity pause -> exact host control -> explicit continuation -> verified response.
+# Customize the completion predicate and allowances first; no tool, todo, file or persistent backend is required.
+system_prompt: Produce a verified report and respect the host's current objective.
+llm: {provider: openai, model: gpt-5.4-mini}
+tools: []
+autonomy:
+  enabled: true  # Explicit task opt-in; loading this file does not start a run.
+  max_turns: 4  # Work-cycle allowance; resolved default: 30.
+  max_llm_calls: 4  # Includes managed auxiliary calls; resolved default: 60.
+  completion: {response_contains: verified report}
+  premature_finish: {action: ask_user, on_unavailable: stop}
+  profiles:
+    replan:
+      # Planner outlines are advisory; review cannot relax the objective, gates or original allowance.
+      premature_finish: {action: continue}
+      progress:
+        stagnation: {max_cycles_without_progress: 1, action: replan, max_replans: 1, on_exhausted: stop}
+      supervision: {plan_changes: require_approval}
+    capacity:
+      max_llm_calls: 1  # Deliberately small to demonstrate capacity, not a production recommendation.
+      premature_finish: {action: continue}
+      on_limit: {action: pause_run, on_unavailable: stop}
+# Host changes do not refill consumed counters or authorize execution by themselves.

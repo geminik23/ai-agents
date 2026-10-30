@@ -1,0 +1,21 @@
+name: ArtifactTask
+version: "1.0.0"
+description: "Report generation with separate artifact existence and content checks"
+
+# Rust supplies the domain record and artifact projection; report://current is a non-filesystem artifact reference.
+# Flow: produce report -> observe actual stored record -> validate schema/content -> complete.
+# Usage (offline): sh examples/eval/mocked/run_mocked_evals.sh --category autonomy
+# Prerequisites: the Rust domain host installs host.records and its actual record revision service.
+# Customize the record schema/predicate in task_domain.rs and its YAML config first; no filesystem gate is required.
+system_prompt: Produce a report with a string title and exactly two numeric rows; a saved but invalid report is not success.
+llm: {provider: openai, model: gpt-5.4-mini}
+tools: [domain]
+autonomy:
+  enabled: true
+  max_turns: 6  # Work-cycle allowance; resolved default: 30.
+  max_llm_calls: 16  # Managed model-call allowance; resolved default: 60.
+  validation:
+    checks: [{id: records, adapter: host.records, config: {domain: report}}]
+  # Artifact projection and content validity are separate predicates; neither alone satisfies this objective.
+  completion: {all: [{artifact_exists: "report://current"}, {validator_passed: records}]}
+# For file artifacts use builtin.artifact/file_info plus an authorized content validator; existence alone remains insufficient.

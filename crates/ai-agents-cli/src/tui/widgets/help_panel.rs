@@ -35,13 +35,20 @@ pub fn render_help_panel(area: Rect, buf: &mut Buffer, theme: &Theme) {
         ]),
         Line::from(vec![
             Span::styled(" Esc       ", theme.label_style),
-            Span::styled("Cancel/close", theme.value_style),
+            Span::styled("Hide/close (not task cancel)", theme.value_style),
         ]),
         Line::from(vec![
             Span::styled(" Ctrl+S    ", theme.label_style),
             Span::styled("Quick save", theme.value_style),
         ]),
         Line::from(""),
+        Line::from("Ctrl+P: reopen exact pending decision"),
+        Line::from("PgUp/PgDn in modal: scroll review"),
+        Line::from("F10: task/todo/validation/artifact view"),
+        Line::from("Ctrl+Up/Down: select observed task"),
+        Line::from("Ctrl+PgUp/PgDn: scroll task details"),
+        Line::from("/task run [--profile ID] OBJECTIVE"),
+        Line::from("/task cancel RUN REV (request, not ACK)"),
         Line::from(Span::styled("Panels:", theme.highlight_style)),
         Line::from(""),
         Line::from(vec![

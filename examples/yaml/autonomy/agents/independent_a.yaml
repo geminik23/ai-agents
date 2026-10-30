@@ -1,0 +1,23 @@
+name: IndependentA
+version: "1.0.0"
+description: "State-owned research participant with retained host guidance"
+
+# The ordinary parent retains this actual child and its task owner; a registry entry alone is not authority.
+# Usage: load through independent_research.yaml and its no-key suite.
+# Flow: input -> state-owned draft -> typed host question -> verified finding.
+# Replace the response predicate with an installed domain validator for real source-quality evidence.
+system_prompt: Produce a verified finding; revise after host guidance.
+llm: {default: first}  # Alias supplied by the parent's shared registry, not a new provider instance.
+tools: []
+states:
+  initial: investigate
+  states:
+    investigate:
+      autonomy:
+        enabled: true  # Opt into this state; default: false.
+        mode: state_until_exit
+        max_turns: 4  # Bound work cycles; resolved default: 30.
+        max_llm_calls: 4  # Bound this independent task; resolved default: 60.
+        completion: {response_contains: verified}
+        premature_finish: {action: ask_user, on_unavailable: stop}
+# In-memory pause requires a retained response endpoint, not SQLite or a background daemon.

@@ -104,6 +104,57 @@ struct InfoOutput {
 
 #[async_trait]
 impl Tool for FileTool {
+    fn declared_write_footprint(
+        &self,
+        args: &Value,
+        _ctx: &ToolExecutionContext,
+        max_targets: usize,
+    ) -> ai_agents_core::Result<Option<ai_agents_core::autonomy::ToolWriteFootprint>> {
+        let input: FileInput = serde_json::from_value(args.clone())?;
+        let path = Path::new(&input.path);
+        let footprint = match input.operation.to_lowercase().as_str() {
+            "read" | "exists" | "list" | "info" => {
+                ai_agents_core::autonomy::ToolWriteFootprint::empty("builtin.file.read.v1")
+            }
+            "delete" => super::fs_mutation::footprint_single(
+                "file.delete",
+                path,
+                false,
+                true,
+                false,
+                max_targets,
+            )?,
+            "mkdir" => super::fs_mutation::footprint_single(
+                "file.mkdir",
+                path,
+                false,
+                false,
+                true,
+                max_targets,
+            )?,
+            "write" | "append" => {
+                if path
+                    .components()
+                    .any(|component| matches!(component, std::path::Component::ParentDir))
+                {
+                    return Err(ai_agents_core::AgentError::Tool(
+                        "declared content footprints do not support parent traversal".into(),
+                    ));
+                }
+                let resolved = crate::security::path::PathPolicyResolver::new()
+                    .and_then(|resolver| resolver.resolve_path(path))
+                    .map_err(|error| ai_agents_core::AgentError::Tool(error.to_string()))?;
+                let mut targets = std::collections::BTreeSet::new();
+                super::fs_mutation::add_footprint_entry(&resolved, &mut targets, max_targets)?;
+                ai_agents_core::autonomy::ToolWriteFootprint {
+                    binding_identity: "builtin.file.content.v1".into(),
+                    targets: targets.into_iter().collect(),
+                }
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some(footprint))
+    }
     fn id(&self) -> &str {
         "file"
     }

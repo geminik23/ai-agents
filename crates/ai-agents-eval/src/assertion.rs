@@ -56,6 +56,9 @@ pub(crate) fn preflight_judge_aliases(
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct Assertion {
+    /// Typed expectations on exact acknowledged task observations, not display strings.
+    #[serde(default)]
+    pub task: Option<crate::task::TaskAssertion>,
     /// Current or expected state name.
     #[serde(default)]
     pub state: Option<String>,
@@ -268,6 +271,29 @@ impl Assertion {
                 )?;
             }
         }
+        if let Some(task) = &self.task {
+            if task.status.is_none()
+                && task.pending_kind.is_none()
+                && task.stop_reason.is_none()
+                && task.same_run.is_none()
+                && task.counters.is_none()
+                && task.progress.is_none()
+                && task.checks.is_empty()
+                && task.events_include.is_empty()
+                && task.event_result_parity.is_none()
+            {
+                return Err(crate::EvalError::Config(format!(
+                    "{location}.task must not be empty"
+                )));
+            }
+            validate_path(task.counters.as_ref(), &format!("{location}.task.counters"))?;
+            validate_path(task.progress.as_ref(), &format!("{location}.task.progress"))?;
+            if task.checks.iter().any(|check| check.id.trim().is_empty()) {
+                return Err(crate::EvalError::Config(format!(
+                    "{location}.task.checks requires nonempty IDs"
+                )));
+            }
+        }
         for (name, judge) in [
             ("response_semantic", self.response_semantic.as_ref()),
             ("judge", self.judge.as_ref()),
@@ -282,7 +308,8 @@ impl Assertion {
     }
 
     fn has_simple_clause(&self) -> bool {
-        self.state.is_some()
+        self.task.is_some()
+            || self.state.is_some()
             || self.state_in.is_some()
             || self.state_not.is_some()
             || self.state_history_contains.is_some()
@@ -822,6 +849,46 @@ pub async fn evaluate_assertion(
     context: AssertionEvalContext<'_>,
 ) -> AssertionOutcome {
     let mut details = Vec::new();
+    if let Some(expected) = &assertion.task {
+        let Some(actual) = &context.evidence.task else {
+            return AssertionOutcome::Error(
+                "task assertion requires acknowledged task observations".into(),
+            );
+        };
+        if (!expected.events_include.is_empty() || expected.event_result_parity.is_some())
+            && !actual.events_complete
+        {
+            return AssertionOutcome::Error("task event evidence is incomplete".into());
+        }
+        for check in &expected.checks {
+            let Some(scope) = &actual.inspection.scope else {
+                return AssertionOutcome::Error("task validation scope is unavailable".into());
+            };
+            if !scope.validation_bindings.contains_key(&check.id) {
+                return AssertionOutcome::Error("unknown task validation check".into());
+            }
+            let outcome = actual
+                .inspection
+                .scope
+                .as_ref()
+                .and_then(|scope| {
+                    ai_agents_runtime::autonomy::latest_validation(
+                        &actual.inspection.evidence.validations,
+                        &check.id,
+                        scope,
+                    )
+                })
+                .map_or(
+                    ai_agents_runtime::autonomy::GateOutcome::Unknown,
+                    |result| result.outcome,
+                );
+            if outcome == ai_agents_runtime::autonomy::GateOutcome::Unknown
+                && outcome != check.outcome
+            {
+                return AssertionOutcome::Error("task validation evidence is unavailable".into());
+            }
+        }
+    }
 
     if let Some(children) = &assertion.all {
         for child in children {
@@ -838,30 +905,33 @@ pub async fn evaluate_assertion(
     }
 
     if let Some(children) = &assertion.any {
+        let mut unavailable = None;
         let mut failures = Vec::new();
+        let mut matched = false;
         for child in children {
             match evaluate_assertion_boxed(child, context).await {
                 AssertionOutcome::Passed(mut d) => {
                     details.append(&mut d);
                     details.push(AssertionResultDetail::pass("any", json!(true), json!(true)));
-                    return AssertionOutcome::Passed(details);
+                    matched = true;
+                    break;
                 }
                 AssertionOutcome::Failed(mut d) => failures.append(&mut d),
-                AssertionOutcome::Error(e) => failures.push(AssertionResultDetail::fail(
-                    "any_branch_error",
-                    json!(e),
-                    json!("pass"),
-                    "branch error",
-                )),
+                AssertionOutcome::Error(error) => unavailable = Some(error),
             }
         }
-        details.extend(failures);
-        details.push(AssertionResultDetail::fail(
-            "any",
-            json!(false),
-            json!(true),
-            "no branch passed",
-        ));
+        if !matched {
+            if let Some(error) = unavailable {
+                return AssertionOutcome::Error(error);
+            }
+            details.extend(failures);
+            details.push(AssertionResultDetail::fail(
+                "any",
+                json!(false),
+                json!(true),
+                "no branch passed",
+            ));
+        }
     }
 
     if let Some(child) = &assertion.not {
@@ -904,6 +974,13 @@ async fn evaluate_simple(
 ) {
     let evidence = context.evidence;
     let response = context.response;
+    if let Some(task) = &assertion.task {
+        evaluate_task(
+            task,
+            evidence.task.as_ref().expect("preflighted task evidence"),
+            details,
+        );
+    }
     if let Some(expected) = &assertion.state {
         check_eq("state", evidence.state.clone(), expected.clone(), details);
     }
@@ -1573,6 +1650,117 @@ fn evaluate_metadata_contains(
     );
 }
 
+fn evaluate_task(
+    expected: &crate::task::TaskAssertion,
+    actual: &crate::task::TaskEvidence,
+    details: &mut Vec<AssertionResultDetail>,
+) {
+    let run = &actual.inspection.run;
+    if let Some(status) = expected.status {
+        push_bool(
+            "task.status",
+            run.status == status,
+            json!(run.status),
+            json!(status),
+            details,
+        );
+    }
+    if let Some(kind) = expected.pending_kind {
+        let kind_actual = run.pending.as_ref().map(|request| request.kind);
+        push_bool(
+            "task.pending_kind",
+            json!(kind_actual) == json!(kind),
+            json!(kind_actual),
+            json!(kind),
+            details,
+        );
+    }
+    if let Some(reason) = &expected.stop_reason {
+        push_bool(
+            "task.stop_reason",
+            run.stop_reason.as_ref() == Some(reason),
+            json!(run.stop_reason),
+            json!(reason),
+            details,
+        );
+    }
+    if let Some(same) = expected.same_run {
+        push_bool(
+            "task.same_run",
+            actual.same_run == Some(same),
+            json!(actual.same_run),
+            json!(same),
+            details,
+        );
+    }
+    for (name, matcher, value) in [
+        ("task.counters", &expected.counters, json!(run.counters)),
+        ("task.progress", &expected.progress, json!(run.progress)),
+    ] {
+        if let Some(matcher) = matcher {
+            evaluate_path(name, Some(&value), matcher, details);
+        }
+    }
+    for check in &expected.checks {
+        let outcome = actual
+            .inspection
+            .scope
+            .as_ref()
+            .and_then(|scope| {
+                ai_agents_runtime::autonomy::latest_validation(
+                    &actual.inspection.evidence.validations,
+                    &check.id,
+                    scope,
+                )
+            })
+            .map_or(
+                ai_agents_runtime::autonomy::GateOutcome::Unknown,
+                |result| result.outcome,
+            );
+        push_bool(
+            "task.check",
+            outcome == check.outcome,
+            json!(outcome),
+            json!(check.outcome),
+            details,
+        );
+    }
+    for kind in &expected.events_include {
+        let found = actual
+            .events
+            .iter()
+            .any(|event| event.kind == *kind && event.run_id.as_deref() == Some(&run.key.run_id));
+        push_bool(
+            "task.event",
+            actual.events_complete && found,
+            json!(found),
+            json!(kind),
+            details,
+        );
+    }
+    if let Some(expected) = expected.event_result_parity {
+        let parity = actual.events_complete
+            && crate::task::terminal_kind(run.status).is_some_and(|kind| {
+                actual
+                    .events
+                    .iter()
+                    .rev()
+                    .find(|event| {
+                        event.run_id.as_deref() == Some(&run.key.run_id)
+                            && crate::task::terminal_kind(run.status) == Some(event.kind)
+                    })
+                    .is_some_and(|event| event.kind == kind && event.revision == Some(run.revision))
+            });
+        push_bool(
+            "task.event_result_parity",
+            actual.events_complete && parity == expected,
+            json!(parity),
+            json!(expected),
+            details,
+        );
+    }
+}
+
 fn evaluate_path(
     name: &str,
     root: Option<&Value>,
@@ -2150,6 +2338,7 @@ mod tests {
 
     fn evidence() -> TurnEvidence {
         TurnEvidence {
+            task: None,
             response_metadata: Some(json!({"intent":"greeting","score":0.9})),
             state: Some("ready".to_string()),
             state_history: vec![ai_agents_core::StateTransitionEvent {
@@ -2746,6 +2935,7 @@ mod tests {
             cost: CostStats::default(),
         };
         evidence.observability = Some(TurnObservabilityEvidence {
+            events: Vec::new(),
             trace_id: Some("trace".to_string()),
             span_ids: vec!["span".to_string()],
             report: Some(ObservabilityReport {

@@ -76,6 +76,8 @@ pub fn finalize_branch(
             manager.finalize_pending_branch(branch_id, status.to_string(), winner, tags.clone());
         if finalized == 0 {
             let mut lifecycle_tags = tags;
+            // Pre-admission cancellation may have no deferred provider span; retain the original identity on its lifecycle event.
+            lifecycle_tags.insert("runtime.branch_id".to_string(), branch_id.to_string());
             lifecycle_tags.insert("runtime.branch_status".to_string(), status.to_string());
             lifecycle_tags.insert("branch_status".to_string(), status.to_string());
             lifecycle_tags.insert("runtime.winner".to_string(), winner.to_string());

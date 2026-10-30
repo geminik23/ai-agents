@@ -1,0 +1,27 @@
+name: Task Unavailable Diagnostics
+agent: ../../../yaml/autonomy/code_fix.yaml
+# A required unavailable capability rejects before task execution, not as a clean workspace.
+# Flow: task preflight -> unavailable diagnostics -> refusal before provider/command dispatch.
+# Commands stay fixture-backed and no file tools are called.
+settings: {timeout_per_turn_ms: 10000, retries: 0}
+fixtures:
+  workspace_policy:
+    read_tools: [diagnostics]
+  llm: {mode: mock, responses: [The task is complete.]}
+  commands:
+    available: true
+    entries:
+      - argv: [cargo, test]
+        response: {success: true, exit_code: 0, termination: exited, stdout: fixture success, stderr: '', combined_output: fixture success, truncated: false, timed_out: false, cwd: '{{ eval.workspace }}', argv_redacted: [cargo, test]}
+  diagnostics: {available: false, items: []}
+scenarios:
+  - id: unavailable-diagnostics-is-not-passing-negative-evidence
+    steps:
+      - !task
+        operation: {action: run, objective: Verify a clean diagnostic result.}
+        expect_error: required validator capability/authority unavailable
+        assert:
+          all:
+            - tool_not_called: command
+            - tool_not_called: diagnostics
+            - tool_not_called: file_edit

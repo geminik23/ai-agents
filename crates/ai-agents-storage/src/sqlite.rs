@@ -2,6 +2,10 @@
 
 use std::str::FromStr;
 
+#[cfg(test)]
+#[path = "sqlite_cancel_tests.rs"]
+mod cancellation_tests;
+
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -74,7 +78,7 @@ pub enum SessionOrderBy {
 
 #[cfg(feature = "sqlite")]
 pub struct SqliteStorage {
-    pool: sqlx::SqlitePool,
+    pub(super) pool: sqlx::SqlitePool,
 }
 
 #[cfg(feature = "sqlite")]
@@ -95,6 +99,7 @@ impl SqliteStorage {
         self.pool.close().await;
     }
 
+    /// Returns connections only after cancelled custom transaction initialization has relinquished its write lock.
     async fn connect(path: &str) -> Result<sqlx::SqlitePool> {
         // Ensure parent directories exist -- SQLite's create_if_missing only creates the file.
         if path != ":memory:"
@@ -115,12 +120,29 @@ impl SqliteStorage {
             .create_if_missing(true)
             .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal);
 
-        sqlx::SqlitePool::connect_with(options)
+        sqlx::sqlite::SqlitePoolOptions::new()
+            .after_release(|connection, _| {
+                Box::pin(Self::rollback_cancelled_initialization(connection))
+            })
+            .connect_with(options)
             .await
             .map_err(|e| AgentError::Persistence(e.to_string()))
     }
 
+    // SQLx custom BEGIN may be acknowledged before its Transaction guard exists; cancellation must not leak that writer into the pool.
+    // Backend rollback repairs only the connection, never invocation receipts, effect certainty or retained task ownership.
+    async fn rollback_cancelled_initialization(
+        connection: &mut sqlx::SqliteConnection,
+    ) -> std::result::Result<bool, sqlx::Error> {
+        use sqlx::{TransactionManager, sqlite::SqliteTransactionManager};
+        while SqliteTransactionManager::get_transaction_depth(connection) > 0 {
+            SqliteTransactionManager::rollback(connection).await?;
+        }
+        Ok(true)
+    }
+
     async fn run_migrations(&self) -> Result<()> {
+        super::sqlite_tasks::migrate(&self.pool).await?;
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS sessions (
@@ -586,6 +608,44 @@ impl SqliteStorage {
 #[cfg(feature = "sqlite")]
 #[async_trait]
 impl AgentStorage for SqliteStorage {
+    /// SQL operations contain no provider invocations; commit acknowledgements and cancellation retain the existing backend contract.
+    fn task_providers(&self) -> Option<Vec<std::sync::Arc<dyn ai_agents_core::LLMProvider>>> {
+        Some(vec![])
+    }
+
+    async fn create_task_run(
+        &self,
+        snapshot: &ai_agents_core::autonomy::TaskRunSnapshot,
+    ) -> Result<()> {
+        self.task_create(snapshot).await
+    }
+    async fn load_task_run(
+        &self,
+        key: &ai_agents_core::autonomy::TaskRunKey,
+    ) -> Result<Option<ai_agents_core::autonomy::TaskRunSnapshot>> {
+        self.task_load(key).await
+    }
+    async fn list_task_runs(
+        &self,
+        filter: &ai_agents_core::autonomy::TaskRunFilter,
+    ) -> Result<Vec<ai_agents_core::autonomy::TaskRunSummary>> {
+        self.task_list(filter).await
+    }
+    async fn mutate_task_run(
+        &self,
+        key: &ai_agents_core::autonomy::TaskRunKey,
+        mutation: &ai_agents_core::autonomy::TaskRunMutation,
+    ) -> Result<ai_agents_core::autonomy::TaskRunSnapshot> {
+        self.task_mutate(key, mutation).await
+    }
+    async fn delete_task_run(
+        &self,
+        key: &ai_agents_core::autonomy::TaskRunKey,
+        revision: u64,
+    ) -> Result<()> {
+        self.task_delete(key, revision).await
+    }
+
     fn supports(&self, capability: StorageCapability) -> bool {
         matches!(
             capability,
@@ -596,6 +656,7 @@ impl AgentStorage for SqliteStorage {
                 | StorageCapability::ActorFacts
                 | StorageCapability::ActorRelationships
                 | StorageCapability::ActorDataDeletion
+                | StorageCapability::TaskRuns
         )
     }
 
@@ -1053,12 +1114,15 @@ impl AgentStorage for SqliteStorage {
         Ok(())
     }
 
+    /// Deletes actor data only after excluding active task writers within the same write transaction.
     async fn delete_actor_data(&self, agent_id: &str, actor_id: &str) -> Result<()> {
         let mut transaction = self
             .pool
-            .begin()
+            .begin_with("BEGIN IMMEDIATE")
             .await
             .map_err(|e| AgentError::Persistence(e.to_string()))?;
+
+        super::sqlite_tasks::delete_actor_tasks(&mut transaction, agent_id, actor_id).await?;
 
         sqlx::query("DELETE FROM actor_facts WHERE agent_id = ? AND actor_id = ?")
             .bind(agent_id)
@@ -1288,12 +1352,14 @@ mod tests {
         let mut snapshot = AgentSnapshot::new("test-agent".into());
         snapshot.memory = MemorySnapshot::new(vec![
             ChatMessage {
+                provenance: None,
                 role: Role::User,
                 content: "Hello".to_string(),
                 name: None,
                 timestamp: None,
             },
             ChatMessage {
+                provenance: None,
                 role: Role::Assistant,
                 content: "Hi there!".to_string(),
                 name: None,

@@ -16,6 +16,186 @@ Fixed framework-owned objects reject unknown fields. Misspelled top-level and ne
 
 ---
 
+## Development-only autonomy configuration
+
+The development tree accepts typed `autonomy` profiles, named validation/progress adapters and enabled automatic state/selected-skill entry. These are not the published 1.1.1 contract. The standard builder installs retained embedded hosting for enabled declarations; development task commands, the plain REPL and task-aware TUI now consume the same controller. A development typed task-evaluation/report foundation is available; complete task-evaluation acceptance remains unfinished. See [development task evaluation](@/docs/evaluation.md#development-task-evaluation-foundation). Top-level `autonomy` configures defaults/profiles rather than automatically replacing every ordinary chat. See [automatic state and skill tasks](@/docs/rust-api.md#automatic-state-and-skill-tasks-development-only) for host lifetime, exact results and explicit resume.
+
+### Profile fields, defaults and merging
+
+For an executable walkthrough, start with [task autonomy from configuration to evaluation](@/docs/task-autonomy.md). Common behavior is YAML-configured; Rust installs providers, tools, domain meaning, actual authority and any requested ceilings. A name in YAML installs none of those capabilities.
+
+Top-level `autonomy` contains flat default profile fields, optional `default_profile`, and a `profiles` map of the same fields. State/skill `autonomy` adds a `profile` selector and inline profile overrides. Profile selection is explicit invocation selection, then the scoped selector, then `default_profile`. Merge order is built-in defaults → top-level defaults → selected profile → state/skill settings → per-run Rust overrides. Numeric resolution then intersects host ceilings; it is not admission or a grant.
+
+| Profile field | Type / resolved default | Contract |
+|---|---|---|
+| `enabled` | boolean / `false` | Opt-in; a profile declaration or YAML load does not execute a task |
+| `mode` | enum / `until_complete` when enabled | `disabled`, `until_complete`, `state_until_exit`, `skill_until_complete`; incompatible invocation scopes reject |
+| `objective`, `objective_template` | optional nonempty strings | Mutually exclusive; automatic scopes combine/resolve accepted input, while explicit invocation supplies its accepted objective; templates support accepted `input`, `user_input`, `objective`, current `context` and `state` |
+| `execution.strategy` | enum / scope-dependent | `skill` for skill scope, otherwise `lifecycle` with stages, otherwise `model_led`; incompatible explicit combinations reject |
+| `max_turns` | positive integer / `30` | Work-cycle allowance, not an invoice or a tool counter |
+| `max_active_time_seconds` | positive integer / `900` | Cumulative active allowance; safe human wait does not refill or consume active work allowance |
+| `max_wall_time_seconds` | optional positive integer / absent unless host-bounded | Whole-run expiry keeps advancing during safe waits |
+| `max_llm_calls`, `max_tool_calls`, `max_command_calls` | positive integers / `60`, `120`, `10` | Pre-execution shared admission includes managed auxiliary/child work; command attempts also consume applicable tool admission |
+| `max_cost_usd` | optional quoted positive decimal / absent | At most six decimal places; requires an actual host ceiling and bounded priced providers, not merely cost telemetry |
+| `max_declared_write_paths` | optional positive integer / absent | Requires an actual host ceiling and implementation-bound target footprints; not a filesystem sandbox |
+| `supervision.stage_changes`, `.plan_changes` | `inherit` or `require_approval` / inherited | Review cannot skip required work, expand authority or relax gates |
+| `lifecycle` | stage list / absent | Ordered stages; empty list explicitly replaces an inherited list |
+| `validation` | validation mapping / absent | Ordered managed checks and optional built-in shortcuts, described below |
+| `completion` | one gate tree / absent | Only eligible Pass can prove completion; required validation and scope rules still apply |
+| `progress` | progress mapping / built-in evidence observer | Optional domain signals or canonical todo integration, not model self-report |
+| `premature_finish` | policy / `continue` | `action: continue | ask_user | summarize_and_stop | fail`; `max_continuations` defaults to the effective turn allowance; optional custom `prompt` supplies controller guidance |
+| `on_limit` | policy / `summarize_and_stop` | `action: summarize_and_stop | fail | ask_user | pause_run`; summaries are deterministic, not unbudgeted model calls |
+| `hitl` | interaction policies / existing review contract | `on_approval_required` and `on_user_question`: `pause_run | reject | auto_if_policy | ask_each_time`; none overrides automatic denial or invents an answer |
+| `persistence` | optional mapping / no automatic restart preparation | See flags and host prerequisites below; a journal alone is not reconstruction authority |
+
+Omitted and null optional profile fields inherit; null is not a general reset operator. Explicit `false` and empty lists are preserved. Completion trees and configured lists replace rather than concatenate. Ordinary nested policy leaves merge; changing a progress adapter binding replaces its associated version/configuration instead of silently inheriting another adapter's config. Setting `objective` replaces an inherited template and vice versa. Gate `eq: null` is different: it is an explicit equality operand.
+
+### Validation, stages and progress
+
+`validation.checks` is a replacement list of named checks. Each entry has required `id` and `adapter`, `contract_version` (default `1`), `required` (default `true`), `schedule` (`each_cycle` by default, or `stage_end`/`completion`), optional positive `timeout_seconds`, and adapter-specific `config` (default `{}`). IDs are unique in the effective profile, including stage-owned checks. `stage_end` requires a stage owner. Unknown names, versions, dependencies or capabilities reject rather than becoming successful skipped checks.
+
+Built-in adapter configuration is strict:
+
+| Adapter | `config` fields | Evidence contract |
+|---|---|---|
+| `builtin.command` | required `command`; optional `cwd`, `host_binding`; `expected_exit: 0` | Exact authorized command result; approved replacement argv/cwd/env cannot validate the original command |
+| `builtin.diagnostics` | optional `path`, `severity`, `host_binding`; severity is `error`, `warning`, `info`, `hint` or `all` | Available, complete, fresh observations; no host capability is a preflight refusal, not an empty diagnostic result |
+| `builtin.judge` | required nonempty `criteria`; optional `llm`, `pass_threshold` | Managed semantic quality; declared alias and all calls share actual admission |
+| `builtin.evidence` | required `assertion` path matcher; optional upstream `validator` | Pure current context or eligible upstream metrics; no ambient I/O |
+| `builtin.artifact` | required `path`; optional `host_binding` | Authorized `file_info` observation; existence alone does not validate content |
+| Custom named adapter | installed implementation's validated config | Versioned pure callback returning results, managed observation requests or a typed external wait |
+
+The optional validation shortcuts are `required`, `commands: [string]`, `diagnostics: {enabled, fail_on_error}` and `judge: {enabled, llm, pass_threshold, criteria}`. They do not create separate executors. Prefer named checks when referring to exact IDs, schedules and dependencies.
+
+Each lifecycle stage has required `id`; optional `instruction`, `completion`, `commands`, `validation`, `suggested_tools`, `required_before_tools`, `retry_on_failure`, `on_failure_stage`, and `max_fix_cycles`. Stages are required by default. Suggested tools do not grant them; required-before-tool constraints are enforced. Repair targets must name an existing earlier stage and their cycle allowance is bounded. A passing task gate cannot skip required validation/review stages. This is ordered lifecycle control, not a DAG language.
+
+`progress` supports `adapter` (default `builtin.evidence`), `contract_version` (default `1`), adapter `config`, optional canonical `todo_tool`, `require_todos`, `require_active_todo`, `enforce_for_tools`, `auto_create_todo_prompt`, and positive `max_open_todos`. Todos are not required when these policies/gates do not request them. Built-in evidence signals select `id`, upstream `validator`, typed `path` and comparison such as `increase` or `change`. High-water marks and bounded observed fingerprints prevent duplicate/oscillating observations from becoming new progress.
+
+`progress.stagnation` is opt-in. Its `max_cycles_without_progress` defaults to `3`, `action` to `stop`, `max_replans` to `0`, and `on_exhausted` to `stop`. Actions are `continue | replan | ask_user | stop | fail`; exhaustion cannot request another replan. Questions need an explicit unavailable policy. Replanning never resets counters, objective, authority or required gates. `premature_finish.on_unavailable` and `on_limit.on_unavailable` use `stop | fail` and default to `stop`.
+
+An enabled `persistence` section defaults `enabled: true`, `save_after_each_step: true`, `resume_on_start: false`. `enabled: false` conflicts with either other flag set to true. Step snapshots do not replace mandatory admission/effect/pause/terminal journals. Preparation/reconstruction requires an explicitly installed compatible host and actual bindings/clock continuity; default production CLI restart remains unavailable.
+
+### Completion gate operands
+
+A gate node has exactly one operator; trees are bounded to depth 32 and 256 nodes. `all`/`any` require nonempty lists, and `not` wraps one gate. Missing, stale, partial or unavailable evidence remains Unknown under negation; it does not become a successful negative fact.
+
+| Operator | Operand |
+|---|---|
+| `todos_done`, `validation_passed`, `response_not_empty` | boolean; positive validation requires actual declared required checks, not an empty set |
+| `todo_count_gte` | integer |
+| `state`, `validator_passed`, `response_contains`, `artifact_exists` | nonempty string |
+| `state_in`, `response_contains_any` | nonempty string list |
+| `context_path`, `progress_path`, `observability` | required `path`; optional `eq` (including explicit null), `gt`, `gte`, `lt`, `lte`, `exists` |
+| `tool_called` | required canonical `id`; optional `count`, `count_gte`, `executed`, `success` matching one eligible factual record |
+| `command_exit` | required `command` and integer `code` |
+| `diagnostics_clear` | required `severity` |
+| `judge` | nonempty `criteria`, optional `llm` and `pass_threshold` |
+| `all`, `any`, `not` | nested gates |
+
+For example, `completion: {all: [{validator_passed: schema}, {artifact_exists: "report://current"}]}` requires a current schema result and an actual artifact observation. A custom host validator supplies the domain meaning without adding a gate variant. Runtime completion gates and eval assertions have related spelling but **different schemas**; eval's `assert.task.checks` inspects acknowledged check outcomes and is not a runtime `completion` gate.
+
+Within a development `validation.checks` entry, `max_evaluation_rounds` is an optional positive integer up to 32 (default 32), and `max_observations_per_round` is an optional positive integer up to 16 (default 16). They bound callback reentry and observation batches respectively and are intersected with host ceilings. A named binding's `contract_version` defaults to 1, not the newest registered version. Custom adapter configuration is schema-validated by its installed host implementation; YAML selects authority bindings but cannot create them. Validation check IDs beginning with `runtime.` are reserved for framework journals and reject before execution; rename affected development IDs and their gate/progress references.
+
+```yaml
+autonomy:
+  enabled: false
+  validation:
+    checks:
+      - id: ready
+        adapter: builtin.evidence
+        contract_version: 1
+        max_evaluation_rounds: 4
+        max_observations_per_round: 2
+        config:
+          assertion: {path: task.ready, eq: true}
+```
+
+This configuration-only snippet does not run a task or establish completion evidence. Omitted autonomy preserves ordinary chat behavior.
+
+The explicit development Rust runner also exposes bounded, default-redacted task lifecycle events through `run_stream`, `resume_stream` and `stream_operation`. These use the same configured profiles and retained control APIs, add no YAML fields and are shared by automatic scoped entry and the development task CLI; the event API itself is not a second command executor. Task events are not provider token deltas or execution permissions. See [task event streams](@/docs/rust-api.md#task-event-streams-development-only).
+
+Explicit Rust task profiles can select `builtin.artifact` with `config: {path: report.json}` and an optional exact `host_binding`. It uses authorized `file_info` observations, not ambient filesystem access; combine `artifact_exists: report.json` with schema/content validation where needed. Host validators may project typed non-filesystem artifact observations through Rust. `observability` gates consume acknowledged run-scoped numeric snapshots when collectors are installed; unavailable or lossy metrics remain unknown, including under negation. These adapters are shared by explicit and automatic scoped execution; they do not grant tools or replace resource admission. See [artifact and numeric telemetry observations](@/docs/rust-api.md#artifact-and-numeric-telemetry-observations-development-only).
+
+For profiles supplied explicitly to the development Rust runner, `premature_finish.action: ask_user` and `on_limit.action: ask_user | pause_run` now produce retained controller requests. `premature_finish.on_unavailable` and `on_limit.on_unavailable` accept `stop | fail`, defaulting to `stop`; stagnation questions still require an explicit `progress.stagnation.on_unavailable`. These policies do not grant an `ask_user` tool or fabricate a required answer, including during automatic entry. Manual resume is a delivery endpoint, and silence is not channel loss. A capacity response cannot refill counters: use the authenticated host's revision-bound limit update first. See [explicit skill execution and controller decisions](@/docs/rust-api.md#explicit-skills-and-controller-decisions-development-only) for response shapes, original bounds and unsupported surfaces.
+
+For the explicit Rust runner, checks execute in declaration order within `each_cycle`, stage-owned `stage_end`, and `completion` boundaries. Required task-completion checks do not block earlier stages; optional failed or unknown alternatives do not waive separate required checks. A retained pause resumes its exact schedule prefix or selected planner attempt. `hitl.on_approval_required` and `hitl.on_user_question` accept `pause_run`, `reject`, `auto_if_policy`, and `ask_each_time`: restrictive policies never approve a request that still needs a human or fabricate a question answer. `ask_each_time` retains human questions/required approvals and adds stage-boundary review when selected for approvals. Explicit required supervision remains required; a restrictive profile stops incomplete instead of auto-approving it. `on_limit.action: fail` returns `Failed` for a controller capacity stop without an extra summary call. Persistence settings also apply to automatic entries when `AutomaticTaskOptions` installs the compatible store and actual restore host; omission uses retained volatile hosting. See [controller scheduling and profiles](@/docs/rust-api.md#standalone-controller-scheduling-and-profiles-development-only).
+
+For the explicit development runner, retained approval/question responses preserve their original request deadline through preparation and final admission, and approvals retain the actual reviewed implementation/control/state binding. An expired approval timeout uses the actual pending child's `hitl.on_timeout`, not a coordinating validator's policy, and its disposition applies only to that original request. Approved command replacements cannot satisfy the original `command_exit` validation; selected skills retain their original state generation across awaited execution and response finishing. Automatic state/skill entries consume the same execution guards; these constraints add no YAML fields. See [guarded standalone execution](@/docs/rust-api.md#guarded-standalone-execution-development-only).
+
+Existing routing, pipeline, concurrent, handoff and group-chat declarations can also be used inside the explicitly invoked development Rust task runner. Repeated same-runtime slots retain distinct operations, generated children share the coordinating run, and partial-failure/aggregation settings keep their existing meaning through retained pauses. Automatic state/skill entry consumes these existing composition paths without adding another executor or changing their failure policies. The separate explicit Rust reconstruction API can resume a prepared safe pause using installed host bindings; a stored topology or YAML declaration alone is not executable authority. Opted-in persistence flags prepare safe restart points, and the explicit Rust startup API selects a unique compatible checkpoint; neither consumes pending decisions nor starts execution merely by constructing or restoring an agent. See [explicit safe-pause reconstruction](@/docs/rust-api.md#explicit-safe-pause-reconstruction-development-only). See [retained composition and ownership](@/docs/rust-api.md#guarded-standalone-execution-development-only).
+
+The existing `runtime.optimization` settings for facts/relationships and speculative routing also apply to conforming agents invoked through the explicit development Rust runner. Managed task completion waits for owned maintenance settlement even when ordinary next-turn freshness is configured as `never` or `same_actor`; ordinary chat retains its configured behavior. Incoming root/child tasks first settle earlier ordinary maintenance without charging it to the new run. In task mode, background overflow `drop` cannot silently discard required work, while `run_inline` preserves same-key ordering. Review rejection does not turn a locally uninvoked speculative selection into a completed no-match or reset used local slots. Custom consumer capabilities are installed in Rust, not by a YAML label. Final proof checks cannot extend dispatch allowance, and acknowledged late effects cannot become task completion credit; ordinary tool timeout recovery remains configured as before. The same managed boundaries apply to automatic state/skill entry. See [managed participation](@/docs/rust-api.md#managed-maintenance-and-speculative-participation-development-only) for callback limits and migration.
+
+For task profiles, `persistence.enabled` opts into safe-pause preparation through the installed Rust `TaskRestoreHost` (a present section defaults to enabled; omission preserves existing explicit execution). `save_after_each_step` defaults to `true` within an enabled section and controls an additional settled-step snapshot, not mandatory admission/effect/pending/pause/terminal journals. `resume_on_start` defaults to `false`; when true, explicit host startup may reconstruct only a unique compatible prepared pause. `enabled: false` conflicts with either other flag set to true. These settings do not grant backend capability: retained memory is process-local, SQLite supports durable reopening, and unsupported backends/namespaces still reject task operations. See [persistence and reviewed recovery](@/docs/rust-api.md#persistence-and-reviewed-recovery-development-only).
+
+### Automatic state and selected-skill entry
+
+Common behavior remains declarative. Rust provides host adapters, ceilings, storage and authorized question/control delivery; it does not require a second state/skill execution loop. In a new ordinary input, an enabled state scope takes precedence before skill dispatch. Otherwise a selected autonomous skill starts its scope after semantic routing/clarification. An existing task always retains its actual owner, profile, shared counters and outer completion gates.
+
+| Scoped field | Type/default | Meaning |
+|---|---|---|
+| `enabled` | Optional boolean; resolved default is `false` | Opts into automatic entry; explicit `false` prevents a new entry, not an outer task's enforcement |
+| `profile` | Optional named profile | Selects top-level profile settings before inline overrides |
+| `mode` | Optional scope mode | Use `state_until_exit` for a declaring-state subtree or `skill_until_complete` for a selected skill; incompatible scopes reject |
+| `objective` | Optional nonempty string | Combines the configured objective with accepted input |
+| `objective_template` | Optional template, mutually exclusive with `objective` | Renders once from accepted `input`/`user_input`, `objective`, `context`, `state` and selected `skill` metadata |
+| `execution.strategy` | `model_led`, `lifecycle`, `skill` | Omission chooses `skill` for a skill entry, otherwise `lifecycle` with stages, otherwise `model_led`; explicit incompatible combinations reject |
+| Limits, gates, validation, progress, HITL and persistence | Existing profile fields | Use the same host-enforced controller and capability checks as explicit tasks |
+
+A state starts only when it handles actual input, including an admitted regenerating transition path, not on construction, ordinary restoration or arrival without response regeneration. The nearest explicit autonomy declaration owns the scope; an omitted child declaration inherits an enclosing declaration when normal state inheritance permits it. An explicit child declaration resolves against the selected profile/defaults; `inherit_parent: false` stops enclosing-state lookup. The declaring subtree, not the current leaf label, defines a `state_until_exit` boundary. Scope exit without eligible completion is incomplete. These structural state gates alone do not prove external ticket or artifact state; declare a host validator when business evidence is required.
+
+```yaml
+states:
+  initial: troubleshooting
+  states:
+    troubleshooting:
+      autonomy:
+        enabled: true
+        mode: state_until_exit
+        objective: Resolve the issue or escalate when blocked.
+        max_turns: 10
+        completion:
+          any: [{state: resolved}, {state: escalated}]
+      transitions:
+        - to: resolved
+          when: The issue is resolved
+        - to: escalated
+          when: The issue requires escalation
+    resolved: {}
+    escalated: {}
+```
+
+A skill's scripted segment runs once under the default `skill` strategy. If gates remain unmet, bounded ordinary model/tool continuation uses its objective and prior results, not rerouting/replaying its completed steps. Explicit `model_led` or `lifecycle` strategies do not force the script. Ordinary skill requirements still apply to a scripted segment, including a prompt step producing its response. For example, this fragment requires the host to install the named source validator before build:
+
+```yaml
+autonomy:
+  profiles:
+    research:
+      enabled: true
+      max_turns: 12
+      validation:
+        checks:
+          - id: verified_sources
+            adapter: host.sources
+            contract_version: 1
+            config: {min_unique: 3}
+      completion: {validator_passed: verified_sources}
+skills:
+  - id: investigate
+    description: Investigate a research request
+    trigger: The user requests a grounded investigation
+    autonomy:
+      profile: research
+      mode: skill_until_complete
+      objective_template: '{{ user_input }}'
+    steps:
+      - prompt: 'Investigate {{ user_input }} using the configured capabilities.'
+```
+
+These fragments use the agent's normal LLM configuration and explicit tool grants; the second also requires the actual Rust validator binding. Unknown adapters, inadequate requested guarantees and missing capabilities reject rather than downgrade. No filesystem, command, todo or interactive tool is universally required.
+
+Embedded hosts inspect the last exact operation through `automatic_task_result()` and resume/control the same runner through `automatic_task_operation(...)` or `automatic_task_runner()`. Do not answer a pending task with a fresh `chat()` call. `chat_stream_events()` includes bounded default-redacted `AgentStreamEvent::Task` observations and one authoritative dispatch `Final`; its task status metadata distinguishes pause from completion. Exact pending/recovery data is trusted-host data, not an event export. Volatile pause is valid while its owner lives; durable preparation needs an explicit compatible store and restore host, not merely a YAML flag. Development task commands, `run --plain` and the interactive TUI service these retained controls; formal task eval/report surfaces remain unfinished. See the [development task CLI](@/docs/cli.md#development-task-cli).
+
 ## Agent Identity
 
 These fields define who your agent is.
@@ -164,6 +344,7 @@ The simplest form: one LLM for everything. Use `llm` as a flat object.
 | `num_ctx` | `u32` | `null` | Ollama context window; merged under request `options` |
 | `keep_alive` | `string` or `number` | `null` | Ollama keep-alive duration; top-level request body field |
 | `num_gpu` | `i32` | `null` | Ollama GPU layer count; merged under request `options` |
+| `declared_pricing` | object | `null` | Development-only, host-audited priced capability for the explicit Rust task API; omitted means no built-in hard-priced binding |
 | *(any other key)* | | | Passed through as provider-specific extra parameter |
 
 ```yaml
@@ -208,6 +389,46 @@ llm:
   function_calling: true
   json_mode: true
 ```
+
+### Declared pricing (development only)
+
+A provider's optional `declared_pricing` object prepares a hard-priced capability; it does not enable YAML task execution. Its model/endpoint and server-enforced token ceilings must be verified by the trusted host, and prices must conservatively cover every supported billable token class. This is separate from floating-point `observability.cost` estimates. See the [provider/request-class inventory](@/docs/providers.md#declared-priced-task-capabilities-development-only) before selecting an adapter.
+
+| Field | Type | Default | Contract |
+|---|---|---|---|
+| `schedule_id` | string | required | Nonempty host version of the audited schedule; numeric content is also pinned |
+| `model` | string | required | Exact configured model |
+| `endpoint` | string | required | Exact normalized HTTP(S) base endpoint; credentials, query strings and fragments are forbidden |
+| `server_input_token_limit` | positive `u32` | required | Audited maximum billable input tokens, including framing/native history/tool schemas |
+| `server_output_token_limit` | positive `u32` | required | Audited maximum total output tokens, including hidden reasoning |
+| `input_micro_usd_per_million` | `u64` | required | Maximum input micro-USD rate per million tokens, not a floating-point estimate |
+| `output_micro_usd_per_million` | `u64` | required | Maximum output micro-USD rate per million tokens |
+| `request_fee_micro_usd` | `u64` | `0` | Complete fixed fee per upstream request |
+| `max_internal_attempts` | positive `u32` | `1` | Total upstream attempts including the first; separate managed retries reserve separately |
+| `complete_usage` | bool | `false` | Host audit of complete usage-reporting semantics; false retains the full upper bound |
+
+The following is fictional configuration syntax, not a current model price or proof of an endpoint's limits. Do not copy its ceilings into a production contract without auditing the actual server.
+
+```yaml
+llm:
+  provider: openai-compatible
+  model: audited-model
+  base_url: https://model.example.invalid/v1/
+  max_tokens: 2048
+  declared_pricing:
+    schedule_id: host-audit-v1
+    model: audited-model
+    endpoint: https://model.example.invalid/v1/
+    server_input_token_limit: 64000
+    server_output_token_limit: 8192
+    input_micro_usd_per_million: 2500000
+    output_micro_usd_per_million: 10000000
+    request_fee_micro_usd: 0
+    max_internal_attempts: 1
+    complete_usage: false
+```
+
+This object is host configuration, not model-supplied authority: model-generated children in hard-priced tasks must use the spawner's authoritative shared providers and cannot install their own prices. The adapter reserves the complete ceilings rather than guessing the current prompt's token count. Effective configuration still needs an explicit output limit within the audited ceiling. With a hard-priced task, unknown extras, arbitrary `extra_body`, unbounded native services and unbounded internal retries are rejected before dispatch. Matching complete unary/native usage may release unused commitment. Google streams may settle complete terminal usage after normal EOF; streams without that receipt, incomplete usage and multi-attempt contracts retain the bound. Ordinary calls without a hard-priced task keep their existing extra-parameter behavior.
 
 ### Tool choice
 
@@ -3278,6 +3499,7 @@ fixtures:
 |-------|------|---------|-------------|
 | `context` | object | `{}` | Runtime context applied after `context_file` |
 | `context_file` | path? | `null` | JSON context file resolved relative to the suite file |
+| `files` | map | `{}` | At most 256 relative UTF-8 files / 8 MiB, materialized inside the attempt without overwriting an existing effect |
 | `tools` | map | `{}` | Mock tool outputs keyed by tool ID |
 | `llm.mode` | enum | `real` | `real`, `mock`, `replay`, or `record` |
 | `llm.responses` | list | `[]` | Ordered mock responses for `mock` mode |
@@ -3364,7 +3586,8 @@ scenarios:
 | `skip` | bool/string | `false` | Skip the scenario. A string value is treated as the skip reason and appears in reports. |
 | `env` | map | `{}` | Serial-only process environment overlay for one scenario attempt. Values are restored after the attempt. Parallel suites that use `env` are rejected. |
 | `turns` | list | `[]` | Direct conversation turns. Each turn uses the same runtime unless `isolation: turn` is configured. |
-| `steps` | list | `[]` | Advanced sequence with run/reset/save/load/context/actor steps. Use this for persistence, actor switching, or multi-session checks. |
+| `steps` | list | `[]` | Advanced sequence with `!task`, run/reset/save/load/context/actor steps; task operations require scenario isolation. Use this for persistence, actor switching, or multi-session checks. |
+| `interactions` | list | `[]` | Up to 256 typed controls for actual independent child participants while an ordinary parent is pending; see [foreground participant controls](@/docs/evaluation.md#foreground-participant-controls) |
 | `turn.input` | `string` | required | User input for a turn |
 | `turn.actor` | `string?` | `null` | Actor override for a single turn |
 | `turn.context` | object | `null` | Turn-level context overlay |
@@ -3556,7 +3779,7 @@ Judge fields:
 | File | Purpose |
 |------|---------|
 | `summary.md` | Human-readable pass/fail summary |
-| `summary.json` | Machine-readable result with `schema_version: 1` |
+| `summary.json` | Machine-readable result: published 1.1.1 uses `schema_version: 1`; the development checkout uses `schema_version: 3` |
 | `per_scenario.jsonl` | One scenario result per line |
 | `failures.md` | Failure-focused report |
 | `junit.xml` | Optional CI report when `--junit` is used |

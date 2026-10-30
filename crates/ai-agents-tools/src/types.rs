@@ -310,6 +310,15 @@ pub struct QuestionResponse {
 /// Host bridge for asking preference or clarification questions.
 #[async_trait]
 pub trait QuestionHandler: Send + Sync {
+    /// Bounds all logical writes made while serving this exact question; unsupported is not inferred from UI labels.
+    fn declared_write_footprint(
+        &self,
+        _request: &QuestionRequest,
+        _ctx: &ai_agents_core::ToolExecutionContext,
+        _max_targets: usize,
+    ) -> ai_agents_core::Result<Option<ai_agents_core::autonomy::ToolWriteFootprint>> {
+        Ok(None)
+    }
     /// Ask a structured question and return a bounded answer.
     async fn ask_question(&self, request: QuestionRequest) -> QuestionResponse;
 }
@@ -377,6 +386,15 @@ pub struct DiagnosticsResponse {
 /// Provider hook for compiler, linter, or editor diagnostics.
 #[async_trait]
 pub trait DiagnosticsProvider: Send + Sync {
+    /// Declares implementation-owned logical writes; diagnostic collection is not assumed side-effect-free.
+    fn declared_write_footprint(
+        &self,
+        _request: &DiagnosticsRequest,
+        _ctx: &ai_agents_core::ToolExecutionContext,
+        _max_targets: usize,
+    ) -> ai_agents_core::Result<Option<ai_agents_core::autonomy::ToolWriteFootprint>> {
+        Ok(None)
+    }
     /// Return whether this provider can serve diagnostics now.
     fn is_available(&self) -> bool {
         true
@@ -392,6 +410,16 @@ pub struct UnavailableDiagnosticsProvider;
 
 #[async_trait]
 impl DiagnosticsProvider for UnavailableDiagnosticsProvider {
+    fn declared_write_footprint(
+        &self,
+        _: &DiagnosticsRequest,
+        _: &ai_agents_core::ToolExecutionContext,
+        _: usize,
+    ) -> ai_agents_core::Result<Option<ai_agents_core::autonomy::ToolWriteFootprint>> {
+        Ok(Some(ai_agents_core::autonomy::ToolWriteFootprint::empty(
+            "host.unavailable.diagnostics.v1",
+        )))
+    }
     fn is_available(&self) -> bool {
         false
     }
@@ -432,6 +460,16 @@ impl StaticDiagnosticsProvider {
 
 #[async_trait]
 impl DiagnosticsProvider for StaticDiagnosticsProvider {
+    fn declared_write_footprint(
+        &self,
+        _: &DiagnosticsRequest,
+        _: &ai_agents_core::ToolExecutionContext,
+        _: usize,
+    ) -> ai_agents_core::Result<Option<ai_agents_core::autonomy::ToolWriteFootprint>> {
+        Ok(Some(ai_agents_core::autonomy::ToolWriteFootprint::empty(
+            "host.static.diagnostics.v1",
+        )))
+    }
     fn is_available(&self) -> bool {
         self.available
     }
@@ -550,6 +588,15 @@ pub struct WebSearchResponse {
 /// Host bridge for provider-neutral public web search.
 #[async_trait]
 pub trait WebSearchProvider: Send + Sync {
+    /// Covers host-local logical writes, not the search service's invoice or unrelated remote storage.
+    fn declared_write_footprint(
+        &self,
+        _request: &WebSearchRequest,
+        _ctx: &ai_agents_core::ToolExecutionContext,
+        _max_targets: usize,
+    ) -> ai_agents_core::Result<Option<ai_agents_core::autonomy::ToolWriteFootprint>> {
+        Ok(None)
+    }
     /// Return whether this provider can serve search requests now.
     fn is_available(&self) -> bool {
         true
@@ -565,6 +612,16 @@ pub struct UnavailableWebSearchProvider;
 
 #[async_trait]
 impl WebSearchProvider for UnavailableWebSearchProvider {
+    fn declared_write_footprint(
+        &self,
+        _: &WebSearchRequest,
+        _: &ai_agents_core::ToolExecutionContext,
+        _: usize,
+    ) -> ai_agents_core::Result<Option<ai_agents_core::autonomy::ToolWriteFootprint>> {
+        Ok(Some(ai_agents_core::autonomy::ToolWriteFootprint::empty(
+            "host.unavailable.search.v1",
+        )))
+    }
     fn is_available(&self) -> bool {
         false
     }
@@ -609,6 +666,16 @@ impl StaticWebSearchProvider {
 
 #[async_trait]
 impl WebSearchProvider for StaticWebSearchProvider {
+    fn declared_write_footprint(
+        &self,
+        _: &WebSearchRequest,
+        _: &ai_agents_core::ToolExecutionContext,
+        _: usize,
+    ) -> ai_agents_core::Result<Option<ai_agents_core::autonomy::ToolWriteFootprint>> {
+        Ok(Some(ai_agents_core::autonomy::ToolWriteFootprint::empty(
+            "host.static.search.v1",
+        )))
+    }
     fn is_available(&self) -> bool {
         self.available
     }
@@ -726,6 +793,16 @@ pub struct CommandResponse {
 /// Host bridge for controlled command execution.
 #[async_trait]
 pub trait CommandRunner: Send + Sync {
+    /// Trusted hosts may declare an enforced complete logical footprint for the actual policy-normalized request.
+    /// Process runners remain unsupported by default; a command name or argv allowlist is not write containment.
+    fn declared_write_footprint(
+        &self,
+        _request: &CommandRequest,
+        _ctx: &ai_agents_core::ToolExecutionContext,
+        _max_targets: usize,
+    ) -> ai_agents_core::Result<Option<ai_agents_core::autonomy::ToolWriteFootprint>> {
+        Ok(None)
+    }
     /// Return whether this runner can execute commands now.
     fn is_available(&self) -> bool {
         true
@@ -745,6 +822,16 @@ pub struct UnavailableCommandRunner;
 
 #[async_trait]
 impl CommandRunner for UnavailableCommandRunner {
+    fn declared_write_footprint(
+        &self,
+        _: &CommandRequest,
+        _: &ai_agents_core::ToolExecutionContext,
+        _: usize,
+    ) -> ai_agents_core::Result<Option<ai_agents_core::autonomy::ToolWriteFootprint>> {
+        Ok(Some(ai_agents_core::autonomy::ToolWriteFootprint::empty(
+            "host.unavailable.command.v1",
+        )))
+    }
     fn is_available(&self) -> bool {
         false
     }
@@ -794,6 +881,16 @@ impl StaticCommandRunner {
 
 #[async_trait]
 impl CommandRunner for StaticCommandRunner {
+    fn declared_write_footprint(
+        &self,
+        _: &CommandRequest,
+        _: &ai_agents_core::ToolExecutionContext,
+        _: usize,
+    ) -> ai_agents_core::Result<Option<ai_agents_core::autonomy::ToolWriteFootprint>> {
+        Ok(Some(ai_agents_core::autonomy::ToolWriteFootprint::empty(
+            "host.static.command.v1",
+        )))
+    }
     fn is_available(&self) -> bool {
         self.available
     }
@@ -1058,21 +1155,89 @@ pub struct TodoItem {
     pub status: TodoStatus,
 }
 
-/// Session-local todo storage shared by the registry and runtime accessor.
+/// Identifies the sole run owner of a canonical todo list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TodoRunBinding {
+    #[serde(default)]
+    pub objective_revision: u64,
+    pub agent_id: String,
+    pub run_id: String,
+    pub token: String,
+}
+
+#[derive(Default)]
+struct TodoStoreState {
+    items: Vec<TodoItem>,
+    binding: Option<TodoRunBinding>,
+    max_open: Option<u32>,
+}
+
+/// Session-local storage shared by the tool and runtime, optionally bound to one task run.
 #[derive(Clone, Default)]
 pub struct TodoStore {
-    inner: Arc<RwLock<Vec<TodoItem>>>,
+    inner: Arc<RwLock<TodoStoreState>>,
+}
+
+tokio::task_local! { static TASK_TODO_AUTHORITY: (TodoStore, TodoRunBinding); }
+
+/// Installs the coordinating canonical store without replacing a child's prepared tool handle.
+pub async fn scope_task_todos<F: std::future::Future>(
+    store: TodoStore,
+    binding: TodoRunBinding,
+    future: F,
+) -> F::Output {
+    TASK_TODO_AUTHORITY.scope((store, binding), future).await
+}
+
+/// A stale scoped binding fails closed instead of falling back to a participant's session-local list.
+pub fn current_task_todo_store() -> ai_agents_core::Result<Option<TodoStore>> {
+    TASK_TODO_AUTHORITY
+        .try_with(|(store, binding)| {
+            if store.list_for_run(binding).is_some() {
+                Ok(Some(store.clone()))
+            } else {
+                Err(ai_agents_core::autonomy::TaskRunStorageError::Conflict.into())
+            }
+        })
+        .unwrap_or(Ok(None))
 }
 
 impl TodoStore {
     /// Return a snapshot of all todo items.
     pub fn list(&self) -> Vec<TodoItem> {
-        self.inner.read().clone()
+        self.inner.read().items.clone()
     }
 
     /// Replace the full todo list.
     pub fn set(&self, items: Vec<TodoItem>) {
-        *self.inner.write() = items;
+        let _ = self.try_set(items);
+    }
+
+    /// Applies the run's open-item bound atomically without replacing the sole canonical list on rejection.
+    pub fn try_set(&self, items: Vec<TodoItem>) -> bool {
+        let mut state = self.inner.write();
+        if state
+            .max_open
+            .is_some_and(|limit| open_todos(&items) > limit as usize)
+        {
+            return false;
+        }
+        state.items = items;
+        true
+    }
+
+    /// Installs a bound only for the current run owner; ordinary session todo behavior is unchanged.
+    pub fn set_run_open_limit(&self, binding: &TodoRunBinding, limit: Option<u32>) -> bool {
+        let mut state = self.inner.write();
+        if state.binding.as_ref() != Some(binding)
+            || limit == Some(0)
+            || limit.is_some_and(|limit| open_todos(&state.items) > limit as usize)
+        {
+            return false;
+        }
+        state.max_open = limit;
+        true
     }
 
     /// Update one item by ID and return whether it existed.
@@ -1083,10 +1248,26 @@ impl TodoStore {
         active_form: Option<String>,
         status: Option<TodoStatus>,
     ) -> bool {
-        let mut items = self.inner.write();
-        let Some(item) = items.iter_mut().find(|item| item.id == id) else {
+        let mut state = self.inner.write();
+        let Some(index) = state.items.iter().position(|item| item.id == id) else {
             return false;
         };
+        let was_open = matches!(
+            state.items[index].status,
+            TodoStatus::Pending | TodoStatus::InProgress
+        );
+        let becomes_open = status
+            .as_ref()
+            .is_some_and(|status| matches!(status, TodoStatus::Pending | TodoStatus::InProgress));
+        if !was_open
+            && becomes_open
+            && state
+                .max_open
+                .is_some_and(|limit| open_todos(&state.items) >= limit as usize)
+        {
+            return false;
+        }
+        let item = &mut state.items[index];
         if let Some(content) = content {
             item.content = content;
         }
@@ -1101,8 +1282,67 @@ impl TodoStore {
 
     /// Remove every todo item.
     pub fn clear(&self) {
-        self.inner.write().clear();
+        self.inner.write().items.clear();
     }
+
+    /// Confirms a host alias observes the same canonical authority rather than an unrelated JSON-returning tool.
+    pub fn shares_store(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    /// Binds a new run atomically and discards only the prior unbound session list.
+    pub fn bind_run(&self, binding: TodoRunBinding, items: Vec<TodoItem>) -> bool {
+        let mut state = self.inner.write();
+        if state.binding.is_some() {
+            return false;
+        }
+        state.binding = Some(binding);
+        state.items = items;
+        true
+    }
+
+    /// Replaces one objective binding and its list under the same lock without exposing an unbound interval.
+    /// The caller must retain the old list for audit and acknowledge the matching durable handoff before execution.
+    pub fn rebind_run(&self, previous: &TodoRunBinding, next: TodoRunBinding) -> bool {
+        let mut state = self.inner.write();
+        if state.binding.as_ref() != Some(previous)
+            || next.agent_id != previous.agent_id
+            || next.run_id != previous.run_id
+            || previous.objective_revision.checked_add(1) != Some(next.objective_revision)
+            || next.token.is_empty()
+            || next.token == previous.token
+        {
+            return false;
+        }
+        state.binding = Some(next);
+        state.items.clear();
+        true
+    }
+
+    /// Returns one authoritative list only when the run binding still matches.
+    pub fn list_for_run(&self, binding: &TodoRunBinding) -> Option<Vec<TodoItem>> {
+        let state = self.inner.read();
+        (state.binding.as_ref() == Some(binding)).then(|| state.items.clone())
+    }
+
+    /// Releases a matching run; a stale adapter cannot detach a newer owner.
+    pub fn release_run(&self, binding: &TodoRunBinding) -> bool {
+        let mut state = self.inner.write();
+        if state.binding.as_ref() != Some(binding) {
+            return false;
+        }
+        state.binding = None;
+        state.max_open = None;
+        true
+    }
+}
+
+// Completed and cancelled items are visible history, not open work.
+fn open_todos(items: &[TodoItem]) -> usize {
+    items
+        .iter()
+        .filter(|item| matches!(item.status, TodoStatus::Pending | TodoStatus::InProgress))
+        .count()
 }
 
 fn default_true() -> bool {

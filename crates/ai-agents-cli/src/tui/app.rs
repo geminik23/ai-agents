@@ -10,7 +10,7 @@ use tracing::Level;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders};
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+use tokio::sync::mpsc::{Receiver, Sender, channel};
 use tui_textarea::TextArea;
 
 use ai_agents::memory::estimate_tokens;
@@ -18,8 +18,9 @@ use ai_agents::tools::{QuestionRequest, QuestionResponse};
 use ai_agents::{Agent, AgentResponse, AgentStreamEvent, RuntimeAgent, StreamChunk};
 use tokio::sync::oneshot;
 
+use super::commands::CommandContext;
 use crate::question::response_from_default;
-use crate::repl::{CliReplConfig, ReplMode, parse_relationship_perspective};
+use crate::repl::{CliReplConfig, ReplMode};
 use crate::stream_reconcile::unique_tool_names;
 use crate::stream_terminal::{
     INCOMPLETE_STREAM_ERROR, StreamDriveControl, StreamDriveOutcome,
@@ -142,17 +143,17 @@ fn record_final_response(
 
 // Forwards one turn and stops polling as soon as the TUI receiver is gone.
 fn send_turn_message(
-    turn_tx: &UnboundedSender<TurnMessage>,
-    wake_tx: &UnboundedSender<AppMessage>,
+    turn_tx: &Sender<TurnMessage>,
+    wake_tx: &Sender<AppMessage>,
     message: TurnMessage,
 ) -> bool {
-    turn_tx.send(message).is_ok() && wake_tx.send(AppMessage::Tick).is_ok()
+    turn_tx.try_send(message).is_ok() && wake_tx.try_send(AppMessage::Tick).is_ok()
 }
 
 async fn forward_stream_to_tui<S>(
     stream: S,
-    turn_tx: &UnboundedSender<TurnMessage>,
-    wake_tx: &UnboundedSender<AppMessage>,
+    turn_tx: &Sender<TurnMessage>,
+    wake_tx: &Sender<AppMessage>,
     turn_id: u64,
 ) -> StreamDriveOutcome
 where
@@ -221,9 +222,9 @@ pub struct App {
     theme: Theme,
     theme_name: String,
     bg_fill: Option<Color>,
-    wake_tx: UnboundedSender<AppMessage>,
-    turn_tx: UnboundedSender<TurnMessage>,
-    turn_rx: UnboundedReceiver<TurnMessage>,
+    wake_tx: Sender<AppMessage>,
+    turn_tx: Sender<TurnMessage>,
+    turn_rx: Receiver<TurnMessage>,
 
     // Input
     input: TextArea<'static>,
@@ -259,6 +260,26 @@ pub struct App {
 
     // Toast notifications
     toasts: Vec<Toast>,
+    host_input: Option<Sender<crate::session::Input>>,
+    host_busy: bool,
+    host_generation: u64,
+    hidden_modal: Option<ModalState>,
+    host_prompt: Option<(u64, String, Option<QuestionRequest>)>,
+    host_answering: bool,
+    task_views: std::collections::BTreeMap<
+        String,
+        (
+            ai_agents::TaskRunDisplay,
+            Option<ai_agents::TaskHostDetails>,
+        ),
+    >,
+    task_panel: bool,
+    task_selected: usize,
+    task_scroll: u16,
+    timeline: std::collections::VecDeque<String>,
+    last_result: Option<Box<crate::session::SessionResult>>,
+    pub(crate) commands:
+        futures::stream::FuturesUnordered<futures::future::BoxFuture<'static, Vec<String>>>,
 }
 
 struct PendingQuestionState {
@@ -267,11 +288,290 @@ struct PendingQuestionState {
 }
 
 impl App {
+    pub(crate) fn attach_host(&mut self, input: Sender<crate::session::Input>) {
+        self.host_input = Some(input);
+    }
+
+    fn bound_display(&mut self) {
+        while self.chat.messages.len() > 256 {
+            self.chat.messages.remove(0);
+        }
+        for message in &mut self.chat.messages {
+            if message.content.len() > 16_384 {
+                message.content = message.content.chars().take(4096).collect::<String>()
+                    + "\n[display truncated]";
+            }
+        }
+        if let Some(text) = &mut self.chat.streaming_content
+            && text.len() > 16_384
+        {
+            *text = text.chars().take(4096).collect::<String>() + "\n[preview truncated]";
+        }
+        let mut bytes = self
+            .chat
+            .messages
+            .iter()
+            .map(|m| m.content.len())
+            .sum::<usize>();
+        while bytes > 32_768 && self.chat.messages.len() > 1 {
+            bytes -= self.chat.messages.remove(0).content.len();
+        }
+        self.toasts.truncate(8);
+    }
+
+    fn reopen_prompt(&mut self) {
+        if self.host_answering {
+            self.add_toast("Decision submitted; waiting for its acknowledged outcome.");
+            return;
+        }
+        if let Some(modal) = self.hidden_modal.take() {
+            self.modal = Some(modal);
+            return;
+        }
+        if let Some((id, text, question)) = &self.host_prompt {
+            let request = question.clone().unwrap_or_else(|| QuestionRequest {
+                question: text.clone(),
+                allow_other: true,
+                ..Default::default()
+            });
+            let mut modal = ModalState::question(
+                &request.question,
+                request.options.clone(),
+                request.multi_select,
+                request.allow_other,
+                request.default.as_ref().map(ToString::to_string),
+            );
+            modal.title = format!("DECISION {id} - Esc hides, Ctrl+P reopens");
+            modal.message = text.clone();
+            self.modal = Some(modal);
+        }
+    }
+
+    pub(crate) fn host_output(&mut self, output: crate::session::Output) {
+        use crate::session::{OperationResult, Output};
+        match output {
+            Output::Prompt { id, text, question } => {
+                self.hidden_modal = None;
+                self.host_prompt = Some((id, text, question));
+                self.host_answering = false;
+                self.reopen_prompt();
+            }
+            Output::PromptClosed(id) => {
+                if self.host_prompt.as_ref().is_some_and(|p| p.0 == id) {
+                    self.host_prompt = None;
+                    self.hidden_modal = None;
+                    self.host_answering = false;
+                    self.modal = None;
+                }
+            }
+            Output::View { display, details } => {
+                let first_view = self.task_views.is_empty();
+                let id = display.summary.key.run_id.clone();
+                let newly_observed = !self.task_views.contains_key(&id);
+                if self
+                    .task_views
+                    .get(&id)
+                    .is_none_or(|(old, _)| old.summary.revision <= display.summary.revision)
+                {
+                    if self.task_views.len() >= 1024
+                        && !self.task_views.contains_key(&id)
+                        && let Some(old) = self
+                            .task_views
+                            .iter()
+                            .find(|(_, (v, _))| v.summary.status.is_terminal())
+                            .map(|(k, _)| k.clone())
+                    {
+                        self.task_views.remove(&old);
+                    }
+                    self.task_views.insert(id.clone(), (*display, details));
+                    if newly_observed {
+                        self.task_selected = self
+                            .task_views
+                            .keys()
+                            .position(|key| key == &id)
+                            .unwrap_or(0);
+                        self.task_scroll = 0;
+                    }
+                }
+                if first_view {
+                    self.task_panel = true;
+                }
+            }
+            Output::Text(text) => {
+                self.timeline.push_back(text.chars().take(2048).collect());
+                while self.timeline.len() > 128 {
+                    self.timeline.pop_front();
+                }
+                self.chat
+                    .streaming_content
+                    .get_or_insert_with(String::new)
+                    .push_str(&text);
+            }
+            Output::Diagnostic(text) => {
+                self.host_answering = false;
+                self.add_system_message(&text);
+            }
+            Output::Flush(ack) => {
+                let _ = ack.send(());
+            }
+            Output::Rejected {
+                generation,
+                message,
+            } => {
+                if generation == self.host_generation {
+                    self.host_busy = false;
+                    self.is_thinking = false;
+                }
+                self.add_system_message(&message);
+            }
+            Output::Result { generation, result } => {
+                if generation != self.host_generation {
+                    return;
+                }
+                self.host_busy = false;
+                self.hidden_modal = None;
+                self.host_prompt = None;
+                self.host_answering = false;
+                self.modal = None;
+                let response = match &result.primary {
+                    OperationResult::Chat(response) => response
+                        .metadata
+                        .as_ref()
+                        .and_then(|m| m.get("task_run"))
+                        .and_then(|m| m.get("run_id"))
+                        .and_then(|id| id.as_str())
+                        .and_then(|id| result.results.get(id))
+                        .and_then(|r| r.final_response.clone())
+                        .unwrap_or_else(|| response.clone()),
+                    OperationResult::Task(initial) => result
+                        .results
+                        .get(&initial.run.key.run_id)
+                        .unwrap_or(initial)
+                        .final_response
+                        .clone()
+                        .unwrap_or_else(|| {
+                            AgentResponse::new(format!(
+                                "Task status: {:?}",
+                                result
+                                    .results
+                                    .get(&initial.run.key.run_id)
+                                    .unwrap_or(initial)
+                                    .run
+                                    .status
+                            ))
+                        }),
+                };
+                for task in result.results.values() {
+                    self.add_system_message(&format!(
+                        "Task {} revision {}: {:?}",
+                        task.run.key.run_id, task.run.revision, task.run.status
+                    ));
+                }
+                self.store_final_response(response);
+                self.task_panel = false;
+                self.last_result = Some(result);
+            }
+        }
+        self.bound_display();
+    }
+
+    fn render_tasks(&self, area: Rect, frame: &mut Frame) {
+        use ratatui::widgets::{Clear, Paragraph, Wrap};
+        Clear.render(area, frame.buffer_mut());
+        let mut lines = vec![format!(
+            "Task views: {} | Ctrl+Up/Down selects | Ctrl+PgUp/PgDn scrolls",
+            self.task_views.len()
+        )];
+        if let Some((id, (display, details))) = self.task_views.iter().nth(self.task_selected) {
+            lines.push(format!(
+                "Run {id} revision {}: {:?} | cancel requested: {}",
+                display.summary.revision, display.summary.status, display.summary.cancel_requested
+            ));
+            lines.push(format!(
+                "Retained locally: {} | restoration review: {:?}",
+                display.locally_retained, display.restoration_review_required
+            ));
+            lines.push(format!(
+                "Active observed: {} ms / {} s | original expiry: {:?}",
+                display.clocks.active_millis,
+                display.limits.max_active_time_seconds,
+                display.clocks.expires_at
+            ));
+            lines.push(format!(
+                "Cumulative: {} turns; {} LLM attempts; {} tool attempts",
+                display.counters.turns,
+                display.counters.llm_attempts,
+                display.counters.tool_attempts
+            ));
+            lines.push(format!(
+                "Last gate: {:?} (historical cycle {:?}, objective revision {:?})",
+                display.last_gate, display.last_gate_cycle, display.last_gate_objective_revision
+            ));
+            if let Some(details) = details
+                && details.revision == display.summary.revision
+            {
+                lines.extend(details.lines.clone());
+                if details.truncated {
+                    lines.push("[local details truncated; exact result unchanged]".into());
+                }
+            }
+        } else {
+            lines.push("No task admitted. Ordinary chat stays ordinary; /task run [--profile ID] OBJECTIVE starts a task.".into());
+        }
+        lines.push("Timeline (bounded observations; not completion authority):".into());
+        lines.extend(self.timeline.iter().cloned());
+        Paragraph::new(lines.join("\n"))
+            .wrap(Wrap { trim: false })
+            .scroll((self.task_scroll, 0))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("TASK - F10 hides; Ctrl+P pending decision"),
+            )
+            .render(area, frame.buffer_mut());
+    }
+
+    fn schedule_command(&mut self, input: &str) {
+        if !self.commands.is_empty() {
+            self.add_toast("A session command is still pending.");
+            return;
+        }
+        if self.host_busy && !input.starts_with("/sessions") {
+            self.add_toast(
+                "Task owns this runtime; use its exact task controls before changing the session.",
+            );
+            return;
+        }
+        let agent = self.agent.clone();
+        let input = input.to_owned();
+        self.commands.push(Box::pin(async move {
+            let mut context = CommandContext {
+                agent,
+                messages: vec![],
+            };
+            context.run(&input).await;
+            context.messages
+        }));
+    }
+
+    pub(crate) fn command_output(&mut self, messages: Vec<String>) {
+        let actor = self.agent.actor_id();
+        self.task_views
+            .retain(|_, (view, _)| view.summary.actor_id == actor);
+        self.task_selected = self
+            .task_selected
+            .min(self.task_views.len().saturating_sub(1));
+        for message in messages {
+            self.add_system_message(&message);
+        }
+        self.bound_display();
+    }
+
     /// Build initial application state from an agent, config, and message sender.
     pub fn new(
         agent: Arc<RuntimeAgent>,
         config: CliReplConfig,
-        tx: UnboundedSender<AppMessage>,
+        tx: Sender<AppMessage>,
         theme: Theme,
         theme_name: String,
     ) -> Self {
@@ -305,7 +605,7 @@ impl App {
         }
 
         let bg_fill = theme_bg_color(&theme_name);
-        let (turn_tx, turn_rx) = unbounded_channel();
+        let (turn_tx, turn_rx) = channel(32);
         Self {
             agent,
             config,
@@ -332,12 +632,39 @@ impl App {
             modal: None,
             pending_question: None,
             toasts: Vec::new(),
+            host_input: None,
+            host_busy: false,
+            host_generation: 0,
+            hidden_modal: None,
+            host_prompt: None,
+            host_answering: false,
+            task_views: Default::default(),
+            task_panel: false,
+            task_selected: 0,
+            task_scroll: 0,
+            timeline: Default::default(),
+            last_result: None,
+            commands: Default::default(),
         }
     }
 
     /// Process one incoming event and return whether the app should keep running.
     pub async fn update(&mut self, msg: AppMessage) -> UpdateResult {
         self.drain_turn_messages();
+        self.bound_display();
+        if let AppMessage::Key(key) = &msg {
+            if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+                return UpdateResult::Quit;
+            }
+            if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('p') {
+                self.reopen_prompt();
+                return UpdateResult::Continue;
+            }
+            if self.host_prompt.is_some() && key.code == KeyCode::Esc {
+                self.hidden_modal = self.modal.take();
+                return UpdateResult::Continue;
+            }
+        }
         if self.modal.is_some()
             && let AppMessage::Key(key) = msg
         {
@@ -463,10 +790,7 @@ impl App {
 
         // Ctrl+S quick-saves the session.
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
-            match self.agent.save_session("default").await {
-                Ok(()) => self.add_toast("Session saved"),
-                Err(e) => self.add_toast(&format!("Save failed: {}", e)),
-            }
+            self.schedule_command("/save default");
             return UpdateResult::Continue;
         }
 
@@ -476,6 +800,22 @@ impl App {
             return UpdateResult::Continue;
         }
 
+        if key.code == KeyCode::F(10) {
+            self.task_panel = !self.task_panel;
+            return UpdateResult::Continue;
+        }
+        if self.task_panel && key.modifiers.contains(KeyModifiers::CONTROL) {
+            match key.code {
+                KeyCode::Up => self.task_selected = self.task_selected.saturating_sub(1),
+                KeyCode::Down => {
+                    self.task_selected =
+                        (self.task_selected + 1).min(self.task_views.len().saturating_sub(1))
+                }
+                KeyCode::PageUp => self.task_scroll = self.task_scroll.saturating_sub(10),
+                KeyCode::PageDown => self.task_scroll = self.task_scroll.saturating_add(10),
+                _ => {}
+            }
+        }
         // Scroll keys
         match key.code {
             KeyCode::PageUp => {
@@ -602,16 +942,83 @@ impl App {
 
         // Enter sends the current input.  Intercept before textarea so
         // Enter does not insert a newline into the buffer.
-        if key.code == KeyCode::Enter && !self.is_thinking {
+        if key.code == KeyCode::Enter && (!self.is_thinking || self.host_input.is_some()) {
             self.completions.close();
             let lines: Vec<String> = self.input.lines().iter().map(|s| s.to_string()).collect();
             let text = lines.join("\n").trim().to_string();
             if text.is_empty() {
                 return UpdateResult::Continue;
             }
+            if text.len() > 65_536 {
+                self.add_toast("Input exceeds the 64 KiB transport limit; nothing was submitted.");
+                return UpdateResult::Continue;
+            }
             self.input.select_all();
             self.input.cut();
 
+            if let Some(tx) = self.host_input.clone()
+                && (text.starts_with("/task ") || !text.starts_with('/'))
+            {
+                if !self.commands.is_empty() && !self.host_busy {
+                    self.add_toast("Wait for the pending session command before starting work.");
+                    return UpdateResult::Continue;
+                }
+                if !self.host_busy && text == "/task list" {
+                    let rows = self
+                        .task_views
+                        .values()
+                        .map(|(v, _)| {
+                            format!(
+                                "{} revision {}: {:?}",
+                                v.summary.key.run_id, v.summary.revision, v.summary.status
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    self.add_system_message(&rows);
+                    return UpdateResult::Continue;
+                }
+                if !self.host_busy
+                    && let Some(id) = text.strip_prefix("/task show ")
+                {
+                    let value = self
+                        .task_views
+                        .get(id)
+                        .map(|(v, _)| serde_json::to_string(v).unwrap())
+                        .unwrap_or_else(|| "No observed scoped run".into());
+                    self.add_system_message(&value);
+                    return UpdateResult::Continue;
+                }
+                if self.host_busy && (!text.starts_with("/task ") || text.starts_with("/task run"))
+                {
+                    self.add_toast("Work is retained; answer its prompt or use task controls.");
+                    return UpdateResult::Continue;
+                }
+                let generation = if self.host_busy {
+                    self.host_generation
+                } else {
+                    self.host_generation.wrapping_add(1)
+                };
+                if let Err(e) = super::host::send(
+                    &tx,
+                    crate::session::Input::UiLine {
+                        generation,
+                        line: text.clone(),
+                    },
+                ) {
+                    self.add_toast(&e.to_string());
+                    return UpdateResult::Continue;
+                }
+                if !self.host_busy {
+                    self.host_generation = generation;
+                    self.host_busy = true;
+                    self.chat_start = Some(Instant::now());
+                    self.is_thinking = true;
+                    self.observed_tool_names.clear();
+                    self.add_system_message(&format!("You: {text}"));
+                }
+                return UpdateResult::Continue;
+            }
             if text.starts_with('/') {
                 return self.handle_slash_command(&text).await;
             }
@@ -683,6 +1090,12 @@ impl App {
             return UpdateResult::Continue;
         }
 
+        // Input growth is bounded independently of the exact task result and recovery checkpoint.
+        if matches!(key.code, KeyCode::Char(_))
+            && self.input.lines().iter().map(String::len).sum::<usize>() >= 65_536
+        {
+            return UpdateResult::Continue;
+        }
         // Forward everything else to the text area, then refresh completions.
         self.input.input(key);
         self.update_completions();
@@ -822,16 +1235,41 @@ impl App {
     async fn handle_slash_command(&mut self, input: &str) -> UpdateResult {
         let lower = input.to_lowercase();
         let trimmed = lower.as_str();
+        if self.host_busy
+            && (trimmed.starts_with("/context set ") || trimmed.starts_with("/context unset "))
+        {
+            self.add_toast(
+                "Work is retained; context changes must not replace its pending decision.",
+            );
+            return UpdateResult::Continue;
+        }
+        if [
+            "/reset",
+            "/save",
+            "/load",
+            "/delete",
+            "/sessions",
+            "/cleanup",
+            "/actor",
+            "/facts",
+            "/relationship",
+            "/rel",
+        ]
+        .iter()
+        .any(|cmd| trimmed == *cmd || trimmed.starts_with(&format!("{cmd} ")))
+        {
+            if matches!(trimmed, "/relationship" | "/rel") {
+                self.toggle_panel(PanelSlot::Relationship);
+            }
+            self.schedule_command(input);
+            return UpdateResult::Continue;
+        }
 
         match trimmed {
             "/quit" | "/exit" => return UpdateResult::Quit,
             "/help" | "/?" => {
                 self.toggle_panel(PanelSlot::Help);
             }
-            "/reset" => match self.agent.reset().await {
-                Ok(()) => self.add_system_message("Agent reset."),
-                Err(e) => self.add_system_message(&format!("[Error] Reset failed: {}", e)),
-            },
             "/state" => match self.agent.current_state() {
                 Some(state) => self.add_system_message(&format!("Current state: {}", state)),
                 None => self.add_system_message("No state machine active."),
@@ -869,392 +1307,11 @@ impl App {
             _ if trimmed.starts_with("/context") => {
                 self.handle_context_command(input);
             }
-            _ if trimmed.starts_with("/save") => {
-                let name = input.split_whitespace().nth(1).unwrap_or("default");
-                match self.agent.save_session(name).await {
-                    Ok(()) => self.add_toast(&format!("Saved '{}'", name)),
-                    Err(e) => self.add_system_message(&format!("[Error] Save failed: {}", e)),
-                }
-            }
-            _ if trimmed.starts_with("/load") => {
-                let name = input.split_whitespace().nth(1).unwrap_or("default");
-                match self.agent.load_session(name).await {
-                    Ok(true) => self.add_toast(&format!("Loaded '{}'", name)),
-                    Ok(false) => self.add_system_message(&format!("Session '{}' not found.", name)),
-                    Err(e) => self.add_system_message(&format!("[Error] Load failed: {}", e)),
-                }
-            }
-            _ if trimmed.starts_with("/delete") => {
-                let name = match input.split_whitespace().nth(1) {
-                    Some(n) => n.to_string(),
-                    None => {
-                        self.add_system_message("Usage: /delete <session_name>");
-                        return UpdateResult::Continue;
-                    }
-                };
-                match self.agent.delete_session(&name).await {
-                    Ok(()) => self.add_toast(&format!("Deleted '{}'", name)),
-                    Err(e) => self.add_system_message(&format!("[Error] Delete failed: {}", e)),
-                }
-            }
-            _ if trimmed.starts_with("/sessions") => {
-                self.handle_tui_sessions_command(input).await;
-            }
-            "/cleanup" => match self.agent.cleanup_expired_sessions().await {
-                Ok(0) => self.add_system_message("No expired sessions to clean up."),
-                Ok(n) => self.add_toast(&format!("Cleaned up {} expired session(s).", n)),
-                Err(e) => self.add_system_message(&format!("[Error] Cleanup failed: {}", e)),
-            },
-            _ if trimmed.starts_with("/actor") => {
-                self.handle_tui_actor_command(input).await;
-            }
-            _ if trimmed.starts_with("/facts") => {
-                self.handle_tui_facts_command(input).await;
-            }
-            _ if trimmed.starts_with("/relationship") || trimmed.starts_with("/rel") => {
-                self.handle_tui_relationship_command(input).await;
-            }
             _ => {
                 self.add_system_message(&format!("Unknown command: {}", input));
             }
         }
         UpdateResult::Continue
-    }
-
-    async fn handle_tui_actor_command(&mut self, input: &str) {
-        let parts: Vec<&str> = input.split_whitespace().collect();
-        match parts.get(1).map(|s| s.to_lowercase()).as_deref() {
-            None | Some("") => match self.agent.actor_id() {
-                Some(id) => self.add_system_message(&format!("Actor: {}", id)),
-                None => self.add_system_message("No actor ID set. Use /actor set <id>"),
-            },
-            Some("set") => {
-                if let Some(id) = parts.get(2) {
-                    match self.agent.set_actor_id(id) {
-                        Ok(()) => {
-                            if let Err(e) = self.agent.load_actor_memory().await {
-                                self.add_system_message(&format!(
-                                    "[Warning] Actor set but failed to load memory: {}",
-                                    e
-                                ));
-                            } else {
-                                let count = self.agent.actor_facts().len();
-                                self.add_toast(&format!(
-                                    "Actor set to: {}. {} fact(s) loaded.",
-                                    id, count
-                                ));
-                            }
-                        }
-                        Err(e) => self.add_system_message(&format!("[Error] {}", e)),
-                    }
-                } else {
-                    self.add_system_message("Usage: /actor set <id>");
-                }
-            }
-            Some("facts") => {
-                let actor_id = match self.agent.actor_id() {
-                    Some(id) => id,
-                    None => {
-                        self.add_system_message("No actor ID set. Use /actor set <id>");
-                        return;
-                    }
-                };
-                let facts = self.agent.actor_facts();
-                let cat_filter = parts.get(2).map(|s| s.to_lowercase());
-                let filtered: Vec<_> = if let Some(ref cat) = cat_filter {
-                    facts
-                        .iter()
-                        .filter(|f| f.category.to_string().to_lowercase() == *cat)
-                        .collect()
-                } else {
-                    facts.iter().collect()
-                };
-                if filtered.is_empty() {
-                    self.add_system_message(&format!("No facts for actor: {}", actor_id));
-                } else {
-                    let mut msg =
-                        format!("Facts for actor {} ({} shown):", actor_id, filtered.len());
-                    for fact in &filtered {
-                        msg.push_str(&format!(
-                            "\n  [{}] {} ({:.2})",
-                            fact.category, fact.content, fact.confidence
-                        ));
-                    }
-                    self.add_system_message(&msg);
-                }
-            }
-            Some("delete") => {
-                let actor_id = match self.agent.actor_id() {
-                    Some(id) => id,
-                    None => {
-                        self.add_system_message("No actor ID set. Use /actor set <id>");
-                        return;
-                    }
-                };
-                match self.agent.delete_actor_data(&actor_id).await {
-                    Ok(()) => self.add_toast(&format!("All data deleted for actor: {}", actor_id)),
-                    Err(e) => self.add_system_message(&format!("[Error] {}", e)),
-                }
-            }
-            _ => {
-                self.add_system_message("Usage: /actor [set <id> | facts [category] | delete]");
-            }
-        }
-    }
-
-    async fn handle_tui_facts_command(&mut self, input: &str) {
-        let parts: Vec<&str> = input.split_whitespace().collect();
-        match parts.get(1).map(|s| s.to_lowercase()).as_deref() {
-            Some("extract") => {
-                let n: usize = parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(10);
-                match self.agent.extract_facts(n).await {
-                    Ok(facts) if facts.is_empty() => {
-                        self.add_system_message("No new facts extracted.");
-                    }
-                    Ok(facts) => {
-                        let mut msg = format!("Extracted {} fact(s):", facts.len());
-                        for fact in &facts {
-                            msg.push_str(&format!(
-                                "\n  [{}] {} ({:.2})",
-                                fact.category, fact.content, fact.confidence
-                            ));
-                        }
-                        self.add_system_message(&msg);
-                    }
-                    Err(e) => {
-                        self.add_system_message(&format!("[Error] Extraction failed: {}", e));
-                    }
-                }
-            }
-            _ => {
-                let facts = self.agent.actor_facts();
-                if facts.is_empty() {
-                    self.add_system_message("No facts for current actor.");
-                } else {
-                    let mut msg = format!("Facts ({}):", facts.len());
-                    for fact in &facts {
-                        msg.push_str(&format!(
-                            "\n  [{}] {} ({:.2})",
-                            fact.category, fact.content, fact.confidence
-                        ));
-                    }
-                    self.add_system_message(&msg);
-                }
-            }
-        }
-    }
-
-    async fn handle_tui_relationship_command(&mut self, input: &str) {
-        let parts: Vec<&str> = input.split_whitespace().collect();
-        let Some(manager) = self.agent.relationship_manager() else {
-            self.add_system_message("Relationship memory is not configured.");
-            return;
-        };
-        let actor_id = match self.agent.actor_id() {
-            Some(id) => id,
-            None => {
-                self.add_system_message("No actor ID set. Use /actor set <id>");
-                return;
-            }
-        };
-        let _ = self.agent.load_actor_relationship().await;
-
-        match parts.get(1).map(|s| s.to_lowercase()).as_deref() {
-            None | Some("") => self.toggle_panel(PanelSlot::Relationship),
-            Some("events") => {
-                let relationship = manager.get_or_create(&actor_id, None);
-                if relationship.notable_events.is_empty() {
-                    self.add_system_message(&format!(
-                        "No notable relationship events for actor: {}",
-                        actor_id
-                    ));
-                    return;
-                }
-                let mut msg = format!("Relationship events for actor {}:", actor_id);
-                for event in &relationship.notable_events {
-                    msg.push_str(&format!(
-                        "\n  [{}] ({:.2}) {}",
-                        event.timestamp.to_rfc3339(),
-                        event.significance,
-                        event.description
-                    ));
-                }
-                self.add_system_message(&msg);
-            }
-            Some("set") => {
-                let dimension = match parts.get(2) {
-                    Some(d) => *d,
-                    None => {
-                        self.add_system_message(
-                            "Usage: /relationship set <dimension> <delta> [reason]",
-                        );
-                        return;
-                    }
-                };
-                let delta = match parts.get(3).and_then(|s| s.parse::<f64>().ok()) {
-                    Some(v) => v,
-                    None => {
-                        self.add_system_message(
-                            "Usage: /relationship set <dimension> <delta> [reason]",
-                        );
-                        return;
-                    }
-                };
-                let reason = if parts.len() > 4 {
-                    Some(parts[4..].join(" "))
-                } else {
-                    None
-                };
-                match self
-                    .agent
-                    .update_relationship_dimension(dimension, delta, reason.as_deref())
-                    .await
-                {
-                    Ok(change) => self.add_toast(&format!(
-                        "{} {} {:+.2} -> {:.2}",
-                        change.perspective, change.dimension, change.delta, change.current
-                    )),
-                    Err(e) => self.add_system_message(&format!("[Error] {}", e)),
-                }
-            }
-            Some("setp") => {
-                let perspective = match parts.get(2) {
-                    Some(value) => match parse_relationship_perspective(value) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            self.add_system_message(&format!(
-                                "{}. Usage: /relationship setp <perspective> <dimension> <delta> [reason]",
-                                e
-                            ));
-                            return;
-                        }
-                    },
-                    None => {
-                        self.add_system_message(
-                            "Usage: /relationship setp <perspective> <dimension> <delta> [reason]",
-                        );
-                        return;
-                    }
-                };
-                let dimension = match parts.get(3) {
-                    Some(d) => *d,
-                    None => {
-                        self.add_system_message(
-                            "Usage: /relationship setp <perspective> <dimension> <delta> [reason]",
-                        );
-                        return;
-                    }
-                };
-                let delta = match parts.get(4).and_then(|s| s.parse::<f64>().ok()) {
-                    Some(v) => v,
-                    None => {
-                        self.add_system_message(
-                            "Usage: /relationship setp <perspective> <dimension> <delta> [reason]",
-                        );
-                        return;
-                    }
-                };
-                let reason = if parts.len() > 5 {
-                    Some(parts[5..].join(" "))
-                } else {
-                    None
-                };
-                match self
-                    .agent
-                    .update_relationship_dimension_for_perspective(
-                        perspective,
-                        dimension,
-                        delta,
-                        reason.as_deref(),
-                    )
-                    .await
-                {
-                    Ok(change) => self.add_toast(&format!(
-                        "{} {} {:+.2} -> {:.2}",
-                        change.perspective, change.dimension, change.delta, change.current
-                    )),
-                    Err(e) => self.add_system_message(&format!("[Error] {}", e)),
-                }
-            }
-            _ => self.add_system_message(
-                "Usage: /relationship, /relationship events, /relationship set <dimension> <delta> [reason], /relationship setp <perspective> <dimension> <delta> [reason]",
-            ),
-        }
-    }
-
-    async fn handle_tui_sessions_command(&mut self, input: &str) {
-        let parts: Vec<&str> = input.split_whitespace().collect();
-        let mut actor_filter: Option<String> = None;
-        let mut tag_filter: Option<String> = None;
-        let mut i = 1;
-        while i < parts.len() {
-            match parts[i] {
-                "--actor" => {
-                    if let Some(v) = parts.get(i + 1) {
-                        actor_filter = Some(v.to_string());
-                        i += 2;
-                        continue;
-                    }
-                }
-                "--tag" => {
-                    if let Some(v) = parts.get(i + 1) {
-                        tag_filter = Some(v.to_string());
-                        i += 2;
-                        continue;
-                    }
-                }
-                _ => {}
-            }
-            i += 1;
-        }
-
-        if actor_filter.is_some() || tag_filter.is_some() {
-            let filter = ai_agents::facts::SessionFilter {
-                actor_id: actor_filter,
-                tags: tag_filter.map(|t| vec![t]),
-                agent_id: None,
-                created_after: None,
-                created_before: None,
-                limit: None,
-            };
-            match self.agent.list_sessions_filtered(&filter).await {
-                Ok(summaries) if summaries.is_empty() => {
-                    self.add_system_message("No sessions match the filter.");
-                }
-                Ok(summaries) => {
-                    let mut msg = format!("Sessions ({} matched):", summaries.len());
-                    for s in &summaries {
-                        let actor = s.actor_id.as_deref().unwrap_or("-");
-                        let tags = if s.tags.is_empty() {
-                            String::new()
-                        } else {
-                            format!(" [{}]", s.tags.join(","))
-                        };
-                        msg.push_str(&format!(
-                            "\n  {}  actor={}{}  msgs={}",
-                            s.session_id, actor, tags, s.message_count
-                        ));
-                    }
-                    self.add_system_message(&msg);
-                }
-                Err(e) => self.add_system_message(&format!("[Error] {}", e)),
-            }
-            return;
-        }
-
-        match self.agent.list_sessions().await {
-            Ok(sessions) if sessions.is_empty() => {
-                self.add_system_message("No saved sessions.");
-            }
-            Ok(sessions) => {
-                let mut msg = format!("Sessions ({}):", sessions.len());
-                for s in &sessions {
-                    msg.push_str(&format!("\n  {}", s));
-                }
-                self.add_system_message(&msg);
-            }
-            Err(e) => self.add_system_message(&format!("[Error] {}", e)),
-        }
     }
 
     fn handle_context_command(&mut self, input: &str) {
@@ -1292,8 +1349,11 @@ impl App {
                     }
                 };
                 match self.agent.remove_context(key) {
-                    Some(_) => self.add_toast(&format!("Removed: {}", key)),
-                    None => self.add_system_message(&format!("Key not found: {}", key)),
+                    Ok(Some(_)) => self.add_toast(&format!("Removed: {}", key)),
+                    Ok(None) => self.add_system_message(&format!("Key not found: {}", key)),
+                    Err(error) => {
+                        self.add_system_message(&format!("Context removal failed: {}", error))
+                    }
                 }
             }
             Some(other) => {
@@ -1303,6 +1363,16 @@ impl App {
     }
 
     fn handle_modal_key(&mut self, key: KeyEvent) -> UpdateResult {
+        if let Some(modal) = self.modal.as_mut() {
+            if key.code == KeyCode::PageUp {
+                modal.review_scroll = modal.review_scroll.saturating_sub(5);
+                return UpdateResult::Continue;
+            }
+            if key.code == KeyCode::PageDown {
+                modal.review_scroll = modal.review_scroll.saturating_add(5);
+                return UpdateResult::Continue;
+            }
+        }
         // Check if this is a question modal and extract the state.
         let is_question = self.modal.as_ref().is_some_and(|m| m.question.is_some());
 
@@ -1312,8 +1382,17 @@ impl App {
             if let Some(ref mut q) = modal.question {
                 self.handle_question_modal_key(key, q);
             }
-            // If modal was cleared during handling, keep it cleared.
-            if self.modal.is_none() {
+            // Completion consumes its request; navigation must restore the temporarily moved modal.
+            if (self.pending_question.is_none() && self.host_prompt.is_none())
+                || self.host_answering
+                || (key.code == KeyCode::Enter
+                    && modal.question.as_ref().is_some_and(|q| {
+                        q.actions
+                            .get(q.selected_action)
+                            .is_some_and(|a| a == "Cancel")
+                            && q.focus == crate::tui::widgets::modal::QuestionFocus::Actions
+                    }))
+            {
                 return UpdateResult::Continue;
             }
             self.modal = Some(modal);
@@ -1428,7 +1507,7 @@ impl App {
                 KeyCode::Backspace => {
                     q.text_input.pop();
                 }
-                KeyCode::Char(ch) => {
+                KeyCode::Char(ch) if q.text_input.len() + ch.len_utf8() <= 65_536 => {
                     q.text_input.push(ch);
                 }
                 _ => {}
@@ -1456,15 +1535,27 @@ impl App {
                     match action.as_deref() {
                         Some("Submit") => {
                             let selected = q.selected_labels();
+                            if self.host_prompt.is_some() && selected.is_empty() {
+                                self.add_toast("Select an answer explicitly.");
+                                return UpdateResult::Continue;
+                            }
                             self.complete_question_response(selected, None, false);
                         }
                         Some("Submit text") => {
+                            if self.host_prompt.is_some() && q.text_input.trim().is_empty() {
+                                self.add_toast("Enter an answer or explicitly select Use default.");
+                                return UpdateResult::Continue;
+                            }
                             let text = if q.text_input.trim().is_empty() {
                                 None
                             } else {
                                 Some(q.text_input.trim().to_string())
                             };
                             self.complete_question_response(Vec::new(), text, false);
+                        }
+                        Some("Cancel") if self.host_prompt.is_some() => {
+                            self.modal = None;
+                            return UpdateResult::Continue;
                         }
                         Some("Use default") => {
                             self.complete_question_response(Vec::new(), None, false);
@@ -1489,6 +1580,37 @@ impl App {
         other_text: Option<String>,
         timed_out: bool,
     ) {
+        if let Some((id, _, request)) = &self.host_prompt {
+            if self.host_answering {
+                return;
+            }
+            let line = if let Some(request) = request {
+                let response = if selected.is_empty() && other_text.is_none() {
+                    response_from_default(request.default.clone(), false)
+                } else {
+                    QuestionResponse {
+                        answered: true,
+                        selected,
+                        other_text,
+                        timed_out: false,
+                        unavailable: false,
+                    }
+                };
+                serde_json::to_string(&response).expect("question response")
+            } else {
+                other_text.unwrap_or_else(|| selected.join(","))
+            };
+            if let Some(tx) = &self.host_input {
+                match super::host::send(tx, crate::session::Input::Reply { id: *id, line }) {
+                    Ok(()) => {
+                        self.host_answering = true;
+                        self.modal = None;
+                    }
+                    Err(e) => self.add_toast(&e.to_string()),
+                }
+            }
+            return;
+        }
         let Some(mut pending) = self.pending_question.take() else {
             self.modal = None;
             return;
@@ -1665,6 +1787,9 @@ impl App {
         };
         render_hint_bar(main_chunks[3], frame.buffer_mut(), &hint_state, &self.theme);
 
+        if self.task_panel {
+            self.render_tasks(content_area, frame);
+        }
         // Modal overlay
         if let Some(ref modal) = self.modal {
             render_modal(size, frame.buffer_mut(), modal, &self.theme);
@@ -1989,7 +2114,226 @@ mod tests {
     };
     use ai_agents::{AgentBuilder, AgentResponse};
     use futures::stream;
-    use tokio::sync::mpsc::{error::TryRecvError, unbounded_channel};
+    use tokio::sync::mpsc::{channel, error::TryRecvError};
+
+    #[tokio::test]
+    async fn question_navigation_preserves_modal_and_global_quit_works_inside_it() {
+        let mut app = test_app();
+        let (tx, _rx) = oneshot::channel();
+        app.show_question_modal(PendingQuestion {
+            request: QuestionRequest {
+                question: "선택".into(),
+                options: vec!["첫째".into(), "둘째".into()],
+                multi_select: true,
+                allow_other: true,
+                ..Default::default()
+            },
+            respond_to: tx,
+        });
+        app.update(AppMessage::Key(KeyEvent::new(
+            KeyCode::Down,
+            KeyModifiers::NONE,
+        )))
+        .await;
+        assert_eq!(
+            app.modal
+                .as_ref()
+                .unwrap()
+                .question
+                .as_ref()
+                .unwrap()
+                .focused_option,
+            1
+        );
+        assert_eq!(
+            app.update(AppMessage::Key(KeyEvent::new(
+                KeyCode::Char('c'),
+                KeyModifiers::CONTROL
+            )))
+            .await,
+            UpdateResult::Quit
+        );
+    }
+
+    #[tokio::test]
+    async fn task_question_escape_hides_without_default_and_exact_korean_answer_is_not_a_command() {
+        let mut app = test_app();
+        let (tx, mut rx) = channel(16);
+        app.attach_host(tx);
+        app.host_output(crate::session::Output::Prompt {
+            id: 7,
+            text: "local secret".into(),
+            question: Some(QuestionRequest {
+                question: "답변".into(),
+                allow_other: true,
+                default: Some(serde_json::json!("default")),
+                ..Default::default()
+            }),
+        });
+        app.update(AppMessage::Key(KeyEvent::new(
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        )))
+        .await;
+        assert!(app.modal.is_none());
+        assert!(rx.try_recv().is_err());
+        app.update(AppMessage::Key(KeyEvent::new(
+            KeyCode::Char('p'),
+            KeyModifiers::CONTROL,
+        )))
+        .await;
+        for ch in "중단하지 마세요".chars() {
+            app.update(AppMessage::Key(KeyEvent::new(
+                KeyCode::Char(ch),
+                KeyModifiers::NONE,
+            )))
+            .await;
+        }
+        app.update(AppMessage::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )))
+        .await;
+        let crate::session::Input::Reply { id, line } = rx.try_recv().unwrap() else {
+            panic!("not a bound answer")
+        };
+        assert_eq!(id, 7);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&line).unwrap()["other_text"],
+            "중단하지 마세요"
+        );
+    }
+
+    #[test]
+    fn late_previous_operation_results_do_not_unlock_current_input() {
+        let mut app = test_app();
+        app.host_generation = 2;
+        app.host_busy = true;
+        app.host_output(crate::session::Output::Result {
+            generation: 1,
+            result: Box::new(crate::session::SessionResult {
+                primary: crate::session::OperationResult::Chat(AgentResponse::new("old")),
+                results: Default::default(),
+                quit: false,
+            }),
+        });
+        assert!(app.host_busy);
+        assert!(app.last_result.is_none());
+        app.host_output(crate::session::Output::Rejected {
+            generation: 1,
+            message: "old rejection".into(),
+        });
+        assert!(app.host_busy);
+        app.host_output(crate::session::Output::Rejected {
+            generation: 2,
+            message: "current rejection".into(),
+        });
+        assert!(!app.host_busy);
+    }
+
+    #[tokio::test]
+    async fn hidden_question_draft_and_scroll_survive_reopening() {
+        let mut app = test_app();
+        let (tx, _rx) = channel(16);
+        app.attach_host(tx);
+        app.host_output(crate::session::Output::Prompt {
+            id: 1,
+            text: (0..50).map(|n| format!("review line {n}\n")).collect(),
+            question: None,
+        });
+        app.modal
+            .as_mut()
+            .unwrap()
+            .question
+            .as_mut()
+            .unwrap()
+            .text_input = "내 초안".into();
+        app.update(AppMessage::Key(KeyEvent::new(
+            KeyCode::PageDown,
+            KeyModifiers::NONE,
+        )))
+        .await;
+        app.update(AppMessage::Key(KeyEvent::new(
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        )))
+        .await;
+        app.update(AppMessage::Key(KeyEvent::new(
+            KeyCode::Char('p'),
+            KeyModifiers::CONTROL,
+        )))
+        .await;
+        let modal = app.modal.as_ref().unwrap();
+        assert_eq!(modal.review_scroll, 5);
+        assert_eq!(modal.question.as_ref().unwrap().text_input, "내 초안");
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("review line"));
+    }
+
+    #[test]
+    fn stale_prompt_close_cannot_remove_newer_prompt() {
+        let mut app = test_app();
+        for id in [1, 2] {
+            app.host_output(crate::session::Output::Prompt {
+                id,
+                text: "Decision".into(),
+                question: None,
+            });
+        }
+        app.host_output(crate::session::Output::PromptClosed(1));
+        assert_eq!(app.host_prompt.as_ref().unwrap().0, 2);
+        assert!(app.modal.is_some());
+    }
+
+    #[test]
+    fn tiny_terminals_and_long_korean_questions_render_without_panicking() {
+        let mut app = test_app();
+        app.host_output(crate::session::Output::Prompt {
+            id: 1,
+            text: "긴 질문".repeat(1024),
+            question: None,
+        });
+        for (w, h) in [(0, 0), (2, 2), (8, 4), (20, 8), (80, 24)] {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+            terminal.draw(|frame| app.render(frame)).unwrap();
+        }
+    }
+
+    #[test]
+    fn bounded_history_does_not_truncate_the_authoritative_result() {
+        let mut app = test_app();
+        let exact = "한글".repeat(20_000);
+        app.host_output(crate::session::Output::Result {
+            generation: 0,
+            result: Box::new(crate::session::SessionResult {
+                primary: crate::session::OperationResult::Chat(AgentResponse::new(&exact)),
+                results: Default::default(),
+                quit: false,
+            }),
+        });
+        let crate::session::OperationResult::Chat(response) =
+            &app.last_result.as_ref().unwrap().primary
+        else {
+            panic!()
+        };
+        assert_eq!(response.content, exact);
+        assert!(app.chat.messages.last().unwrap().content.len() < 16_384);
+        for _ in 0..1000 {
+            app.add_system_message("display");
+        }
+        app.bound_display();
+        assert!(app.chat.messages.len() <= 256);
+    }
 
     struct UnusedLlm;
 
@@ -2029,7 +2373,7 @@ mod tests {
             .llm(Arc::new(UnusedLlm))
             .build()
             .expect("test agent should build");
-        let (wake_tx, _wake_rx) = unbounded_channel();
+        let (wake_tx, _wake_rx) = channel(32);
         App::new(
             Arc::new(agent),
             CliReplConfig::default(),
@@ -2056,8 +2400,8 @@ mod tests {
 
     #[tokio::test]
     async fn incomplete_eof_forwards_content_then_chat_error() {
-        let (turn_tx, mut turn_rx) = unbounded_channel();
-        let (wake_tx, mut wake_rx) = unbounded_channel();
+        let (turn_tx, mut turn_rx) = channel(32);
+        let (wake_tx, mut wake_rx) = channel(32);
 
         let outcome = forward_stream_to_tui(
             stream::iter(vec![content("partial")]),
@@ -2084,8 +2428,8 @@ mod tests {
 
     #[tokio::test]
     async fn final_is_forwarded_without_a_second_terminal_message() {
-        let (turn_tx, mut turn_rx) = unbounded_channel();
-        let (wake_tx, mut wake_rx) = unbounded_channel();
+        let (turn_tx, mut turn_rx) = channel(32);
+        let (wake_tx, mut wake_rx) = channel(32);
         let events = stream::iter(vec![AgentStreamEvent::Final(AgentResponse::new("answer"))]);
 
         let outcome = forward_stream_to_tui(events, &turn_tx, &wake_tx, 7).await;
@@ -2102,8 +2446,8 @@ mod tests {
 
     #[tokio::test]
     async fn terminal_error_is_forwarded_without_incomplete_eof() {
-        let (turn_tx, mut turn_rx) = unbounded_channel();
-        let (wake_tx, mut wake_rx) = unbounded_channel();
+        let (turn_tx, mut turn_rx) = channel(32);
+        let (wake_tx, mut wake_rx) = channel(32);
         let events = stream::iter(vec![
             AgentStreamEvent::Chunk(StreamChunk::Error {
                 message: "failed".to_string(),
@@ -2125,8 +2469,8 @@ mod tests {
 
     #[tokio::test]
     async fn closed_receiver_interrupts_a_pending_source() {
-        let (turn_tx, _turn_rx) = unbounded_channel();
-        let (wake_tx, wake_rx) = unbounded_channel();
+        let (turn_tx, _turn_rx) = channel(32);
+        let (wake_tx, wake_rx) = channel(32);
         drop(wake_rx);
 
         let outcome = tokio::time::timeout(
@@ -2187,7 +2531,7 @@ mod tests {
             },
         ] {
             app.turn_tx
-                .send(message)
+                .try_send(message)
                 .expect("turn queue should remain open");
         }
 
@@ -2223,7 +2567,7 @@ mod tests {
         assert!(agent_messages(&app).is_empty());
 
         app.turn_tx
-            .send(TurnMessage::StreamEvent {
+            .try_send(TurnMessage::StreamEvent {
                 turn_id: 1,
                 event: Box::new(content("late abandoned content")),
             })
@@ -2239,7 +2583,7 @@ mod tests {
         app.current_tools = vec!["new-tool".to_string()];
 
         app.turn_tx
-            .send(TurnMessage::StreamEvent {
+            .try_send(TurnMessage::StreamEvent {
                 turn_id: new_turn_id,
                 event: Box::new(content("new preview")),
             })
@@ -2252,7 +2596,7 @@ mod tests {
         assert_eq!(app.current_tools, vec!["new-tool"]);
 
         app.turn_tx
-            .send(TurnMessage::StreamEvent {
+            .try_send(TurnMessage::StreamEvent {
                 turn_id: new_turn_id,
                 event: Box::new(AgentStreamEvent::Final(AgentResponse::new(
                     "new authoritative response",

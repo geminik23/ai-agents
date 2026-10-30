@@ -22,7 +22,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::{BTreeSet, HashMap};
 
 use ai_agents_context::ContextSource;
-use ai_agents_core::{AgentError, Result};
+use ai_agents_core::{AgentError, Result, autonomy::AutonomyConfig};
 use ai_agents_disambiguation::DisambiguationConfig;
 use ai_agents_hitl::HITLConfig;
 use ai_agents_observability::ObservabilityConfig;
@@ -46,6 +46,9 @@ use super::{ParallelToolsConfig, StreamingConfig};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentSpec {
     pub name: String,
+
+    #[serde(default, skip_serializing_if = "is_default_autonomy")]
+    pub autonomy: AutonomyConfig,
 
     #[serde(default = "default_version")]
     pub version: String,
@@ -214,6 +217,11 @@ impl LLMConfigOrSelector {
             },
         }
     }
+}
+
+// Preserve the serialized shape of agents that never enabled autonomy.
+fn is_default_autonomy(value: &AutonomyConfig) -> bool {
+    *value == AutonomyConfig::default()
 }
 
 fn default_version() -> String {
@@ -406,6 +414,7 @@ impl Default for AgentSpec {
     fn default() -> Self {
         Self {
             name: "Agent".to_string(),
+            autonomy: AutonomyConfig::default(),
             version: default_version(),
             description: None,
             system_prompt: "You are a helpful assistant.".to_string(),
@@ -491,47 +500,6 @@ fn serde_error_message(error: &serde_yaml::Error) -> String {
         .strip_suffix(&suffix)
         .unwrap_or(&message)
         .to_string()
-}
-
-fn collect_unsupported_yaml_keys(
-    value: &serde_yaml::Value,
-    path: &str,
-    unsupported_paths: &mut Vec<String>,
-) {
-    match value {
-        serde_yaml::Value::Mapping(mapping) => {
-            for (key, child) in mapping {
-                let Some(key) = key.as_str() else {
-                    unsupported_paths.push(if path.is_empty() {
-                        "<non-string-key>".to_string()
-                    } else {
-                        format!("{path}.<non-string-key>")
-                    });
-                    continue;
-                };
-                let child_path = if path.is_empty() {
-                    key.to_string()
-                } else {
-                    format!("{path}.{key}")
-                };
-                if key == "<<" {
-                    unsupported_paths.push(child_path);
-                    continue;
-                }
-                collect_unsupported_yaml_keys(child, &child_path, unsupported_paths);
-            }
-        }
-        serde_yaml::Value::Sequence(values) => {
-            for (index, child) in values.iter().enumerate() {
-                collect_unsupported_yaml_keys(
-                    child,
-                    &format!("{path}[{index}]"),
-                    unsupported_paths,
-                );
-            }
-        }
-        _ => {}
-    }
 }
 
 impl AgentSpec {
@@ -793,10 +761,10 @@ impl AgentSpec {
         aliases
     }
 
+    /// Loads framework-owned YAML through the shared structural key preflight before strict field decoding.
     pub fn from_yaml_strict(yaml: &str) -> Result<Self> {
         let input_value: serde_yaml::Value = serde_yaml::from_str(yaml)?;
-        let mut unsupported_paths = Vec::new();
-        collect_unsupported_yaml_keys(&input_value, "", &mut unsupported_paths);
+        let unsupported_paths = ai_agents_core::strict_yaml::unsupported_yaml_keys(&input_value);
         if !unsupported_paths.is_empty() {
             return Err(AgentError::InvalidSpec(format!(
                 "Unsupported AgentSpec YAML key(s): {}",
@@ -846,7 +814,7 @@ impl AgentSpec {
         Ok(spec)
     }
 
-    /// Validates structure without requiring host-supplied provider aliases to exist yet.
+    /// Validates structure and autonomy references without requiring host providers or an invocation objective yet.
     pub fn validate(&self) -> Result<()> {
         if let Some(config) = self.llm.router_roles() {
             config
@@ -879,6 +847,7 @@ impl AgentSpec {
         self.tool_security.validate()?;
         self.runtime.optimization.validate()?;
         self.validate_runtime_optimization_cross_fields()?;
+        super::autonomy::validate_agent_config(&self.autonomy, self.states.as_ref(), &self.skills)?;
 
         Ok(())
     }

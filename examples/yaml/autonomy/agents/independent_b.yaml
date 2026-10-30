@@ -1,0 +1,22 @@
+name: IndependentB
+version: "1.0.0"
+description: "Second independent task participant using the same hosting contract"
+
+# This child has the same protocol as independent_a.yaml but a distinct live runtime and provider alias.
+# Usage: load through independent_research.yaml and its no-key suite.
+# Flow: input -> state-owned draft -> typed host question -> verified finding.
+# Customize the domain gate rather than using request count as evidence of research progress.
+system_prompt: Produce a verified finding; revise after host guidance.
+llm: {default: second}  # Select the actual inherited alias; do not construct a replacement provider.
+tools: []
+states:
+  initial: investigate
+  states:
+    investigate:
+      autonomy:
+        enabled: true  # Opt into this state; default: false.
+        mode: state_until_exit
+        max_turns: 4  # Bound work cycles; resolved default: 30.
+        max_llm_calls: 4  # Bound this independent task; resolved default: 60.
+        completion: {response_contains: verified}
+        premature_finish: {action: ask_user, on_unavailable: stop}

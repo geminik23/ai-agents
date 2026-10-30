@@ -31,6 +31,13 @@ fn preview_text(text: &str, max_chars: usize) -> String {
 /// `RuntimeAgent` invokes turn hooks while retaining root-turn ownership. A direct nested chat or stream call into the same runtime returns an `AgentError` instead of waiting on the non-reentrant gate. Nested calls into another runtime are allowed until a runtime gate identity repeats in the task-local call chain.
 #[async_trait]
 pub trait AgentHooks: Send + Sync {
+    /// Certifies caller-owned callbacks that preserve task admission and route managed effects through existing execution boundaries.
+    /// Return every captured provider handle, or an empty list for conforming callbacks with no direct model work; None rejects task participation.
+    /// Certification is not an execution grant or a sandbox for arbitrary hidden I/O and detached work.
+    fn task_providers(&self) -> Option<Vec<Arc<dyn ai_agents_core::LLMProvider>>> {
+        None
+    }
+
     async fn on_message_received(&self, _message: &str) {}
 
     async fn on_llm_start(&self, _messages: &[ChatMessage]) {}
@@ -160,7 +167,12 @@ pub trait AgentHooks: Send + Sync {
 pub struct NoopHooks;
 
 #[async_trait]
-impl AgentHooks for NoopHooks {}
+impl AgentHooks for NoopHooks {
+    /// No-op hooks perform no provider calls or external effects.
+    fn task_providers(&self) -> Option<Vec<Arc<dyn ai_agents_core::LLMProvider>>> {
+        Some(vec![])
+    }
+}
 
 pub struct LoggingHooks {
     prefix: String,
@@ -188,6 +200,11 @@ impl Default for LoggingHooks {
 
 #[async_trait]
 impl AgentHooks for LoggingHooks {
+    /// Logging stays synchronous within the caller and introduces no provider invocation.
+    fn task_providers(&self) -> Option<Vec<Arc<dyn ai_agents_core::LLMProvider>>> {
+        Some(vec![])
+    }
+
     async fn on_message_received(&self, message: &str) {
         let preview = preview_text(message, 100);
         info!("{} Message received: {}", self.prefix, preview);
@@ -464,6 +481,15 @@ impl Default for CompositeHooks {
 
 #[async_trait]
 impl AgentHooks for CompositeHooks {
+    /// A composite cannot hide an unsupported member or replace the member's captured implementation handles.
+    fn task_providers(&self) -> Option<Vec<Arc<dyn ai_agents_core::LLMProvider>>> {
+        let mut providers = vec![];
+        for hook in &self.hooks {
+            providers.extend(hook.task_providers()?);
+        }
+        Some(providers)
+    }
+
     async fn on_message_received(&self, message: &str) {
         for hook in &self.hooks {
             hook.on_message_received(message).await;

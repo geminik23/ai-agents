@@ -14,6 +14,14 @@ The ai-agents framework connects YAML agent definitions to a Rust runtime. This 
 
 ---
 
+## Development task execution and events
+
+The development Rust task runner supervises objectives using the existing runtime, shared resource ledger and eligible completion evidence. It is not a separate coding-agent engine: tools, todos and local files are optional. Its explicit event streams describe execution, validation, progress, human decisions and acknowledged results through that same controller. A turn response is not task completion, a pending event is not approval authority, and dropping a stream is not cleanup acknowledgement. Default-safe display events are separate from exact host results and recovery data. Development YAML state and selected-skill declarations can now promote an ordinary input into that same controller. State scope takes precedence before skill dispatch; work already inside a task inherits its actual owner, ledger and completion contract. State exit is not success and script exhaustion is not completion. Development task commands, the plain REPL and task-aware TUI consume the same controller through a foreground host session. The TUI separates screen visibility, operation ownership and request identity; typed task evaluation consumes the same controller and exact observations, including independent child decisions while an ordinary parent is pending. See [development task evaluation](@/docs/evaluation.md#development-task-evaluation-foundation) for fixture, report and lifetime boundaries. See the [development task CLI](@/docs/cli.md#development-task-cli) for supported commands and process-lifetime limits. See [task event streams](@/docs/rust-api.md#task-event-streams-development-only) for the development-only lifetime and privacy contract.
+
+Automatic entry begins when a configured state handles input or a semantic router selects an autonomous skill, not when the agent is constructed or a state is merely restored. Prepared input, clarification context, selected definitions and completed effects are retained. Embedded hosts keep the controller alive, read exact pending data through trusted APIs and explicitly resume or stop the same run. In ordinary compositions, a paused automatic child is awaited in the original caller rather than aggregated as a successful response; this does not serialize that ordinary call stack for restart. See [automatic state and skill tasks](@/docs/rust-api.md#automatic-state-and-skill-tasks-development-only).
+
+Follow [the task hosting and evaluation walkthrough](@/docs/task-autonomy.md) to connect a real domain integration to both an application and its eval suite. It distinguishes workflow movement, model claims, actual effects, eligible evidence and acknowledged task completion.
+
 ## Architecture
 
 
@@ -21,7 +29,7 @@ The dependency layers flow in one direction:
 
 1. **Core** (`ai-agents-core`) - shared dependency-light types, error types, and trait definitions used across the workspace.
 2. **Feature crates** - each layer builds on core: `ai-agents-llm`, `ai-agents-memory`, `ai-agents-tools`, `ai-agents-state`, `ai-agents-skills`, `ai-agents-context`, `ai-agents-process`, `ai-agents-reasoning`, `ai-agents-recovery`, `ai-agents-hitl`, `ai-agents-hooks`, `ai-agents-disambiguation`, `ai-agents-storage`, `ai-agents-template`, `ai-agents-persona`, `ai-agents-facts`, `ai-agents-relationships`, `ai-agents-observability`, and `ai-agents-eval`.
-3. **Runtime** (`ai-agents-runtime`) - wires every feature crate together into a running agent loop. Also contains the dynamic agent spawner module.
+3. **Runtime** (`ai-agents-runtime`) - wires execution feature crates into the agent loop and task controller, and owns dynamic spawning. Evaluation is a consumer of runtime, not a reverse runtime dependency.
 4. **Facade** (`ai-agents`) - provides a reviewed, curated user-facing surface for normal embedding and host integration.
 5. **CLI** (`ai-agents-cli`) - a binary crate providing the `ai-agents-cli` command.
 
@@ -51,7 +59,7 @@ layers:
     - ai-agents-facts
     - ai-agents-relationships
     - ai-agents-observability
-    - ai-agents-eval
+  evaluation: ai-agents-eval   # consumes the runtime; it does not own another task executor
   core: ai-agents-core         # shared traits and types
 ```
 

@@ -225,6 +225,11 @@ impl ai_agents_core::Memory for CompactingMemory {
 
 #[async_trait]
 impl Memory for CompactingMemory {
+    /// Captured summarizer handles must already use admission; replacing them after construction is not safe.
+    fn supports_task_admission(&self) -> bool {
+        self.summarizer.supports_task_admission()
+    }
+
     async fn get_context(&self) -> Result<ConversationContext> {
         let _operation = self.operation_lock.lock().await;
         let messages = self.messages.read().clone();
@@ -404,6 +409,7 @@ mod tests {
 
     fn make_message(content: &str) -> ChatMessage {
         ChatMessage {
+            provenance: None,
             role: Role::User,
             content: content.to_string(),
             name: None,

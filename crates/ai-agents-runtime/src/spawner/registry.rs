@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
@@ -17,6 +17,9 @@ use ai_agents_observability::{current_observation_context, with_observation_cont
 
 use super::spawner::SpawnedAgent;
 
+#[path = "task_broadcast.rs"]
+mod task_broadcast;
+
 /// Summary information for a registered agent, returned by `list()`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpawnedAgentInfo {
@@ -27,18 +30,87 @@ pub struct SpawnedAgentInfo {
 
 /// Tracks spawned agents and provides inter-agent messaging.
 pub struct AgentRegistry {
-    agents: RwLock<HashMap<String, Arc<SpawnedAgent>>>,
+    agents: Arc<RwLock<HashMap<String, Arc<SpawnedAgent>>>>,
     hooks: Option<Arc<dyn RegistryHooks>>,
     /// When true, `send()` prefixes messages with `[From {sender}]: `.
     send_with_context: bool,
+    task_pins: Arc<Mutex<HashMap<String, usize>>>,
+}
+
+/// A live catalogue reservation pins one actual registered instance, including before its first turn is admitted.
+pub(crate) struct PinnedTaskAgent {
+    pub(crate) agent: Arc<RuntimeAgent>,
+    agents: Arc<RwLock<HashMap<String, Arc<SpawnedAgent>>>>,
+    pins: Arc<Mutex<HashMap<String, usize>>>,
+    id: String,
+}
+
+impl PinnedTaskAgent {
+    /// Source-only coordinates describe the actual captured registry; they cannot mint a new pin after reconstruction.
+    pub(crate) fn reconstruction_target(&self) -> (usize, String, Arc<RuntimeAgent>) {
+        (
+            Arc::as_ptr(&self.agents) as usize,
+            self.id.clone(),
+            self.agent.clone(),
+        )
+    }
+
+    /// The registry read guard spans final participant enrollment, preventing removal between validation and owner installation.
+    pub(crate) fn with_binding<T>(
+        &self,
+        action: impl FnOnce(&Arc<RuntimeAgent>) -> Result<T>,
+    ) -> Result<T> {
+        let agents = self.agents.read();
+        let actual = agents
+            .get(&self.id)
+            .ok_or_else(|| AgentError::Config("task registry target disappeared".into()))?;
+        if !Arc::ptr_eq(&actual.agent, &self.agent) {
+            return Err(AgentError::Config(
+                "task registry implementation changed".into(),
+            ));
+        }
+        action(&actual.agent)
+    }
+}
+
+impl Drop for PinnedTaskAgent {
+    /// Each guard retires only its own reservation; another run's pin cannot be released by stale cleanup.
+    fn drop(&mut self) {
+        let mut pins = self.pins.lock();
+        if let Some(count) = pins.get_mut(&self.id) {
+            *count -= 1;
+            if *count == 0 {
+                pins.remove(&self.id);
+            }
+        }
+    }
 }
 
 impl AgentRegistry {
     pub fn new() -> Self {
         Self {
-            agents: RwLock::new(HashMap::new()),
+            agents: Arc::new(RwLock::new(HashMap::new())),
             hooks: None,
             send_with_context: true,
+            task_pins: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Computes only coordination/hook writes; child invocations still require their own shared-ledger admission.
+    /// The registry holds an immutable actual hook handle, so this binding cannot be replaced between quote and callback.
+    pub(crate) fn declared_write_footprint(
+        &self,
+        operation: &str,
+        args: &serde_json::Value,
+        ctx: &ai_agents_core::ToolExecutionContext,
+        max_targets: usize,
+    ) -> Result<Option<ai_agents_core::autonomy::ToolWriteFootprint>> {
+        if let Some(hooks) = &self.hooks {
+            hooks.declared_write_footprint(operation, args, ctx, max_targets)
+        } else {
+            Ok(Some(ai_agents_core::autonomy::ToolWriteFootprint::empty(
+                format!("framework.registry.{operation}.v1"),
+            )))
         }
     }
 
@@ -99,6 +171,7 @@ impl AgentRegistry {
         Ok(())
     }
 
+    /// Validates replacement topology before mutation; retained task pins and owners cannot be removed by session restoration.
     pub(crate) async fn reconcile(
         &self,
         target_ids: &HashSet<String>,
@@ -130,9 +203,27 @@ impl AgentRegistry {
                 }
             }
 
-            //
+            let retirement_candidates = agents
+                .iter()
+                .filter(|(id, _)| !target_ids.contains(*id))
+                .map(|(_, agent)| agent.clone())
+                .collect::<Vec<_>>();
+            let _retirements = retirement_candidates
+                .iter()
+                .map(|agent| agent.agent.try_registry_retirement())
+                .collect::<Result<Vec<_>>>()?;
+            let pins = self.task_pins.lock();
+            if agents.iter().any(|(id, agent)| {
+                !target_ids.contains(id)
+                    && (pins.get(id).is_some_and(|count| *count != 0)
+                        || agent.agent.has_task_owner())
+            }) {
+                return Err(AgentError::Config(
+                    "task-reserved topology cannot be removed".into(),
+                ));
+            }
+            drop(pins);
             // Build the complete replacement map before swapping it so validation failures preserve the prior topology.
-            //
             let mut next = agents.clone();
             let removed_ids = next
                 .keys()
@@ -166,6 +257,107 @@ impl AgentRegistry {
             if let Some(ref hooks) = self.hooks {
                 hooks.on_agent_spawned(&id, &spec).await;
             }
+        }
+        Ok(())
+    }
+
+    /// Capture the actual implementation under the registry lock; labels alone cannot establish a task catalogue binding.
+    pub(crate) fn pin_task_target(
+        &self,
+        id: &str,
+        runtime_id: &str,
+    ) -> Result<Arc<PinnedTaskAgent>> {
+        let agents = self.agents.read();
+        let actual = agents
+            .get(id)
+            .ok_or_else(|| AgentError::Config(format!("task target not registered: {id}")))?;
+        if actual.agent.info().id != runtime_id {
+            return Err(AgentError::Config("task target identity changed".into()));
+        }
+        let mut pins = self.task_pins.lock();
+        let count = pins.entry(id.into()).or_default();
+        *count = count
+            .checked_add(1)
+            .ok_or_else(|| AgentError::Config("task catalogue reservation overflow".into()))?;
+        Ok(Arc::new(PinnedTaskAgent {
+            agent: actual.agent.clone(),
+            agents: self.agents.clone(),
+            pins: self.task_pins.clone(),
+            id: id.into(),
+        }))
+    }
+
+    /// Blocking SDK consumers retain the exact registered object across preparation and root-gate waits under an inherited task.
+    /// This registration guard grants no invocation authority; the child still passes its own final admission.
+    pub(crate) fn capture_task_target(
+        &self,
+        id: &str,
+        target: &Arc<RuntimeAgent>,
+    ) -> Result<Option<Arc<PinnedTaskAgent>>> {
+        if crate::autonomy::current_execution().is_none() {
+            return Ok(None);
+        }
+        let pinned = self.pin_task_target(id, &target.info().id)?;
+        if !Arc::ptr_eq(&pinned.agent, target) {
+            return Err(AgentError::Config(
+                "task target changed before capture".into(),
+            ));
+        }
+        Ok(Some(pinned))
+    }
+
+    /// Pins available catalogue entries for a blocking SDK composition before hooks or auxiliary calls can yield.
+    /// The original algorithm still validates missing targets when used; this guard adds no new selection or execution authority.
+    pub(crate) fn capture_task_catalogue<'a>(
+        &self,
+        ids: impl IntoIterator<Item = &'a str>,
+    ) -> Result<Vec<Arc<PinnedTaskAgent>>> {
+        if crate::autonomy::current_execution().is_none() {
+            return Ok(Vec::new());
+        }
+        ids.into_iter()
+            .filter_map(|id| {
+                self.get(id)
+                    .map(|agent| self.capture_task_target(id, &agent))
+            })
+            .collect::<Result<Vec<_>>>()
+            .map(|pins| pins.into_iter().flatten().collect())
+    }
+
+    /// Sender formatting is part of future message semantics and must survive reconstruction unchanged.
+    pub(crate) fn reconstruction_send_context(&self) -> bool {
+        self.send_with_context
+    }
+
+    /// Source identity is used only to match actual registry handles within one capture.
+    pub(crate) fn reconstruction_identity(&self) -> usize {
+        Arc::as_ptr(&self.agents) as usize
+    }
+
+    /// Complete source membership includes unstarted and generated entries, not only already invoked child operations.
+    pub(crate) fn reconstruction_entries(&self) -> Vec<Arc<SpawnedAgent>> {
+        let mut entries: Vec<_> = self.agents.read().values().cloned().collect();
+        entries.sort_by(|left, right| left.id.cmp(&right.id));
+        entries
+    }
+
+    /// Publishes a completely validated empty staging registry without replaying registration hooks.
+    /// This internal method does not replace entries, remove foreign owners or grant child invocation authority.
+    pub(crate) fn reconstruct_entries(&self, entries: Vec<SpawnedAgent>) -> Result<()> {
+        let mut agents = self.agents.write();
+        if !agents.is_empty() || !self.task_pins.lock().is_empty() {
+            return Err(AgentError::Config(
+                "reconstruction registry is not empty".into(),
+            ));
+        }
+        let mut names = HashSet::new();
+        if entries.iter().any(|entry| !names.insert(entry.id.clone())) {
+            return Err(AgentError::Config(
+                "duplicate restored registry entry".into(),
+            ));
+        }
+        for entry in entries {
+            agents.insert(entry.id.clone(), Arc::new(entry));
         }
         Ok(())
     }
@@ -250,10 +442,20 @@ impl AgentRegistry {
             .collect()
     }
 
-    /// Remove an agent from the registry and return it.
+    /// Removes an unreserved agent; task catalogue pins and live runtime owners preserve entries until acknowledged cleanup.
     pub async fn remove(&self, id: &str) -> Option<Arc<SpawnedAgent>> {
         let removed = {
             let mut agents = self.agents.write();
+            let target = agents.get(id)?.clone();
+            let _retirement = target.agent.try_registry_retirement().ok()?;
+            if self
+                .task_pins
+                .lock()
+                .get(id)
+                .is_some_and(|count| *count != 0)
+            {
+                return None;
+            }
             agents.remove(id)
         };
         if let Some(agent) = removed.as_ref() {
@@ -269,12 +471,12 @@ impl AgentRegistry {
         removed
     }
 
-    /// Send a message from one agent to another and return the response.
+    /// Sends one message and retains its ordinary call frame while a hosted automatic recipient is paused.
     pub async fn send(&self, from: &str, to: &str, message: &str) -> Result<AgentResponse> {
-        self.send_inner(from, to, message, None).await
+        crate::autonomy::automatic::scope_composing(self.send_inner(from, to, message, None)).await
     }
 
-    /// Send a message with structured actor context for actor-scoped memory.
+    /// Sends with actor context while preserving the same retained automatic-child delivery contract.
     pub async fn send_with_actor_context(
         &self,
         from: &str,
@@ -282,10 +484,171 @@ impl AgentRegistry {
         message: &str,
         actor_context: TurnActorContext,
     ) -> Result<AgentResponse> {
-        self.send_inner(from, to, message, Some(actor_context))
-            .await
+        crate::autonomy::automatic::scope_composing(self.send_inner(
+            from,
+            to,
+            message,
+            Some(actor_context),
+        ))
+        .await
     }
 
+    /// Captures framework-owned parent and child bindings and the selected failure policy before the sender callback; resume never reissues delivery.
+    /// Erasure separates optional dependency-wait construction from nested model/tool polling stacks.
+    pub(crate) fn send_task_message<'a>(
+        self: &'a Arc<Self>,
+        from: &'a str,
+        to: &'a str,
+        message: &'a str,
+        actor: TurnActorContext,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<AgentResponse>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let Some(invocation) = crate::autonomy::message::take_message() else {
+                return self.send_with_actor_context(from, to, message, actor).await;
+            };
+            let execution = crate::autonomy::current_execution()
+                .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
+            let message_admission = execution.message_admission.lock().await;
+            execution.check_message_slot(&invocation.frame)?;
+            let target = self
+                .get(to)
+                .ok_or_else(|| AgentError::Other(format!("Target agent not found: {to}")))?;
+
+            target.preflight_standalone_autonomy()?;
+            target.reject_task_ancestor()?;
+            let mut frame = *invocation.frame;
+            frame.required = crate::autonomy::child_required();
+            let input = if self.send_with_context {
+                format!("[From {from}]: {message}")
+            } else {
+                message.into()
+            };
+            frame.delegate_id = to.into();
+            frame.delegate_runtime_id = target.info().id;
+            frame.delegate_input = input.clone();
+            frame.actor = actor.clone();
+            let mut state: crate::autonomy::message::MessageState =
+                serde_json::from_value(frame.cursor.clone())?;
+            state.child_actor = Some(actor.clone());
+            state.waiting_for = execution.message_dependency(&frame)?;
+            let deferred = state.waiting_for.is_some();
+            frame.cursor = serde_json::to_value(state)?;
+            frame.children = vec![crate::autonomy::composition::CompositionChild {
+                registry_id: to.into(),
+                runtime_id: frame.delegate_runtime_id.clone(),
+                operation: frame.child_operation.clone(),
+            }];
+            Box::pin(execution.retain_delegate_frame(frame.clone(), self.clone())).await?;
+            execution.targets.bind_tool(&frame.id, invocation.tool)?;
+            let captured = execution.targets.resolve(&frame.child_operation)?;
+            if !Arc::ptr_eq(&target, &captured) {
+                return Err(AgentError::Config(
+                    "message target implementation changed before dispatch".into(),
+                ));
+            }
+            drop(message_admission);
+            if let Some(hooks) = &self.hooks {
+                hooks.on_message_sent(from, to, message).await;
+            }
+            // The parent implementation ran once; another incoming operation waits without touching the parked target history.
+            if deferred && execution.wait_message_dependency(&frame).await? {
+                return Err(AgentError::TaskSuspended(frame.id));
+            }
+            crate::autonomy::composition::scope_message_composition(
+                frame.runtime_id.clone(),
+                frame.id.clone(),
+                Box::pin(crate::autonomy::scope_child_invocation(
+                    frame.child_operation,
+                    target.info().id,
+                    Box::pin(target.chat_with_actor_context(&input, actor)),
+                )),
+            )
+            .await
+        })
+    }
+
+    /// Saves an already selected route and failure policy before child dispatch; resuming does not repeat selection or messaging hooks.
+    /// Erasure keeps optional dependency waits out of nested selected-route polling frames.
+    pub(crate) fn route_task_message<'a>(
+        self: &'a Arc<Self>,
+        to: &'a str,
+        input: &'a str,
+        actor: Option<TurnActorContext>,
+        reason: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<AgentResponse>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let Some(invocation) = crate::autonomy::message::take_message() else {
+                let child = self
+                    .get(to)
+                    .ok_or_else(|| AgentError::Other(format!("Routed agent not found: {to}")))?;
+                let _target_pin = self.capture_task_target(to, &child)?;
+                return if let Some(actor) = actor {
+                    child.chat_with_actor_context(input, actor).await
+                } else {
+                    child.chat(input).await
+                };
+            };
+            let execution = crate::autonomy::current_execution()
+                .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
+            let message_admission = execution.message_admission.lock().await;
+            execution.check_message_slot(&invocation.frame)?;
+            let child = self
+                .get(to)
+                .ok_or_else(|| AgentError::Other(format!("Routed agent not found: {to}")))?;
+            child.preflight_standalone_autonomy()?;
+            child.reject_task_ancestor()?;
+            let mut frame = invocation.frame;
+            frame.required = crate::autonomy::child_required();
+            frame.delegate_id = to.into();
+            frame.delegate_runtime_id = child.info().id;
+            frame.delegate_input = input.into();
+            frame.children = vec![crate::autonomy::composition::CompositionChild {
+                registry_id: to.into(),
+                runtime_id: frame.delegate_runtime_id.clone(),
+                operation: frame.child_operation.clone(),
+            }];
+            let mut state: crate::autonomy::message::MessageState =
+                serde_json::from_value(frame.cursor.clone())?;
+            state.response = crate::autonomy::message::MessageResponse::Route {
+                reason: reason.into(),
+            };
+            state.child_actor = actor.clone();
+            state.waiting_for = execution.message_dependency(&frame)?;
+            let deferred = state.waiting_for.is_some();
+            frame.cursor = serde_json::to_value(state)?;
+            Box::pin(execution.retain_delegate_frame((*frame).clone(), self.clone())).await?;
+            execution.targets.bind_tool(&frame.id, invocation.tool)?;
+            let captured = execution.targets.resolve(&frame.child_operation)?;
+            if !Arc::ptr_eq(&captured, &child) {
+                return Err(AgentError::Config("route target binding changed".into()));
+            }
+            drop(message_admission);
+            // Completed route selection remains bound while a prior incoming operation owns the target history.
+            if deferred && execution.wait_message_dependency(&frame).await? {
+                return Err(AgentError::TaskSuspended(frame.id));
+            }
+            crate::autonomy::composition::scope_message_composition(
+                frame.runtime_id,
+                frame.id,
+                Box::pin(crate::autonomy::scope_child_invocation(
+                    frame.child_operation,
+                    child.info().id,
+                    Box::pin(async {
+                        if let Some(actor) = actor {
+                            child.chat_with_actor_context(input, actor).await
+                        } else {
+                            child.chat(input).await
+                        }
+                    }),
+                )),
+            )
+            .await
+        })
+    }
+
+    /// Task-scoped blocking messages pin membership before sender hooks, while ordinary messaging keeps its snapshot semantics.
     async fn send_inner(
         &self,
         from: &str,
@@ -301,6 +664,7 @@ impl AgentRegistry {
         let target =
             target.ok_or_else(|| AgentError::Other(format!("Target agent not found: {}", to)))?;
 
+        let _target_pin = self.capture_task_target(to, &target)?;
         if let Some(ref hooks) = self.hooks {
             hooks.on_message_sent(from, to, message).await;
         }
@@ -341,16 +705,16 @@ impl AgentRegistry {
             .await
     }
 
-    //
-    // Captures the caller's complete immutable gate ancestry before spawning and cheaply propagates it so recipients preserve cycle detection while the sender waits.
-    //
+    /// Captures ancestry, shared admission, original invocation restrictions and mutation tracking before spawning recipients.
+    /// Losing task-locals at a broadcast boundary must not turn an optional nested dependency into a global required-child stop.
+    /// Each task-scoped recipient retains its actual registration until its invocation returns, including while its root gate is busy.
     async fn broadcast_inner(
         &self,
         from: &str,
         message: &str,
         actor_context: Option<TurnActorContext>,
     ) -> Vec<(String, Result<AgentResponse>)> {
-        let targets: Vec<(String, Arc<RuntimeAgent>)> = {
+        let mut targets: Vec<(String, Arc<RuntimeAgent>)> = {
             let agents = self.agents.read();
             agents
                 .iter()
@@ -362,6 +726,7 @@ impl AgentRegistry {
         if targets.is_empty() {
             return Vec::new();
         }
+        targets.sort_by(|left, right| left.0.cmp(&right.0));
 
         let formatted = if self.send_with_context {
             format!("[From {}]: {}", from, message)
@@ -379,29 +744,48 @@ impl AgentRegistry {
         let mut handles = Vec::with_capacity(targets.len());
         let observation_context = current_observation_context();
         let gate_identity_stack = current_runtime_gate_identity_stack();
+        let required = crate::autonomy::child_required();
         for (id, agent) in targets {
             let msg = formatted.clone();
             let context = actor_context.clone();
             let observation_context = observation_context.clone();
             let gate_identity_stack = Arc::clone(&gate_identity_stack);
-            handles.push(tokio::spawn(async move {
-                scope_runtime_gate_identity_stack(&gate_identity_stack, async move {
-                    let run = async move {
-                        if let Some(context) = context {
-                            agent.chat_with_actor_context(&msg, context).await
-                        } else {
-                            agent.chat(&msg).await
-                        }
-                    };
-                    let result = if let Some(context) = observation_context {
-                        with_observation_context(context, run).await
-                    } else {
-                        run.await
-                    };
-                    (id, result)
-                })
+            let execution = crate::autonomy::current_execution();
+            let invocation = crate::autonomy::invocation::InvocationScope::capture();
+            let target_pin = self.capture_task_target(&id, &agent);
+            handles.push(tokio::spawn(Box::pin(async move {
+                crate::autonomy::scope_child_requirement(
+                    required,
+                    crate::autonomy::scope_inherited_execution(
+                        execution,
+                        invocation,
+                        Box::pin(scope_runtime_gate_identity_stack(
+                            &gate_identity_stack,
+                            async move {
+                                let _target_pin = match target_pin {
+                                    Ok(pin) => pin,
+                                    Err(error) => return (id, Err(error)),
+                                };
+                                // The worker explicitly retains the ordinary composing role across spawn; this grants no task authority.
+                                let run = crate::autonomy::automatic::scope_composing(async move {
+                                    if let Some(context) = context {
+                                        agent.chat_with_actor_context(&msg, context).await
+                                    } else {
+                                        agent.chat(&msg).await
+                                    }
+                                });
+                                let result = if let Some(context) = observation_context {
+                                    with_observation_context(context, run).await
+                                } else {
+                                    run.await
+                                };
+                                (id, result)
+                            },
+                        )),
+                    ),
+                )
                 .await
-            }));
+            })));
         }
 
         let mut results = Vec::new();
@@ -448,6 +832,17 @@ impl std::fmt::Debug for AgentRegistry {
 /// Optional lifecycle hooks for registry events.
 #[async_trait]
 pub trait RegistryHooks: Send + Sync {
+    /// Declares the complete logical write set for this operation's callback tail; unsupported is conservative by default.
+    /// This capability does not authorize child work, provider calls or hidden detached execution.
+    fn declared_write_footprint(
+        &self,
+        _operation: &str,
+        _args: &serde_json::Value,
+        _ctx: &ai_agents_core::ToolExecutionContext,
+        _max_targets: usize,
+    ) -> Result<Option<ai_agents_core::autonomy::ToolWriteFootprint>> {
+        Ok(None)
+    }
     /// Called after an agent is successfully registered.
     async fn on_agent_spawned(&self, _id: &str, _spec: &AgentSpec) {}
 

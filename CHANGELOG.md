@@ -1,5 +1,113 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- Task evaluation: development typed operations and foreground child decisions share configured hosts, exact continuation, isolated domain bindings and bounded redacted results without replacing the parent's response
+- Task observability: development task lifecycle facts carry run, profile and stage attribution through existing aggregation without replacing authoritative invocation accounting
+- Task TUI: development terminal sessions share task hosting and exact human decisions with the plain frontend, show bounded task evidence and retain original work through acknowledged shutdown
+- Local task details: authenticated development hosts can read bounded human-readable observations without exporting recovery data or treating historical checks as current completion proof
+- Task CLI: development task commands and plain REPL share configured runners, retained human decisions, scoped provider-free journal management, bounded output and acknowledged foreground shutdown; default production restart remains unavailable
+- Foreground task hosts: development integrations track actual participating controllers through existing composition boundaries, expose prompts only after public acknowledgement and preserve protection after uncertain effects
+- Configured task hosting: development Rust hosts prepare configured task-capable storage, inspect safe snapshots with storage alone, and share explicit and automatic runners with truthful response availability and cleanup
+- Task host inspection and cancellation: development Rust hosts read bounded redacted snapshots and typed pending prompts, distinguish cancellation requests from acknowledged cleanup, and preserve controller delivery and final-stage review
+- Automatic task entry: development-only YAML state and selected-skill tasks share the existing controller, retained host decisions, bounded lifecycle events and acknowledged completion without replaying prepared work
+- Task event streams: development-only Rust hosts observe bounded, default-redacted task execution, retained decisions and acknowledged outcomes with explicit foreground close and recovery-safe drop
+- Task artifact validation: development profiles collect authorized file metadata or explicit host artifact projections with exact validation-proof freshness
+- Task numeric telemetry: development completion gates consume acknowledged run-scoped observations across pause and reconstruction; missing, lossy and unmeasured metrics remain unknown
+- Task recovery: development-only reviewed recovery preserves interrupted usage and effect commitments without replay, including cancellation-only reconstruction of prepared cursors
+- Task persistence policies: development-only Rust profiles prepare restartable safe pauses and select a unique compatible startup checkpoint without consuming human decisions or adopting abandoned owners
+- Task priced execution: development-only audited model and endpoint contracts reserve complete token ceilings and bounded internal retries, settling matching complete usage while retaining unknown commitments
+- Task write capabilities: development-only local utilities and host-bound footprints preserve actual implementation ownership; retained question answers do not invoke ordinary UI handlers
+- Task maintenance: development-only actor facts and relationships share task ownership, invocation accounting and original bounds through inline, parallel and background work
+- Task speculation: development-only alternatives settle before winner effects, retain exact transition review and tool-batch pauses, and resume only genuinely uninvoked work without resetting allowance
+- Task restoration: development-only explicit host reconstruction resumes prepared safe pauses in fresh runtimes or processes with preserved topology, progress and usage, separate restoration review and current authorization
+- Task controller scheduling: development-only standalone profiles enforce required stage/check ordering, bounded repair and retained replanning without repeating completed work or selecting interventions twice
+- Task interaction profiles: development-only reject, policy-only and per-stage review settings execute without auto-approving required human decisions; final controller views reflect consumed allowance and selected decisions
+- Task skill execution: development-only explicit skill entry preserves the admitted definition, inherited accounting and completed steps before continuing under the same task controller
+- Task controller interaction: development-only stagnation, blockage and premature-finish questions plus limit questions/pauses retain exact work positions and require explicit responses or host limit revisions
+- Task evidence: development-only frozen host revision sources bind validation and external waits to actual targets; explicit delivery-loss reports follow stop/fail policy without polling or replay
+- Task host controls: development-only retained objective changes retire safe pending work, preserve audit/usage and canonical todos, and require explicit revision-bound continuation
+- Task supervision: development-only lifecycle advancement/fix rewinds, controller replans and initial/reflection executable-plan adoption retain exact approval/rejection positions without proposal regeneration
+- Standalone task execution: development-only foreground Rust invocation with runtime reservation, managed-attempt journaling, persisted message provenance and deadline-aware finalization; explicit and automatic scoped hosts share the same controller
+- Task resource admission: development-only declared-priced reservations, logical write targets, shared child execution and todo authority, objective templates and initial skill continuation without replay; supported managed origins share admission while default production restart remains unavailable
+- Task interaction continuation: development-only clarification/confirmation, transition approval and rejection, script/actions/fallback and model-tool composition retain exact progress; shared targets defer new histories, explicit host stop closes safe pauses and host limit revision preserves pending work, without granting authority from serialized receipts
+- Task broadcast continuation: development-only typed broadcasts retain recipient operations and ordered results under a live tool-message permit; ordinary broadcast and calls without a permit remain blocking
+- Task recovery cleanup: development-only explicit host acknowledgement releases abandoned live protection after acknowledged host effect reconciliation, including interrupted terminal cleanup; automatic replay and arbitrary in-flight reconstruction remain unavailable
+- Task checkpoint storage: development-only conditional in-memory and SQLite persistence with explicit ownership, recovery, cancellation and actor deletion safety; journal readability does not itself install executable reconstruction
+- Task validation: development-only tri-state checks, tool/fallback/child observation continuation and external signals preserve post-turn controller progress; fixed host permits and single logical journal charges survive re-pause, without adding a second executor or inferring completion from unavailable evidence
+
+### Changed
+- Evaluation compatibility: development report schema 3 separates participant control results from parent turns, retains acknowledged evidence after interrupted foreground work and rejects task controls in chat-only JSONL
+- Rust evaluation compatibility: scenario and turn literals add empty interaction collections; existing typed task fields, task-step variants and lifecycle categories retain their owning module paths
+- TUI integration compatibility: low-level question, log and app constructors use bounded senders; modal literals include review scrolling and constructors remain the preferred interface
+- Approval review: configured and host-selected context fields remain visible without tool-specific field filters, while automatic approval styles use the foreground bridge without raw terminal output
+- CLI command compatibility: development command matches include the task family while ordinary run, validation and evaluation retain their distinct result contracts
+- Rust task hosting: development automatic tasks retain shared runtime state and explicit host access; finish fluent configuration before publishing retained controller handles
+- Task validation names: development check IDs reserve the runtime journal namespace and reject collisions before ownership or execution
+- Rust recovery compatibility: development task mutations add guarded reconciliation and cleanup-only claim/publication; custom stores opt into recovery and compatibility-aware candidate inspection
+- Rust session metadata: the setter now returns an ownership-aware result, and ordinary session rebinding and actor deletion reject reserved task runtimes
+- Rust recovery errors: exhaustive development storage-error matches distinguish clock continuity loss from actual admission deadline exhaustion
+- Rust resource compatibility: development tool contexts add an optional admitted-footprint receipt, transparent tools forward combined preparation and response-only capabilities, and host footprint methods default to unsupported
+- Rust task participation: custom hooks, storage, fact extractors and relationship evaluators declare captured providers through default-unsupported captured-provider capability methods; ordinary chat remains usable without opting in
+- Rust restoration compatibility: development host reconstruction bindings and versioned manifests are explicit, custom task stores opt into guarded reconstruction writes, and legacy checkpoints require live preparation rather than automatic executable migration
+- Rust controller compatibility: development premature-finish/limit literals add `on_unavailable`, pending-kind matches add `Limit`, and validator executors gain a defaulted capacity-preflight hook; serialized data still cannot restore live execution authority
+- Rust validation compatibility: development evidence/scope/progress literals add validation dependency maps; executable driver round trips use `restore_retained` with a live predecessor, while JSON-only restore remains audit-only
+- Rust task evidence compatibility: development final-checkpoint literals add a live evidence guard that custom stores must preserve at backend admission; validation drivers retain private monotonic bounds and use constructors rather than external struct literals
+- Rust task host-control compatibility: development response/pending matches add `Continue`/`HostContinue`; stores gain certified no-write claim outcomes and opt-in objective control, and private checkpoints retain review and plan-adoption data without an executable migration promise
+- Rust task checkpoint compatibility: development payloads add multi-call coordination, script/action/controller and non-tool interaction locations, observation child groups, fallback ancestry and deferred finalization; older runtimes are not guaranteed to decode them, and unchanged envelope versions do not promise executable restart
+- Rust task execution compatibility: tools gain an additive typed task-execution bridge, and exhaustive development effect-state matches must handle acknowledged suspended message invocations without refunding consumed attempts
+- Rust task continuation compatibility: development response and validation outcome matches add external signals and safe suspension, driver literals add parked observation data, and executors gain compatible asynchronous suspension acknowledgement; task stores gain default-unsupported paused limit control and host-control literals include original expiry bounds
+- Rust task compatibility: message literals include optional provenance, actor/context mutation APIs report ownership errors, and additive provider billing, tool footprint and task-todo methods declare capabilities; existing serialized messages remain readable
+- Rust configuration compatibility: typed autonomy fields, validation driver bounds and objective-bound todo identities require affected struct literals to be updated; these development additions are not the published stable API
+
+### Fixed
+- Task objective templates: explicit invocation accepts the same accepted-input aliases as automatic scope templates without mutable-context shadowing
+- Evaluation request evidence: actual provider dispatch captures scripted skill and validation calls while preserving native requests, budgets and capability bindings
+- Evaluation custody: task timeouts drain original work, retain files and stop retries after uncertain cleanup, while missing or truncated evidence cannot pass through negation
+- Task host pause lifetimes: retire unserviceable volatile questions and reviews through acknowledged cleanup, preserve cancellation precedence and retain protection after failed or lost receipts
+- Task reconstruction bounds: reject predictable intermediate-journal size failures before claiming a usable pause and compare registry membership independently of listing order
+- Task pause acknowledgements: verify exact batch and composed checkpoint receipts before transferring revision, numeric-observation cursors or safe-pause ownership
+- Task effect boundaries: recheck cancellation and clocks after final host proof, preserve acknowledged effects while rejecting late task credit, and retain ordinary timeout recovery and resumed-message history cleanup
+- Task branch identity: pre-invocation cancellations retain correlatable branch identities and truthful dispositions without refunding consumed alternatives
+- Task reconstruction clocks: distinguish backward UTC from expired allowance while preserving preclaim pauses and charged post-claim custody
+- Task admission handoff: settle earlier ordinary maintenance without holding a gate needed by its callbacks, and preserve child operation attribution and optional failure policy across spawned work
+- Task branch outcomes: preserve reviewed alternatives until actual adoption, distinguish uninvoked selection from no-match, and retire interrupted observations without replaying effects or erasing committed transitions
+- Task provider lifetime: reject late synchronous results and post-acknowledgement success while preserving consumed attempts, original stream restrictions and proven pre-dispatch refunds
+- Background maintenance: preserve tracked joins through cancelled drains and sibling failures, retain late admissions and preserve same-key inline-overflow ordering
+- Actor maintenance: reject foreign runtime mutation during a task, exclude controller-only relationship interactions and propagate failed fact eviction instead of publishing a false authoritative cache
+- Task restoration custody: cancelled preclaim capture preserves its usable pause, failed reconstruction does not leak owner cycles, and temporary participant retirement cannot clear newer ownership
+- Task composition: preserve distinct repeated-child operations through pause and outcome acknowledgement, and unblock successors after settled optional nested failures without replaying completed work
+- Task owner cleanup: interrupted child release can resume without inspecting or clearing a newer owner of an already released runtime
+- Task checkpoint latency: reduce repeated recovery-data processing during nested continuation while preserving complete validation, exact receipts and original deadlines
+- Task response admission: retain the original reviewed implementation and request deadlines through preparation and admission waits, use the actual pending child's timeout policy, and preserve exact timeout dispositions across later gates without transferring approval
+- Task command evidence: approved replacement commands retain their actual execution records without proving success of the original validation command or changed working-directory, argv or environment operands
+- Task skill bindings: retain the original state generation through prompt, tool, checkpoint, completion-credit, reflection and output waits without replaying completed effects or publishing stale success
+- Task controller continuation: resume only the pending schedule/planner work, preserve parent capacity pauses after completed child delivery, and keep normal stage/repair work separate from forced continuation limits
+- Task capacity continuation: preserve skill steps, native calls, model iterations and validator attempts across resource waits; publish no new executable pause after actual expiry and retain protection for uncertain acknowledgements
+- Task proof eligibility: unavailable or stale metrics cannot prove absence or progress; derived validator and progress results retain exact upstream proof freshness across multiple host targets
+- Task invocation admission: preserve original validation bounds and pinned host proof through tool/provider admission, child tasks and returned streams without refunding already dispatched work
+- SQLite task cancellation: roll back orphaned transaction initialization before connection reuse so interrupted admission or refund cannot retain a write lock in the pool
+- Independent validation: production SDK observations track actual nested and interrupted mutations, while retained restoration preserves the original live monotonic bound without enabling restart
+- Task validation publication: recheck original deadlines, frozen target bindings and cached-result freshness after persistence waits, including reviewed stage credit and backend completion admission
+- Task acknowledgement safety: reject inconsistent checkpoint receipts and retain runtime custody for ambiguous storage errors regardless of error variant
+- Task checkpoint identity: preserve finite JSON numbers exactly across serialization so timing metadata and validation metrics do not spuriously invalidate retained checkpoints
+- Task resume clocks: anchor active-interval markers to acknowledged storage time so UTC rollback cannot invalidate a resumed checkpoint or reset monotonic usage
+- Task review admission: preserve original root/child deadlines and control bindings through claim, consumption and application waits while retaining explicit configured timeout-policy behavior
+- Task objective handoff: preserve intervention limits, archive superseded validator attempts and reconstruct required-check eligibility without replaying completed work
+- Task fallback recovery: retain retry position, original lifecycle and distinct hop evidence across message pauses without duplicate rate admission or stale approval rebinding; uncertain task timeouts cannot start fresh fallback work
+- Task state actions: reject changed state bindings after awaited preparation before prompt dispatch, context publication or the next saved action
+- Task clarification: development-only retained questions honor configured human-review deadlines and settle expiry without semantic replay; in-flight state changes preserve newer exchanges instead of clearing them
+- Task validation continuation: preserve immutable attempt identity after mutations, reject oversized responses before claim, acknowledge signals before callback reentry and safely settle cancellation or expiry racing resume acknowledgement
+- Task action continuation: preserve approval and rejection positions, original escalation input, processed skill context through re-pause and single finalization; exhausted or unavailable clarification cannot pass completion gates, and heap-owned boundaries protect default nested stacks
+- Task message continuation: retain pipeline/concurrent/group/handoff/broadcast cursors and generated-child identity; capture all prior declared/model dispatches, validate dynamic group predecessors and reject ancestor-source waits without replay or premature reentry
+- Task limit revision: keep controller and admission ceilings consistent, reject expired backend control writes and invalid acknowledgements, and preserve live pauses after proven non-writing refusal
+- Task checkpoint reads: serialize snapshot delivery with shared updates so parallel participants do not spuriously stop with ownership conflicts
+- Task registry: retain actual registered instances through task cleanup and blocking SDK preparation, including unstarted manager/synthesizer agents and late-registered targets; prevent removal and admission races without granting execution authority
+- Task broadcasts: preserve optional dependency failure policy across spawned recipients and return results in stable registry-ID order
+- Interrupted turns: dropping a pending state re-dispatch no longer leaves later messages and response hooks attached to the abandoned turn
+- Shared model providers: concurrent requests retain their own prompt and model settings through dispatch and stream opening, including extra fallback settings and exact configuration cache matching
+
 ## 1.1.2 - 2026-10-11
 
 ### Fixed

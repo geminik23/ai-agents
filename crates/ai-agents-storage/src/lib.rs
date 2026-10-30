@@ -2,6 +2,15 @@
 
 mod snapshot;
 mod storage;
+mod task_memory;
+#[cfg(test)]
+mod task_race_tests;
+#[cfg(test)]
+mod task_tests;
+pub use task_memory::InMemoryTaskStorage;
+
+#[cfg(feature = "sqlite")]
+mod sqlite_tasks;
 
 pub use ai_agents_core::{
     FactCategory, FactFilter, KeyFact, SessionFilter, SessionMetadata, SessionSummary,

@@ -83,6 +83,18 @@ pub trait Tool: Send + Sync {
     /// Execute the tool with arguments and executor context.
     async fn execute(&self, args: Value, ctx: ToolExecutionContext) -> ToolResult;
 
+    /// Executes a managed task call without converting internal control transfer into model-visible failure text.
+    /// Implementations opting into suspension still need a framework-owned exact continuation before returning TaskSuspended.
+    async fn execute_task(&self, args: Value, ctx: ToolExecutionContext) -> Result<ToolResult> {
+        Ok(self.execute(args, ctx).await)
+    }
+
+    /// Declares the exact framework message/routing result protocol, without extra post-dispatch implementation work or result transformation.
+    /// This capability is not a tool grant, an arbitrary workflow continuation, or an execution permit.
+    fn supports_task_messages(&self) -> bool {
+        false
+    }
+
     /// Policy bindings used by the shared executor to apply configured policy.
     fn policy_bindings(&self) -> ToolPolicyBindings {
         ToolPolicyBindings::default()
@@ -96,6 +108,75 @@ pub trait Tool: Send + Sync {
     /// Classify a specific call when risk depends on arguments.
     fn classify_call(&self, _args: &Value) -> ToolCallClassification {
         ToolCallClassification::from_metadata(&self.safety_metadata())
+    }
+
+    /// Describes a validated host question that can be parked before invoking this implementation.
+    /// None keeps ordinary execution; a tool ID or interaction metadata alone does not confer this capability.
+    fn task_question(&self, _args: &Value) -> Result<Option<Value>> {
+        Ok(None)
+    }
+
+    /// Validates a task answer against the exact arguments and prepares the implementation's normal result.
+    /// The executor must still reauthorize and admit the invocation before publishing this result.
+    fn task_question_result(&self, _args: &Value, _answer: &Value) -> Result<ToolResult> {
+        Err(crate::AgentError::Tool(
+            "task question answers are unsupported".into(),
+        ))
+    }
+
+    /// Executes a previously validated answer at the shared final invocation boundary without polling a host handler.
+    /// Wrappers should forward this method and retain their normal execution instrumentation.
+    async fn execute_task_question(
+        &self,
+        args: Value,
+        answer: Value,
+        _ctx: ToolExecutionContext,
+    ) -> ToolResult {
+        self.task_question_result(&args, &answer)
+            .unwrap_or_else(|error| ToolResult::error(error.to_string()))
+    }
+
+    /// Declares use of the coordinating task's canonical todo authority instead of a captured participant-local list.
+    fn manages_task_todos(&self) -> bool {
+        false
+    }
+
+    /// Computes an implementation-bound footprint from final approved arguments under executor resource protection.
+    /// None is unsupported even when call metadata claims read-only; enumeration must stop at max_targets.
+    fn declared_write_footprint(
+        &self,
+        _args: &Value,
+        _ctx: &ToolExecutionContext,
+        _max_targets: usize,
+    ) -> Result<Option<crate::autonomy::ToolWriteFootprint>> {
+        Ok(None)
+    }
+
+    /// Prepares the footprint and retained implementation from the same selection, preventing mutable host-slot ABA.
+    /// Fixed implementations inherit their existing footprint; mutable host adapters must override this method.
+    fn prepare_write_footprint(
+        &self,
+        args: &Value,
+        ctx: &ToolExecutionContext,
+        max_targets: usize,
+    ) -> Result<Option<crate::autonomy::ToolWriteAdmission>> {
+        Ok(self
+            .declared_write_footprint(args, ctx, max_targets)?
+            .map(|footprint| crate::autonomy::ToolWriteAdmission {
+                footprint,
+                binding: None,
+            }))
+    }
+
+    /// Covers only the validated response executor, not the ordinary interactive handler.
+    /// Unsupported defaults prevent a custom response override from inheriting an unproven empty footprint.
+    fn prepare_question_write_footprint(
+        &self,
+        _args: &Value,
+        _ctx: &ToolExecutionContext,
+        _max_targets: usize,
+    ) -> Result<Option<crate::autonomy::ToolWriteAdmission>> {
+        Ok(None)
     }
 
     /// Returns a [`ToolInfo`] struct from the above methods.

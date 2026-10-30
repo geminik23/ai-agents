@@ -28,6 +28,30 @@ AI Agents supports 12 LLM providers out of the box - from cloud APIs like OpenAI
 
 ---
 
+## Declared-priced task capabilities (development only)
+
+Ordinary provider support is not hard-priced task support. The development standalone Rust task runner can use an immutable host-audited `DeclaredPricing` contract installed before provider handles are captured. The same object can be declared as `llm.declared_pricing` or on a named `llms` entry; it is optional and is not forwarded as provider JSON. It does not activate YAML task entry or change the published 1.1.1 task contract.
+
+| Adapter | Priced request classes with an audited contract | Explicit limits |
+|---|---|---|
+| OpenAI | Completion, native tools, stream | Native choice follows existing adapter support |
+| OpenAI-compatible | Completion, stream; native tools with explicit `function_calling: true` | The host must audit the actual server, model and reporting semantics; compatibility is not a price proof |
+| Google GenerateContent | Completion, native auto tool choice, stream | Signed native history and the normal first-party request builder are retained |
+| OpenRouter | Completion, native tools, stream | Routing and model-tier prices require a complete host contract; unknown native service options are rejected |
+| Groq, Cohere, Mistral | Completion, stream | Native tool requests retain their existing unsupported status |
+| Anthropic, DeepSeek, xAI, Phind, Ollama | Unsupported for the built-in hard-priced capability | The current upstream-specific dispatch/accounting contracts are not audited by this adapter; ordinary use is unchanged |
+| Custom/local Rust providers | Explicit host implementation of request bounds and settlement | Neither local execution nor a provider label implies free or conforming execution |
+
+`DeclaredPricing` binds `schedule_id`, exact `model`, normalized HTTP(S) `endpoint`, `server_input_token_limit`, `server_output_token_limit`, integer `input_micro_usd_per_million` and `output_micro_usd_per_million`. Optional fields are `request_fee_micro_usd` (default `0`), `max_internal_attempts` (default `1`, including the initial upstream call) and `complete_usage` (default `false`). Token ceilings are audited server-enforced maxima, not desired client limits or token estimates. Rates must cover the highest applicable input/output tiers, cached input and reasoning classes. A false host declaration is not made true by parsing it; hosts are responsible for verifying that external contract.
+
+Model-generated child YAML cannot install an audited pricing contract. Inside a hard-priced task, a spawner without a host-installed authoritative shared provider registry rejects fresh child construction before provider/credential setup. Shared mode ignores child provider and pricing declarations and uses the actual host-installed handles; hosts can also register already prepared child runtimes explicitly. A generated model name, zero-rate table or copied identity cannot mint a new priced capability.
+
+The full input/output ceilings plus request fee are reserved for every possible internal attempt, with checked integer arithmetic and upward rounding. This intentionally trades utilization for a conservative bound without introducing an unproven generic tokenizer. Effective per-call output and reasoning settings must stay inside the contract. Unknown extras, arbitrary body overrides and native search/service fees without a complete adapter bound are rejected under hard pricing; no fallback may bypass that denial. Enabled internal resilience needs an explicit total-attempt count no larger than the installed contract. Multi-attempt results retain the full reservation because upstream may report only the final attempt.
+
+Only audited complete provider usage may release unused reservation. Google additionally requires an explicitly reported total rather than relying on a display total synthesized by normalization. Missing/partial usage retains the complete upper bound. Google streams can settle a complete explicitly reported terminal usage receipt only after normal EOF; early cumulative or later partial reports are not final billing evidence. Other adapters' streams currently retain their full bound because the upstream stream API does not preserve a complete billing receipt. Errors, cancellation after possible dispatch, drop and lost acknowledgements never imply a refund or cleanup. The guarantee covers declared prices for managed conforming model requests, not actual invoices, unrelated tool-service fees, arbitrary host I/O or exactly-once effects.
+
+See [Rust task APIs](@/docs/rust-api.md#guarded-standalone-execution-development-only) and [YAML pricing fields](@/docs/yaml-reference.md#declared-pricing-development-only). Offline fixture acceptance is separate from live provider/billing validation; no live paid run is needed to use the tests.
+
 ## OpenAI
 
 Set the API key and pick a model:

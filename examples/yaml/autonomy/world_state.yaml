@@ -1,0 +1,19 @@
+name: WorldTask
+version: "1.0.0"
+description: "World-state completion from a version-bound host predicate"
+
+# Rust binds the world adapter to actual host state. Natural-language location claims are not world-state evidence.
+# Flow: admitted action -> host world revision changes -> predicate observation -> completion.
+# Usage (offline): sh examples/eval/mocked/run_mocked_evals.sh --category autonomy
+# Prerequisites: installed host.records and its actual world revision source; no graph engine or game server is required.
+# Customize the world predicate in the host adapter, not English response matching or a new core gate.
+system_prompt: Reach the configured world goal using admitted domain actions.
+llm: {provider: openai, model: gpt-5.4-mini}
+tools: [domain]
+autonomy:
+  enabled: true
+  max_turns: 5  # Work-cycle allowance; resolved default: 30.
+  max_llm_calls: 12  # Shared managed-call allowance; resolved default: 60.
+  validation:
+    checks: [{id: records, adapter: host.records, config: {domain: world}}]
+  completion: {validator_passed: records}

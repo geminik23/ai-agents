@@ -36,6 +36,18 @@ struct RouteToAgentInput {
 }
 
 impl RouteToAgentTool {
+    /// Captures the next round-robin position for an installed host's opaque reconstruction-state binding.
+    pub fn round_robin_position(&self) -> usize {
+        self.counter.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Seeds only an unpublished tool instance; a frozen registered Arc cannot be moved here to reset live selection state.
+    pub fn with_round_robin_position(self, position: usize) -> Self {
+        self.counter
+            .store(position, std::sync::atomic::Ordering::Release);
+        self
+    }
+
     pub fn new(registry: Arc<AgentRegistry>, llm: Arc<LLMRegistry>) -> Self {
         Self {
             registry,
@@ -61,6 +73,45 @@ impl Tool for RouteToAgentTool {
 
     fn input_schema(&self) -> Value {
         generate_schema::<RouteToAgentInput>()
+    }
+
+    /// Selection and dispatch participate in the exact framework message continuation rather than generic tool replay.
+    fn supports_task_messages(&self) -> bool {
+        true
+    }
+
+    /// Task routing preserves the selected target and propagates typed suspension without repeating selection on resume.
+    async fn execute_task(
+        &self,
+        args: Value,
+        _ctx: ai_agents_core::ToolExecutionContext,
+    ) -> ai_agents_core::Result<ToolResult> {
+        let input = args.get("input").and_then(Value::as_str).ok_or_else(|| {
+            ai_agents_core::AgentError::Tool("missing required field: input".into())
+        })?;
+        let candidates = args
+            .get("candidates")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                ai_agents_core::AgentError::Tool("missing required field: candidates".into())
+            })?
+            .iter()
+            .filter_map(|candidate| candidate.as_str().map(String::from))
+            .collect::<Vec<_>>();
+        let method = if args.get("method").and_then(Value::as_str) == Some("round_robin") {
+            RoutingMethod::RoundRobin
+        } else {
+            RoutingMethod::Llm
+        };
+        let Some(llm) = super::role_provider(&self.llm, LLMRole::OrchestrationRouting, None)?
+        else {
+            return Ok(ToolResult::error("no router LLM configured"));
+        };
+        match Box::pin(super::route::route_task(&self.registry, llm.as_ref(), input, &candidates, method, Some(&self.counter))).await {
+            Ok(result) => Ok(ToolResult::ok(json!({"selected_agent":result.selected_agent,"response":result.response.content,"reason":result.reason}).to_string())),
+            Err(error @ ai_agents_core::AgentError::TaskSuspended(_)) => Err(error),
+            Err(error) => Ok(ToolResult::error(format!("routing failed: {error}"))),
+        }
     }
 
     // Resolves captured auxiliary roles without widening tool grants or changing participant ownership.
@@ -141,6 +192,22 @@ impl PipelineProcessTool {
 
 #[async_trait]
 impl Tool for PipelineProcessTool {
+    /// Typed task dispatch retains the actual pipeline cursor rather than converting suspension into failure.
+    async fn execute_task(
+        &self,
+        args: Value,
+        ctx: ai_agents_core::ToolExecutionContext,
+    ) -> ai_agents_core::Result<ToolResult> {
+        if crate::autonomy::suspension::message_request().is_some() {
+            super::task_tools::dispatch(self.registry.clone(), None, args, false).await
+        } else {
+            Ok(self.execute(args, ctx).await)
+        }
+    }
+    /// Capability enables capture only under the shared executor's live final-invocation permit.
+    fn supports_task_messages(&self) -> bool {
+        true
+    }
     fn id(&self) -> &str {
         "pipeline_process"
     }
@@ -245,6 +312,23 @@ impl ConcurrentAskTool {
 
 #[async_trait]
 impl Tool for ConcurrentAskTool {
+    /// Typed task dispatch retains admitted sibling results and propagates suspension after draining.
+    async fn execute_task(
+        &self,
+        args: Value,
+        ctx: ai_agents_core::ToolExecutionContext,
+    ) -> ai_agents_core::Result<ToolResult> {
+        if crate::autonomy::suspension::message_request().is_some() {
+            super::task_tools::dispatch(self.registry.clone(), Some(self.llm.clone()), args, true)
+                .await
+        } else {
+            Ok(self.execute(args, ctx).await)
+        }
+    }
+    /// Capability enables capture only under the shared executor's live final-invocation permit.
+    fn supports_task_messages(&self) -> bool {
+        true
+    }
     fn id(&self) -> &str {
         "concurrent_ask"
     }
@@ -373,6 +457,28 @@ impl GroupDiscussionTool {
 
 #[async_trait]
 impl Tool for GroupDiscussionTool {
+    /// Typed group discussion resumes acknowledged transcript and speaker positions without repeating completed rounds.
+    async fn execute_task(
+        &self,
+        args: Value,
+        ctx: ai_agents_core::ToolExecutionContext,
+    ) -> ai_agents_core::Result<ToolResult> {
+        if crate::autonomy::suspension::message_request().is_some() {
+            super::task_tools::dispatch_kind(
+                self.registry.clone(),
+                Some(self.llm.clone()),
+                args,
+                crate::autonomy::message::MessageResponse::Group,
+            )
+            .await
+        } else {
+            Ok(self.execute(args, ctx).await)
+        }
+    }
+    /// The final executor captures the actual group tool and selected catalogue.
+    fn supports_task_messages(&self) -> bool {
+        true
+    }
     fn id(&self) -> &str {
         "group_discussion"
     }
@@ -514,6 +620,28 @@ impl HandoffConversationTool {
 
 #[async_trait]
 impl Tool for HandoffConversationTool {
+    /// Typed handoff preserves the selected specialist and evaluator decisions at each acknowledged position.
+    async fn execute_task(
+        &self,
+        args: Value,
+        ctx: ai_agents_core::ToolExecutionContext,
+    ) -> ai_agents_core::Result<ToolResult> {
+        if crate::autonomy::suspension::message_request().is_some() {
+            super::task_tools::dispatch_kind(
+                self.registry.clone(),
+                Some(self.llm.clone()),
+                args,
+                crate::autonomy::message::MessageResponse::Handoff,
+            )
+            .await
+        } else {
+            Ok(self.execute(args, ctx).await)
+        }
+    }
+    /// The final executor captures the actual handoff tool and selected catalogue.
+    fn supports_task_messages(&self) -> bool {
+        true
+    }
     fn id(&self) -> &str {
         "handoff_conversation"
     }

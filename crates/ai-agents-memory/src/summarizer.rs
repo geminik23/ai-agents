@@ -15,6 +15,11 @@ use super::native::readable_projection;
 /// Most users use `LLMSummarizer`, auto-configured from the YAML `summarizer_llm` field.
 #[async_trait]
 pub trait Summarizer: Send + Sync {
+    /// Custom summarizers must explicitly declare that internal model work preserves the task admission scope.
+    fn supports_task_admission(&self) -> bool {
+        false
+    }
+
     /// Produce a summary from a batch of messages.
     async fn summarize(&self, messages: &[ChatMessage]) -> Result<String>;
 
@@ -91,6 +96,11 @@ fn format_role(role: &Role) -> &'static str {
 
 #[async_trait]
 impl Summarizer for LLMSummarizer {
+    /// Both summary and merge calls must be wrapped before this consumer captures its handles.
+    fn supports_task_admission(&self) -> bool {
+        self.llm.manages_invocation_admission() && self.merge_llm.manages_invocation_admission()
+    }
+
     async fn summarize(&self, messages: &[ChatMessage]) -> Result<String> {
         if messages.is_empty() {
             return Ok(String::new());
@@ -146,6 +156,11 @@ pub struct NoopSummarizer;
 
 #[async_trait]
 impl Summarizer for NoopSummarizer {
+    /// Deterministic concatenation has no provider attempt to admit.
+    fn supports_task_admission(&self) -> bool {
+        true
+    }
+
     async fn summarize(&self, messages: &[ChatMessage]) -> Result<String> {
         Ok(readable_projection(messages)?
             .iter()
@@ -219,6 +234,7 @@ mod tests {
 
     fn make_message(role: Role, content: &str) -> ChatMessage {
         ChatMessage {
+            provenance: None,
             role,
             content: content.to_string(),
             name: None,

@@ -1,0 +1,29 @@
+# Eval host: task-domain-evals
+# Failed health is truthful; a real escalation and all required stages can satisfy this profile.
+name: Operations Escalation Task
+agent: ../../../yaml/autonomy/ops_remediation.yaml
+settings: {timeout_per_turn_ms: 10000, retries: 0}
+fixtures:
+  llm:
+    mode: mock
+    responses:
+      - I claim remediation succeeded.
+      - '{"tool":"domain","arguments":{"op":"incident"}}'
+      - An incident record is open; health remains down.
+      - Reviewed the escalation and remaining outage.
+scenarios:
+  - id: verified-escalation-does-not-skip-review
+    steps:
+      - !task
+        operation: {action: run, objective: Restore health or escalate the incident.}
+        assert:
+          all:
+            - task:
+                status: completed
+                counters: {path: turns, eq: 3}
+                checks: [{id: health, outcome: fail}, {id: records, outcome: pass}]
+                events_include: [stage_started, stage_completed]
+                event_result_parity: true
+            - tool_called: {id: domain, count: 1, executed: true, success: true}
+            - response_contains: remaining outage
+            - tool_not_called: command

@@ -2,6 +2,8 @@
 
 pub mod builtin;
 mod condition;
+mod footprint;
+
 pub mod mcp;
 mod provider;
 mod registry;
@@ -27,11 +29,12 @@ pub use types::{
     DiagnosticSeverity, DiagnosticsProvider, DiagnosticsProviderSlot, DiagnosticsRequest,
     DiagnosticsResponse, FileVersionEvidence, FileVersionStore, ProcessCommandRunner,
     QuestionHandler, QuestionHandlerSlot, QuestionRequest, QuestionResponse, StaticCommandRunner,
-    StaticDiagnosticsProvider, StaticWebSearchProvider, TodoItem, TodoStatus, TodoStore,
-    ToolAliases, ToolContext, ToolMetadata, ToolProviderType, TrustLevel, UnavailableCommandRunner,
-    UnavailableDiagnosticsProvider, UnavailableWebSearchProvider, WebSearchProvider,
-    WebSearchProviderSlot, WebSearchRequest, WebSearchResponse, WebSearchResultItem,
-    WebSearchSafeSearch, file_version_evidence,
+    StaticDiagnosticsProvider, StaticWebSearchProvider, TodoItem, TodoRunBinding, TodoStatus,
+    TodoStore, ToolAliases, ToolContext, ToolMetadata, ToolProviderType, TrustLevel,
+    UnavailableCommandRunner, UnavailableDiagnosticsProvider, UnavailableWebSearchProvider,
+    WebSearchProvider, WebSearchProviderSlot, WebSearchRequest, WebSearchResponse,
+    WebSearchResultItem, WebSearchSafeSearch, current_task_todo_store, file_version_evidence,
+    scope_task_todos,
 };
 
 pub use builtin::HttpTool;

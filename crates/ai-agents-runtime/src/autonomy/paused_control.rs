@@ -1,0 +1,695 @@
+//! Authenticated Rust host stop reuses exact safe cleanup without treating an answer as control authority.
+
+use super::*;
+use std::future::Future;
+
+#[derive(Clone)]
+pub(super) struct HostStop {
+    reason: String,
+    kind: &'static str,
+    status: TaskRunStatus,
+    request_id: Option<String>,
+    cancellation: Option<Arc<RetirementCancellation>>,
+}
+
+// A single unavailable cleanup can yield to exactly one cancellation-only successor, never to a later resume or host edit.
+struct RetirementCancellation {
+    predecessor: TaskRunSnapshot,
+    accepted: std::sync::atomic::AtomicBool,
+}
+
+tokio::task_local! { static HOST_STOP: HostStop; }
+
+/// Only the explicit Rust host API installs a stop reason; external signals and tool responses cannot deserialize it.
+async fn scope_stop<F: Future>(control: HostStop, future: F) -> F::Output {
+    HOST_STOP.scope(control, future).await
+}
+
+/// Cancellation helpers retain their original semantics unless the host explicitly owns a stop operation.
+pub(super) fn stop_reason() -> Option<HostStop> {
+    HOST_STOP.try_with(Clone::clone).ok().filter(|control| {
+        control.cancellation.as_ref().is_none_or(|cancellation| {
+            !cancellation
+                .accepted
+                .load(std::sync::atomic::Ordering::Acquire)
+        })
+    })
+}
+
+// This live cleanup witness accepts only a fully verified RequestCancel successor; it cannot authorize replay or adopt an unrelated revision.
+pub(super) fn accept_retirement_cancellation(
+    snapshot: &TaskRunSnapshot,
+    expected_revision: u64,
+) -> ai_agents_core::Result<bool> {
+    let Some(control) = HOST_STOP.try_with(Clone::clone).ok() else {
+        return Ok(false);
+    };
+    let Some(cancellation) = control.cancellation else {
+        return Ok(false);
+    };
+    if cancellation.predecessor.revision != expected_revision || !snapshot.cancel_requested {
+        return Ok(false);
+    }
+    super::super::store::verify_checkpoint_receipt(
+        &cancellation.predecessor,
+        &TaskRunMutation::RequestCancel { expected_revision },
+        snapshot,
+    )?;
+    cancellation
+        .accepted
+        .store(true, std::sync::atomic::Ordering::Release);
+    Ok(true)
+}
+
+impl AutonomyRunner {
+    /// Retires an acknowledged volatile pause when the configured host exposes no usable response endpoint.
+    /// Existing typed cancellation cleans pending histories without invoking them; failed or lost ACK retains the original custody protection.
+    pub(super) async fn retire_unavailable_pause(
+        &self,
+        acknowledged: &TaskRunSnapshot,
+    ) -> ai_agents_core::Result<TaskRunResult> {
+        self.retire_input_snapshot(
+            acknowledged,
+            TaskRunStatus::Incomplete,
+            "capability_unavailable",
+        )
+        .await
+    }
+
+    // Policy selection never reloads the predecessor; the existing witness alone admits an exact cancellation-only successor.
+    async fn retire_input_snapshot(
+        &self,
+        acknowledged: &TaskRunSnapshot,
+        status: TaskRunStatus,
+        kind: &'static str,
+    ) -> ai_agents_core::Result<TaskRunResult> {
+        let run_id = &acknowledged.key.run_id;
+        scope_stop(
+            HostStop {
+                reason: "host has no task response endpoint for a volatile pause".into(),
+                kind,
+                status,
+                request_id: None,
+                cancellation: Some(Arc::new(RetirementCancellation {
+                    predecessor: acknowledged.clone(),
+                    accepted: std::sync::atomic::AtomicBool::new(false),
+                })),
+            },
+            self.cancel_paused(run_id, acknowledged.revision),
+        )
+        .await
+    }
+
+    /// Retires a known-safe pause after confirmed foreground input loss, preserving controller and external unavailable policies.
+    /// Exact revision admission and existing typed cleanup remain authoritative; this does not acknowledge a running operation or uncertain effects.
+    pub async fn input_unavailable_paused(
+        &self,
+        run_id: &str,
+        revision: u64,
+    ) -> ai_agents_core::Result<TaskRunResult> {
+        let snapshot = self
+            .active
+            .lock()
+            .as_ref()
+            .filter(|execution| execution.run_id == run_id)
+            .map(|execution| execution.acknowledged_snapshot())
+            .ok_or(TaskRunStorageError::NotResumable)?;
+        if snapshot.revision != revision {
+            return Err(TaskRunStorageError::Conflict.into());
+        }
+        let payload: TaskCheckpointPayload = serde_json::from_value(snapshot.payload.clone())?;
+        payload.validate(&snapshot, &self.config_identity)?;
+        let controller = controller_checkpoint(&payload)?;
+        use super::super::controller::ControllerProposal;
+        let fallback = match controller
+            .as_ref()
+            .and_then(|state| state.review.as_ref())
+            .map(|review| &review.proposal)
+        {
+            Some(
+                ControllerProposal::Capacity { .. }
+                | ControllerProposal::Question { limit: Some(_), .. },
+            ) => {
+                payload
+                    .settings
+                    .on_limit
+                    .as_ref()
+                    .and_then(|policy| policy.on_unavailable)
+                    == Some(InteractionUnavailableAction::Fail)
+            }
+            Some(ControllerProposal::Question { reason, .. }) if reason == "no_progress" => {
+                payload
+                    .settings
+                    .progress
+                    .as_ref()
+                    .and_then(|p| p.stagnation.as_ref())
+                    .and_then(|p| p.on_unavailable)
+                    == Some(StagnationAction::Fail)
+            }
+            Some(ControllerProposal::Question { .. }) => {
+                payload
+                    .settings
+                    .premature_finish
+                    .as_ref()
+                    .and_then(|policy| policy.on_unavailable)
+                    == Some(InteractionUnavailableAction::Fail)
+            }
+            _ if controller.is_none()
+                && payload
+                    .pending
+                    .as_ref()
+                    .is_some_and(|p| matches!(p.kind, TaskPendingKind::Limit)) =>
+            {
+                payload
+                    .settings
+                    .on_limit
+                    .as_ref()
+                    .and_then(|policy| policy.on_unavailable)
+                    == Some(InteractionUnavailableAction::Fail)
+            }
+            _ => false,
+        };
+        if let Some(wait) = controller
+            .as_ref()
+            .and_then(|state| state.driver.as_ref())
+            .and_then(|driver| driver.wait.as_ref())
+        {
+            if self.agent.autonomy_extensions().condition(&wait.binding.id) != Some(&wait.binding) {
+                return Err(TaskRunStorageError::NotResumable.into());
+            }
+            let failed = matches!(
+                self.agent
+                    .autonomy_extensions()
+                    .condition_unavailable_policy(&wait.binding.id),
+                ExternalUnavailablePolicy::Fail
+            );
+            return self
+                .retire_input_snapshot(
+                    &snapshot,
+                    if failed {
+                        TaskRunStatus::Failed
+                    } else {
+                        TaskRunStatus::Incomplete
+                    },
+                    "external_unavailable",
+                )
+                .await;
+        }
+        if fallback {
+            self.retire_input_snapshot(&snapshot, TaskRunStatus::Failed, "controller_unavailable")
+                .await
+        } else {
+            self.retire_unavailable_pause(&snapshot).await
+        }
+    }
+
+    /// Stops a known-safe retained pause without invoking its pending operation; the host authenticates its caller.
+    /// A conditional claim excludes competing responses, and protection is released only after terminal acknowledgement.
+    pub async fn stop_paused(
+        &self,
+        run_id: &str,
+        expected_revision: u64,
+        reason: &str,
+    ) -> ai_agents_core::Result<TaskRunResult> {
+        if reason.trim().is_empty() || reason.chars().count() > 512 {
+            return Err(ai_agents_core::AgentError::Config(
+                "host stop requires a bounded audit reason".into(),
+            ));
+        }
+        scope_stop(
+            HostStop {
+                reason: reason.into(),
+                kind: "stop",
+                status: TaskRunStatus::Incomplete,
+                request_id: None,
+                cancellation: None,
+            },
+            self.cancel_paused(run_id, expected_revision),
+        )
+        .await
+    }
+
+    /// Reports host-confirmed delivery loss for one retained external wait, never inferred from silence or signal payloads.
+    /// Frozen stop/fail policy uses existing safe cleanup and CAS; stale freshness cannot prevent known-safe retirement.
+    pub async fn external_unavailable_paused(
+        &self,
+        run_id: &str,
+        expected_revision: u64,
+        request_id: &str,
+        reason: &str,
+    ) -> ai_agents_core::Result<TaskRunResult> {
+        if reason.trim().is_empty() || reason.chars().count() > 512 {
+            return Err(ai_agents_core::AgentError::Config(
+                "external unavailability requires a bounded audit reason".into(),
+            ));
+        }
+        let snapshot = self
+            .store
+            .load(run_id)
+            .await?
+            .ok_or(TaskRunStorageError::NotFound)?;
+        if snapshot.revision != expected_revision {
+            return Err(TaskRunStorageError::Conflict.into());
+        }
+        let payload: TaskCheckpointPayload = serde_json::from_value(snapshot.payload.clone())?;
+        payload.validate(&snapshot, &self.config_identity)?;
+        let state = self.retained_controller(&snapshot, &payload)?;
+        let wait = state
+            .driver
+            .as_ref()
+            .and_then(|driver| driver.wait.as_ref())
+            .filter(|wait| wait.request_id == request_id)
+            .ok_or(TaskRunStorageError::NotResumable)?;
+        if self.agent.autonomy_extensions().condition(&wait.binding.id) != Some(&wait.binding) {
+            return Err(TaskRunStorageError::NotResumable.into());
+        }
+        let status = match self
+            .agent
+            .autonomy_extensions()
+            .condition_unavailable_policy(&wait.binding.id)
+        {
+            ExternalUnavailablePolicy::Stop => TaskRunStatus::Incomplete,
+            ExternalUnavailablePolicy::Fail => TaskRunStatus::Failed,
+        };
+        scope_stop(
+            HostStop {
+                reason: reason.into(),
+                kind: "external_unavailable",
+                status,
+                request_id: Some(request_id.into()),
+                cancellation: None,
+            },
+            self.cancel_paused(run_id, expected_revision),
+        )
+        .await
+    }
+
+    /// Reports host-confirmed delivery loss for one controller question or capacity wait, never inferred from silence.
+    pub async fn controller_unavailable_paused(
+        &self,
+        run_id: &str,
+        expected_revision: u64,
+        request_id: &str,
+        reason: &str,
+    ) -> ai_agents_core::Result<TaskRunResult> {
+        if reason.trim().is_empty() || reason.chars().count() > 512 {
+            return Err(ai_agents_core::AgentError::Config(
+                "controller unavailability requires a bounded audit reason".into(),
+            ));
+        }
+        let snapshot = self
+            .store
+            .load(run_id)
+            .await?
+            .ok_or(TaskRunStorageError::NotFound)?;
+        if snapshot.revision != expected_revision {
+            return Err(TaskRunStorageError::Conflict.into());
+        }
+        let payload: TaskCheckpointPayload = serde_json::from_value(snapshot.payload.clone())?;
+        payload.validate(&snapshot, &self.config_identity)?;
+        if controller_checkpoint(&payload)?.is_none()
+            && payload.pending.as_ref().is_some_and(|pending| {
+                pending.id == request_id && matches!(pending.kind, TaskPendingKind::Limit)
+            })
+        {
+            super::super::controller::pending_capacity(payload.pending.as_ref().unwrap())?;
+            let fallback = payload
+                .settings
+                .on_limit
+                .as_ref()
+                .and_then(|policy| policy.on_unavailable);
+            return scope_stop(
+                HostStop {
+                    reason: reason.into(),
+                    kind: "controller_unavailable",
+                    status: if fallback == Some(InteractionUnavailableAction::Fail) {
+                        TaskRunStatus::Failed
+                    } else {
+                        TaskRunStatus::Incomplete
+                    },
+                    request_id: Some(request_id.into()),
+                    cancellation: None,
+                },
+                self.cancel_paused(run_id, expected_revision),
+            )
+            .await;
+        }
+        let state = self.retained_controller(&snapshot, &payload)?;
+        let review = state
+            .review
+            .as_ref()
+            .filter(|review| review.id == request_id)
+            .ok_or(TaskRunStorageError::NotResumable)?;
+        let fallback = match &review.proposal {
+            super::super::controller::ControllerProposal::Capacity { .. }
+            | super::super::controller::ControllerProposal::Question { limit: Some(_), .. } => {
+                payload
+                    .settings
+                    .on_limit
+                    .as_ref()
+                    .and_then(|policy| policy.on_unavailable)
+            }
+            super::super::controller::ControllerProposal::Question { reason: cause, .. }
+                if cause == "no_progress" =>
+            {
+                return scope_stop(
+                    HostStop {
+                        reason: reason.into(),
+                        kind: "controller_unavailable",
+                        status: if payload
+                            .settings
+                            .progress
+                            .as_ref()
+                            .and_then(|p| p.stagnation.as_ref())
+                            .and_then(|p| p.on_unavailable)
+                            == Some(StagnationAction::Fail)
+                        {
+                            TaskRunStatus::Failed
+                        } else {
+                            TaskRunStatus::Incomplete
+                        },
+                        request_id: Some(request_id.into()),
+                        cancellation: None,
+                    },
+                    self.cancel_paused(run_id, expected_revision),
+                )
+                .await;
+            }
+            super::super::controller::ControllerProposal::Question { .. } => payload
+                .settings
+                .premature_finish
+                .as_ref()
+                .and_then(|policy| policy.on_unavailable),
+            _ => return Err(TaskRunStorageError::NotResumable.into()),
+        };
+        scope_stop(
+            HostStop {
+                reason: reason.into(),
+                kind: "controller_unavailable",
+                status: if fallback == Some(InteractionUnavailableAction::Fail) {
+                    TaskRunStatus::Failed
+                } else {
+                    TaskRunStatus::Incomplete
+                },
+                request_id: Some(request_id.into()),
+                cancellation: None,
+            },
+            self.cancel_paused(run_id, expected_revision),
+        )
+        .await
+    }
+
+    /// Revises numeric ceilings without consuming the pending response or executing work; the host authenticates its caller.
+    /// Failed or lost acknowledgement preserves protection, while a successful revision keeps individual operation deadlines unchanged.
+    pub async fn revise_limits_paused(
+        &self,
+        run_id: &str,
+        expected_revision: u64,
+        limits: TaskRunLimits,
+        reason: &str,
+    ) -> ai_agents_core::Result<TaskRunResult> {
+        let _delivery = self.automatic_delivery_guard(run_id);
+        let result =
+            Box::pin(self.revise_limits_paused_inner(run_id, expected_revision, limits, reason))
+                .await;
+        self.automatic_operation_result(result)
+    }
+
+    /// Applies only authenticated numeric revision while preserving pending work and the original operation deadlines.
+    async fn revise_limits_paused_inner(
+        &self,
+        run_id: &str,
+        expected_revision: u64,
+        limits: TaskRunLimits,
+        reason: &str,
+    ) -> ai_agents_core::Result<TaskRunResult> {
+        let _resume = self.resume_gate.lock().await;
+        if !self.store.supports_paused_limit_revision() {
+            return Err(ai_agents_core::AgentError::Config(
+                "paused limit revision is unsupported by this task store".into(),
+            ));
+        }
+        let snapshot = self
+            .store
+            .load(run_id)
+            .await?
+            .ok_or(TaskRunStorageError::NotFound)?;
+        if snapshot.revision != expected_revision {
+            return Err(TaskRunStorageError::Conflict.into());
+        }
+        let payload: TaskCheckpointPayload = serde_json::from_value(snapshot.payload.clone())?;
+        payload.validate(&snapshot, &self.config_identity)?;
+        let (proposed, _) = super::super::control::prepare_paused_limit_revision(
+            &snapshot,
+            limits.clone(),
+            reason,
+            &self.host,
+        )?;
+        let (owner, whole_expiry) = {
+            let paused = self.paused.lock();
+            let paused = paused
+                .get(run_id)
+                .ok_or(TaskRunStorageError::NotResumable)?;
+            paused.owner.check()?;
+            if paused.participants.unsettled()
+                || paused
+                    .whole_expiry
+                    .is_some_and(|expiry| std::time::Instant::now() >= expiry)
+            {
+                return Err(TaskRunStorageError::NotResumable.into());
+            }
+            (paused.owner.clone(), paused.whole_expiry)
+        };
+        let revised_expiry = match (
+            whole_expiry,
+            payload.clocks.expires_at,
+            proposed.clocks.expires_at,
+        ) {
+            (Some(original), Some(old), Some(new)) => {
+                let delta = new.signed_duration_since(old);
+                Some(
+                    if delta >= chrono::Duration::zero() {
+                        original.checked_add(
+                            delta
+                                .to_std()
+                                .map_err(|_| TaskRunStorageError::InvalidCheckpoint)?,
+                        )
+                    } else {
+                        original.checked_sub(
+                            (-delta)
+                                .to_std()
+                                .map_err(|_| TaskRunStorageError::InvalidCheckpoint)?,
+                        )
+                    }
+                    .ok_or(TaskRunStorageError::InvalidCheckpoint)?,
+                )
+            }
+            (None, None, Some(new)) => Some(
+                std::time::Instant::now()
+                    .checked_add(
+                        (new - chrono::Utc::now())
+                            .to_std()
+                            .map_err(|_| TaskRunStorageError::AdmissionExpired)?,
+                    )
+                    .ok_or(TaskRunStorageError::InvalidCheckpoint)?,
+            ),
+            (None, None, None) => None,
+            _ => return Err(TaskRunStorageError::InvalidCheckpoint.into()),
+        };
+        if revised_expiry.is_some_and(|expiry| std::time::Instant::now() >= expiry) {
+            return Err(TaskRunStorageError::AdmissionExpired.into());
+        }
+        // Audit growth and checkpoint validation are proven pre-write failures, so reject them before arming abandonment.
+        let expected = snapshot.transition(
+            &TaskRunMutation::HostControl {
+                expected_revision,
+                owner_token: None,
+                status: TaskRunStatus::Paused,
+                payload: serde_json::to_value(&proposed)?,
+                deadline: whole_expiry,
+                expires_at: payload.clocks.expires_at,
+            },
+            chrono::Utc::now(),
+        )?;
+        proposed.validate(&expected, &self.config_identity)?;
+        proposed.validate_successor_with_control(&payload, expected.revision, false, true)?;
+        let mut cleanup = OwnedTurnCleanup::new(owner);
+        let saved = self
+            .store
+            .revise_paused_limits(
+                run_id,
+                expected_revision,
+                limits,
+                reason,
+                &self.host,
+                whole_expiry,
+            )
+            .await?;
+        let Some(saved) = saved else {
+            cleanup.finish();
+            return Err(TaskRunStorageError::Conflict.into());
+        };
+        if saved.key != snapshot.key
+            || saved.actor_id != snapshot.actor_id
+            || saved.schema_version != snapshot.schema_version
+            || saved.revision
+                != snapshot
+                    .revision
+                    .checked_add(1)
+                    .ok_or(TaskRunStorageError::InvalidCheckpoint)?
+            || saved.created_at != snapshot.created_at
+            || saved.updated_at < snapshot.updated_at
+            || saved.owner_token.is_some()
+            || saved.cancel_requested != snapshot.cancel_requested
+            || saved.status != TaskRunStatus::Paused
+            || saved.payload != serde_json::to_value(&proposed)?
+        {
+            return Err(TaskRunStorageError::InvalidCheckpoint.into());
+        }
+        let run = TaskRun::from_checkpoint(&saved, &self.config_identity)?;
+        self.paused
+            .lock()
+            .get_mut(run_id)
+            .ok_or(TaskRunStorageError::NotResumable)?
+            .whole_expiry = revised_expiry;
+        cleanup.finish();
+        self.acknowledged_automatic_result(TaskRunResult {
+            run,
+            final_response: None,
+        })
+    }
+
+    /// Stop claims rather than fabricating cancellation; every cleanup admission requires an exact successor receipt.
+    pub(super) async fn admit_paused_cleanup(
+        &self,
+        snapshot: TaskRunSnapshot,
+    ) -> ai_agents_core::Result<TaskRunSnapshot> {
+        let mutation = if let Some(control) = stop_reason() {
+            if let Some(request_id) = &control.request_id {
+                let payload: TaskCheckpointPayload =
+                    serde_json::from_value(snapshot.payload.clone())?;
+                if payload.pending.as_ref().is_none_or(|pending| {
+                    pending.id != *request_id
+                        || if control.kind == "external_unavailable" {
+                            !matches!(pending.kind, TaskPendingKind::ExternalCondition)
+                        } else {
+                            !matches!(
+                                pending.kind,
+                                TaskPendingKind::UserQuestion
+                                    | TaskPendingKind::HostContinue
+                                    | TaskPendingKind::Limit
+                            )
+                        }
+                }) {
+                    return Err(TaskRunStorageError::NotResumable.into());
+                }
+            }
+            if snapshot.cancel_requested {
+                return Err(TaskRunStorageError::NotResumable.into());
+            }
+            TaskRunMutation::Claim {
+                expected_revision: snapshot.revision,
+                owner_token: uuid::Uuid::new_v4().to_string(),
+            }
+        } else if snapshot.cancel_requested {
+            return Ok(snapshot);
+        } else {
+            TaskRunMutation::RequestCancel {
+                expected_revision: snapshot.revision,
+            }
+        };
+        let saved = if let TaskRunMutation::Claim {
+            expected_revision,
+            owner_token,
+        } = &mutation
+            && stop_reason().is_some_and(|control| control.cancellation.is_some())
+        {
+            // Only a certified no-write claim refusal permits a cancellation-only re-read; custom transport errors remain ambiguous.
+            match self
+                .store
+                .claim_paused(
+                    &snapshot.key.run_id,
+                    *expected_revision,
+                    owner_token.clone(),
+                )
+                .await?
+            {
+                Some(saved) => saved,
+                None => {
+                    let current = self
+                        .store
+                        .load(&snapshot.key.run_id)
+                        .await?
+                        .ok_or(TaskRunStorageError::NotFound)?;
+                    if accept_retirement_cancellation(&current, *expected_revision)? {
+                        return Ok(current);
+                    }
+                    return Err(TaskRunStorageError::Conflict.into());
+                }
+            }
+        } else {
+            self.store.mutate(&snapshot.key.run_id, &mutation).await?
+        };
+        super::super::store::verify_checkpoint_receipt(&snapshot, &mutation, &saved)?;
+        Ok(saved)
+    }
+
+    /// A host-stop terminal checkpoint retains usage and exact settled histories and never publishes task completion.
+    pub(super) async fn acknowledge_paused_cleanup(
+        &self,
+        admitted: &TaskRunSnapshot,
+        mut payload: TaskCheckpointPayload,
+    ) -> ai_agents_core::Result<TaskRunSnapshot> {
+        let mutation = if let Some(control) = stop_reason() {
+            payload.stop_reason = Some(
+                match control.kind {
+                    "stop" => "user_stopped",
+                    "capability_unavailable" => "capability_unavailable",
+                    _ => "external_unavailable",
+                }
+                .into(),
+            );
+            let sequence = payload
+                .evidence
+                .records
+                .iter()
+                .map(|record| record.sequence)
+                .chain(
+                    payload
+                        .evidence
+                        .tool_calls
+                        .iter()
+                        .map(|record| record.sequence),
+                )
+                .max()
+                .unwrap_or(0)
+                .checked_add(1)
+                .ok_or_else(|| {
+                    ai_agents_core::AgentError::Config("audit sequence overflow".into())
+                })?;
+            payload.evidence.records.push(TaskEvidenceRecord { run_id: admitted.key.run_id.clone(), sequence, stage: payload.stage.clone(), attempt: None,
+                origin: "host.control".into(), data: serde_json::json!({"action":{"kind":control.kind,"request_id":control.request_id},"reason":control.reason,"expected_revision":admitted.revision.saturating_sub(1)}) });
+            TaskRunMutation::FinalCheckpoint {
+                expected_revision: admitted.revision,
+                owner_token: admitted
+                    .owner_token
+                    .clone()
+                    .ok_or(TaskRunStorageError::Owned)?,
+                status: control.status,
+                payload: serde_json::to_value(payload)?,
+                release: true,
+                expires_at: None,
+                evidence: None,
+                deadline: std::time::Instant::now(),
+            }
+        } else {
+            TaskRunMutation::AcknowledgeCancel {
+                expected_revision: admitted.revision,
+                payload: serde_json::to_value(payload)?,
+            }
+        };
+        let saved = self.store.mutate(&admitted.key.run_id, &mutation).await?;
+        super::super::store::verify_checkpoint_receipt(admitted, &mutation, &saved)?;
+        Ok(saved)
+    }
+}

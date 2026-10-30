@@ -1,130 +1,131 @@
-//
-// TUI module: ratatui-based terminal interface with panels and streaming.
-//
+//! Bounded terminal presentation and shared foreground hosting have independent lifetimes.
 
 pub mod app;
+mod commands;
 pub mod event;
+mod host;
 pub mod log_layer;
 pub mod palette;
 pub mod theme;
 pub mod widgets;
 
-use std::io;
-use std::sync::Arc;
-use std::time::Duration;
-
+use self::{
+    app::{App, UpdateResult},
+    event::AppMessage,
+    log_layer::TuiLogLayer,
+    palette::resolve_theme,
+};
+use crate::{
+    repl::CliReplConfig,
+    session::{Endpoint, FrontendSession, Input, Output},
+};
+use ai_agents::RuntimeAgent;
 use anyhow::{Context, Result};
-use crossterm::event::{Event, EventStream};
-use crossterm::execute;
-use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+use crossterm::{
+    event::{Event, EventStream},
+    execute,
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use futures::StreamExt;
-use ratatui::Terminal;
-use ratatui::backend::CrosstermBackend;
+use ratatui::{Terminal, backend::CrosstermBackend};
+use std::{io, sync::Arc, time::Duration};
+use tokio::sync::mpsc;
 use tracing_subscriber::layer::SubscriberExt;
 
-use ai_agents::RuntimeAgent;
+/// Restores terminal state even when partial setup or drawing fails; this is not task cleanup acknowledgement.
+struct TerminalGuard;
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        let _ = execute!(io::stdout(), LeaveAlternateScreen, crossterm::cursor::Show);
+    }
+}
 
-use crate::question::TuiQuestionHandler;
-use crate::repl::CliReplConfig;
-
-use self::app::{App, UpdateResult};
-use self::event::AppMessage;
-use self::log_layer::TuiLogLayer;
-use self::palette::resolve_theme;
-
-/// Run the ratatui TUI event loop.
+/// Hosts an already configured runtime; ordinary approval handlers remain the embedding caller's responsibility.
+/// The CLI uses checked preparation and a bounded bridge before entering this function's presentation loop.
 pub async fn run_tui(
     agent: RuntimeAgent,
     config: CliReplConfig,
     theme_name: Option<String>,
 ) -> Result<()> {
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AppMessage>();
+    let (session, input, output) = FrontendSession::embedded();
+    agent.set_question_handler(Some(session.bridge()));
+    run_prepared(agent, config, theme_name, session, input, output).await
+}
 
-    // Install a global tracing subscriber that captures logs into the TUI channel.
-    // This must happen BEFORE enable_raw_mode so no fmt subscriber ever writes to the terminal.
-    // Default to WARN to avoid flooding the chat with per-turn INFO lines.
+/// Polls the original shared foreground driver through shutdown rather than dropping work when a screen closes.
+pub(crate) async fn run_prepared(
+    agent: RuntimeAgent,
+    config: CliReplConfig,
+    theme_name: Option<String>,
+    mut session: FrontendSession,
+    input: mpsc::Sender<Input>,
+    mut output: mpsc::Receiver<Output>,
+) -> Result<()> {
+    let (tx, mut rx) = mpsc::channel::<AppMessage>(32);
     let log_level = std::env::var("RUST_LOG")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(tracing::Level::WARN);
-    let log_layer = TuiLogLayer::new(tx.clone(), log_level);
-    let subscriber = tracing_subscriber::registry().with(log_layer);
+    let subscriber = tracing_subscriber::registry().with(TuiLogLayer::new(tx.clone(), log_level));
     let _ = tracing::subscriber::set_global_default(subscriber);
-
     enable_raw_mode().context("failed to enable raw mode")?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen).context("failed to enter alternate screen")?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend).context("failed to create terminal")?;
-    terminal.clear().context("failed to clear terminal")?;
-
-    // Resolve the initial theme. CLI flag / YAML metadata -> fallback to "dark".
-    let initial_theme_name = theme_name.unwrap_or_else(|| "dark".to_string());
-    let initial_theme = resolve_theme(&initial_theme_name).unwrap_or_else(|| {
-        // Unknown name: fall back to dark and show a toast later.
-        resolve_theme("dark").unwrap()
-    });
-
-    // Spawn async terminal event reader using crossterm event-stream.
-    let tx_keys = tx.clone();
-    tokio::spawn(async move {
-        let mut reader = EventStream::new();
-        while let Some(event_result) = reader.next().await {
-            match event_result {
-                Ok(Event::Key(key)) => {
-                    if tx_keys.send(AppMessage::Key(key)).is_err() {
-                        break;
-                    }
-                }
-                Ok(Event::Resize(w, h)) => {
-                    if tx_keys.send(AppMessage::Resize(w, h)).is_err() {
-                        break;
-                    }
-                }
-                Ok(_) => {}
-                Err(_) => break,
-            }
-        }
-    });
-
-    // Spawn tick timer for spinner animation and toast expiry.
-    let tx_tick = tx.clone();
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_millis(100));
-        loop {
-            interval.tick().await;
-            if tx_tick.send(AppMessage::Tick).is_err() {
-                break;
-            }
-        }
-    });
-
-    agent.set_question_handler(Some(TuiQuestionHandler::new(tx.clone())));
-    let agent_arc = Arc::new(agent);
-    let mut app = App::new(agent_arc, config, tx, initial_theme, initial_theme_name);
-
-    // Main event loop.
+    let _terminal_guard = TerminalGuard;
+    execute!(io::stdout(), EnterAlternateScreen).context("failed to enter alternate screen")?;
+    let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+    terminal.clear()?;
+    let name = theme_name.unwrap_or_else(|| "dark".into());
+    let theme = resolve_theme(&name).unwrap_or_else(|| resolve_theme("dark").unwrap());
+    let agent = Arc::new(agent);
+    let mut app = App::new(agent.clone(), config.clone(), tx, theme, name);
+    app.attach_host(input.clone());
+    let (endpoint, endpoint_rx) = tokio::sync::watch::channel(Endpoint::Open);
+    session.set_endpoint(endpoint_rx);
+    let mut driver = Box::pin(host::run(session, agent, config));
+    let mut reader = EventStream::new();
+    let mut tick = tokio::time::interval(Duration::from_millis(100));
+    let mut stopping = false;
+    let mut output_open = true;
+    let mut input_open = true;
+    let mut draw_error = None;
     loop {
-        terminal
-            .draw(|frame| app.render(frame))
-            .context("failed to draw frame")?;
-
-        if let Some(msg) = rx.recv().await {
-            if app.update(msg).await == UpdateResult::Quit {
-                break;
+        if draw_error.is_none()
+            && let Err(error) = terminal.draw(|frame| app.render(frame))
+        {
+            draw_error = Some(error);
+            stopping = true;
+            // A broken renderer is confirmed endpoint loss; close delivery without pretending its work is settled.
+            output.close();
+            let _ = endpoint.send(Endpoint::Shutdown);
+        }
+        tokio::select! {
+            result=&mut driver => {
+                // The original driver has returned an actual result or protected error; drain its bounded suffix first.
+                while let Ok(event)=output.try_recv() {app.host_output(event);}
+                if let Some(error)=draw_error {return Err(error.into());}
+                result?;
+                return Ok(());
             }
-        } else {
-            break;
+            event=output.recv(), if output_open => {
+                match event {Some(event)=>app.host_output(event),None=>output_open=false}
+            }
+            event=reader.next(), if input_open => {
+                match event {
+                    Some(Ok(Event::Key(key))) if key.kind != crossterm::event::KeyEventKind::Release && !(key.kind == crossterm::event::KeyEventKind::Repeat && key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) && key.code == crossterm::event::KeyCode::Char('c')) => {
+                        if app.update(AppMessage::Key(key)).await==UpdateResult::Quit {
+                            if stopping { anyhow::bail!("forced exit: task cleanup is unconfirmed; inspect ownership before recovery"); }
+                            stopping=true;
+                            let _=endpoint.send(Endpoint::Shutdown);
+                        }
+                    }
+                    Some(Ok(Event::Resize(w,h))) => {app.update(AppMessage::Resize(w,h)).await;}
+                    Some(Err(_)) | None => { input_open=false;let _=endpoint.send(Endpoint::Closed); }
+                    _=>{}
+                }
+            }
+            Some(messages)=app.commands.next(), if !app.commands.is_empty() => {app.command_output(messages);}
+            Some(message)=rx.recv() => {app.update(message).await;}
+            _=tick.tick() => {app.update(AppMessage::Tick).await;}
         }
     }
-
-    // Teardown.
-    disable_raw_mode().context("failed to disable raw mode")?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)
-        .context("failed to leave alternate screen")?;
-    terminal.show_cursor().context("failed to show cursor")?;
-
-    Ok(())
 }

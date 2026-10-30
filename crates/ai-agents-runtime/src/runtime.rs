@@ -13,6 +13,38 @@ use tracing::{debug, error, info, instrument, warn};
 const DISAMBIGUATION_STATE_GENERATION_KEY: &str = "_runtime.disambiguation_state_generation";
 const MAX_TOOL_FALLBACK_HOPS: usize = 16;
 
+tokio::task_local! {
+    static TOOL_FALLBACK_REQUEST: std::cell::RefCell<Option<(ToolExecutionRequest, ToolFallbackState)>>;
+}
+
+#[path = "autonomy/automatic_runtime.rs"]
+mod task_automatic;
+#[path = "autonomy/composition_runtime.rs"]
+mod task_composition;
+#[path = "autonomy/continuation_runtime.rs"]
+mod task_continuation;
+#[path = "autonomy/interaction_runtime.rs"]
+mod task_interaction;
+#[path = "autonomy/location_runtime.rs"]
+mod task_location;
+#[path = "autonomy/message_runtime.rs"]
+mod task_message;
+#[path = "autonomy/observation_runtime.rs"]
+mod task_observation;
+#[path = "autonomy/restore_runtime.rs"]
+mod task_restore;
+#[path = "autonomy/state_runtime.rs"]
+mod task_state;
+
+#[cfg(test)]
+#[path = "autonomy/ad_acceptance_tests.rs"]
+mod ad_acceptance_tests;
+#[cfg(test)]
+#[path = "autonomy/ad_dispatch_tests.rs"]
+mod ad_dispatch_tests;
+#[cfg(test)]
+#[path = "autonomy/boundary_tests.rs"]
+mod autonomy_boundary_tests;
 #[cfg(test)]
 #[path = "routing_tests.rs"]
 mod routing_tests;
@@ -56,7 +88,12 @@ pub(crate) type ToolResourceLocks = Arc<RwLock<HashMap<String, Weak<tokio::sync:
 struct ToolResourceGuards {
     guards: Vec<tokio::sync::OwnedMutexGuard<()>>,
     locks: ToolResourceLocks,
+    task_owner: Option<Arc<crate::autonomy::RunOwner>>,
+    retain_on_drop: bool,
+    effect_custody: Arc<AtomicBool>,
 }
+
+tokio::task_local! { static TOOL_EFFECT_CUSTODY: Arc<AtomicBool>; }
 
 //
 // Couples one acquired root-turn gate with the immutable ancestry owner that must remain active through hooks, orchestration, and stream polling.
@@ -80,7 +117,21 @@ struct RuntimeSessionRestorePoint {
 }
 
 impl Drop for ToolResourceGuards {
+    // Once a task invocation may have started, drop/error cannot assert that its host effects stopped.
     fn drop(&mut self) {
+        if (self.retain_on_drop || self.effect_custody.load(Ordering::SeqCst))
+            && let Some(owner) = self.task_owner.take()
+        {
+            let retained = Self {
+                guards: std::mem::take(&mut self.guards),
+                locks: self.locks.clone(),
+                task_owner: None,
+                retain_on_drop: false,
+                effect_custody: Arc::new(AtomicBool::new(false)),
+            };
+            owner.retain_effect_guard(retained);
+            return;
+        }
         self.guards.clear();
         self.locks.write().retain(|_, lock| lock.strong_count() > 0);
     }
@@ -238,6 +289,40 @@ impl ToolApprovalBinding {
             || self.runtime_control_version != versions.runtime_control
             || self.state_generation != versions.state
             || !Arc::ptr_eq(&self.reviewed_tool, resolved_tool)
+    }
+}
+
+// A retained approval pins the reviewed implementation and generations independently of serialized receipt data.
+struct RetainedToolReview {
+    tool: Arc<dyn ai_agents_core::Tool>,
+    tools: Arc<ToolRegistry>,
+    name: String,
+    control: Arc<RuntimeControlState>,
+    control_version: u64,
+    state: Option<Arc<StateMachine>>,
+    generation: Option<u64>,
+}
+impl std::fmt::Debug for RetainedToolReview {
+    // Diagnostics expose only the kind, not reviewed arguments or private configuration.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RetainedToolReview")
+    }
+}
+impl ai_agents_core::autonomy::TaskFinalAdmission for RetainedToolReview {
+    // Old approval cannot be rebound to a currently valid but different implementation or generation.
+    fn validate(&self) -> Result<()> {
+        if self.control.version.load(Ordering::SeqCst) != self.control_version
+            || self.state.as_ref().map(|state| state.generation()) != self.generation
+            || self
+                .tools
+                .resolve(&self.name)
+                .is_none_or(|resolved| !Arc::ptr_eq(&resolved.tool, &self.tool))
+        {
+            return Err(AgentError::Config(
+                "Retained approval binding changed".into(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -450,6 +535,8 @@ enum PostLoopResult {
     /// Transition fired.
     /// `regenerated == false` means content is byte-identical to the input: the caller must not emit it again.
     Transitioned { content: String, regenerated: bool },
+    /// Task regeneration keeps its full call accumulation while the enclosing root retains finalization ownership.
+    TaskRegenerated(AgentResponse),
     /// Transition fired into a state that requires full dispatch.
     /// Caller re-enters run_loop_internal to apply the correct handler.
     NeedsRedispatch,
@@ -458,6 +545,7 @@ enum PostLoopResult {
 /// Outcome of applying a `PostLoopResult`, shared by the blocking and streaming loops.
 struct AppliedPostLoop {
     content: String,
+    tool_calls: Option<Vec<ToolCall>>,
     transitioned: bool,
     /// True when `content` replaces what the consumer already saw; false when it is byte-identical to the pre-transition content.
     regenerated: bool,
@@ -470,6 +558,59 @@ struct StateTransitionReservation<'a> {
 impl Drop for StateTransitionReservation<'_> {
     fn drop(&mut self) {
         self.reserved.store(false, Ordering::SeqCst);
+    }
+}
+
+// Deferred observations outlive scheduler collection only when an exact retained continuation accepts them.
+// This guard is declared before the branch set so provider spans drop before interrupted observations are published.
+struct TaskBranchObservations {
+    owner: Option<Arc<crate::autonomy::RunOwner>>,
+    manager: Option<Arc<ObservabilityManager>>,
+    receipts: Vec<crate::autonomy::location::TaskSpeculativeBranch>,
+    retained: bool,
+}
+
+impl TaskBranchObservations {
+    // Capture actual owner and manager handles; dropping outside task-local scope must not lose or duplicate observations.
+    fn new(agent: &RuntimeAgent) -> Self {
+        Self {
+            owner: crate::autonomy::current_execution().map(|execution| execution.owner.clone()),
+            manager: agent.observability_manager.clone(),
+            receipts: Vec::new(),
+            retained: false,
+        }
+    }
+
+    // Resumed actions receive inert receipt data from their exact return position, not a new observation or execution identity.
+    fn for_return(
+        agent: &RuntimeAgent,
+        position: &crate::autonomy::location::TaskStateReturn,
+    ) -> Self {
+        let mut guard = Self::new(agent);
+        if let crate::autonomy::location::TaskStateReturn::SpeculativeSelection { selection } =
+            position
+        {
+            guard.receipts = selection.branches.clone();
+        }
+        guard
+    }
+}
+
+impl Drop for TaskBranchObservations {
+    // Interrupted observation publication is not proof that cancellation stopped an external provider or retired its reservation.
+    fn drop(&mut self) {
+        if !self.retained
+            && let Some(owner) = &self.owner
+        {
+            for receipt in &self.receipts {
+                owner.finalize_branch_observation(
+                    self.manager.as_ref(),
+                    receipt,
+                    "cancelled",
+                    false,
+                );
+            }
+        }
     }
 }
 
@@ -486,6 +627,32 @@ impl<'a> RootTurnCleanup<'a> {
 impl Drop for RootTurnCleanup<'_> {
     fn drop(&mut self) {
         self.agent.end_root_turn();
+    }
+}
+
+// Keeps both redispatch counters balanced when a nested future is cancelled before its await returns.
+struct RedispatchScope<'a> {
+    agent: &'a RuntimeAgent,
+}
+
+impl<'a> RedispatchScope<'a> {
+    // Enter before polling nested work so root bookkeeping stays owned by the original turn.
+    fn new(agent: &'a RuntimeAgent) -> Self {
+        *agent.redispatch_depth.write() += 1;
+        if let Some(context) = agent.active_turn_context.write().as_mut() {
+            context.enter_redispatch();
+        }
+        Self { agent }
+    }
+}
+
+impl Drop for RedispatchScope<'_> {
+    // Unwind before root cleanup, including when the owning future or stream is dropped.
+    fn drop(&mut self) {
+        *self.agent.redispatch_depth.write() -= 1;
+        if let Some(context) = self.agent.active_turn_context.write().as_mut() {
+            context.exit_redispatch();
+        }
     }
 }
 
@@ -583,7 +750,17 @@ impl RuntimeControlHandle {
     }
 }
 
+/// One runtime identity; internal controller handles share its state rather than cloning an agent or its history.
+/// Complete fluent construction before obtaining a task handle; published task state is never copied for reconfiguration.
 pub struct RuntimeAgent {
+    inner: Arc<RuntimeAgentState>,
+    automatic_host: Option<Arc<crate::autonomy::automatic::AutomaticTaskHost>>,
+}
+
+/// Private-field storage for the runtime's single live identity, exposed only as the target of field delegation.
+#[doc(hidden)]
+pub struct RuntimeAgentState {
+    automatic_host: RwLock<std::sync::Weak<crate::autonomy::automatic::AutomaticTaskHost>>,
     info: AgentInfo,
     llm_registry: Arc<LLMRegistry>,
     memory: Arc<dyn Memory>,
@@ -628,6 +805,8 @@ pub struct RuntimeAgent {
     /// Set by try_skill_route() when skill-level disambiguation triggers clarification.
     /// Read by run_loop() when clarification resolves to route directly to the skill.
     pending_skill_id: RwLock<Option<String>>,
+    // Ordinary skill clarification retains accepted processing context until selection can transfer into a task.
+    pending_automatic_input: RwLock<Option<crate::autonomy::automatic::PreparedSkillInput>>,
     current_plan: RwLock<Option<Plan>>,
     /// Tool IDs declared in the top-level `tools:` spec.
     declared_tool_ids: Option<Vec<String>>,
@@ -675,10 +854,34 @@ pub struct RuntimeAgent {
     background_maintenance: Arc<BackgroundMaintenanceQueue>,
     /// Cross-tool locks for side-effecting calls that target the same resource.
     resource_locks: ToolResourceLocks,
+    /// Live mutation clock for independent production observations, including ordinary calls on this runtime.
+    observation_mutations: Arc<AtomicU64>,
     /// Host-only runtime control state.
     runtime_control: Arc<RuntimeControlState>,
     /// Serializes independent externally initiated root turns across blocking and streaming APIs.
     root_turn_gate: RootTurnGate,
+    /// A foreground run retains this reservation between turns and after abandoned work.
+    autonomy_owner: crate::autonomy::RunOwnerSlot,
+    /// Session mutations and direct host operations exclude run reservation without changing ordinary root reentry.
+    autonomy_mutations: tokio::sync::RwLock<()>,
+    autonomy_extensions: Arc<crate::autonomy::FrozenAutonomyExtensions>,
+}
+
+impl std::ops::Deref for RuntimeAgent {
+    type Target = RuntimeAgentState;
+
+    // All execution handles refer to the same locks, generations, memory and root gate.
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl std::ops::DerefMut for RuntimeAgent {
+    // Fluent construction is exclusive; a retained task must never receive a silently detached configuration copy.
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        Arc::get_mut(&mut self.inner)
+            .expect("finish runtime configuration before publishing task handles")
+    }
 }
 
 impl std::fmt::Debug for RuntimeAgent {
@@ -840,6 +1043,7 @@ impl RuntimeAgent {
     }
 
     /// Constructs auxiliary consumers fallibly while preserving legacy optional selection.
+    /// One shared live state owns execution identity; internal controller handles reuse its history, locks and generations rather than copying them.
     #[allow(clippy::too_many_arguments)]
     pub fn try_new(
         info: AgentInfo,
@@ -853,6 +1057,11 @@ impl RuntimeAgent {
         llm_registry
             .validate_router_roles()
             .map_err(|error| AgentError::Config(error.to_string()))?;
+        let root_turn_gate = Arc::new(tokio::sync::Mutex::new(()));
+        let memory: Arc<dyn Memory> = Arc::new(crate::autonomy::TaskMemory::new(
+            memory,
+            root_turn_gate.clone(),
+        ));
         let (skill_router, skill_executor) = if !skills.is_empty() {
             let router_llm = match llm_registry
                 .resolve_role_override(ai_agents_llm::LLMRole::SkillsSelection, None)
@@ -872,69 +1081,145 @@ impl RuntimeAgent {
             ContextManager::new(HashMap::new(), info.name.clone(), info.version.clone());
 
         Ok(Self {
-            info,
-            llm_registry,
-            memory,
-            tools,
-            skills,
-            skill_router,
-            skill_executor,
-            base_system_prompt: system_prompt,
-            max_iterations,
-            iteration_count: RwLock::new(0),
-            max_context_tokens: 128000,
-            memory_token_budget: None,
-            recovery_manager: RecoveryManager::default(),
-            tool_security: ToolSecurityEngine::default(),
-            process_processor: None,
-            message_filters: RwLock::new(HashMap::new()),
-            state_machine: None,
-            transition_evaluator: None,
-            context_manager: Arc::new(context_manager),
-            template_renderer: TemplateRenderer::new(),
-            tool_call_history: RwLock::new(Vec::new()),
-            parallel_tools: ParallelToolsConfig::default(),
-            streaming: StreamingConfig::default(),
-            hooks: Arc::new(NoopHooks),
-            hitl_engine: None,
-            approval_handler: Arc::new(RejectAllHandler::new()),
-            storage_config: StorageConfig::default(),
-            storage: RwLock::new(None),
-            storage_init: tokio::sync::Mutex::new(()),
-            reasoning_config: ReasoningConfig::default(),
-            reflection_config: ReflectionConfig::default(),
-            disambiguation_manager: None,
-            disambiguation_epoch: AtomicU64::new(0),
-            disambiguation_admission: tokio::sync::RwLock::new(()),
-            state_transition_reserved: AtomicBool::new(false),
-            persona_manager: None,
-            pending_skill_id: RwLock::new(None),
-            current_plan: RwLock::new(None),
-            declared_tool_ids: None,
-            context_initialized: AtomicBool::new(false),
-            spawner: None,
-            spawner_registry: None,
-            redispatch_depth: RwLock::new(0),
-            active_turn_context: RwLock::new(None),
-            root_user_message_committed: AtomicBool::new(false),
-            active_native_exchanges: RwLock::new(Vec::new()),
-            actor_id: RwLock::new(None),
-            fact_store: RwLock::new(None),
-            fact_extractor: RwLock::new(None),
-            actor_facts_cache: Arc::new(RwLock::new(HashMap::new())),
-            messages_since_extraction: Arc::new(RwLock::new(0)),
-            actor_memory_config: None,
-            facts_config: None,
-            session_metadata: RwLock::new(ai_agents_core::SessionMetadata::default()),
-            current_session_id: RwLock::new(None),
-            relationship_manager: None,
-            observability_manager: None,
-            runtime_config: RuntimeConfig::default(),
-            background_maintenance: Arc::new(BackgroundMaintenanceQueue::default()),
-            resource_locks: new_tool_resource_locks(),
-            runtime_control: Arc::new(RuntimeControlState::default()),
-            root_turn_gate: Arc::new(tokio::sync::Mutex::new(())),
+            automatic_host: None,
+            inner: Arc::new(RuntimeAgentState {
+                automatic_host: RwLock::new(std::sync::Weak::new()),
+                info,
+                llm_registry,
+                memory,
+                tools,
+                skills,
+                skill_router,
+                skill_executor,
+                base_system_prompt: system_prompt,
+                max_iterations,
+                iteration_count: RwLock::new(0),
+                max_context_tokens: 128000,
+                memory_token_budget: None,
+                recovery_manager: RecoveryManager::default(),
+                tool_security: ToolSecurityEngine::default(),
+                process_processor: None,
+                message_filters: RwLock::new(HashMap::new()),
+                state_machine: None,
+                transition_evaluator: None,
+                context_manager: Arc::new(context_manager),
+                template_renderer: TemplateRenderer::new(),
+                tool_call_history: RwLock::new(Vec::new()),
+                parallel_tools: ParallelToolsConfig::default(),
+                streaming: StreamingConfig::default(),
+                hooks: Arc::new(NoopHooks),
+                hitl_engine: None,
+                approval_handler: Arc::new(RejectAllHandler::new()),
+                storage_config: StorageConfig::default(),
+                storage: RwLock::new(None),
+                storage_init: tokio::sync::Mutex::new(()),
+                reasoning_config: ReasoningConfig::default(),
+                reflection_config: ReflectionConfig::default(),
+                disambiguation_manager: None,
+                disambiguation_epoch: AtomicU64::new(0),
+                disambiguation_admission: tokio::sync::RwLock::new(()),
+                state_transition_reserved: AtomicBool::new(false),
+                persona_manager: None,
+                pending_skill_id: RwLock::new(None),
+                pending_automatic_input: Default::default(),
+                current_plan: RwLock::new(None),
+                declared_tool_ids: None,
+                context_initialized: AtomicBool::new(false),
+                spawner: None,
+                spawner_registry: None,
+                redispatch_depth: RwLock::new(0),
+                active_turn_context: RwLock::new(None),
+                root_user_message_committed: AtomicBool::new(false),
+                active_native_exchanges: RwLock::new(Vec::new()),
+                actor_id: RwLock::new(None),
+                fact_store: RwLock::new(None),
+                fact_extractor: RwLock::new(None),
+                actor_facts_cache: Arc::new(RwLock::new(HashMap::new())),
+                messages_since_extraction: Arc::new(RwLock::new(0)),
+                actor_memory_config: None,
+                facts_config: None,
+                session_metadata: RwLock::new(ai_agents_core::SessionMetadata::default()),
+                current_session_id: RwLock::new(None),
+                relationship_manager: None,
+                observability_manager: None,
+                runtime_config: RuntimeConfig::default(),
+                background_maintenance: Arc::new(BackgroundMaintenanceQueue::default()),
+                resource_locks: new_tool_resource_locks(),
+                observation_mutations: Arc::new(AtomicU64::new(0)),
+                runtime_control: Arc::new(RuntimeControlState::default()),
+                root_turn_gate,
+                autonomy_owner: Arc::new(RwLock::new(None)),
+                autonomy_mutations: tokio::sync::RwLock::new(()),
+                autonomy_extensions: crate::autonomy::AutonomyExtensions::builtins().freeze(),
+            }),
         })
+    }
+
+    /// Compares the actual shared runtime identity, not the address of an internal controller handle.
+    pub(crate) fn same_runtime(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    /// Borrows the live state into an owned controller handle without retaining its hosting service in a cycle.
+    pub(crate) fn shared_task_handle(&self) -> Arc<Self> {
+        Arc::new(Self {
+            inner: self.inner.clone(),
+            automatic_host: None,
+        })
+    }
+
+    /// Captures immutable host bindings before the builder publishes this runtime.
+    pub(crate) fn with_autonomy_extensions(
+        mut self,
+        extensions: Arc<crate::autonomy::FrozenAutonomyExtensions>,
+    ) -> Self {
+        self.autonomy_extensions = extensions;
+        self
+    }
+
+    /// Returns the canonical store for explicit host bindings, not another mutable task authority.
+    pub fn todo_store(&self) -> ai_agents_tools::TodoStore {
+        self.tools.todo_store()
+    }
+
+    /// Reports construction-time inventory; every invocation still rechecks policy, availability and state narrowing.
+    pub fn validation_capabilities(&self) -> crate::autonomy::ValidationCapabilities {
+        let scope = self.runtime_control.tool_scope_override.read().clone();
+        crate::autonomy::ValidationCapabilities {
+            tools: self
+                .get_top_level_tool_ids_for_scope(scope.as_deref())
+                .into_iter()
+                .filter(|id| self.validation_operation_available(id))
+                .collect(),
+            judge: self.llm_registry.default().is_ok(),
+            planner: self.llm_registry.default().is_ok(),
+            host_revisions: self.autonomy_extensions.has_host_revisions(),
+        }
+    }
+
+    /// Capability presence does not authorize a call; host-bound calls retain the complete shared execution path.
+    pub(crate) fn validation_operation_available(&self, tool: &str) -> bool {
+        self.tools.resolve(tool).is_some() && self.host_tool_unavailability(tool).is_none()
+    }
+
+    /// Retains mutation freshness across independent SDK driver round trips without constructing a task ledger.
+    pub(crate) fn observation_mutation_clock(&self) -> Arc<AtomicU64> {
+        self.observation_mutations.clone()
+    }
+
+    /// Provides frozen adapters for selected-profile preflight without replacing live bindings.
+    pub fn autonomy_extensions(&self) -> &Arc<crate::autonomy::FrozenAutonomyExtensions> {
+        &self.autonomy_extensions
+    }
+
+    /// Matches explicit host validation authority and uses the ordinary executor; labels or model arguments cannot mint permits.
+    pub async fn invoke_host_validation(
+        &self,
+        binding: &str,
+        request: ToolExecutionRequest,
+        context: &crate::autonomy::HostValidationContext<'_>,
+    ) -> Result<ToolExecutionRecord> {
+        crate::autonomy::invoke_bound(self, binding, request, context).await
     }
 
     pub fn with_declared_tool_ids(mut self, ids: Option<Vec<String>>) -> Self {
@@ -1054,7 +1339,17 @@ impl RuntimeAgent {
         current_turn_actor_context()
     }
 
-    fn effective_actor_id(&self) -> Option<String> {
+    // An admitted task retains one actor/storage scope even if context resolution updates session defaults.
+    // Configured runners capture this resolved scope so later host lookups cannot reuse another actor's store.
+    pub(crate) fn effective_actor_id(&self) -> Option<String> {
+        if let Some(input) = crate::autonomy::current_turn_input(&self.root_turn_gate) {
+            return input.owner.actor_id.clone();
+        }
+        if let Some(execution) = crate::autonomy::current_execution()
+            && Arc::ptr_eq(&execution.owner.gate, &self.root_turn_gate)
+        {
+            return execution.owner.actor_id.clone();
+        }
         self.current_turn_actor_context()
             .and_then(|ctx| ctx.effective_actor_id().map(|id| id.to_string()))
             .or_else(|| self.actor_id.read().clone())
@@ -1151,27 +1446,49 @@ impl RuntimeAgent {
         actor_context: crate::TurnActorContext,
     ) -> Pin<Box<dyn Future<Output = Result<AgentResponse>> + Send + 'a>> {
         Box::pin(async move {
+            if let Some(execution) = crate::autonomy::current_execution()
+                && !current_runtime_gate_identity_stack()
+                    .iter()
+                    .any(|gate| Arc::ptr_eq(gate, &self.root_turn_gate))
+            {
+                let result = self
+                    .run_task_participant(input, Some(actor_context), execution.clone())
+                    .await;
+                if result.is_err()
+                    && !matches!(&result, Err(AgentError::TaskSuspended(_)))
+                    && crate::autonomy::child_required()
+                {
+                    execution.stop("required_child_failure");
+                }
+                return result;
+            }
+            if self.automatic_host().is_some() {
+                return Box::pin(self.automatic_chat(input, Some(actor_context))).await;
+            }
             let RootTurnAdmission {
                 guard,
                 identity_stack,
             } = self.acquire_root_turn().await?;
-            let result = scope_runtime_gate_identity_stack(&identity_stack, async move {
-                let actor_id = actor_context.effective_actor_id().map(str::to_string);
-                let run = async move {
-                    scope_actor_context(
-                        actor_context,
-                        Box::pin(async move { self.run_loop(input).await }),
-                    )
-                    .await
-                };
-                let result = if let Some(context) = self.build_observation_context(actor_id) {
-                    with_observation_context(context, run).await
-                } else {
-                    run.await
-                };
-                self.export_observability_if_configured().await;
-                result
-            })
+            let result = Box::pin(scope_runtime_gate_identity_stack(
+                &identity_stack,
+                async move {
+                    let actor_id = actor_context.effective_actor_id().map(str::to_string);
+                    let run = async move {
+                        scope_actor_context(
+                            actor_context,
+                            Box::pin(async move { self.run_loop(input).await }),
+                        )
+                        .await
+                    };
+                    let result = if let Some(context) = self.build_observation_context(actor_id) {
+                        with_observation_context(context, run).await
+                    } else {
+                        run.await
+                    };
+                    self.export_observability_if_configured().await;
+                    result
+                },
+            ))
             .await;
             drop(guard);
             result
@@ -1180,6 +1497,13 @@ impl RuntimeAgent {
 
     /// Rejects recursive ownership before waiting, then acquires the external root-turn gate and builds one immutable extended ancestry snapshot.
     async fn acquire_root_turn(&self) -> Result<RootTurnAdmission> {
+        self.check_autonomy_access()?;
+        if let Some(execution) = crate::autonomy::current_execution() {
+            execution.stop("unsupported_child_participation");
+            return Err(AgentError::Config(
+                "autonomy child participation is not installed".into(),
+            ));
+        }
         let gate_identity = Arc::clone(&self.root_turn_gate);
         let current_identity_stack = current_runtime_gate_identity_stack();
         if current_identity_stack
@@ -1192,6 +1516,7 @@ impl RuntimeAgent {
             )));
         }
         let guard = Arc::clone(&gate_identity).lock_owned().await;
+        self.check_autonomy_access()?;
         //
         // Root admission is the only place that extends ancestry, so later scopes can preserve the complete chain with an `Arc` clone.
         //
@@ -1202,6 +1527,574 @@ impl RuntimeAgent {
             guard,
             identity_stack: identity_stack.into(),
         })
+    }
+
+    // Direct operations must carry the private runtime-qualified owner, not a request source label.
+    fn check_autonomy_operation(&self) -> Result<()> {
+        if let Some(owner) = self.autonomy_owner.read().as_ref() {
+            let permitted = crate::autonomy::current_turn_input(&self.root_turn_gate)
+                .is_some_and(|input| Arc::ptr_eq(&input.owner, owner))
+                || crate::autonomy::current_execution().is_some_and(|execution| {
+                    Arc::ptr_eq(&execution.owner, owner) || execution.participants.owns(owner)
+                });
+            if !permitted {
+                return Err(AgentError::Other(
+                    "runtime is reserved by an autonomy run".into(),
+                ));
+            }
+            owner.check()?;
+            if crate::autonomy::current_execution()
+                .is_some_and(|execution| execution.stop_reason().is_some())
+            {
+                return Err(AgentError::Other("autonomy execution has stopped".into()));
+            }
+        } else if crate::autonomy::current_execution().is_some() {
+            return Err(AgentError::Config(
+                "autonomy child participation is not installed".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    // External entry cannot use a run ID or task label to enter a reserved runtime.
+    fn check_autonomy_access(&self) -> Result<()> {
+        if let Some(owner) = self.autonomy_owner.read().as_ref() {
+            return Err(AgentError::Other(format!(
+                "RuntimeAgent '{}' is busy with autonomy run '{}'",
+                self.info.id, owner.run_id
+            )));
+        }
+        Ok(())
+    }
+
+    /// Checks actual prepared provider, memory and maintenance bindings before standalone or inherited child work begins.
+    /// Managed participation is explicit; registration and optimization flags do not certify hidden custom work.
+    pub(crate) fn preflight_standalone_autonomy(&self) -> Result<()> {
+        if self.autonomy_owner.read().is_none()
+            && self
+                .disambiguation_manager
+                .as_ref()
+                .map(|manager| manager.has_pending_now())
+                .transpose()?
+                .unwrap_or(false)
+        {
+            return Err(AgentError::Config(
+                "task entry cannot adopt an unrelated clarification exchange".into(),
+            ));
+        }
+        if self.llm_registry.aliases().iter().any(|alias| {
+            self.llm_registry
+                .get(alias)
+                .is_ok_and(|provider| !provider.manages_invocation_admission())
+        }) {
+            return Err(AgentError::Config(
+                "frozen provider lacks task admission capability".into(),
+            ));
+        }
+        if !self.memory.supports_task_admission() {
+            return Err(AgentError::Config(
+                "memory lacks provenance/admission capability".into(),
+            ));
+        }
+        self.task_maintenance_providers()?;
+
+        Ok(())
+    }
+
+    /// Runs a child under its own gate and reservation with inherited accounting and protection after drop or failed acknowledgement.
+    /// Dependency-only reentry needs acknowledged predecessor retirement, and child outcome acknowledgement precedes aggregation and release.
+    /// A slot waiting for the root gate must observe a sibling's closed admission barrier before classifying a parked-target conflict.
+    fn run_task_participant<'a>(
+        &'a self,
+        input: &'a str,
+        actor: Option<crate::TurnActorContext>,
+        execution: Arc<crate::autonomy::RunExecution>,
+    ) -> Pin<Box<dyn Future<Output = Result<AgentResponse>> + Send + 'a>> {
+        Box::pin(async move {
+            self.preflight_standalone_autonomy()?;
+            self.preflight_priced_autonomy(
+                ai_agents_core::autonomy::InvocationAdmission::requires_priced_llm(
+                    execution.as_ref(),
+                ),
+            )?;
+            if let Some((store, _)) = execution.task_todos()
+                && self
+                    .validation_capabilities()
+                    .tools
+                    .iter()
+                    .any(|id| id == "todo")
+                && self
+                    .tools
+                    .get("todo")
+                    .is_some_and(|tool| !tool.manages_task_todos())
+                && !self.todo_store().shares_store(&store)
+            {
+                return Err(AgentError::Config(
+                    "child todo implementation does not share the canonical task authority".into(),
+                ));
+            }
+
+            // Capture even parked continuations on the coordinating collector set before any resumed child work.
+            execution.owner.telemetry.register(self.observability());
+            let ancestry = current_runtime_gate_identity_stack();
+            if ancestry
+                .iter()
+                .any(|gate| Arc::ptr_eq(gate, &self.root_turn_gate))
+            {
+                return Err(AgentError::Other("reentrant task participant".into()));
+            }
+            if let Some(operation) = crate::autonomy::current_child_invocation(&self.info.id)
+                && let Some(frame) =
+                    Box::pin(execution.parked_child_composition(&operation, input, &self.info.id))
+                        .await?
+            {
+                let targets = {
+                    let frames = execution.delegate_frames.lock();
+                    crate::autonomy::composition::response_targets_frame(&frame, &frames)
+                };
+                if targets
+                    || execution.deferred_batch_ready(&frame)
+                    || execution.deferred_declared_ready(&frame)
+                {
+                    return Box::pin(self.resume_parked_task_composition(
+                        input, actor, execution, operation, frame,
+                    ))
+                    .await;
+                }
+                return Err(AgentError::TaskSuspended(frame.id));
+            }
+            if let Some(operation) = crate::autonomy::current_child_invocation(&self.info.id)
+                && let Some((pending, batch)) =
+                    Box::pin(execution.parked_child_batch(&operation, input, &self.info.id)).await?
+            {
+                if let Some(response) =
+                    crate::autonomy::composition::take_group_response(&operation, &pending.id)
+                {
+                    return Box::pin(self.resume_parked_task_child(
+                        input, actor, execution, operation, pending, batch, response,
+                    ))
+                    .await;
+                }
+                return Err(AgentError::TaskSuspended(pending.id));
+            }
+
+            let guard = loop {
+                // Ordinary callbacks may reenter this runtime; drain without its gate, then recheck under the gate before installing an owner.
+                if execution
+                    .participants
+                    .owner_for(&self.root_turn_gate)
+                    .is_none()
+                {
+                    Box::pin(self.await_task_maintenance_handoff(&execution)).await?;
+                }
+                let lock = self.root_turn_gate.clone().lock_owned();
+                let guard = tokio::time::timeout(execution.remaining_duration(), async {
+                tokio::pin!(lock);
+                loop {
+                    tokio::select! { guard = &mut lock => return Ok(guard), _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {
+                        if ai_agents_core::autonomy::InvocationAdmission::execution_stopped(execution.as_ref()) { return Err(AgentError::Other("child root admission cancelled".into())); }
+                    } }
+                }
+            }).await.map_err(|_| AgentError::Other("child root admission deadline exceeded".into()))??;
+                if execution
+                    .participants
+                    .owner_for(&self.root_turn_gate)
+                    .is_some()
+                    || self.background_maintenance.is_empty()
+                {
+                    break guard;
+                }
+                drop(guard);
+            };
+            if let Some(parent) = crate::autonomy::composition::composition_admission_denial() {
+                return Err(AgentError::TaskSuspended(parent));
+            }
+            let incoming = crate::autonomy::current_child_invocation(&self.info.id);
+            if execution.target_has_pending_operation(&self.info.id, incoming.as_deref()) {
+                return Err(AgentError::Config(
+                    "another incoming operation still owns this parked runtime".into(),
+                ));
+            }
+
+            let _mutations = self.autonomy_mutations.try_write().map_err(|_| {
+                AgentError::Other("child runtime has an active host operation".into())
+            })?;
+            let owner = if let Some(owner) = execution.participants.owner_for(&self.root_turn_gate)
+            {
+                if self
+                    .autonomy_owner
+                    .read()
+                    .as_ref()
+                    .is_none_or(|current| !Arc::ptr_eq(current, &owner))
+                {
+                    return Err(AgentError::Other("child runtime owner changed".into()));
+                }
+                owner.check()?;
+                if actor
+                    .as_ref()
+                    .and_then(|context| context.effective_actor_id())
+                    .is_some_and(|actor| owner.actor_id.as_deref() != Some(actor))
+                    && !crate::autonomy::current_child_invocation(&self.info.id)
+                        .is_some_and(|operation| execution.has_composition_child(&operation))
+                {
+                    return Err(AgentError::Other(
+                        "child actor scope differs from its admitted binding".into(),
+                    ));
+                }
+                owner
+            } else {
+                self.check_autonomy_access()?;
+                crate::autonomy::RunOwner::new(
+                    execution.run_id.clone(),
+                    self.root_turn_gate.clone(),
+                    actor
+                        .as_ref()
+                        .and_then(|context| context.effective_actor_id().map(str::to_string))
+                        .or_else(|| self.effective_actor_id()),
+                )?
+            };
+
+            // Box ledger futures before nesting runtime polling; checkpoints contain large exact continuation DTOs.
+            let mut lease = Box::pin(execution.enroll_child(
+                owner.clone(),
+                self.autonomy_owner.clone(),
+                crate::autonomy::current_child_invocation(&self.info.id).as_deref(),
+            ))
+            .await?;
+            drop(_mutations);
+            let mut cleanup = crate::autonomy::OwnedTurnCleanup::new(owner.clone());
+            let operation = crate::autonomy::current_child_invocation(&self.info.id)
+                .unwrap_or_else(|| execution.next_child_operation(&self.info.id));
+            let mut identities = ancestry.to_vec();
+            identities.push(self.root_turn_gate.clone());
+            let identities: RootTurnGateIdentityStack = identities.into();
+            let turn = crate::autonomy::AutonomyTurnInput {
+                owner,
+                objective: input.into(),
+                controller_message:
+                    serde_json::json!({"delegated_objective":input,"operation":operation})
+                        .to_string(),
+                source: crate::autonomy::AutonomyTurnSource::ChildObjective,
+            };
+            let result = scope_runtime_gate_identity_stack(
+                &identities,
+                crate::autonomy::scope_turn(
+                    turn,
+                    Box::pin(async {
+                        Box::pin(self.init_storage()).await?;
+                        if let Some(cached) =
+                            Box::pin(execution.cached_child(&operation, input, &self.info.id))
+                                .await?
+                        {
+                            Box::pin(execution.verify_child_actor(&operation, &actor)).await?;
+                            return Ok(cached);
+                        }
+
+                        let initial = crate::autonomy::TaskRuntimeCheckpoint::between_turns(
+                            Box::pin(self.save_state_full()).await?,
+                        )?;
+                        Box::pin(execution.checkpoint_child(&operation, initial, input, None))
+                            .await?;
+                        Box::pin(execution.bind_child_actor(&operation, &actor)).await?;
+
+                        let outcome = crate::autonomy::scope_child_operation(
+                            operation.clone(),
+                            crate::autonomy::scope_child_requirement(
+                                crate::autonomy::child_required(),
+                                async {
+                                    if let Some(actor) = actor {
+                                        scope_actor_context(actor, Box::pin(self.run_loop(input)))
+                                            .await
+                                    } else {
+                                        Box::pin(self.run_loop(input)).await
+                                    }
+                                },
+                            ),
+                        )
+                        .await;
+
+                        self.export_observability_if_configured().await;
+                        if matches!(&outcome, Err(AgentError::TaskSuspended(_))) {
+                            let batch = execution.parked_batches.lock().get(&self.info.id).cloned();
+                            let runtime = Box::pin(self.task_suspension_snapshot()).await?;
+                            let message_parent = execution.delegate_frames.lock().get(&self.info.id)
+                                .is_some_and(|frame| frame.dispatch == crate::autonomy::composition::CompositionDispatch::ToolBatch);
+                            if let Some(batch) = batch.filter(|_| !message_parent) {
+                                Box::pin(
+                                    execution.checkpoint_child_park(&operation, runtime, batch),
+                                )
+                                .await?;
+                            } else {
+                                Box::pin(
+                                    execution
+                                        .checkpoint_child_composition_park(&operation, runtime),
+                                )
+                                .await?;
+                            }
+                            return Ok::<_, AgentError>(outcome);
+                        }
+                        let runtime = crate::autonomy::TaskRuntimeCheckpoint::between_turns(
+                            Box::pin(self.save_state_full()).await?,
+                        )?;
+                        Box::pin(execution.checkpoint_child(
+                            &operation,
+                            runtime,
+                            input,
+                            Some(&outcome),
+                        ))
+                        .await?;
+                        Ok::<_, AgentError>(outcome)
+                    }),
+                ),
+            )
+            .await;
+            match result {
+                Ok(outcome) => {
+                    if matches!(&outcome, Err(AgentError::TaskSuspended(_))) {
+                        lease.acknowledge_park();
+                    } else {
+                        lease.acknowledge();
+                    }
+                    cleanup.finish();
+                    drop(guard);
+                    outcome
+                }
+                Err(error) => Err(error),
+            }
+        })
+    }
+
+    /// Drains pre-existing ordinary work without adopting its effects or charging it to the incoming task.
+    /// Dropping or stopping this wait leaves the queue's shared completions intact; no child owner is installed until acknowledged quiescence.
+    async fn await_task_maintenance_handoff(
+        &self,
+        execution: &crate::autonomy::RunExecution,
+    ) -> Result<()> {
+        let drain = self.flush_background_tasks();
+        tokio::pin!(drain);
+        let mut tick = tokio::time::interval(std::time::Duration::from_millis(10));
+        loop {
+            if ai_agents_core::autonomy::InvocationAdmission::execution_stopped(execution)
+                || ai_agents_llm::current_invocation_bounds()
+                    .is_some_and(|bounds| bounds.remaining().is_zero())
+            {
+                return Err(AgentError::Other(
+                    "child maintenance handoff stopped".into(),
+                ));
+            }
+            ai_agents_llm::validate_invocation_evidence()?;
+            tokio::select! {
+                result = &mut drain => {
+                    result?;
+                    let payload: Box<crate::autonomy::TaskCheckpointPayload> = serde_json::from_value(execution.load_owned().await?.payload)?;
+                    execution.check(&payload)?;
+                    ai_agents_llm::validate_invocation_evidence()?;
+                    return Ok(());
+                },
+                _ = tick.tick() => {}
+            }
+        }
+    }
+
+    /// Renders one accepted objective from immutable invocation data before the run owns or mutates the runtime.
+    /// Input aliases share the accepted invocation value, so an explicitly invoked profile can reuse an automatic scope's objective template.
+    pub(crate) fn render_autonomy_objective(&self, template: &str, input: &str) -> Result<String> {
+        let mut environment = minijinja::Environment::new();
+        environment.set_undefined_behavior(minijinja::UndefinedBehavior::Strict);
+        environment.render_str(template, serde_json::json!({"input":input,"user_input":input,"objective":input,"context":self.context_manager.get_all(),"state":self.current_state()})).map_err(|error| AgentError::TemplateError(error.to_string()))
+    }
+
+    /// Captures actual maintenance, storage and callback providers without replacing frozen handles or granting new effects.
+    /// Custom consumers must explicitly preserve caller scope; labels and registered names cannot certify hidden work.
+    fn task_maintenance_providers(&self) -> Result<Vec<Arc<dyn LLMProvider>>> {
+        let mut providers = self.hooks.task_providers().ok_or_else(|| {
+            AgentError::Config("runtime hooks lack task admission capability".into())
+        })?;
+        if let Some(storage) = self.storage.read().as_ref() {
+            providers.extend(storage.task_providers().ok_or_else(|| {
+                AgentError::Config("runtime storage lacks task admission capability".into())
+            })?);
+        }
+        if let Some(store) = self.fact_store.read().as_ref() {
+            providers.extend(store.task_providers().ok_or_else(|| {
+                AgentError::Config("fact storage lacks task admission capability".into())
+            })?);
+        }
+        if let Some(extractor) = self.fact_extractor.read().as_ref() {
+            providers.extend(extractor.task_providers().ok_or_else(|| {
+                AgentError::Config("fact extractor lacks task admission capability".into())
+            })?);
+        }
+        if let Some(manager) = &self.relationship_manager {
+            providers.extend(manager.task_providers().ok_or_else(|| {
+                AgentError::Config("relationship evaluator lacks task admission capability".into())
+            })?);
+        }
+        if providers
+            .iter()
+            .any(|provider| !provider.manages_invocation_admission())
+        {
+            return Err(AgentError::Config(
+                "maintenance provider lacks task admission capability".into(),
+            ));
+        }
+        Ok(providers)
+    }
+
+    /// Checks frozen registry and maintenance participants before a hard-priced run; each actual request still needs its own bound.
+    pub(crate) fn preflight_priced_autonomy(&self, priced: bool) -> Result<()> {
+        if priced
+            && (self.llm_registry.aliases().iter().any(|alias| {
+                self.llm_registry
+                    .get(alias)
+                    .is_ok_and(|provider| provider.priced_capability_identity().is_none())
+            }) || self
+                .task_maintenance_providers()?
+                .iter()
+                .any(|provider| provider.priced_capability_identity().is_none()))
+        {
+            return Err(AgentError::Config(
+                "priced cost needs a verified provider accounting binding before task admission"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Reserves a runtime under the root gate; subsequent turns use the private capability, not public chat.
+    pub(crate) async fn reserve_autonomy_run(
+        &self,
+        run_id: String,
+    ) -> Result<Arc<crate::autonomy::RunOwner>> {
+        let admission = loop {
+            let admission = self.acquire_root_turn().await?;
+            scope_runtime_gate_identity_stack(&admission.identity_stack, self.init_storage())
+                .await?;
+            self.preflight_standalone_autonomy()?;
+            if self.background_maintenance.is_empty() {
+                break admission;
+            }
+            // A previous ordinary callback can need this gate; never wait for it while preventing its own completion.
+            drop(admission);
+            self.flush_background_tasks().await?;
+        };
+        if self
+            .disambiguation_manager
+            .as_ref()
+            .map(|manager| manager.has_pending_now())
+            .transpose()?
+            .unwrap_or(false)
+        {
+            return Err(AgentError::Config(
+                "task entry cannot adopt an unrelated clarification exchange".into(),
+            ));
+        }
+        // Never wait for mutations while holding the root gate: their hooks may need that same gate.
+        let _mutations = self
+            .autonomy_mutations
+            .try_write()
+            .map_err(|_| AgentError::Other("runtime has an active host operation".into()))?;
+        let owner = crate::autonomy::RunOwner::new(
+            run_id,
+            self.root_turn_gate.clone(),
+            self.effective_actor_id(),
+        )?;
+        owner.telemetry.register(self.observability());
+        *self.autonomy_owner.write() = Some(owner.clone());
+        drop(admission);
+        Ok(owner)
+    }
+
+    /// Releases only the exact owner after acknowledged settlement and maintenance quiescence, then retires private response and skill bindings.
+    /// Close work admission before waiting for the gate so a captured producer cannot race cleanup.
+    pub(crate) async fn release_autonomy_run(
+        &self,
+        owner: &Arc<crate::autonomy::RunOwner>,
+    ) -> Result<()> {
+        owner.work.close();
+        if owner.work.unsettled() {
+            return Err(AgentError::Other(
+                "runtime maintenance is not acknowledged quiescent".into(),
+            ));
+        }
+        let _gate = self.root_turn_gate.lock().await;
+        let mut current = self.autonomy_owner.write();
+        if current
+            .as_ref()
+            .is_none_or(|active| !Arc::ptr_eq(active, owner))
+        {
+            return Err(AgentError::Other("autonomy runtime owner mismatch".into()));
+        }
+        *current = None;
+        owner.responses.lock().clear();
+        owner.skill_finishing.lock().clear();
+        Ok(())
+    }
+
+    /// Executes one admitted ordinary controller turn while retaining the native root owner and a single finalizer.
+    pub(crate) async fn run_autonomy_turn(
+        &self,
+        input: crate::autonomy::AutonomyTurnInput,
+    ) -> Result<AgentResponse> {
+        Box::pin(self.run_autonomy_turn_with_skill(input, None, None)).await
+    }
+
+    /// Resumes a capacity-denied script or model loop under the same root gate without replaying completed work or resetting iterations.
+    pub(crate) async fn run_autonomy_turn_with_skill(
+        &self,
+        input: crate::autonomy::AutonomyTurnInput,
+        skill: Option<Box<crate::autonomy::location::TaskSkillLocation>>,
+        model: Option<Box<crate::autonomy::TaskLoopState>>,
+    ) -> Result<AgentResponse> {
+        let active = self.autonomy_owner.read().clone();
+        if active
+            .as_ref()
+            .is_none_or(|owner| !Arc::ptr_eq(owner, &input.owner))
+        {
+            return Err(AgentError::Other("autonomy runtime owner mismatch".into()));
+        }
+        input.owner.check()?;
+        let stack = current_runtime_gate_identity_stack();
+        if stack
+            .iter()
+            .any(|gate| Arc::ptr_eq(gate, &self.root_turn_gate))
+        {
+            return Err(AgentError::Other("reentrant autonomy turn".into()));
+        }
+        let guard = self.root_turn_gate.clone().lock_owned().await;
+        if self
+            .autonomy_owner
+            .read()
+            .as_ref()
+            .is_none_or(|owner| !Arc::ptr_eq(owner, &input.owner))
+        {
+            return Err(AgentError::Other("autonomy runtime owner mismatch".into()));
+        }
+        input.owner.check()?;
+        let mut identities = stack.to_vec();
+        identities.push(self.root_turn_gate.clone());
+        let identities: RootTurnGateIdentityStack = identities.into();
+        let mut cleanup = crate::autonomy::OwnedTurnCleanup::new(input.owner.clone());
+        let objective = input.objective.clone();
+        let prepared = input.owner.prepared.lock().take();
+        let work: Pin<Box<dyn Future<Output = Result<AgentResponse>> + Send + '_>> =
+            if let Some(prepared) = prepared {
+                Box::pin(self.run_automatic_prepared(prepared))
+            } else if let Some(skill) = skill {
+                self.resume_capacity_skill(skill)
+            } else if let Some(model) = model {
+                self.resume_capacity_model(model)
+            } else {
+                Box::pin(self.run_loop(&objective))
+            };
+        let result = scope_runtime_gate_identity_stack(
+            &identities,
+            crate::autonomy::scope_turn(input, work),
+        )
+        .await;
+        cleanup.finish();
+        drop(guard);
+        result
     }
 
     /// Run one serialized turn with turn-scoped actor context without mutating the runtime's global actor ID.
@@ -1222,10 +2115,18 @@ impl RuntimeAgent {
         self.chat_with_actor_context(input, actor_context).await
     }
 
-    /// Ensure the effective actor's relationship is loaded from storage into the relationship manager.
+    /// Loads a relationship only under the actual runtime owner, retaining its storage and callback tail across cancellation.
     pub async fn load_actor_relationship(&self) -> Result<()> {
-        self.maybe_load_actor_relationship().await;
-        Ok(())
+        let _mutations = self
+            .autonomy_mutations
+            .try_read()
+            .map_err(|_| AgentError::Other("runtime is admitting an autonomy run".into()))?;
+        self.check_autonomy_operation()?;
+        crate::autonomy::owned_maintenance(
+            "relationship_load",
+            self.maybe_load_actor_relationship(),
+        )
+        .await
     }
 
     /// Manually apply a delta to the effective actor's `agent_to_actor` relationship perspective and persist the updated relationship when storage is configured.
@@ -1254,6 +2155,26 @@ impl RuntimeAgent {
         delta: f64,
         reason: Option<&str>,
     ) -> Result<ai_agents_relationships::DimensionChange> {
+        let _mutations = self
+            .autonomy_mutations
+            .try_read()
+            .map_err(|_| AgentError::Other("runtime is admitting an autonomy run".into()))?;
+        self.check_autonomy_operation()?;
+        crate::autonomy::owned_maintenance(
+            "relationship_update",
+            self.update_relationship_owned(perspective, dimension, delta, reason),
+        )
+        .await
+    }
+
+    // Mutation, persistence and hooks share one logical effect boundary; a returned model request is not their completion.
+    async fn update_relationship_owned(
+        &self,
+        perspective: ai_agents_relationships::RelationshipPerspective,
+        dimension: &str,
+        delta: f64,
+        reason: Option<&str>,
+    ) -> Result<ai_agents_relationships::DimensionChange> {
         let manager = self
             .relationship_manager
             .as_ref()
@@ -1261,6 +2182,7 @@ impl RuntimeAgent {
         let actor_id = self.effective_actor_id().ok_or_else(|| {
             AgentError::Config("No actor ID set. Use set_actor_id() first".into())
         })?;
+        crate::autonomy::work::maintenance_effect();
         let change = manager.update_dimension_for_perspective(
             &actor_id,
             perspective,
@@ -1332,6 +2254,11 @@ impl RuntimeAgent {
 
     /// Set the current actor ID (player, user, another agent, etc.).
     pub fn set_actor_id(&self, actor_id: &str) -> ai_agents_core::Result<()> {
+        let _mutations = self
+            .autonomy_mutations
+            .try_read()
+            .map_err(|_| AgentError::Other("runtime is admitting an autonomy run".into()))?;
+        self.check_autonomy_operation()?;
         *self.actor_id.write() = Some(actor_id.to_string());
         {
             let mut meta = self.session_metadata.write();
@@ -1343,10 +2270,16 @@ impl RuntimeAgent {
         Ok(())
     }
 
-    /// Clear the current actor binding while retaining the session actor roster.
-    pub fn clear_actor_id(&self) {
+    /// Clears the actor binding only outside unrelated task ownership, retaining the session actor roster.
+    pub fn clear_actor_id(&self) -> Result<()> {
+        let _mutations = self
+            .autonomy_mutations
+            .try_read()
+            .map_err(|_| AgentError::Other("runtime is admitting an autonomy run".into()))?;
+        self.check_autonomy_operation()?;
         *self.actor_id.write() = None;
         self.session_metadata.write().actor_id = None;
+        Ok(())
     }
 
     /// Set the current actor ID. Convenience wrapper around set_actor_id.
@@ -1354,8 +2287,18 @@ impl RuntimeAgent {
         self.set_actor_id(user_id)
     }
 
-    /// Load facts for the current actor from storage and cache them for prompt injection.
+    /// Loads actor facts only under the current runtime owner; the mutation lease excludes competing run admission across storage and hooks.
     pub async fn load_actor_memory(&self) -> ai_agents_core::Result<()> {
+        let _mutations = self
+            .autonomy_mutations
+            .try_read()
+            .map_err(|_| AgentError::Other("runtime is admitting an autonomy run".into()))?;
+        self.check_autonomy_operation()?;
+        crate::autonomy::owned_maintenance("facts_load", self.load_actor_memory_owned()).await
+    }
+
+    // Cache publication and the loaded hook remain owned even after the storage read has returned.
+    async fn load_actor_memory_owned(&self) -> Result<()> {
         let actor_id = match self.effective_actor_id() {
             Some(id) => id,
             None => return Ok(()),
@@ -1365,6 +2308,7 @@ impl RuntimeAgent {
         if let Some(store) = store_opt {
             let facts = store.get_facts(&actor_id).await?;
             let count = facts.len();
+            crate::autonomy::work::maintenance_effect();
             self.actor_facts_cache
                 .write()
                 .insert(actor_id.clone(), facts);
@@ -1376,36 +2320,66 @@ impl RuntimeAgent {
     }
 
     /// Load actor memory only when the effective actor has no cached facts yet.
-    async fn maybe_load_actor_memory(&self) {
+    async fn maybe_load_actor_memory(&self) -> Result<()> {
         let Some(actor_id) = self.effective_actor_id() else {
-            return;
+            return Ok(());
         };
         if self.actor_facts_cache.read().contains_key(&actor_id) {
-            return;
+            return Ok(());
         }
-        let _ = self.load_actor_memory().await;
+        match self.load_actor_memory().await {
+            Ok(()) => Ok(()),
+            Err(error) => self.maintenance_failure(error),
+        }
     }
 
-    /// Pre-turn lifecycle shared by streaming and non-streaming paths.
-    async fn pre_turn_session_lifecycle(&self) {
+    /// Pre-turn lifecycle shared by streaming and non-streaming paths, including owned actor loading before the first provider request.
+    async fn pre_turn_session_lifecycle(&self) -> Result<()> {
         if *self.redispatch_depth.read() > 0 {
-            return;
+            return Ok(());
         }
         self.resolve_actor_id_from_context();
         self.await_background_before_next_turn().await;
         self.record_session_actor_if_needed();
-        self.maybe_load_actor_memory().await;
-        self.maybe_load_actor_relationship().await;
-        *self.messages_since_extraction.write() += 1;
+        if self.actor_memory_config.is_some()
+            || self.facts_config.is_some()
+            || self.relationship_manager.is_some()
+        {
+            crate::autonomy::owned_maintenance("actor_load", async {
+                self.maybe_load_actor_memory().await?;
+                self.maybe_load_actor_relationship().await
+            })
+            .await?;
+        }
+        if !crate::autonomy::current_turn_input(&self.root_turn_gate)
+            .is_some_and(|input| input.controller_only())
+        {
+            *self.messages_since_extraction.write() += 1;
+        }
+        Ok(())
     }
 
     /// Post-turn lifecycle shared by streaming and non-streaming paths.
+    /// Task maintenance owns its full persistence and hook tail, not only the nested model requests.
     async fn post_turn_session_lifecycle(&self) -> Result<()> {
+        if crate::autonomy::current_turn_input(&self.root_turn_gate)
+            .is_some_and(|input| input.controller_only())
+        {
+            return Ok(());
+        }
         if *self.redispatch_depth.read() > 0 {
             return Ok(());
         }
         *self.messages_since_extraction.write() += 1;
-        self.run_post_turn_maintenance().await
+        if !self
+            .facts_config
+            .as_ref()
+            .is_some_and(|config| config.enabled && config.auto_extract)
+            && self.relationship_manager.is_none()
+        {
+            return Ok(());
+        }
+        crate::autonomy::owned_maintenance("post_turn", self.run_post_turn_maintenance()).await
     }
 
     /// Starts root-turn bookkeeping for user-message commit tracking.
@@ -1458,8 +2432,13 @@ impl RuntimeAgent {
         }
     }
 
-    /// Writes the processed user message once for the root turn.
+    /// Commits one root objective or provenance-tagged delegated input; controller continuation and redispatch do not duplicate it.
     async fn commit_root_user_message(&self, processed_input: &str) -> Result<()> {
+        if crate::autonomy::current_turn_input(&self.root_turn_gate)
+            .is_some_and(|input| !input.initial_work())
+        {
+            return Ok(());
+        }
         if *self.redispatch_depth.read() > 0 {
             return Ok(());
         }
@@ -1560,12 +2539,17 @@ impl RuntimeAgent {
         }
     }
 
-    /// Runs post-turn facts and relationship maintenance according to runtime policy.
+    /// Runs post-turn facts and relationships only for conversational input, never controller-only turns.
     async fn run_post_turn_maintenance(&self) -> Result<()> {
+        if crate::autonomy::current_turn_input(&self.root_turn_gate)
+            .is_some_and(|input| input.controller_only())
+        {
+            return Ok(());
+        }
         let optimization = &self.runtime_config.optimization;
         if !optimization.enabled {
-            self.auto_extract_facts().await;
-            self.auto_update_relationship().await;
+            self.auto_extract_facts().await?;
+            self.auto_update_relationship().await?;
             return Ok(());
         }
 
@@ -1580,13 +2564,15 @@ impl RuntimeAgent {
 
         match (facts_mode, relationships_mode) {
             (MaintenanceMode::InlineSerial, MaintenanceMode::InlineSerial) => {
-                self.auto_extract_facts().await;
-                self.auto_update_relationship().await;
+                self.auto_extract_facts().await?;
+                self.auto_update_relationship().await?;
             }
             (MaintenanceMode::InlineParallel, MaintenanceMode::InlineParallel) => {
                 let facts = self.auto_extract_facts();
                 let relationships = self.auto_update_relationship();
-                tokio::join!(facts, relationships);
+                let (facts, relationships) = tokio::join!(facts, relationships);
+                facts?;
+                relationships?;
             }
             (MaintenanceMode::Background, MaintenanceMode::Background) => {
                 self.schedule_facts_background().await?;
@@ -1595,21 +2581,22 @@ impl RuntimeAgent {
             (MaintenanceMode::Background, MaintenanceMode::InlineParallel)
             | (MaintenanceMode::Background, MaintenanceMode::InlineSerial) => {
                 self.schedule_facts_background().await?;
-                self.auto_update_relationship().await;
+                self.auto_update_relationship().await?;
             }
             (MaintenanceMode::InlineParallel, MaintenanceMode::Background)
             | (MaintenanceMode::InlineSerial, MaintenanceMode::Background) => {
-                self.auto_extract_facts().await;
+                self.auto_extract_facts().await?;
                 self.schedule_relationship_background().await?;
             }
             _ => {
-                self.auto_extract_facts().await;
-                self.auto_update_relationship().await;
+                self.auto_extract_facts().await?;
+                self.auto_update_relationship().await?;
             }
         }
         Ok(())
     }
 
+    // Schedules actor facts from a provenance-filtered snapshot, never controller-derived history.
     async fn schedule_facts_background(&self) -> Result<()> {
         let policy = self.runtime_config.optimization.post_turn.facts.clone();
         let should_extract = self
@@ -1619,6 +2606,15 @@ impl RuntimeAgent {
             .unwrap_or(false);
         if !should_extract {
             return Ok(());
+        }
+        if crate::autonomy::current_execution().is_some()
+            && let Some(actor_id) = self.effective_actor_id()
+        {
+            self.flush_background_tasks_for_actor_purpose(
+                &actor_id,
+                RuntimeTaskPurpose::PostTurnFacts,
+            )
+            .await?;
         }
         let msgs_since = *self.messages_since_extraction.read();
         if msgs_since < 2 {
@@ -1640,10 +2636,10 @@ impl RuntimeAgent {
             Ok(messages) => messages,
             Err(error) => {
                 warn!(error = %error, "failed to snapshot messages for fact extraction");
-                return Ok(());
+                return self.maintenance_failure(error);
             }
         };
-        let messages = Self::readable_native_messages(messages)?;
+        let messages = Self::actor_memory_messages(messages)?;
         let recent: Vec<_> = messages
             .iter()
             .rev()
@@ -1683,6 +2679,7 @@ impl RuntimeAgent {
                     .extract(&recent, &existing, Some(&actor_for_task), &categories)
                     .await?;
                 if !facts.is_empty() {
+                    crate::autonomy::work::maintenance_effect();
                     if let Some(store) = store {
                         let authoritative = store.add_facts(&actor_for_task, facts.clone()).await?;
                         cache.write().insert(actor_for_task.clone(), authoritative);
@@ -1719,6 +2716,7 @@ impl RuntimeAgent {
             .await
     }
 
+    // Schedules relationship maintenance from actor-visible history without changing provider replay history.
     async fn schedule_relationship_background(&self) -> Result<()> {
         let policy = self
             .runtime_config
@@ -1738,15 +2736,22 @@ impl RuntimeAgent {
             );
             return Ok(());
         };
+        if crate::autonomy::current_execution().is_some() {
+            self.flush_background_tasks_for_actor_purpose(
+                &actor_id,
+                RuntimeTaskPurpose::PostTurnRelationship,
+            )
+            .await?;
+        }
         let recent_messages = manager.config().auto_update.recent_messages;
         let messages = match self.memory.get_messages(Some(recent_messages)).await {
             Ok(messages) => messages,
             Err(error) => {
                 warn!(actor = %actor_id, error = %error, "failed to snapshot messages for relationship update");
-                return Ok(());
+                return self.maintenance_failure(error);
             }
         };
-        let messages = Self::readable_native_messages(messages)?;
+        let messages = Self::actor_memory_messages(messages)?;
         let storage = self.storage.read().clone();
         let hooks = Arc::clone(&self.hooks);
         let agent_id = self.info.id.clone();
@@ -1760,7 +2765,9 @@ impl RuntimeAgent {
         let task = async move {
             let run = async move {
                 if manager.config().auto_update.enabled {
-                    let update = manager.auto_update(&actor_for_task, &messages).await?;
+                    let proposal = manager.propose_update(&actor_for_task, &messages).await?;
+                    crate::autonomy::work::maintenance_effect();
+                    let update = manager.apply_evaluation(&actor_for_task, proposal)?;
                     if !update.changes.is_empty() {
                         hooks
                             .on_relationship_change(&actor_for_task, &update.changes)
@@ -1774,6 +2781,7 @@ impl RuntimeAgent {
                     && let (Some(storage), Some(value)) =
                         (storage, manager.relationship_as_value(&actor_for_task)?)
                 {
+                    crate::autonomy::work::maintenance_effect();
                     storage
                         .save_relationship(&agent_id, &actor_for_task, &value)
                         .await?;
@@ -1794,7 +2802,8 @@ impl RuntimeAgent {
             .await
     }
 
-    /// Queues background maintenance or applies the configured overflow behavior.
+    /// Queues maintenance with its live run lease and restrictions captured before spawning or inline overflow.
+    /// Already admitted task work must settle before gates; required task maintenance cannot silently use the ordinary drop policy.
     async fn spawn_or_handle_background<F>(
         &self,
         key: Option<MaintenanceSequenceKey>,
@@ -1805,6 +2814,8 @@ impl RuntimeAgent {
     where
         F: Future<Output = Result<()>> + Send + 'static,
     {
+        let managed = crate::autonomy::current_execution().is_some();
+        let task = crate::autonomy::owned_maintenance(label, task);
         if self.background_maintenance.is_full() {
             match self
                 .runtime_config
@@ -1813,6 +2824,12 @@ impl RuntimeAgent {
                 .on_background_overflow
             {
                 BackgroundOverflowPolicy::RunInline => {
+                    // The inline overflow body cannot overtake the queued predecessor for the same actor and purpose.
+                    if let Some(key) = &key {
+                        self.background_maintenance
+                            .flush_scope_purpose(&key.scope_id, key.task_kind)
+                            .await?;
+                    }
                     record_background_maintenance_event(
                         self.observability_manager.as_ref(),
                         label,
@@ -1849,6 +2866,11 @@ impl RuntimeAgent {
                     }
                 }
                 BackgroundOverflowPolicy::Drop => {
+                    if managed {
+                        return Err(AgentError::Other(
+                            "required task maintenance cannot be dropped on overflow".into(),
+                        ));
+                    }
                     self.record_skipped_maintenance(
                         label,
                         ObservationPurpose::Other(label.to_string()),
@@ -1970,14 +2992,24 @@ impl RuntimeAgent {
         self.format_relationship_for_context().map(|(_, text)| text)
     }
 
-    /// Manually extract facts from the last N messages.
+    /// Manually extracts facts under the actual runtime owner; raw host component handles remain a separate trusted boundary.
     pub async fn extract_facts(
         &self,
         last_n: usize,
     ) -> ai_agents_core::Result<Vec<ai_agents_core::KeyFact>> {
-        self.extract_facts_with_source(last_n, "manual").await
+        let _mutations = self
+            .autonomy_mutations
+            .try_read()
+            .map_err(|_| AgentError::Other("runtime is admitting an autonomy run".into()))?;
+        self.check_autonomy_operation()?;
+        crate::autonomy::owned_maintenance(
+            "manual_facts",
+            self.extract_facts_with_source(last_n, "manual"),
+        )
+        .await
     }
 
+    // Extracts only actor-visible messages while retaining exact task/native history in the backing memory.
     async fn extract_facts_with_source(
         &self,
         last_n: usize,
@@ -1988,7 +3020,7 @@ impl RuntimeAgent {
             None => return Ok(vec![]),
         };
 
-        let messages = Self::readable_native_messages(self.memory.get_messages(None).await?)?;
+        let messages = Self::actor_memory_messages(self.memory.get_messages(None).await?)?;
         let recent: Vec<_> = messages.iter().rev().take(last_n).rev().cloned().collect();
 
         if recent.is_empty() {
@@ -2016,6 +3048,7 @@ impl RuntimeAgent {
 
         // Save to storage and update the actor-scoped cache when an actor is known.
         if !facts.is_empty() {
+            crate::autonomy::work::maintenance_effect();
             let fact_store_opt = self.fact_store.read().clone();
             let mut stored_total = 0usize;
             let mut cache_updated = false;
@@ -2242,16 +3275,18 @@ impl RuntimeAgent {
         None
     }
 
-    async fn maybe_load_actor_relationship(&self) {
+    // Loading and interaction bookkeeping are distinct; task load errors cannot silently manufacture a default relationship.
+    async fn maybe_load_actor_relationship(&self) -> Result<()> {
         let Some(manager) = self.relationship_manager.as_ref() else {
-            return;
+            return Ok(());
         };
         let Some(actor_id) = self.effective_actor_id() else {
-            return;
+            return Ok(());
         };
 
         let mut should_fire_loaded = false;
         if manager.get(&actor_id).is_none() {
+            crate::autonomy::work::maintenance_effect();
             let mut loaded = false;
             if manager.config().persistence.enabled {
                 let storage = self.storage.read().clone();
@@ -2260,12 +3295,14 @@ impl RuntimeAgent {
                         Ok(Some(value)) => match manager.insert_from_value(value) {
                             Ok(_) => loaded = true,
                             Err(e) => {
-                                warn!(actor = %actor_id, error = %e, "failed to restore relationship")
+                                warn!(actor = %actor_id, error = %e, "failed to restore relationship");
+                                self.maintenance_failure(e)?;
                             }
                         },
                         Ok(None) => {}
                         Err(e) => {
-                            warn!(actor = %actor_id, error = %e, "failed to load relationship")
+                            warn!(actor = %actor_id, error = %e, "failed to load relationship");
+                            self.maintenance_failure(e)?;
                         }
                     }
                 }
@@ -2278,12 +3315,21 @@ impl RuntimeAgent {
         }
 
         let actor_name = self.resolve_actor_name_from_context();
-        let relationship = manager.touch_interaction(&actor_id, actor_name.as_deref());
+        crate::autonomy::work::maintenance_effect();
+        // Controller continuations may read the relationship, but are not additional actor interactions.
+        let relationship = if crate::autonomy::current_turn_input(&self.root_turn_gate)
+            .is_some_and(|input| input.controller_only())
+        {
+            manager.get_or_create(&actor_id, actor_name.as_deref())
+        } else {
+            manager.touch_interaction(&actor_id, actor_name.as_deref())
+        };
         if should_fire_loaded {
             self.hooks
                 .on_relationship_loaded(&actor_id, &relationship)
                 .await;
         }
+        Ok(())
     }
 
     fn format_relationship_for_context(&self) -> Option<(String, String)> {
@@ -2324,6 +3370,7 @@ impl RuntimeAgent {
             return Ok(());
         };
         if let Some(value) = manager.relationship_as_value(actor_id)? {
+            crate::autonomy::work::maintenance_effect();
             storage
                 .save_relationship(&self.info.id, actor_id, &value)
                 .await?;
@@ -2331,16 +3378,19 @@ impl RuntimeAgent {
         Ok(())
     }
 
-    async fn auto_update_relationship(&self) {
+    // Task maintenance propagates failure to the owning ledger; ordinary chat retains best-effort relationship updates.
+    async fn auto_update_relationship(&self) -> Result<()> {
         let Some(manager) = self.relationship_manager.as_ref() else {
-            return;
+            return Ok(());
         };
         let Some(actor_id) = self.effective_actor_id() else {
-            return;
+            return Ok(());
         };
         if !manager.config().auto_update.enabled {
-            let _ = self.persist_actor_relationship(&actor_id).await;
-            return;
+            if let Err(error) = self.persist_actor_relationship(&actor_id).await {
+                return self.maintenance_failure(error);
+            }
+            return Ok(());
         }
 
         let recent_messages = manager.config().auto_update.recent_messages;
@@ -2348,25 +3398,30 @@ impl RuntimeAgent {
             Ok(messages) => messages,
             Err(e) => {
                 warn!(actor = %actor_id, error = %e, "failed to read messages for relationship update");
-                return;
+                return self.maintenance_failure(e);
             }
         };
-        let messages = match Self::readable_native_messages(messages) {
+        let messages = match Self::actor_memory_messages(messages) {
             Ok(messages) => messages,
             Err(error) => {
                 warn!(actor = %actor_id, error = %error, "failed to project native history for relationship update");
-                return;
+                return self.maintenance_failure(error);
             }
         };
 
         match self
             .observe_purpose(
                 ObservationPurpose::RelationshipUpdate,
-                manager.auto_update(&actor_id, &messages),
+                manager.propose_update(&actor_id, &messages),
             )
             .await
         {
-            Ok(update) => {
+            Ok(proposal) => {
+                crate::autonomy::work::maintenance_effect();
+                let update = match manager.apply_evaluation(&actor_id, proposal) {
+                    Ok(update) => update,
+                    Err(error) => return self.maintenance_failure(error),
+                };
                 if !update.changes.is_empty() {
                     self.hooks
                         .on_relationship_change(&actor_id, &update.changes)
@@ -2379,6 +3434,7 @@ impl RuntimeAgent {
                     Ok(()) => true,
                     Err(e) => {
                         warn!(actor = %actor_id, error = %e, "failed to persist relationship");
+                        self.maintenance_failure(e)?;
                         false
                     }
                 };
@@ -2400,12 +3456,26 @@ impl RuntimeAgent {
                     debug!(actor_id = %actor_id, persisted = persisted, "relationship evaluation ran but found no changes");
                 }
             }
-            Err(e) => warn!(actor = %actor_id, error = %e, "relationship update failed"),
+            Err(e) => {
+                warn!(actor = %actor_id, error = %e, "relationship update failed");
+                self.maintenance_failure(e)?;
+            }
+        }
+        Ok(())
+    }
+
+    // Best-effort chat maintenance cannot swallow a managed task failure and fabricate settled successful work.
+    fn maintenance_failure(&self, error: AgentError) -> Result<()> {
+        if let Some(execution) = crate::autonomy::current_execution() {
+            execution.stop("maintenance_failed");
+            Err(error)
+        } else {
+            Ok(())
         }
     }
 
-    /// Run auto-extraction after a chat turn.
-    async fn auto_extract_facts(&self) {
+    /// Runs conversational fact extraction once; managed failures propagate without changing ordinary best-effort chat.
+    async fn auto_extract_facts(&self) -> Result<()> {
         let should_extract = self
             .facts_config
             .as_ref()
@@ -2414,7 +3484,7 @@ impl RuntimeAgent {
 
         if !should_extract {
             debug!("fact extraction skipped because auto extraction is disabled");
-            return;
+            return Ok(());
         }
 
         let msgs_since = *self.messages_since_extraction.read();
@@ -2423,7 +3493,7 @@ impl RuntimeAgent {
                 messages_since_extraction = msgs_since,
                 "fact extraction skipped until threshold is reached"
             );
-            return;
+            return Ok(());
         }
 
         match self.extract_facts_with_source(msgs_since, "auto").await {
@@ -2436,8 +3506,10 @@ impl RuntimeAgent {
             }
             Err(e) => {
                 warn!("fact extraction failed: {}", e);
+                self.maintenance_failure(e)?;
             }
         }
+        Ok(())
     }
 
     pub fn with_persona(mut self, manager: Arc<ai_agents_persona::PersonaManager>) -> Self {
@@ -2731,7 +3803,7 @@ impl RuntimeAgent {
         }
     }
 
-    /// Performs the single rate admission after locks are held and rejects changed runtime, policy, or state authority.
+    /// Performs lock-held rate admission only while original observation bounds, pinned proof and runtime/policy/state authority remain valid.
     fn admit_tool_execution(
         &self,
         expected_runtime_version: u64,
@@ -2768,6 +3840,18 @@ impl RuntimeAgent {
                 reason: "state scope changed before admission".to_string(),
             };
         }
+        if ai_agents_llm::current_invocation_bounds()
+            .is_some_and(|bounds| bounds.remaining().is_zero())
+        {
+            return SecurityCheckResult::Block {
+                reason: "validation deadline expired before rate admission".into(),
+            };
+        }
+        if ai_agents_llm::validate_invocation_evidence().is_err() {
+            return SecurityCheckResult::Block {
+                reason: "validation input proof changed before rate admission".into(),
+            };
+        }
         security_engine.admit_tool_execution(canonical_id)
     }
 
@@ -2796,28 +3880,55 @@ impl RuntimeAgent {
         self.message_filters.write().insert(name.into(), filter);
     }
 
+    /// Updates host context only under compatible run ownership; raw host handles remain trusted integrations.
     pub fn set_context(&self, key: &str, value: Value) -> Result<()> {
+        let _mutations = self
+            .autonomy_mutations
+            .try_read()
+            .map_err(|_| AgentError::Other("runtime is admitting an autonomy run".into()))?;
+        self.check_autonomy_operation()?;
         self.context_manager.update(key, value)
     }
 
+    /// Context updates use the same reservation exclusion as set_context, including between child turns.
     pub fn update_context(&self, path: &str, value: Value) -> Result<()> {
-        self.context_manager.update(path, value)
+        self.set_context(path, value)
     }
 
     pub fn get_context(&self) -> HashMap<String, Value> {
         self.build_context_with_overlays()
     }
 
-    pub fn remove_context(&self, key: &str) -> Option<Value> {
-        self.context_manager.remove(key)
+    /// Reports ownership denial rather than disguising a reserved-runtime mutation as a missing key.
+    pub fn remove_context(&self, key: &str) -> Result<Option<Value>> {
+        let _mutations = self
+            .autonomy_mutations
+            .try_read()
+            .map_err(|_| AgentError::Other("runtime is admitting an autonomy run".into()))?;
+        self.check_autonomy_operation()?;
+        Ok(self.context_manager.remove(key))
     }
 
+    /// Holds mutation admission through provider refresh so reservation cannot begin while host context is changing.
     pub async fn refresh_context(&self, key: &str) -> Result<()> {
+        let _mutations = self.autonomy_mutations.read().await;
+        self.check_autonomy_operation()?;
         self.context_manager.refresh(key).await
     }
 
-    pub fn register_context_provider(&self, name: &str, provider: Arc<dyn ContextProvider>) {
+    /// Provider replacement is a context mutation and cannot change a reserved participant's backing authority.
+    pub fn register_context_provider(
+        &self,
+        name: &str,
+        provider: Arc<dyn ContextProvider>,
+    ) -> Result<()> {
+        let _mutations = self
+            .autonomy_mutations
+            .try_read()
+            .map_err(|_| AgentError::Other("runtime is admitting an autonomy run".into()))?;
+        self.check_autonomy_operation()?;
         self.context_manager.register_provider(name, provider);
+        Ok(())
     }
 
     pub fn current_state(&self) -> Option<String> {
@@ -2888,6 +3999,8 @@ impl RuntimeAgent {
 
     /// Applies a manual transition after reserving its exit actions and keeping async lifecycle work outside the commit lock.
     pub async fn transition_to(&self, state: &str) -> Result<()> {
+        let _mutations = self.autonomy_mutations.read().await;
+        self.check_autonomy_operation()?;
         let Some(ref sm) = self.state_machine else {
             return Ok(());
         };
@@ -2938,8 +4051,13 @@ impl RuntimeAgent {
     }
 
     /// Delete all facts and sessions for an actor, gated by privacy.allow_deletion.
-    /// Returns Err when actor_memory.privacy.allow_deletion is false.
+    /// Reserved runtimes reject deletion before storage or cache changes; privacy deletion requires acknowledged task cleanup first.
     pub async fn delete_actor_data(&self, actor_id: &str) -> Result<()> {
+        let _mutations = self
+            .autonomy_mutations
+            .try_read()
+            .map_err(|_| AgentError::Other("runtime is admitting an autonomy run".into()))?;
+        self.check_autonomy_access()?;
         let allowed = self
             .actor_memory_config
             .as_ref()
@@ -2977,9 +4095,15 @@ impl RuntimeAgent {
         Ok(())
     }
 
-    /// Overwrite session metadata (tags, ttl, custom fields).
-    pub fn set_session_metadata(&self, meta: ai_agents_core::SessionMetadata) {
+    /// Overwrites session metadata only outside task ownership, without changing a reserved runtime's actor/session binding.
+    pub fn set_session_metadata(&self, meta: ai_agents_core::SessionMetadata) -> Result<()> {
+        let _mutations = self
+            .autonomy_mutations
+            .try_read()
+            .map_err(|_| AgentError::Other("runtime is admitting an autonomy run".into()))?;
+        self.check_autonomy_access()?;
         *self.session_metadata.write() = meta;
+        Ok(())
     }
 
     /// Delete sessions whose TTL has expired. Returns number of sessions removed.
@@ -3102,8 +4226,11 @@ impl RuntimeAgent {
         Ok(snapshot)
     }
 
-    /// Restores persisted state after invalidating any pending confirmation ownership.
+    /// Restores ordinary session state only outside a foreground task; it is not task continuation resume.
     pub async fn restore_state(&self, snapshot: AgentSnapshot) -> Result<()> {
+        self.check_autonomy_access()?;
+        let _mutations = self.autonomy_mutations.read().await;
+        self.check_autonomy_access()?;
         let _admission = self.disambiguation_admission.write().await;
         if self.state_transition_reserved.load(Ordering::SeqCst) {
             return Err(AgentError::Other(
@@ -3174,43 +4301,52 @@ impl RuntimeAgent {
         })
     }
 
+    // Protects this complete restore component, including actor/session identity after memory restoration.
     async fn apply_session_restore_unchecked(
         &self,
         session_id: &str,
         stored: StoredSessionRestore,
     ) -> Result<()> {
+        let _mutations = self.autonomy_mutations.read().await;
+        self.check_autonomy_access()?;
         self.restore_state(stored.snapshot).await?;
         let metadata = stored.metadata.unwrap_or_default();
         if let Some(actor_id) = metadata.actor_id.as_deref() {
             self.set_actor_id(actor_id)?;
         } else {
-            self.clear_actor_id();
+            self.clear_actor_id()?;
         }
-        self.set_session_metadata(metadata);
+        self.set_session_metadata(metadata)?;
         *self.current_session_id.write() = Some(session_id.to_string());
         Ok(())
     }
 
+    // Rollback uses the same reservation exclusion as forward restoration across all identity updates.
     async fn restore_session_restore_point(
         &self,
         restore_point: &RuntimeSessionRestorePoint,
     ) -> Result<()> {
+        let _mutations = self.autonomy_mutations.read().await;
+        self.check_autonomy_access()?;
         self.restore_state(restore_point.snapshot.clone()).await?;
         if let Some(actor_id) = restore_point.actor_id.as_deref() {
             self.set_actor_id(actor_id)?;
         } else {
-            self.clear_actor_id();
+            self.clear_actor_id()?;
         }
-        self.set_session_metadata(restore_point.metadata.clone());
+        self.set_session_metadata(restore_point.metadata.clone())?;
         *self.current_session_id.write() = restore_point.session_id.clone();
         Ok(())
     }
 
+    // A foreground task cannot reserve a partially applied session or prevent its rollback.
     async fn apply_session_restore(
         &self,
         session_id: &str,
         stored: StoredSessionRestore,
     ) -> Result<()> {
+        let _mutations = self.autonomy_mutations.read().await;
+        self.check_autonomy_access()?;
         let before = self.capture_session_restore_point().await?;
         if let Err(error) = self
             .apply_session_restore_unchecked(session_id, stored)
@@ -3265,7 +4401,14 @@ impl RuntimeAgent {
         Ok(true)
     }
 
+    /// Saves and binds an ordinary session under the mutation lease; task-owned runtimes cannot switch identity or run unrelated session hooks.
+    /// Snapshot export through save_to remains a separate host operation and is not executable task persistence.
     pub async fn save_session(&self, session_id: &str) -> Result<()> {
+        let _mutations = self
+            .autonomy_mutations
+            .try_read()
+            .map_err(|_| AgentError::Other("runtime is admitting an autonomy run".into()))?;
+        self.check_autonomy_access()?;
         let storage = self.storage.read().clone();
         match storage {
             Some(s) => {
@@ -3766,7 +4909,27 @@ impl RuntimeAgent {
         &self,
         scope_override: Option<&[String]>,
     ) -> Result<AvailableToolIdsSnapshot> {
+        self.get_available_tool_ids_with_validation_grant(scope_override, None)
+            .await
+    }
+
+    /// Adds only a matched execution-local host grant, then applies unchanged runtime and state narrowing.
+    async fn get_available_tool_ids_with_validation_grant(
+        &self,
+        scope_override: Option<&[String]>,
+        extra: Option<&str>,
+    ) -> Result<AvailableToolIdsSnapshot> {
         let mut available = self.get_top_level_tool_ids_for_scope(scope_override);
+        if let Some(extra) = extra
+            && scope_override.is_none_or(|ids| {
+                ids.iter()
+                    .any(|id| self.tools.canonical_id(id).as_deref() == Some(extra))
+            })
+            && self.tools.resolve(extra).is_some()
+            && !available.iter().any(|id| id == extra)
+        {
+            available.push(extra.to_owned());
+        }
         let (state_generation, state_scopes) = self
             .state_machine
             .as_ref()
@@ -4131,6 +5294,7 @@ impl RuntimeAgent {
             .await
     }
 
+    // Ephemeral controller instructions enter only provider messages, never the stored user or actor history.
     async fn build_messages_internal(
         &self,
         fire_persona_hooks: bool,
@@ -4151,6 +5315,14 @@ impl RuntimeAgent {
         messages.extend(history);
         if let Some(user_message) = ephemeral_user_message {
             messages.push(ChatMessage::user(user_message));
+        }
+        if let Some(input) = crate::autonomy::current_turn_input(&self.root_turn_gate)
+            && !input.controller_message.is_empty()
+        {
+            messages.push(ChatMessage::system(format!(
+                "Autonomy controller instruction (not a user statement):\n{}",
+                input.controller_message
+            )));
         }
 
         let total_tokens = self.estimate_total_tokens(&messages);
@@ -4783,7 +5955,13 @@ impl RuntimeAgent {
         Ok(())
     }
 
-    // Removes opaque replay state before messages enter auxiliary semantic systems while leaving stored history untouched.
+    // Actor extraction excludes task-derived messages after restore, while semantic runtime subsystems retain task history.
+    fn actor_memory_messages(mut messages: Vec<ChatMessage>) -> Result<Vec<ChatMessage>> {
+        messages.retain(|message| message.provenance.is_none());
+        Self::readable_native_messages(messages)
+    }
+
+    // Removes opaque replay state before auxiliary semantic systems consume otherwise complete task/conversation history.
     fn readable_native_messages(mut messages: Vec<ChatMessage>) -> Result<Vec<ChatMessage>> {
         for message in &mut messages {
             if matches!(
@@ -5001,7 +6179,8 @@ impl RuntimeAgent {
         )
     }
 
-    /// Builds evidence with the exact generations used by the corresponding decision.
+    /// Builds evidence with the exact generations and logical executor-hop identity used by the corresponding decision.
+    /// Retained task timing starts at the original lifecycle, not the most recent host resume.
     #[allow(clippy::too_many_arguments)]
     fn record_from_parts_at(
         &self,
@@ -5013,13 +6192,21 @@ impl RuntimeAgent {
         executed: bool,
         success: bool,
         output: String,
-        metadata: HashMap<String, Value>,
+        mut metadata: HashMap<String, Value>,
         policy: ToolPolicyDecisionRecord,
         approval: Option<ToolApprovalRecord>,
         timed_out: bool,
         output_truncated: bool,
         versions: ToolDecisionVersions,
     ) -> ToolExecutionRecord {
+        if let Some(cursor) = crate::autonomy::suspension::executor_progress()
+            && crate::autonomy::current_execution().is_some()
+        {
+            metadata.insert(
+                "_task_executor_hop".into(),
+                serde_json::json!(cursor.ancestry.len()),
+            );
+        }
         ToolExecutionRecord {
             call_id: request.call_id.clone(),
             requested_name: request.requested_name.clone(),
@@ -5037,7 +6224,15 @@ impl RuntimeAgent {
             policy,
             approval,
             started_at,
-            duration_ms: start.elapsed().as_millis() as u64,
+            duration_ms: if crate::autonomy::current_execution().is_some()
+                && crate::autonomy::suspension::executor_progress()
+                    .is_some_and(|cursor| cursor.started_at.is_some())
+            {
+                u64::try_from((chrono::Utc::now() - started_at).num_milliseconds().max(0))
+                    .unwrap_or(u64::MAX)
+            } else {
+                start.elapsed().as_millis() as u64
+            },
             timed_out,
             cancelled: false,
             cancellation_reason: None,
@@ -5045,8 +6240,23 @@ impl RuntimeAgent {
         }
     }
 
-    /// Sends a finalized tool record to hooks, history, and error handling.
+    /// Captures actual-hop mutation freshness before hooks or persistence waits; failed task evidence acknowledgement blocks later admission.
     async fn finish_tool_record(&self, record: &ToolExecutionRecord) {
+        crate::autonomy::invocation::capture_observation_mutation(
+            record,
+            &self.observation_mutations,
+        );
+        if let Some(execution) = crate::autonomy::current_execution()
+            && let Err(error) = Box::pin(execution.capture_tool_record(record, &self.info.id)).await
+        {
+            execution.stop("evidence_storage_failure");
+            warn!(error = %error, "task execution evidence was not acknowledged");
+        }
+        self.publish_tool_record(record).await;
+    }
+
+    /// Emits the logical request lifecycle after its evidence owner has selected the appropriate publication boundary.
+    async fn publish_tool_record(&self, record: &ToolExecutionRecord) {
         let result = ToolResult {
             success: record.success,
             output: record.model_output_string(),
@@ -5068,7 +6278,7 @@ impl RuntimeAgent {
         }
     }
 
-    /// Releases resource locks before hooks run because hooks may invoke another tool.
+    /// Releases settled locks before hooks; unknown task effects retain protection under the reserved owner.
     async fn finish_tool_record_after_resource_guards(
         &self,
         resource_guards: ToolResourceGuards,
@@ -5129,73 +6339,300 @@ impl RuntimeAgent {
         Ok((limits, timeout))
     }
 
-    /// Invokes a resolved tool once with one fresh attempt deadline, timeout, cancellation, and actor context.
+    /// Reserves each actual task attempt after policy admission and rechecks original observation bounds and pinned host proof before first poll.
+    /// Expiry before invocation settles as non-invocation; returned effects settle factually before continuing restrictions decide result eligibility.
+    /// An ineligible acknowledged result cannot retry, fall back or supply completion credit, but its consumption and actual result remain auditable.
     async fn execute_resolved_tool_once(
         &self,
         tool: Arc<dyn ai_agents_core::Tool>,
         args: Value,
         mut ctx: ToolExecutionContext,
         timeout: ValidatedToolTimeout,
-    ) -> Result<(ToolResult, bool, bool, bool)> {
+    ) -> Result<(ToolResult, bool, bool, bool, bool)> {
+        if ai_agents_llm::current_invocation_bounds()
+            .is_some_and(|bounds| bounds.remaining().is_zero())
+        {
+            return Ok((
+                ToolResult::error("Validation invocation deadline exceeded"),
+                true,
+                false,
+                false,
+                true,
+            ));
+        }
         if self.runtime_control.emergency_deny.load(Ordering::SeqCst) {
             return Ok((
                 ToolResult::error("Tool execution cancelled by runtime control"),
                 false,
                 true,
                 false,
+                true,
             ));
         }
         //
-        // The tool observes the same checked timeout enforced below, starting immediately before this invocation attempt.
-        // Each retry receives a new deadline rather than inheriting time spent in policy handling or earlier attempts.
+        // Acknowledgement may await storage, so cancellation and generations are checked again before the first tool poll.
         //
-        ctx.deadline = Some(
-            chrono::Utc::now()
-                .checked_add_signed(timeout.deadline_delta)
-                .ok_or_else(|| {
-                    AgentError::Config(
-                        "effective tool timeout_ms exceeds the current UTC deadline range"
-                            .to_string(),
-                    )
-                })?,
-        );
+        let state_generation = self.state_machine.as_ref().map(|state| state.generation());
         //
         // Mark invocation inside the future so cancellation before the first poll remains executed false.
         //
         let invoked = Arc::new(AtomicBool::new(false));
         let invoked_by_future = Arc::clone(&invoked);
         let actor_context = current_turn_actor_context();
-        let future = async move {
-            invoked_by_future.store(true, Ordering::SeqCst);
-            if let Some(actor_context) = actor_context {
-                scope_actor_context(actor_context, tool.execute(args, ctx)).await
+        let effect_custody = TOOL_EFFECT_CUSTODY.try_with(Arc::clone).ok();
+        let custody_for_future = effect_custody.clone();
+        let execution = crate::autonomy::current_execution();
+        if let Some(execution) = &execution {
+            ctx.cancellation = ctx.cancellation.with_secondary(
+                execution.cancellation.clone(),
+                Some("task cancellation".into()),
+            );
+        }
+        // Suspend before reserving an attempt; a resumed answer still passes the final invocation checks below.
+        let mut question_result = None;
+        if let Some(execution) = &execution
+            && execution.pauses_question(&self.info.id)
+            && tool.task_question(&args)?.is_some()
+        {
+            if let Some(answer) =
+                crate::autonomy::suspension::take_resumed_question(&ctx.call_id, &args)
+            {
+                tool.task_question_result(&args, &answer)?;
+                question_result = Some(answer);
             } else {
-                tool.execute(args, ctx).await
+                return Err(AgentError::Config(
+                    "task question response lost before final invocation".into(),
+                ));
             }
+        }
+        // Retain the real host implementation through admission and execution so a slot swap cannot reuse a dead pointer's receipt.
+        let mut footprint_binding = None;
+        let mut admitted_footprint = None;
+        let attempt = if let Some(execution) = &execution {
+            let admission = Box::pin(execution.admit_tool_path(
+                tool.as_ref(),
+                &args,
+                &ctx,
+                question_result.is_some(),
+            ))
+            .await;
+            let (id, footprint) = match admission {
+                Ok(admitted) => admitted,
+                Err(error) => {
+                    if let Some(request) = execution.park_capacity(&self.info.id, &ctx, &args)? {
+                        return Err(AgentError::TaskSuspended(request));
+                    }
+                    return Err(error);
+                }
+            };
+            if let Some(prepared) = footprint {
+                admitted_footprint = Some(prepared.footprint);
+                footprint_binding = prepared.binding;
+            }
+            Some(id)
+        } else {
+            None
         };
-        tokio::pin!(future);
-        let timer = tokio::time::sleep(timeout.timer);
+        let bounds = ai_agents_llm::current_invocation_bounds();
+        let timer_duration = execution.as_ref().map_or(timeout.timer, |run| {
+            timeout.timer.min(run.remaining_duration())
+        });
+        let timer_duration = bounds.map_or(timer_duration, |bounds| {
+            timer_duration.min(bounds.remaining())
+        });
+        let invocation_deadline = std::time::Instant::now()
+            .checked_add(timer_duration)
+            .ok_or_else(|| AgentError::Config("tool deadline overflow".into()))?;
+        let deadline_delta = if timer_duration == timeout.timer {
+            timeout.deadline_delta
+        } else {
+            chrono::Duration::from_std(timer_duration)
+                .map_err(|_| AgentError::Config("tool deadline overflow".into()))?
+        };
+        ctx.deadline = Some(
+            chrono::Utc::now()
+                .checked_add_signed(deadline_delta)
+                .ok_or_else(|| AgentError::Config("tool deadline overflow".into()))?,
+        );
+        // Revalidate with the exact final context, including deadline, that the implementation will receive.
+        // Storage admission can wait; changed entry targets must not reuse the previously reserved union.
+        let footprint_changed = if let Some(footprint) = &admitted_footprint {
+            let limit = if question_result.is_some() {
+                tool.prepare_question_write_footprint(&args, &ctx, footprint.targets.len().max(1))
+                    .map(|prepared| prepared.map(|prepared| prepared.footprint))
+            } else {
+                tool.declared_write_footprint(&args, &ctx, footprint.targets.len().max(1))
+            };
+            match limit {
+                Ok(Some(current)) => &current != footprint,
+                _ => true,
+            }
+        } else {
+            false
+        };
+        // Host tools compare this attempt's acknowledged receipt with their captured actual implementation before effects.
+        // It is not a grant and reconstruction cannot turn its serialized identity into live authority.
+        ctx.admitted_write_footprint = admitted_footprint;
+        if crate::autonomy::response::check_response_admission().is_err()
+            || ai_agents_llm::validate_invocation_evidence().is_err()
+            || bounds.is_some_and(|bounds| bounds.remaining().is_zero())
+            || footprint_changed
+            || footprint_binding
+                .as_ref()
+                .is_some_and(|binding| binding.validate().is_err())
+            || execution.as_ref().is_some_and(|run| {
+                !run.progress_allows(&args, &ctx)
+                    || !run.allows_tool(&ctx.canonical_id)
+                    || self.tools.version() != ctx.registry_version
+            })
+            || self.runtime_control.emergency_deny.load(Ordering::SeqCst)
+            || execution
+                .as_ref()
+                .is_some_and(|run| run.stop_reason().is_some())
+            || self.runtime_control.version.load(Ordering::SeqCst) != ctx.runtime_control_version
+            || self
+                .runtime_safety_snapshot()
+                .tool_security
+                .policy_version()
+                != ctx.policy_version
+            || self.state_machine.as_ref().map(|state| state.generation()) != state_generation
+        {
+            if let (Some(execution), Some(attempt)) = (&execution, &attempt) {
+                Box::pin(execution.settle(attempt, serde_json::json!({"not_invoked":true}), false))
+                    .await?;
+            }
+            return Ok((
+                ToolResult::error("Tool authorization or cancellation changed before invocation"),
+                false,
+                true,
+                false,
+                true,
+            ));
+        }
+        let message_invocation =
+            self.prepare_message_invocation(tool.clone(), &args, &ctx, attempt.as_ref())?;
+        if let (Some(execution), Some(invocation)) = (&execution, &message_invocation) {
+            execution.approval_deadlines.lock().insert(
+                format!("composition:{}", invocation.frame.id),
+                std::time::Instant::now()
+                    .checked_add(timer_duration)
+                    .ok_or_else(|| AgentError::Config("message deadline overflow".into()))?,
+            );
+        }
+        let managed = execution.is_some();
+        let dispatch_execution = execution.clone();
+        let mut future = Box::pin(crate::autonomy::message::scope_message(
+            message_invocation,
+            async move {
+                // Final synchronous host checks may consume time without yielding to the driver's timeout monitor.
+                if crate::autonomy::response::check_response_admission().is_err()
+                    || ai_agents_llm::validate_invocation_evidence().is_err()
+                    || self.runtime_control.emergency_deny.load(Ordering::SeqCst)
+                    || ctx.cancellation.is_cancelled()
+                    || dispatch_execution.as_ref().is_some_and(|run| {
+                        ai_agents_core::autonomy::InvocationAdmission::execution_stopped(
+                            run.as_ref(),
+                        )
+                    })
+                    || bounds.is_some_and(|bounds| bounds.remaining().is_zero())
+                    || (managed && std::time::Instant::now() >= invocation_deadline)
+                {
+                    return Ok(ToolResult::error(
+                        "Validation proof, cancellation or original deadline changed before tool dispatch",
+                    ));
+                }
+                // This exact response has reached its effect boundary; it cannot constrain or authorize later operations.
+                crate::autonomy::response::response_applied();
+                if let Some(custody) = &custody_for_future {
+                    custody.store(true, Ordering::SeqCst);
+                }
+                invoked_by_future.store(true, Ordering::SeqCst);
+                if !ctx.classification.read_only {
+                    crate::autonomy::invocation::start_observation_mutation(
+                        &self.observation_mutations,
+                    );
+                }
+                if let Some(answer) = question_result {
+                    return Ok(tool.execute_task_question(args, answer, ctx).await);
+                }
+                let work = async {
+                    if managed {
+                        tool.execute_task(args, ctx).await
+                    } else {
+                        Ok(tool.execute(args, ctx).await)
+                    }
+                };
+                if let Some(actor_context) = actor_context {
+                    scope_actor_context(actor_context, work).await
+                } else {
+                    work.await
+                }
+            },
+        ));
+        let timer = tokio::time::sleep_until(invocation_deadline.into());
         tokio::pin!(timer);
         let mut cancel_tick = tokio::time::interval(std::time::Duration::from_millis(50));
 
         loop {
             tokio::select! {
-                result = &mut future => return Ok((result, false, false, true)),
+                result = &mut future => {
+                    drop(future);
+                    // Typed transfer is safe only after the framework message frame acknowledges its child's cursor.
+                    // A failed acknowledgement leaves custody armed and the dispatched marker intact for recovery.
+                    if matches!(&result, Err(AgentError::TaskSuspended(_))) {
+                        let execution = execution.as_ref().ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
+                        let attempt = attempt.as_ref().ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
+                        let id = Box::pin(execution.suspend_message(&self.info.id, attempt)).await?;
+                        if let Some(custody) = &effect_custody { custody.store(false, Ordering::SeqCst); }
+                        return Err(AgentError::TaskSuspended(id));
+                    }
+                    let result = result.unwrap_or_else(|error| ToolResult::error(error.to_string()));
+                    // Preserve the actual returned effect separately from its eligibility; a late ACK cannot renew this invocation.
+                    let result_eligible = crate::autonomy::invocation::check_dispatched_invocation().is_ok()
+                        && !self.runtime_control.emergency_deny.load(Ordering::SeqCst)
+                        && (!managed || std::time::Instant::now() < invocation_deadline);
+                    if let (Some(execution), Some(attempt)) = (&execution, &attempt) {
+                        let settlement = if invoked.load(Ordering::SeqCst) { serde_json::to_value(&result)? } else { serde_json::json!({"not_invoked":true}) };
+                        Box::pin(execution.settle(attempt, settlement, false)).await?;
+                        execution.retire_completed_message(&self.info.id, attempt);
+                    }
+                    if let Some(custody) = &effect_custody { custody.store(false, Ordering::SeqCst); }
+                    let eligible = crate::autonomy::invocation::check_dispatched_invocation().is_ok()
+                        && !self.runtime_control.emergency_deny.load(Ordering::SeqCst)
+                        && (!managed || std::time::Instant::now() < invocation_deadline)
+                        && result_eligible;
+                    if !eligible && let Some(execution) = &execution {
+                        execution.stop("tool_result_ineligible");
+                    }
+                    return Ok((result, false, false, invoked.load(Ordering::SeqCst), eligible));
+                }
                 _ = &mut timer => {
+                    drop(future);
+                    if let (Some(execution), Some(attempt)) = (&execution, &attempt) {
+                        Box::pin(execution.settle(attempt, serde_json::json!({"timed_out":true}), true)).await?;
+                    }
                     return Ok((
                         ToolResult::error("Tool execution timed out"),
                         true,
                         false,
                         invoked.load(Ordering::SeqCst),
+                        true,
                     ));
                 }
                 _ = cancel_tick.tick() => {
-                    if self.runtime_control.emergency_deny.load(Ordering::SeqCst) {
+                    if self.runtime_control.emergency_deny.load(Ordering::SeqCst)
+                        || execution.as_ref().is_some_and(|run| run.stop_reason().is_some())
+                    {
+                        drop(future);
+                        if let (Some(execution), Some(attempt)) = (&execution, &attempt) {
+                            Box::pin(execution.settle(attempt, serde_json::json!({"cancelled":true}), true)).await?;
+                        }
                         return Ok((
                             ToolResult::error("Tool execution cancelled by runtime control"),
                             false,
                             true,
                             invoked.load(Ordering::SeqCst),
+                            true,
                         ));
                     }
                 }
@@ -5217,7 +6654,7 @@ impl RuntimeAgent {
         }
     }
 
-    /// Acquires all declared resource locks in stable key order and supports emergency cancellation while waiting.
+    /// Acquires declared locks in stable order; run cancellation and deadline stops also bound waits on retained uncertain-effect protection.
     async fn acquire_tool_resource_locks(&self, keys: &[String]) -> Option<ToolResourceGuards> {
         let locks = {
             let mut table = self.resource_locks.write();
@@ -5237,7 +6674,12 @@ impl RuntimeAgent {
         let mut resource_guards = ToolResourceGuards {
             guards: Vec::with_capacity(locks.len()),
             locks: Arc::clone(&self.resource_locks),
+            task_owner: crate::autonomy::current_execution()
+                .map(|execution| execution.owner.clone()),
+            retain_on_drop: false,
+            effect_custody: Arc::new(AtomicBool::new(false)),
         };
+        let execution = crate::autonomy::current_execution();
         let mut locks = locks.into_iter();
         while let Some(lock) = locks.next() {
             let mut lock = Box::pin(lock.lock_owned());
@@ -5248,7 +6690,7 @@ impl RuntimeAgent {
                         break;
                     }
                     _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {
-                        if self.runtime_control.emergency_deny.load(Ordering::SeqCst) {
+                        if ai_agents_llm::current_invocation_bounds().is_some_and(|bounds| bounds.remaining().is_zero()) || self.runtime_control.emergency_deny.load(Ordering::SeqCst) || execution.as_ref().is_some_and(|run| ai_agents_core::autonomy::InvocationAdmission::execution_stopped(run.as_ref())) {
                             drop(lock);
                             drop(locks);
                             drop(resource_guards);
@@ -5261,7 +6703,9 @@ impl RuntimeAgent {
         Some(resource_guards)
     }
 
-    /// Executes retry sub-attempts inside one logical executor request while assigning every invocation a fresh deadline.
+    /// Executes retry sub-attempts inside one logical executor request while assigning every new invocation a fresh deadline.
+    /// A settled retained-message result consumes no new attempt and continues from its captured retry index.
+    /// Known returned but ineligible effects stay factual and cannot trigger a retry or fallback.
     ///
     /// Hooks and `ToolExecutionRecord` finalization remain request-level and occur once after this retry loop returns.
     async fn run_tool_with_retries(
@@ -5272,21 +6716,38 @@ impl RuntimeAgent {
         ctx: ToolExecutionContext,
         timeout: ValidatedToolTimeout,
         max_retries: u32,
-    ) -> Result<(ToolResult, bool, bool, bool)> {
+    ) -> Result<(ToolResult, bool, bool, bool, bool)> {
         let max_retries = if ctx.classification.safely_retryable {
             max_retries
         } else {
             0
         };
-        let mut attempts = 0;
-        let mut invoked = false;
+        let progress = crate::autonomy::suspension::executor_progress();
+        let mut attempts = progress.as_ref().map_or(0, |cursor| cursor.retry_index);
+        let mut invoked = progress.as_ref().is_some_and(|cursor| cursor.invoked);
         loop {
-            let (result, timed_out, cancelled, attempt_invoked) = self
-                .execute_resolved_tool_once(tool.clone(), args.clone(), ctx.clone(), timeout)
-                .await?;
+            crate::autonomy::suspension::update_executor_progress(|cursor| {
+                cursor.retry_index = attempts;
+                cursor.invoked = invoked;
+            });
+            let (result, timed_out, cancelled, attempt_invoked, eligible) = if let Some(result) =
+                crate::autonomy::suspension::take_settled_tool_result(&ctx.call_id)
+            {
+                let eligible = crate::autonomy::invocation::check_dispatched_invocation().is_ok()
+                    && !self.runtime_control.emergency_deny.load(Ordering::SeqCst);
+                (result, false, false, true, eligible)
+            } else {
+                Box::pin(self.execute_resolved_tool_once(
+                    tool.clone(),
+                    args.clone(),
+                    ctx.clone(),
+                    timeout,
+                ))
+                .await?
+            };
             invoked |= attempt_invoked;
-            if result.success || timed_out || cancelled || attempts >= max_retries {
-                return Ok((result, timed_out, cancelled, invoked));
+            if !eligible || result.success || timed_out || cancelled || attempts >= max_retries {
+                return Ok((result, timed_out, cancelled, invoked, eligible));
             }
             attempts += 1;
             warn!(tool = %canonical_id, attempt = attempts, error = %result.output, "Retrying failed tool call");
@@ -5313,22 +6774,139 @@ impl RuntimeAgent {
     }
 
     /// Executes a tool request through scope, policy, HITL, timeout, bounded recovery, and evidence recording.
+    /// Each fallback hop installs its own private request scope in the inner driver, without duplicating a large outer record-return frame.
+    /// A retained resume cursor selects only the actual pending hop so completed failed ancestors and their admission are not replayed.
+    /// Cursor consumption happens when polled, after the caller's private response and executor scopes are installed.
     fn execute_tool_record(
         &self,
         request: ToolExecutionRequest,
     ) -> Pin<Box<dyn Future<Output = Result<ToolExecutionRecord>> + Send + '_>> {
-        Box::pin(self.execute_tool_record_inner(request, ToolFallbackState::default()))
+        Box::pin(async move {
+            if let Some(cursor) =
+                crate::autonomy::suspension::take_resumed_executor(&request.call_id)
+            {
+                self.execute_tool_record_inner(
+                    cursor.request.clone(),
+                    ToolFallbackState {
+                        visited_canonical_ids: cursor.ancestry.clone(),
+                    },
+                    Some(cursor),
+                )
+                .await
+            } else {
+                self.execute_tool_record_inner(request, ToolFallbackState::default(), None)
+                    .await
+            }
+        })
     }
 
     /// Implements one logical shared-executor request while preserving policy, HITL, availability, final admission, hooks, retry evidence, and bounded fallback ordering.
     ///
+    /// Host validation replaces only the ordinary grant predicate for a matched private invocation scope, never provider-visible exposure, state/runtime narrowing, policy, approval or final generation admission.
+    /// Sequential fallback polling keeps bounded ancestry without retaining one large executor frame per hop.
+    /// Its exact arguments are rechecked after HITL so a modified call cannot reuse the original fixed-operation authority.
     /// A failed request selected for fallback releases its guards and finalizes its own record before the fallback starts as a separate shared-executor request. Canonical ancestry crosses that boundary so alias-mediated cycles and overlong acyclic chains stop before the start hook, approval, locks, or invocation while retaining terminal completion evidence.
-    async fn execute_tool_record_inner(
+    fn execute_tool_record_inner(
+        &self,
+        request: ToolExecutionRequest,
+        fallback_state: ToolFallbackState,
+        mut resumed: Option<crate::autonomy::suspension::TaskExecutorCursor>,
+    ) -> Pin<Box<dyn Future<Output = Result<ToolExecutionRecord>> + Send + '_>> {
+        Box::pin(async move {
+            let mut next = (request, fallback_state);
+            loop {
+                let (request, fallback_state) = next;
+                let parked = resumed.take().unwrap_or_else(|| {
+                    crate::autonomy::suspension::TaskExecutorCursor::new(
+                        request.clone(),
+                        fallback_state.visited_canonical_ids.clone(),
+                    )
+                });
+                let result = TOOL_FALLBACK_REQUEST
+                    .scope(std::cell::RefCell::new(None), async {
+                        let work = Box::pin(
+                            self.execute_tool_record_scoped(request.clone(), fallback_state),
+                        );
+                        let work = crate::autonomy::scope_task_request(request.clone(), work);
+                        let work = async {
+                            match work.await {
+                                Err(error @ AgentError::TaskSuspended(_)) => {
+                                    let cursor = crate::autonomy::suspension::executor_progress()
+                                        .ok_or(
+                                        crate::autonomy::TaskRunStorageError::InvalidCheckpoint,
+                                    )?;
+                                    if let Some(execution) = crate::autonomy::current_execution() {
+                                        execution.parked_executor_cursors.lock().insert(
+                                            (self.info.id.clone(), cursor.request.call_id.clone()),
+                                            cursor,
+                                        );
+                                    }
+                                    Err(error)
+                                }
+                                result => result,
+                            }
+                        };
+                        let record =
+                            crate::autonomy::suspension::scope_executor_progress(parked, work)
+                                .await?;
+                        let successor = TOOL_FALLBACK_REQUEST.with(|slot| slot.borrow_mut().take());
+                        Ok::<_, AgentError>((record, successor))
+                    })
+                    .await;
+                let (record, successor) = match result {
+                    Err(error @ AgentError::TaskSuspended(_)) => return Err(error),
+                    result => result?,
+                };
+                if let Some(successor) = successor {
+                    next = successor;
+                } else {
+                    return Ok(record);
+                }
+            }
+        })
+    }
+
+    // Runs shared policy, approval, admission and record publication under each request's own source and fallback ancestry.
+    // The retained hop keeps its original start hook and timing while fresh attempts still reauthorize and consume admission.
+    // Original retained response bindings restrict preparation even if current approval gates disappear; known non-invocation still publishes ordinary denial records.
+    // Task question rejection is recorded before invocation and never manufactures an answer or consumes a tool slot.
+    async fn execute_tool_record_scoped(
         &self,
         request: ToolExecutionRequest,
         fallback_state: ToolFallbackState,
     ) -> Result<ToolExecutionRecord> {
-        let started_at = chrono::Utc::now();
+        let _mutations = self.autonomy_mutations.read().await;
+        self.check_autonomy_operation()?;
+        // Retained responses restrict preparation even when the current approval gate disappeared while paused.
+        // A known pre-body denial still follows ordinary record/cleanup handling rather than abandoning a safely retained caller.
+        if let Err(error) = crate::autonomy::response::check_response_admission()
+            .and_then(|_| ai_agents_llm::validate_invocation_evidence())
+        {
+            return Box::pin(async {
+                let reason = error.to_string();
+                let record = self.record_from_parts(
+                    &request,
+                    request.requested_name.clone(),
+                    request.arguments.clone(),
+                    chrono::Utc::now(),
+                    Instant::now(),
+                    false,
+                    false,
+                    reason.clone(),
+                    HashMap::new(),
+                    ToolPolicyDecisionRecord::deny(reason),
+                    None,
+                    false,
+                    false,
+                );
+                self.finish_tool_record(&record).await;
+                Ok(record)
+            })
+            .await;
+        }
+        let started_at = crate::autonomy::suspension::executor_progress()
+            .and_then(|cursor| cursor.started_at)
+            .unwrap_or_else(chrono::Utc::now);
         let start = Instant::now();
         info!(tool = %request.requested_name, args = %request.arguments, "Executing tool");
 
@@ -5377,7 +6955,19 @@ impl RuntimeAgent {
 
         let canonical_id = resolved.identity.canonical_id.clone();
 
-        let initial_scope_snapshot = self.get_available_tool_ids_snapshot().await?;
+        let extra = crate::autonomy::validation_extra_grant(
+            &self.info.id,
+            &request,
+            &canonical_id,
+            &request.arguments,
+        );
+        let scope_override = self.runtime_control.tool_scope_override.read().clone();
+        let initial_scope_snapshot = self
+            .get_available_tool_ids_with_validation_grant(
+                scope_override.as_deref(),
+                extra.as_deref(),
+            )
+            .await?;
         if !initial_scope_snapshot
             .tool_ids
             .iter()
@@ -5453,9 +7043,20 @@ impl RuntimeAgent {
             &classification,
             initial_recovery_timeout_ms,
         )?;
-        self.hooks
-            .on_tool_start(&canonical_id, &executed_arguments)
-            .await;
+        if crate::autonomy::suspension::executor_progress()
+            .is_none_or(|cursor| cursor.started_at.is_none())
+        {
+            if let Some(execution) = crate::autonomy::current_execution() {
+                // This is a logical request, not invocation evidence or approval authority.
+                crate::autonomy::events::emit(&execution, crate::autonomy::TaskRunEventKind::ToolStarted, || serde_json::json!({"tool":crate::autonomy::events::safe_text(&canonical_id),"call":crate::autonomy::events::safe_text(&request.call_id),"source":crate::autonomy::events::safe_source(&request.source)})).await;
+            }
+            self.hooks
+                .on_tool_start(&canonical_id, &executed_arguments)
+                .await;
+            crate::autonomy::suspension::update_executor_progress(|cursor| {
+                cursor.started_at = Some(started_at)
+            });
+        }
         metadata.insert(
             "classification".to_string(),
             serde_json::to_value(&classification).unwrap_or(Value::Null),
@@ -5469,6 +7070,9 @@ impl RuntimeAgent {
             metadata.insert("policy_snapshot".to_string(), policy_snapshot.clone());
         }
 
+        if let Some(binding) = crate::autonomy::validation_metadata(&request) {
+            metadata.insert("host_validation".into(), binding);
+        }
         let mut approval_record = Some(ToolApprovalRecord {
             status: ToolApprovalStatus::NotRequired,
             reason: None,
@@ -5510,6 +7114,16 @@ impl RuntimeAgent {
             );
             self.finish_tool_record(&record).await;
             return Ok(record);
+        }
+        if crate::autonomy::validation_requires_approval(&request)
+            && matches!(
+                security_result,
+                SecurityCheckResult::Allow | SecurityCheckResult::Warn { .. }
+            )
+        {
+            security_result = SecurityCheckResult::RequireConfirmation {
+                message: "Host validation binding requires approval".into(),
+            };
         }
         match &security_result {
             SecurityCheckResult::Allow => {}
@@ -6080,15 +7694,18 @@ impl RuntimeAgent {
         let binding_security_result = security_engine
             .validate_tool_execution_with_bindings(&canonical_id, &executed_arguments, &bindings)
             .await?;
-        let approval_confirmation_required = matches!(
-            binding_security_result,
-            SecurityCheckResult::RequireConfirmation { .. }
-        ) || security_engine
-            .classification_approval_message(
-                &canonical_id,
-                &resolved.tool.classify_call(&executed_arguments),
-            )
-            .is_some();
+        let approval_confirmation_required =
+            crate::autonomy::validation_requires_approval(&request)
+                || matches!(
+                    binding_security_result,
+                    SecurityCheckResult::RequireConfirmation { .. }
+                )
+                || security_engine
+                    .classification_approval_message(
+                        &canonical_id,
+                        &resolved.tool.classify_call(&executed_arguments),
+                    )
+                    .is_some();
         let approval_binding = approval_record.as_ref().and_then(|record| {
             matches!(
                 record.status,
@@ -6240,8 +7857,16 @@ impl RuntimeAgent {
             }
         };
         let policy_snapshot = security_engine.policy_snapshot(&canonical_id);
-        let resource_lock_keys =
-            tool_resource_lock_keys(&canonical_id, &final_arguments, &bindings, &classification);
+        // Framework message coordination must not hold a mutation lock needed by its own child.
+        // Descendant tools still acquire their ordinary resource locks under the shared run authority.
+        let resource_lock_keys = if resolved.tool.supports_task_messages()
+            && crate::autonomy::current_execution().is_some()
+            && crate::autonomy::suspension::message_request().is_some()
+        {
+            Vec::new()
+        } else {
+            tool_resource_lock_keys(&canonical_id, &final_arguments, &bindings, &classification)
+        };
         metadata.insert(
             "effective_limits".to_string(),
             serde_json::to_value(&limits).unwrap_or(Value::Null),
@@ -6297,8 +7922,15 @@ impl RuntimeAgent {
         // Admission must reject any later state transition, reset, or restore before consuming rate capacity or invoking the tool.
         //
         let available_snapshot = self
-            .get_available_tool_ids_snapshot_for_scope(
+            .get_available_tool_ids_with_validation_grant(
                 control_snapshot.tool_scope_override.as_deref(),
+                crate::autonomy::validation_extra_grant(
+                    &self.info.id,
+                    &request,
+                    &canonical_id,
+                    &final_arguments,
+                )
+                .as_deref(),
             )
             .await?;
         versions.state = available_snapshot.state_generation;
@@ -6310,7 +7942,12 @@ impl RuntimeAgent {
             "state_generation_snapshot".to_string(),
             serde_json::to_value(available_snapshot.state_generation).unwrap_or(Value::Null),
         );
-        if !available_snapshot
+        if !crate::autonomy::validation_arguments_valid(
+            &self.info.id,
+            &request,
+            &canonical_id,
+            &final_arguments,
+        ) || !available_snapshot
             .tool_ids
             .iter()
             .any(|tool_id| tool_id == &canonical_id)
@@ -6365,12 +8002,14 @@ impl RuntimeAgent {
             }
             SecurityCheckResult::Allow | SecurityCheckResult::RequireConfirmation { .. } => {}
         }
-        let final_confirmation_required = matches!(
-            final_security_result,
-            SecurityCheckResult::RequireConfirmation { .. }
-        ) || security_engine
-            .classification_approval_message(&canonical_id, &classification)
-            .is_some();
+        let final_confirmation_required = crate::autonomy::validation_requires_approval(&request)
+            || matches!(
+                final_security_result,
+                SecurityCheckResult::RequireConfirmation { .. }
+            )
+            || security_engine
+                .classification_approval_message(&canonical_id, &classification)
+                .is_some();
         let stale_approval = approval_binding.as_ref().is_some_and(|binding| {
             binding.is_stale(
                 &canonical_id,
@@ -6417,11 +8056,46 @@ impl RuntimeAgent {
             return Ok(record);
         }
 
+        // Rejecting a question supplies no fabricated answer and consumes no invocation slot; independent escalation can still satisfy task gates.
+        if let Some(execution) = crate::autonomy::current_execution()
+            && execution.rejects_question()
+            && resolved.tool.task_question(&final_arguments)?.is_some()
+        {
+            let reason = "Task profile rejects required user input".to_string();
+            let record = final_denial(
+                canonical_id,
+                reason.clone(),
+                ToolPolicyDecisionRecord::deny(reason),
+                metadata,
+                versions,
+            );
+            self.finish_tool_record(&record).await;
+            return Ok(record);
+        }
+        // Park validated questions before locks and atomic rate admission, which belong only to an actual invocation.
+        // The answer is bound to final approved arguments and is consumed only after resumed authorization succeeds.
+        if let Some(execution) = crate::autonomy::current_execution()
+            && execution.pauses_question(&self.info.id)
+            && let Some(question) = resolved.tool.task_question(&final_arguments)?
+            && !crate::autonomy::suspension::has_resumed_question(
+                &request.call_id,
+                &final_arguments,
+            )
+        {
+            let id = execution.park_question(
+                &self.info.id,
+                &request.call_id,
+                &final_arguments,
+                question,
+            )?;
+            return Err(AgentError::TaskSuspended(id));
+        }
+
         //
         // Hold conflict locks across final generation admission and invocation.
         // Completion hooks and fallback execution run only after these guards are released.
         //
-        let Some(resource_guards) = self.acquire_tool_resource_locks(&resource_lock_keys).await
+        let Some(mut resource_guards) = self.acquire_tool_resource_locks(&resource_lock_keys).await
         else {
             //
             // Cancellation while lock admission waits is terminal runtime-control evidence, even though the non-executed result retains its denial policy outcome.
@@ -6496,7 +8170,7 @@ impl RuntimeAgent {
             actor_id: turn_actor
                 .as_ref()
                 .and_then(|context| context.effective_actor_id().map(str::to_string))
-                .or_else(|| self.actor_id()),
+                .or_else(|| self.effective_actor_id()),
             origin_actor_id: turn_actor
                 .as_ref()
                 .and_then(|context| context.origin_actor_id.clone()),
@@ -6528,22 +8202,34 @@ impl RuntimeAgent {
             limits: limits.clone(),
             policy_snapshot,
             custom_config: security_engine.custom_config(&canonical_id),
+            admitted_write_footprint: None,
         };
-        let (mut result, timed_out, cancelled, invoked) = self
-            .run_tool_with_retries(
-                &canonical_id,
-                resolved.tool.clone(),
-                executed_arguments.clone(),
-                tool_context,
-                timeout,
-                tool_config.max_retries,
+        // Arm custody only on the first implementation poll; progress or capability denial is proven non-invocation.
+        let (mut result, timed_out, cancelled, invoked, eligible) = TOOL_EFFECT_CUSTODY
+            .scope(
+                resource_guards.effect_custody.clone(),
+                Box::pin(self.run_tool_with_retries(
+                    &canonical_id,
+                    resolved.tool.clone(),
+                    executed_arguments.clone(),
+                    tool_context,
+                    timeout,
+                    tool_config.max_retries,
+                )),
             )
             .await?;
 
         //
+        // A known returned result is quiescent; timeout/cancellation after invocation is not proof that effects stopped.
+        resource_guards.retain_on_drop = invoked && (timed_out || cancelled);
+        //
         // Runtime cancellation is terminal for the logical request. Recovery fallback must not mask the cancelled record or start new work after the host asked active execution to stop.
         //
-        let fallback_tool = if !result.success && !cancelled {
+        let fallback_tool = if !result.success
+            && eligible
+            && !cancelled
+            && !(timed_out && invoked && crate::autonomy::current_execution().is_some())
+        {
             match &tool_config.on_failure {
                 ToolFailureAction::Skip => {
                     result = ToolResult::ok(format!(
@@ -6581,6 +8267,15 @@ impl RuntimeAgent {
             output_truncated,
             versions,
         );
+        // Tool metadata cannot forge eligibility: install the executor's private decision after merging the actual result metadata.
+        if crate::autonomy::current_execution().is_some() {
+            record
+                .metadata
+                .insert("_task_result_eligible".into(), Value::Bool(eligible));
+            if !eligible && let Some(execution) = crate::autonomy::current_execution() {
+                execution.stop("tool_result_ineligible");
+            }
+        }
         record.cancelled = cancelled;
         if cancelled {
             record.cancellation_reason = Some("runtime control cancellation".to_string());
@@ -6599,11 +8294,19 @@ impl RuntimeAgent {
                 fallback_arguments,
                 ToolCallSource::Fallback { original_tool },
             );
-            return Box::pin(self.execute_tool_record_inner(fallback_request, fallback_state))
-                .await;
+            // The driver starts this separately authorized request only after this frame has returned and released its locks.
+            TOOL_FALLBACK_REQUEST
+                .try_with(|slot| *slot.borrow_mut() = Some((fallback_request, fallback_state)))
+                .map_err(|_| AgentError::Other("fallback has no shared executor driver".into()))?;
+            return Ok(record);
         }
         self.finish_tool_record_after_resource_guards(resource_guards, &record)
             .await;
+        if !eligible && crate::autonomy::current_execution().is_some() {
+            return Err(AgentError::Tool(
+                "tool result exceeded its original authority after acknowledged settlement".into(),
+            ));
+        }
         Ok(record)
     }
 
@@ -6630,8 +8333,18 @@ impl RuntimeAgent {
     // This method is branch-safe because it only asks the router which skill matches.
     // Do not add disambiguation, pending-skill writes, or skill execution here.
     //
-    /// Selects a skill without executing it.
+    /// Selects a skill without executing it; an explicitly admitted task skill bypasses only semantic selection, never scope or execution checks.
     async fn select_skill_candidate(&self, input: &str) -> Result<Option<SkillCandidate>> {
+        if let Some(turn) = crate::autonomy::current_turn_input(&self.root_turn_gate)
+            && turn.initial_work()
+            && crate::autonomy::current_execution()
+                .is_some_and(|execution| execution.needs_skill_segment())
+            && let Some(skill) = turn.owner.skill.read().clone()
+        {
+            self.validate_autonomy_skill_binding(&skill)?;
+            let available = self.admit_autonomy_skill(&skill.id)?;
+            return Ok(Some(SkillCandidate::new(available.id.clone(), available)));
+        }
         let Some(ref router) = self.skill_router else {
             return Ok(None);
         };
@@ -6657,10 +8370,8 @@ impl RuntimeAgent {
         Ok(Some(SkillCandidate::new(skill_id, skill)))
     }
 
-    //
-    // This is the commit half of skill routing.
-    // It may mutate pending skill state, run clarification, and execute skill steps.
-    //
+    /// Commits selected skill routing, clarification and execution without replaying a completed selection.
+    /// Task generation invalidation preserves newer manager exchanges while ordinary chat retains its reset behavior.
     async fn commit_skill_candidate_route_result(
         &self,
         candidate: SkillCandidate,
@@ -6702,8 +8413,10 @@ impl RuntimeAgent {
             if current_state_generation != expected_state_generation
                 || self.disambiguation_epoch.load(Ordering::SeqCst) != expected_disambiguation_epoch
             {
-                disambiguator.clear_pending().await;
-                *self.pending_skill_id.write() = None;
+                if crate::autonomy::current_execution().is_none() {
+                    disambiguator.clear_pending().await;
+                    *self.pending_skill_id.write() = None;
+                }
                 return Err(AgentError::Other(
                     "State or reset ownership changed during skill disambiguation".to_string(),
                 ));
@@ -6730,6 +8443,7 @@ impl RuntimeAgent {
                         "Skill requires clarification before execution"
                     );
                     *self.pending_skill_id.write() = Some(skill_id.clone());
+                    self.retain_automatic_skill_input(&skill_id, input);
                     let response = AgentResponse::new(&question.question).with_metadata(
                         "disambiguation",
                         serde_json::json!({
@@ -6762,7 +8476,7 @@ impl RuntimeAgent {
                         )
                         .await?;
                     drop(admission);
-                    let content = self.execute_skill(&skill, &enriched_input).await?;
+                    let content = self.execute_selected_skill(&skill, &enriched_input).await?;
                     return Ok(SkillRouteResult::Response { skill_id, content });
                 }
                 DisambiguationResult::ProceedWithBestGuess { enriched_input } => {
@@ -6774,7 +8488,7 @@ impl RuntimeAgent {
                         )
                         .await?;
                     drop(admission);
-                    let content = self.execute_skill(&skill, &enriched_input).await?;
+                    let content = self.execute_selected_skill(&skill, &enriched_input).await?;
                     return Ok(SkillRouteResult::Response { skill_id, content });
                 }
                 DisambiguationResult::GiveUp { reason } => {
@@ -6822,12 +8536,34 @@ impl RuntimeAgent {
             )
             .await?;
         drop(admission);
-        let content = self.execute_skill(&skill, input).await?;
+        let content = self.execute_selected_skill(&skill, input).await?;
         Ok(SkillRouteResult::Response { skill_id, content })
     }
 
-    /// Result of skill routing.
-    async fn try_skill_route(&self, input: &str) -> Result<SkillRouteResult> {
+    /// Routes only the accepted task input to a script; controller continuations use native/model history without replaying that segment.
+    /// Optional semantic skill construction is erased so runtimes without routing do not retain it on nested model polling stacks.
+    fn try_skill_route<'a>(
+        &'a self,
+        input: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<SkillRouteResult>> + Send + 'a>> {
+        let explicit = crate::autonomy::current_turn_input(&self.root_turn_gate)
+            .is_some_and(|turn| turn.initial_work() && turn.owner.skill.read().is_some());
+        if self.skill_router.is_none() && !explicit {
+            return Box::pin(async { Ok(SkillRouteResult::NoMatch) });
+        }
+        Box::pin(self.try_skill_route_inner(input))
+    }
+
+    /// Installed skill routing selects once under the admitted turn; later controller work skips completed selection.
+    async fn try_skill_route_inner(&self, input: &str) -> Result<SkillRouteResult> {
+        if crate::autonomy::current_turn_input(&self.root_turn_gate).is_some_and(|turn| {
+            !turn.initial_work()
+                || (turn.owner.skill.read().is_some()
+                    && crate::autonomy::current_execution()
+                        .is_some_and(|execution| !execution.needs_skill_segment()))
+        }) {
+            return Ok(SkillRouteResult::NoMatch);
+        }
         if let Some(candidate) = self.select_skill_candidate(input).await? {
             self.commit_skill_candidate_route_result(candidate, input)
                 .await
@@ -6882,6 +8618,8 @@ impl RuntimeAgent {
                         .await?;
                 }
                 drop(admission);
+                self.park_task_clarification(processed_input, &response)
+                    .await?;
                 self.finish_turn_if_root(&response).await?;
                 Ok(Some(response))
             }
@@ -6889,7 +8627,7 @@ impl RuntimeAgent {
         }
     }
 
-    /// Execute a skill with reasoning and reflection, returning the response string.
+    /// Executes ordinary scripts directly and task scripts from an acknowledged cursor without rerouting or replaying completed steps.
     async fn execute_skill(&self, skill: &SkillDefinition, input: &str) -> Result<String> {
         if let Some(ref executor) = self.skill_executor {
             let skill_reasoning = self.get_skill_reasoning_config(skill);
@@ -6902,26 +8640,19 @@ impl RuntimeAgent {
                 "Skill reasoning/reflection config"
             );
 
-            let response = self
-                .observe_purpose(
+            let response = if crate::autonomy::current_turn_input(&self.root_turn_gate).is_some() {
+                Box::pin(self.execute_task_skill(skill, input)).await?
+            } else {
+                self.observe_purpose(
                     ObservationPurpose::SkillPrompt,
                     executor.execute_with_invoker(skill, input, serde_json::json!({}), self),
                 )
-                .await?;
+                .await?
+            };
 
-            if skill_reflection.requires_evaluation() && skill_reflection.is_enabled() {
-                let should_reflect = self
-                    .should_reflect_with_config(input, &response, &skill_reflection)
-                    .await?;
-                if should_reflect {
-                    let evaluated = self
-                        .evaluate_and_retry_with_config(input, response, &skill_reflection)
-                        .await?;
-                    return Ok(evaluated);
-                }
-            }
-
-            return Ok(response);
+            return self
+                .reflect_skill_response(input, response, &skill_reflection)
+                .await;
         }
         Err(AgentError::Skill(
             "No skill executor configured".to_string(),
@@ -6936,7 +8667,7 @@ impl RuntimeAgent {
             .as_ref()
             .and_then(|r| r.get_skill(skill_id).cloned())
             .ok_or_else(|| AgentError::Skill(format!("Skill not found: {}", skill_id)))?;
-        self.execute_skill(&skill, input).await
+        self.execute_selected_skill(&skill, input).await
     }
 
     // Uses one explicit reflection configuration for both skill and ordinary response gating.
@@ -7154,8 +8885,13 @@ OVERALL: PASS/FAIL"#,
         Ok(EvaluationResult::new(overall_pass, confidence).with_criteria(criteria_results))
     }
 
-    /// Process input through the pipeline (state-level override or agent-level).
+    /// Processes each accepted or delegated objective once; controller continuation does not repeat extraction.
     async fn process_input(&self, input: &str) -> Result<ProcessData> {
+        if crate::autonomy::current_turn_input(&self.root_turn_gate)
+            .is_some_and(|turn| !turn.initial_work())
+        {
+            return Ok(ProcessData::new(input));
+        }
         if let Some(processor) = self.get_state_process_processor() {
             let purpose = observation_purpose_for_process(processor.input_purpose_hint());
             return self
@@ -7213,6 +8949,18 @@ OVERALL: PASS/FAIL"#,
         let Some(timeout_state) = sm.check_timeout() else {
             return Ok(());
         };
+        if crate::autonomy::current_turn_input(&self.root_turn_gate).is_some()
+            && crate::autonomy::location::current_state_return().is_some()
+        {
+            return Box::pin(self.apply_task_transition_target(
+                &sm.current(),
+                &timeout_state,
+                "max_turns exceeded",
+                None,
+            ))
+            .await
+            .map(|_| ());
+        }
         let claim_admission = self.disambiguation_admission.write().await;
         if sm.check_timeout().as_deref() != Some(timeout_state.as_str()) {
             return Ok(());
@@ -7377,8 +9125,63 @@ OVERALL: PASS/FAIL"#,
             .await
     }
 
-    /// Runs state transition approval before any transition side effects.
-    async fn approve_transition_target(&self, from_state: &str, target: &str) -> Result<bool> {
+    /// Runs state transition approval before effects and retains the exact selected caller position for task suspension.
+    async fn approve_transition_target(
+        &self,
+        from_state: &str,
+        target: &str,
+        reason: &str,
+        staged: Option<&HashMap<String, Value>>,
+        processed_input: Option<&str>,
+    ) -> Result<bool> {
+        if crate::autonomy::current_turn_input(&self.root_turn_gate).is_some()
+            && let Some(position) = crate::autonomy::location::current_state_return()
+            && let Some(engine) = &self.hitl_engine
+        {
+            let generation = self.state_machine.as_ref().map(|m| m.generation());
+            let epoch = self.disambiguation_epoch.load(Ordering::SeqCst);
+            let kind = crate::autonomy::interaction::TaskInteractionKind::StateApproval {
+                from_state: from_state.into(),
+                target: target.into(),
+                reason: reason.into(),
+                staged: staged.cloned(),
+                processed_input: processed_input.map(str::to_owned),
+                definition: serde_json::to_value(
+                    self.state_machine
+                        .as_ref()
+                        .and_then(|m| m.current_definition()),
+                )?,
+                return_to: Box::new(position),
+            };
+            let check = self
+                .observe_purpose(
+                    ObservationPurpose::HitlLocalization,
+                    engine.check_state_transition_with_localization(
+                        Some(from_state),
+                        target,
+                        &self.build_hitl_language_context(),
+                        self.approval_handler.as_ref(),
+                        Some(&self.llm_registry),
+                    ),
+                )
+                .await?;
+            if generation != self.state_machine.as_ref().map(|m| m.generation())
+                || epoch != self.disambiguation_epoch.load(Ordering::SeqCst)
+            {
+                return Err(AgentError::Other(
+                    "transition review ownership changed".into(),
+                ));
+            }
+            if let Some(request) = check.clone().into_request() {
+                self.park_task_interaction(kind, Some(request), None)
+                    .await?;
+            }
+            let result = self.request_hitl_approval(check).await?;
+            return Ok(matches!(
+                result,
+                ApprovalResult::Approved | ApprovalResult::Modified { .. }
+            ));
+        }
         let approved = self.check_state_hitl(Some(from_state), target).await?;
         if !approved {
             info!(to = %target, "State transition rejected by HITL");
@@ -7397,6 +9200,12 @@ OVERALL: PASS/FAIL"#,
         let Some(ref sm) = self.state_machine else {
             return Ok(false);
         };
+        if crate::autonomy::current_turn_input(&self.root_turn_gate).is_some()
+            && crate::autonomy::location::current_state_return().is_some()
+        {
+            return Box::pin(self.apply_task_transition_target(from_state, target, reason, staged))
+                .await;
+        }
         let claim_admission = self.disambiguation_admission.write().await;
         if sm.current() != from_state {
             return Ok(false);
@@ -7431,6 +9240,10 @@ OVERALL: PASS/FAIL"#,
 
         self.execute_state_enter_actions(&entered, is_reentry).await;
         drop(reservation);
+        if let Some(execution) = crate::autonomy::current_execution() {
+            // State commitment remains distinct from task completion and its later evidence checks.
+            crate::autonomy::events::emit(&execution, crate::autonomy::TaskRunEventKind::StateTransition, || serde_json::json!({"from":crate::autonomy::events::safe_text(from_state),"to":crate::autonomy::events::safe_text(&entered)})).await;
+        }
         self.hooks
             .on_state_transition(Some(from_state), &entered, reason)
             .await;
@@ -7445,7 +9258,10 @@ OVERALL: PASS/FAIL"#,
         target: &str,
         reason: &str,
     ) -> Result<bool> {
-        if !self.approve_transition_target(from_state, target).await? {
+        if !self
+            .approve_transition_target(from_state, target, reason, None, None)
+            .await?
+        {
             return Ok(false);
         }
         self.apply_transition_target(from_state, target, reason, None)
@@ -7477,7 +9293,13 @@ OVERALL: PASS/FAIL"#,
         processed_input: &str,
     ) -> Result<bool> {
         if !self
-            .approve_transition_target(&candidate.from_state, candidate.target())
+            .approve_transition_target(
+                &candidate.from_state,
+                candidate.target(),
+                &candidate.reason,
+                Some(staged),
+                Some(processed_input),
+            )
             .await?
         {
             return Ok(false);
@@ -7517,6 +9339,7 @@ OVERALL: PASS/FAIL"#,
     }
 
     /// Attempts deterministic pre-response routing before old-state response generation.
+    /// Task redispatch consumes retained processed data so approved transitions do not repeat input processing.
     async fn try_pre_response_transition(
         &self,
         processed_input: &str,
@@ -7579,6 +9402,15 @@ OVERALL: PASS/FAIL"#,
         {
             return Ok(None);
         }
+        if let Some(crate::autonomy::location::TaskStateReturn::Prepared { data }) =
+            crate::autonomy::location::current_state_return()
+        {
+            // Automatic arrival consumes the original preparation before ordinary redispatch could repeat extraction.
+            self.promote_automatic_state(&data).await?;
+            if crate::autonomy::current_turn_input(&self.root_turn_gate).is_some() {
+                return Box::pin(self.run_accepted_input(data)).await.map(Some);
+            }
+        }
         self.redispatch_current_state(processed_input)
             .await
             .map(Some)
@@ -7588,7 +9420,20 @@ OVERALL: PASS/FAIL"#,
     // Speculative branches overlap independent decisions but still commit exactly one path.
     // Losing branches must remain data only and must not write memory, run tools, or emit output.
     //
-    async fn try_speculative_branches(
+    fn try_speculative_branches<'a>(
+        &'a self,
+        processed_input: &'a str,
+        input_context: &'a HashMap<String, Value>,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<AgentResponse>>> + Send + 'a>> {
+        if !self.runtime_config.optimization.enabled {
+            return Box::pin(async { Ok(None) });
+        }
+        Box::pin(self.try_speculative_branches_inner(processed_input, input_context))
+    }
+
+    // Construction stays outside the recursive turn's polling frame even when speculation is disabled.
+    // Branch execution remains same-task and preserves the existing commit, discard and cancellation boundaries.
+    async fn try_speculative_branches_inner(
         &self,
         processed_input: &str,
         input_context: &HashMap<String, Value>,
@@ -7598,6 +9443,12 @@ OVERALL: PASS/FAIL"#,
             return Ok(None);
         }
 
+        // An explicit script and later controller turns keep their installed no-reroute contract; ordinary initial work can speculate.
+        if crate::autonomy::current_turn_input(&self.root_turn_gate)
+            .is_some_and(|turn| !turn.initial_work() || turn.owner.skill.read().is_some())
+        {
+            return Ok(None);
+        }
         let effective_reasoning_mode = self.get_effective_reasoning_config().mode.clone();
         if !matches!(
             effective_reasoning_mode,
@@ -7650,6 +9501,10 @@ OVERALL: PASS/FAIL"#,
             return Ok(None);
         }
 
+        let speculative_binding = (
+            self.task_review_binding(),
+            self.state_machine.as_ref().map(|state| state.generation()),
+        );
         let main_kind = if transition_enabled {
             RuntimeOptimizationKind::ParallelStateTransition
         } else if skill_enabled {
@@ -7661,6 +9516,7 @@ OVERALL: PASS/FAIL"#,
             return Ok(None);
         }
 
+        let mut task_branch_observations = TaskBranchObservations::new(self);
         let mut branch_set = ScheduledBranchSet::new(optimization.max_parallel_runtime_tasks)?;
         let main_branch = RuntimeBranch::new(
             RuntimeTaskPurpose::MainResponse,
@@ -7796,15 +9652,53 @@ OVERALL: PASS/FAIL"#,
         }
 
         if matches!(effective_reasoning_mode, ReasoningMode::Auto) && !reasoning_enabled {
-            self.finalize_pending_branches(branch_set.cancel_pending());
+            Box::pin(self.settle_pending_branches(&mut branch_set)).await?;
             return Ok(None);
         }
 
         if !transition_enabled && !skill_enabled && !reasoning_enabled {
-            self.finalize_pending_branches(branch_set.cancel_pending());
+            Box::pin(self.settle_pending_branches(&mut branch_set)).await?;
             return Ok(None);
         }
 
+        for (enabled, id, optimization, behavior) in [
+            (
+                true,
+                &main_id,
+                main_kind,
+                RuntimeCommitBehavior::FinalResponse,
+            ),
+            (
+                transition_enabled,
+                &transition_id,
+                RuntimeOptimizationKind::ParallelStateTransition,
+                RuntimeCommitBehavior::TransitionDecision,
+            ),
+            (
+                skill_enabled,
+                &skill_id,
+                RuntimeOptimizationKind::SpeculativeSkillRouting,
+                RuntimeCommitBehavior::SkillSelection,
+            ),
+            (
+                reasoning_enabled,
+                &reasoning_id,
+                RuntimeOptimizationKind::SpeculativeReasoningAuto,
+                RuntimeCommitBehavior::ReasoningDecision,
+            ),
+        ] {
+            if enabled {
+                task_branch_observations.receipts.push(
+                    crate::autonomy::location::TaskSpeculativeBranch {
+                        id: id.clone(),
+                        optimization,
+                        behavior,
+                        failed: false,
+                        uninvoked: false,
+                    },
+                );
+            }
+        }
         let mut main_pending = true;
         let mut skill_pending = skill_enabled;
         let mut reasoning_pending = reasoning_enabled;
@@ -7813,6 +9707,9 @@ OVERALL: PASS/FAIL"#,
         // so they start unfinalized; only "no skill branch and no skills at all" is finalized up front.
         let mut skill_finalized = !skill_enabled && self.skill_router.is_none();
         let mut reasoning_finalized = !reasoning_enabled;
+        let mut skill_unfinished = false;
+        let mut reasoning_unfinished = false;
+        let mut main_observed = false;
         let mut main_result: Option<Result<MainResponseDraft>> = None;
         let mut transition_candidate: Option<TransitionCandidate> = None;
         let mut skill_candidate: Option<SkillCandidate> = None;
@@ -7823,12 +9720,148 @@ OVERALL: PASS/FAIL"#,
 
         loop {
             if let Some(candidate) = transition_candidate.take() {
+                if crate::autonomy::current_turn_input(&self.root_turn_gate).is_some() {
+                    // Settle admitted alternatives before review/actions can suspend and unwind the branch set.
+                    let outcomes =
+                        Box::pin(self.collect_pending_task_branches(&mut branch_set)).await?;
+                    if speculative_binding
+                        != (
+                            self.task_review_binding(),
+                            self.state_machine.as_ref().map(|state| state.generation()),
+                        )
+                    {
+                        return Err(AgentError::Other(
+                            "speculative transition binding changed before adoption".into(),
+                        ));
+                    }
+                    let skill_checked =
+                        (skill_finalized || skill_candidate.is_some()) && !skill_unfinished;
+                    let reasoning_checked = (reasoning_finalized || reasoning_decision.is_some())
+                        && !reasoning_unfinished;
+                    let mut selection = crate::autonomy::location::TaskSpeculativeSelection {
+                        data: crate::autonomy::interaction::prepared_input()
+                            .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?,
+                        turn: self.active_turn_context.read().clone().map(Box::new),
+                        draft: None,
+                        draft_error: None,
+                        draft_uninvoked: false,
+                        skill: skill_candidate.take(),
+                        skill_checked,
+                        reasoning: reasoning_decision.take(),
+                        reasoning_checked,
+                        auto_detected: reasoning_enabled,
+                        branches: vec![crate::autonomy::location::TaskSpeculativeBranch {
+                            id: transition_id.clone(),
+                            optimization: RuntimeOptimizationKind::ParallelStateTransition,
+                            behavior: RuntimeCommitBehavior::TransitionDecision,
+                            failed: false,
+                            uninvoked: false,
+                        }],
+                    };
+                    if selection.skill.is_some() {
+                        selection
+                            .branches
+                            .push(crate::autonomy::location::TaskSpeculativeBranch {
+                                id: skill_id.clone(),
+                                optimization: RuntimeOptimizationKind::SpeculativeSkillRouting,
+                                behavior: RuntimeCommitBehavior::SkillSelection,
+                                failed: false,
+                                uninvoked: false,
+                            });
+                    }
+                    if selection.reasoning.is_some() {
+                        selection
+                            .branches
+                            .push(crate::autonomy::location::TaskSpeculativeBranch {
+                                id: reasoning_id.clone(),
+                                optimization: RuntimeOptimizationKind::SpeculativeReasoningAuto,
+                                behavior: RuntimeCommitBehavior::ReasoningDecision,
+                                failed: false,
+                                uninvoked: false,
+                            });
+                    }
+                    if let Some(result) = main_result.take() {
+                        if !main_observed {
+                            selection.branches.push(
+                                crate::autonomy::location::TaskSpeculativeBranch {
+                                    id: main_id.clone(),
+                                    optimization: main_kind,
+                                    behavior: RuntimeCommitBehavior::FinalResponse,
+                                    failed: result.is_err(),
+                                    uninvoked: false,
+                                },
+                            );
+                        }
+                        match result {
+                            Ok(draft) => selection.draft = Some(draft),
+                            Err(error) => selection.draft_error = Some(error.to_string()),
+                        }
+                    }
+                    for (outcome, unfinished) in outcomes {
+                        selection.absorb(outcome, unfinished);
+                    }
+                    let position =
+                        crate::autonomy::location::TaskStateReturn::SpeculativeSelection {
+                            selection: Box::new(selection),
+                        };
+                    let approval = crate::autonomy::location::scope_state_return(
+                        position.clone(),
+                        Box::pin(self.approve_transition_target(
+                            &candidate.from_state,
+                            candidate.target(),
+                            &candidate.reason,
+                            None,
+                            Some(processed_input),
+                        )),
+                    )
+                    .await;
+                    let approved = match approval {
+                        Ok(approved) => approved,
+                        Err(error) => {
+                            task_branch_observations.retained =
+                                matches!(error, AgentError::TaskSuspended(_));
+                            return Err(error);
+                        }
+                    };
+                    let transition = if approved {
+                        self.commit_root_user_message(processed_input).await?;
+                        crate::autonomy::location::scope_state_return(
+                            position.clone(),
+                            Box::pin(self.apply_transition_target(
+                                &candidate.from_state,
+                                candidate.target(),
+                                &candidate.reason,
+                                None,
+                            )),
+                        )
+                        .await
+                    } else {
+                        Ok(false)
+                    };
+                    let transitioned = match transition {
+                        Ok(transitioned) => transitioned,
+                        Err(error) => {
+                            task_branch_observations.retained =
+                                matches!(error, AgentError::TaskSuspended(_));
+                            return Err(error);
+                        }
+                    };
+                    return Box::pin(self.resume_state_return_outcome(position, transitioned))
+                        .await
+                        .map(Some);
+                }
                 if self
-                    .approve_transition_target(&candidate.from_state, candidate.target())
+                    .approve_transition_target(
+                        &candidate.from_state,
+                        candidate.target(),
+                        &candidate.reason,
+                        None,
+                        None,
+                    )
                     .await?
                 {
-                    // Drop losing provider futures before transition side effects can reuse their shared resources.
-                    self.finalize_pending_branches(branch_set.cancel_pending());
+                    // Managed losers settle before winner effects; ordinary chat retains its existing drop-before-reuse behavior.
+                    Box::pin(self.settle_pending_branches(&mut branch_set)).await?;
                     if !main_pending {
                         self.finalize_branch_loss(
                             &main_id,
@@ -7912,8 +9945,8 @@ OVERALL: PASS/FAIL"#,
                     Ok(Some(candidate)) => skill_candidate = Some(candidate),
                     Ok(None) => {}
                     Err(error) => {
-                        // Serial selection failure ends the turn exactly as the serial path would.
-                        self.finalize_pending_branches(branch_set.cancel_pending());
+                        // Serial selection failure ends the turn after managed siblings settle, without executing their results.
+                        Box::pin(self.settle_pending_branches(&mut branch_set)).await?;
                         return Err(error);
                     }
                 }
@@ -7950,7 +9983,7 @@ OVERALL: PASS/FAIL"#,
                         Some(false),
                     );
                 }
-                self.finalize_pending_branches(branch_set.cancel_pending());
+                Box::pin(self.settle_pending_branches(&mut branch_set)).await?;
                 return self
                     .commit_winning_skill_candidate(candidate, processed_input, input_context)
                     .await;
@@ -7977,7 +10010,7 @@ OVERALL: PASS/FAIL"#,
                             main_result.as_ref().map(|result| result.is_err()),
                         );
                     }
-                    self.finalize_pending_branches(branch_set.cancel_pending());
+                    Box::pin(self.settle_pending_branches(&mut branch_set)).await?;
                     self.commit_root_user_message(processed_input).await?;
                     return if matches!(reasoning_mode, ReasoningMode::PlanAndExecute) {
                         self.handle_plan_and_execute(processed_input, input_context, true)
@@ -8018,7 +10051,7 @@ OVERALL: PASS/FAIL"#,
                             main_result.as_ref().map(|result| result.is_err()),
                         );
                     }
-                    self.finalize_pending_branches(branch_set.cancel_pending());
+                    Box::pin(self.settle_pending_branches(&mut branch_set)).await?;
                     return Ok(None);
                 }
 
@@ -8033,7 +10066,7 @@ OVERALL: PASS/FAIL"#,
                                 "failed",
                                 false,
                             );
-                            self.finalize_pending_branches(branch_set.cancel_pending());
+                            Box::pin(self.settle_pending_branches(&mut branch_set)).await?;
                             return Err(error);
                         }
                     };
@@ -8044,7 +10077,7 @@ OVERALL: PASS/FAIL"#,
                         "committed",
                         true,
                     );
-                    self.finalize_pending_branches(branch_set.cancel_pending());
+                    Box::pin(self.settle_pending_branches(&mut branch_set)).await?;
                     return self
                         .commit_main_response_draft(
                             processed_input,
@@ -8052,6 +10085,7 @@ OVERALL: PASS/FAIL"#,
                             draft,
                             ReasoningMode::None,
                             reasoning_enabled,
+                            false,
                         )
                         .await
                         .map(Some);
@@ -8065,6 +10099,7 @@ OVERALL: PASS/FAIL"#,
             let Some(outcome) = branch_set.next_completed().await else {
                 return Ok(None);
             };
+            let unfinished = branch_set.unfinished(&outcome);
             let branch_id = outcome.branch.branch_id();
             match outcome.result {
                 RuntimeBranchResult::MainDraft(draft) => {
@@ -8148,6 +10183,7 @@ OVERALL: PASS/FAIL"#,
                         false,
                     );
                     if branch_id == main_id {
+                        main_observed = true;
                         main_pending = false;
                         main_result =
                             Some(Err(AgentError::Other("main branch cancelled".to_string())));
@@ -8155,10 +10191,12 @@ OVERALL: PASS/FAIL"#,
                         transition_finalized = true;
                         transition_fallback_required = true;
                     } else if branch_id == skill_id {
+                        skill_unfinished = unfinished;
                         skill_pending = false;
                         skill_finalized = true;
                         skill_fallback_required = true;
                     } else if branch_id == reasoning_id {
+                        reasoning_unfinished = unfinished;
                         reasoning_pending = false;
                         reasoning_finalized = true;
                         reasoning_fallback_required = true;
@@ -8168,6 +10206,269 @@ OVERALL: PASS/FAIL"#,
         }
     }
 
+    // A resumed review or state action restores data and consumed local speculative capacity, never a live runtime capability.
+    fn restore_speculative_context(
+        &self,
+        selection: &crate::autonomy::location::TaskSpeculativeSelection,
+    ) {
+        if let Some(saved) = &selection.turn {
+            let mut current = self.active_turn_context.write();
+            if current
+                .as_ref()
+                .is_none_or(|turn| turn.turn_id != saved.turn_id)
+            {
+                let mut saved = (**saved).clone();
+                saved.user_message_committed =
+                    self.root_user_message_committed.load(Ordering::SeqCst);
+                *current = Some(saved);
+            }
+        }
+        self.update_active_turn_context(&selection.data.content, selection.data.context.clone());
+    }
+
+    // Resumes the selected transition's exact return point: accepted routes reuse prepared input, rejected routes adopt settled alternatives without rerouting.
+    // Serialized alternatives are inert data; ordinary state, skill, tool and final-response drivers keep their existing live admission checks.
+    async fn resume_speculative_selection(
+        &self,
+        mut selection: crate::autonomy::location::TaskSpeculativeSelection,
+        transitioned: bool,
+    ) -> Result<AgentResponse> {
+        let mut observation_cleanup = TaskBranchObservations::new(self);
+        observation_cleanup.receipts = selection.branches.clone();
+        self.restore_speculative_context(&selection);
+        let execution = crate::autonomy::current_execution()
+            .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
+        if ai_agents_core::autonomy::InvocationAdmission::execution_stopped(execution.as_ref()) {
+            self.finalize_speculative_receipts(&mut selection, None);
+            return Err(AgentError::Other(
+                "task speculative adoption is no longer admitted".into(),
+            ));
+        }
+        if transitioned {
+            self.finalize_speculative_receipts(
+                &mut selection,
+                Some(RuntimeCommitBehavior::TransitionDecision),
+            );
+            return Box::pin(self.run_accepted_input(selection.data)).await;
+        }
+        let data = selection.data.clone();
+        let skill = if selection.skill_checked {
+            selection.skill.take()
+        } else {
+            self.select_skill_candidate(&data.content).await?
+        };
+        if let Some(skill) = skill {
+            self.finalize_speculative_receipts(
+                &mut selection,
+                Some(RuntimeCommitBehavior::SkillSelection),
+            );
+            if !self.skills.iter().any(|actual| {
+                actual.id == skill.skill_id
+                    && serde_json::to_value(actual).ok() == serde_json::to_value(&skill.skill).ok()
+            }) {
+                return Err(AgentError::Config(
+                    "saved speculative skill binding changed".into(),
+                ));
+            }
+            if let Some(response) = crate::autonomy::interaction::scope_prepared_input(
+                data.clone(),
+                Box::pin(self.commit_winning_skill_candidate(skill, &data.content, &data.context)),
+            )
+            .await?
+            {
+                return Ok(response);
+            }
+        }
+        let reasoning = if selection.reasoning_checked {
+            selection.reasoning.take()
+        } else {
+            Some(self.determine_reasoning_mode_strict(&data.content).await?)
+        };
+        if let Some(mode) = reasoning
+            && !matches!(mode, ReasoningMode::None)
+        {
+            self.finalize_speculative_receipts(
+                &mut selection,
+                Some(RuntimeCommitBehavior::ReasoningDecision),
+            );
+            self.commit_root_user_message(&data.content).await?;
+            return if matches!(mode, ReasoningMode::PlanAndExecute) {
+                Box::pin(self.handle_plan_and_execute(&data.content, &data.context, true)).await
+            } else {
+                Box::pin(self.run_committed_response_loop_with_reasoning(
+                    &data.content,
+                    &data.context,
+                    mode,
+                    true,
+                ))
+                .await
+            };
+        }
+        self.finalize_speculative_receipts(
+            &mut selection,
+            Some(RuntimeCommitBehavior::FinalResponse),
+        );
+        let draft = if selection.draft_uninvoked {
+            Some(
+                Box::pin(self.generate_main_response_draft(&data.content, &ReasoningMode::None))
+                    .await?,
+            )
+        } else {
+            selection.draft
+        };
+        match draft {
+            Some(draft) => {
+                Box::pin(self.commit_main_response_draft(
+                    &data.content,
+                    &data.context,
+                    draft,
+                    ReasoningMode::None,
+                    selection.auto_detected,
+                    true,
+                ))
+                .await
+            }
+            None => Err(AgentError::LLM(selection.draft_error.unwrap_or_else(
+                || "speculative draft has no settled outcome".into(),
+            ))),
+        }
+    }
+
+    // A selected task winner cannot erase dispatched loser attempts or release their provider resources before acknowledged settlement.
+    // Drain the existing same-task branch set; losers remain inert data and never execute tools, history commits or root finalizers.
+    async fn settle_pending_branches(
+        &self,
+        branches: &mut ScheduledBranchSet<'_>,
+    ) -> Result<Vec<(crate::optimization::RuntimeBranchOutcome, bool)>> {
+        let Some(execution) = crate::autonomy::current_execution() else {
+            self.finalize_pending_branches(branches.cancel_pending());
+            return Ok(vec![]);
+        };
+        let outcomes = Box::pin(self.collect_pending_task_branches(branches)).await?;
+        for (outcome, unfinished) in &outcomes {
+            let failed = matches!(outcome.result, RuntimeBranchResult::Failed(_));
+            self.finalize_optional_branch(
+                &outcome.branch.branch_id(),
+                outcome.branch.optimization,
+                outcome.branch.commit_behavior,
+                if *unfinished || matches!(outcome.result, RuntimeBranchResult::Cancelled) {
+                    "cancelled"
+                } else if failed {
+                    "failed"
+                } else {
+                    "discarded"
+                },
+                false,
+            );
+        }
+        if ai_agents_core::autonomy::InvocationAdmission::execution_stopped(execution.as_ref()) {
+            return Err(AgentError::Other(format!(
+                "task speculative settlement stopped: {}",
+                execution
+                    .stop_reason()
+                    .unwrap_or_else(|| "execution_stopped".into())
+            )));
+        }
+        Ok(outcomes)
+    }
+
+    // Reviewed alternatives remain pending observation data until their actual adoption or cancellation is known.
+    // Closing new invocation admission never discards consumed attempts or drops an already dispatched loser.
+    async fn collect_pending_task_branches(
+        &self,
+        branches: &mut ScheduledBranchSet<'_>,
+    ) -> Result<Vec<(crate::optimization::RuntimeBranchOutcome, bool)>> {
+        branches.close_admission();
+        let mut outcomes = Vec::new();
+        while let Some(outcome) = branches.next_completed().await {
+            let unfinished = branches.unfinished(&outcome);
+            outcomes.push((outcome, unfinished));
+        }
+        Ok(outcomes)
+    }
+
+    // A reviewed continuation resolves each deferred observation once; receipt metadata cannot authorize any provider, tool or transition.
+    fn finalize_speculative_receipts(
+        &self,
+        selection: &mut crate::autonomy::location::TaskSpeculativeSelection,
+        selected: Option<RuntimeCommitBehavior>,
+    ) {
+        for receipt in selection.branches.drain(..) {
+            let winner =
+                !receipt.failed && !receipt.uninvoked && selected == Some(receipt.behavior);
+            let status = if receipt.uninvoked {
+                "cancelled"
+            } else if receipt.failed {
+                "failed"
+            } else if winner {
+                "committed"
+            } else if selected.is_none() {
+                "cancelled"
+            } else {
+                "discarded"
+            };
+            self.finalize_optional_branch(
+                &receipt.id,
+                receipt.optimization,
+                receipt.behavior,
+                status,
+                winner,
+            );
+        }
+    }
+
+    // State commit resolves the winning transition before entry actions can fail or pause; observation cleanup must not erase that committed state.
+    fn finalize_speculative_transition(
+        &self,
+        position: &mut crate::autonomy::location::TaskStateReturn,
+    ) {
+        if let crate::autonomy::location::TaskStateReturn::SpeculativeSelection { selection } =
+            position
+        {
+            self.finalize_speculative_receipts(
+                selection,
+                Some(RuntimeCommitBehavior::TransitionDecision),
+            );
+        }
+    }
+
+    // Action cancellation preserves an already committed transition but cannot force an unfinished exit to commit.
+    fn retire_speculative_actions(
+        &self,
+        actions: &mut crate::autonomy::location::TaskActionsLocation,
+    ) {
+        if actions.transition.entering {
+            self.finalize_speculative_transition(&mut actions.return_to);
+        } else {
+            self.cancel_speculative_return(&mut actions.return_to);
+        }
+    }
+
+    // Terminal non-model exits retire deferred observations without polling any saved tool, skill or provider.
+    fn retire_location_observations(&self, location: &mut crate::autonomy::location::TaskLocation) {
+        match location {
+            crate::autonomy::location::TaskLocation::Actions(actions) => {
+                self.retire_speculative_actions(actions)
+            }
+            crate::autonomy::location::TaskLocation::Skill(skill) => {
+                if let Some(actions) = &mut skill.actions {
+                    self.retire_speculative_actions(actions);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Cancelling a known-safe pause retires observations only; it cannot replay selection or grant pending effects.
+    fn cancel_speculative_return(&self, position: &mut crate::autonomy::location::TaskStateReturn) {
+        if let crate::autonomy::location::TaskStateReturn::SpeculativeSelection { selection } =
+            position
+        {
+            self.finalize_speculative_receipts(selection, None);
+        }
+    }
+
+    // Only ordinary non-task branches use drop as local scheduler cancellation, never as task effect settlement.
     fn finalize_pending_branches(&self, branches: Vec<RuntimeBranch>) {
         for branch in branches {
             self.finalize_optional_branch(
@@ -8214,6 +10515,22 @@ OVERALL: PASS/FAIL"#,
         status: &str,
         winner: bool,
     ) {
+        // The live owner, not serialized receipt metadata, deduplicates disposition across pause and cleanup retries.
+        if let Some(execution) = crate::autonomy::current_execution() {
+            execution.owner.finalize_branch_observation(
+                self.observability_manager.as_ref(),
+                &crate::autonomy::location::TaskSpeculativeBranch {
+                    id: branch_id.into(),
+                    optimization,
+                    behavior: commit_behavior,
+                    failed: status == "failed",
+                    uninvoked: false,
+                },
+                status,
+                winner,
+            );
+            return;
+        }
         crate::optimization::observability::finalize_branch(
             self.observability_manager.as_ref(),
             branch_id,
@@ -8324,7 +10641,7 @@ OVERALL: PASS/FAIL"#,
         ))
     }
 
-    /// Re-enters the runtime loop after an optimized transition commits.
+    /// Re-enters after an optimized transition without duplicating root effects; the nested scope must unwind before root finalization or cancellation cleanup.
     async fn redispatch_current_state(&self, processed_input: &str) -> Result<AgentResponse> {
         const MAX_REDISPATCH_DEPTH: u32 = 3;
         let current_depth = *self.redispatch_depth.read();
@@ -8334,15 +10651,10 @@ OVERALL: PASS/FAIL"#,
             self.finish_turn_if_root(&response).await?;
             return Ok(response);
         }
-        *self.redispatch_depth.write() += 1;
-        if let Some(context) = self.active_turn_context.write().as_mut() {
-            context.enter_redispatch();
-        }
-        let result = Box::pin(self.run_loop_internal(processed_input)).await;
-        *self.redispatch_depth.write() -= 1;
-        if let Some(context) = self.active_turn_context.write().as_mut() {
-            context.exit_redispatch();
-        }
+        let result = {
+            let _redispatch = RedispatchScope::new(self);
+            Box::pin(self.run_loop_internal(processed_input)).await
+        };
         let response = result?;
         self.finish_turn_if_root(&response).await?;
         Ok(response)
@@ -8355,7 +10667,13 @@ OVERALL: PASS/FAIL"#,
             if let Some(context) = self.active_turn_context.write().as_mut() {
                 context.mark_post_turn_lifecycle_completed();
             }
-            self.hooks.on_response(response).await;
+            let mut projected_response = response.clone();
+            if let Some(input) = crate::autonomy::current_turn_input(&self.root_turn_gate) {
+                projected_response.metadata.get_or_insert_with(HashMap::new).insert(
+                    "autonomy_input".into(), serde_json::json!({"run_id":input.owner.run_id,"source":format!("{:?}",input.source)})
+                );
+            }
+            self.hooks.on_response(&projected_response).await;
             self.end_root_turn();
         }
         Ok(())
@@ -8798,8 +11116,14 @@ OVERALL: PASS/FAIL"#,
         }
     }
 
-    // Selects an auxiliary judge only for auto mode and propagates hierarchy configuration errors.
+    // Controller continuations must not rebuild an already executed plan or rerun its completed tools.
+    // Initial task inputs retain ordinary reasoning selection and managed provider/tool admission.
     async fn determine_reasoning_mode_strict(&self, input: &str) -> Result<ReasoningMode> {
+        if crate::autonomy::current_turn_input(&self.root_turn_gate)
+            .is_some_and(|turn| !turn.initial_work())
+        {
+            return Ok(ReasoningMode::None);
+        }
         let effective_config = self.get_effective_reasoning_config();
 
         if !matches!(effective_config.mode, ReasoningMode::Auto) {
@@ -8872,7 +11196,7 @@ Respond with ONLY the mode name (none, cot, react, or plan_and_execute)."#,
 
     // Generates a plan only after the effective tool scope is known so scope failures cannot expose the full registry to the planner.
     // Resolves the planner independently while preserving fail-closed scope checks before invocation.
-    async fn generate_plan(&self, input: &str) -> Result<Plan> {
+    pub(crate) async fn generate_plan(&self, input: &str) -> Result<Plan> {
         let effective = self.get_effective_reasoning_config();
         let planning_config = effective.get_planning();
 
@@ -9366,7 +11690,20 @@ Respond in JSON format:
     /// `Proceed` carries the input the internal loop must run on. Some branches (`Abandoned` with a replacement input)
     /// have already committed the original user message before returning it; the internal loop's own commit is then a no-op
     /// because `root_user_message_committed` is set. Callers must not reset root-turn state between this call and the loop.
-    async fn resolve_disambiguation(&self, input: &str) -> Result<DisambiguationDispatch> {
+    fn resolve_disambiguation<'a>(
+        &'a self,
+        input: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<DisambiguationDispatch>> + Send + 'a>> {
+        if self.disambiguation_manager.is_none() {
+            return Box::pin(async move { Ok(DisambiguationDispatch::Proceed(input.to_owned())) });
+        }
+        Box::pin(self.resolve_disambiguation_inner(input))
+    }
+
+    /// Installed-manager work retains original task input and skill positions through escalation; exhausted tasks stop before completion gates.
+    /// In-flight task generation changes fail without clearing manager state because a trusted host may have installed a newer exchange.
+    /// Its optional future is constructed outside unrelated nested model polling frames.
+    async fn resolve_disambiguation_inner(&self, input: &str) -> Result<DisambiguationDispatch> {
         let Some(ref disambiguator) = self.disambiguation_manager else {
             return Ok(DisambiguationDispatch::Proceed(input.to_string()));
         };
@@ -9402,6 +11739,11 @@ Respond in JSON format:
         if current_state_generation != state_generation
             || self.disambiguation_epoch.load(Ordering::SeqCst) != disambiguation_epoch
         {
+            if crate::autonomy::current_execution().is_some() {
+                return Err(AgentError::Other(
+                    "Task clarification ownership changed during semantic work".into(),
+                ));
+            }
             disambiguator.clear_pending().await;
             *self.pending_skill_id.write() = None;
             disambiguation_result = DisambiguationResult::Abandoned { new_input: None };
@@ -9450,6 +11792,7 @@ Respond in JSON format:
                     awaiting_confirmation,
                 );
                 drop(admission);
+                self.park_task_clarification(input, &response).await?;
                 self.finish_turn_if_root(&response).await?;
                 Ok(DisambiguationDispatch::Terminal(response))
             }
@@ -9534,17 +11877,47 @@ Respond in JSON format:
                         format!("I'm sorry, I couldn't understand your request: {}", reason)
                     });
                 let response = AgentResponse::new(&apology);
+                if let Some(execution) = crate::autonomy::current_execution() {
+                    execution.stop("disambiguation_exhausted");
+                }
                 self.finish_turn_if_root(&response).await?;
                 Ok(DisambiguationDispatch::Terminal(response))
             }
             DisambiguationResult::Escalate { reason } => {
+                let (original_input, prepared, skill_id) =
+                    match crate::autonomy::interaction::clarification_return() {
+                        Some(
+                            crate::autonomy::interaction::TaskInteractionKind::Clarification {
+                                manager,
+                                input: original,
+                                prepared,
+                                skill_id,
+                            },
+                        ) => (
+                            manager
+                                .get("original_input")
+                                .and_then(Value::as_str)
+                                .unwrap_or(&original)
+                                .to_string(),
+                            prepared,
+                            skill_id,
+                        ),
+                        _ => (
+                            input.to_string(),
+                            crate::autonomy::interaction::prepared_input(),
+                            self.pending_skill_id.read().clone(),
+                        ),
+                    };
                 *self.pending_skill_id.write() = None;
                 info!(reason = %reason, "Escalating to human");
                 if let Some(ref hitl) = self.hitl_engine {
                     let trigger =
                         ApprovalTrigger::condition("disambiguation_escalation", reason.clone());
                     let mut context_map = HashMap::new();
-                    context_map.insert("original_input".to_string(), serde_json::json!(input));
+                    context_map.insert(
+                        "original_input".to_string(),
+                        serde_json::json!(&original_input),
+                    );
                     context_map.insert("reason".to_string(), serde_json::json!(&reason));
                     let check_result = HITLCheckResult::required(
                         trigger,
@@ -9552,6 +11925,19 @@ Respond in JSON format:
                         format!("User request needs human assistance: {}", reason),
                         Some(hitl.config().default_timeout_seconds),
                     );
+                    if let Some(request) = check_result.clone().into_request() {
+                        self.park_task_interaction(
+                            crate::autonomy::interaction::TaskInteractionKind::Escalation {
+                                input: original_input.clone(),
+                                reason: reason.clone(),
+                                prepared,
+                                skill_id,
+                            },
+                            Some(request),
+                            None,
+                        )
+                        .await?;
+                    }
                     let result = self.request_hitl_approval(check_result).await?;
                     if matches!(
                         result,
@@ -9571,11 +11957,20 @@ Respond in JSON format:
                         format!("I need human assistance to help with your request: {}", reason)
                     });
                 let response = AgentResponse::new(&apology);
+                if let Some(execution) = crate::autonomy::current_execution() {
+                    execution.stop("interaction_unavailable");
+                }
                 self.finish_turn_if_root(&response).await?;
                 Ok(DisambiguationDispatch::Terminal(response))
             }
             DisambiguationResult::Abandoned { new_input } => {
                 *self.pending_skill_id.write() = None;
+                if let Some(execution) = crate::autonomy::current_execution() {
+                    execution.stop("scope_ended");
+                    let response = AgentResponse::new("Task clarification was abandoned");
+                    self.finish_turn_if_root(&response).await?;
+                    return Ok(DisambiguationDispatch::Terminal(response));
+                }
 
                 info!(
                     has_new_input = new_input.is_some(),
@@ -9643,37 +12038,65 @@ Respond in JSON format:
         let _root_cleanup = RootTurnCleanup::new(self);
         info!(input_len = input.len(), "Starting chat");
 
-        self.hooks.on_message_received(input).await;
+        if !crate::autonomy::current_turn_input(&self.root_turn_gate)
+            .is_some_and(|turn| turn.controller_only())
+        {
+            self.hooks.on_message_received(input).await;
+        }
 
-        self.prepare_turn_context().await?;
+        crate::autonomy::location::scope_state_return(
+            crate::autonomy::location::TaskStateReturn::ReadyContext {
+                input: input.into(),
+            },
+            self.prepare_turn_context(),
+        )
+        .await?;
 
         // Clear stale disambiguation context from previous turns.
         // This prevents resolved_intent from leaking across turns and causing incorrect deterministic routing on subsequent inputs.
         self.clear_disambiguation_context();
+        Box::pin(self.run_after_ready_context(input)).await
+    }
 
-        // Disambiguation check (before input processing). The shared gate finalizes terminal clarification
-        // responses itself; this loop only dispatches on the outcome.
-        let input_to_run = match self.resolve_disambiguation(input).await? {
-            DisambiguationDispatch::Terminal(response) => return Ok(response),
-            DisambiguationDispatch::RecheckSkill {
-                skill_id,
-                enriched_input,
-                disambiguation_epoch,
-                state_generation,
-            } => {
-                return self
-                    .recheck_skill_disambiguation(
-                        &skill_id,
-                        &enriched_input,
-                        disambiguation_epoch,
-                        state_generation,
-                    )
-                    .await;
-            }
-            DisambiguationDispatch::Proceed(input) => input,
-        };
+    /// Readiness and receive hooks are already complete when a saved timeout or clarification returns here.
+    /// Erasure prevents unused semantic-dispatch construction from multiplying nested participant polling stacks.
+    fn run_after_ready_context<'a>(
+        &'a self,
+        input: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<AgentResponse>> + Send + 'a>> {
+        Box::pin(async move {
+            // Disambiguation check (before input processing). The shared gate finalizes terminal clarification
+            // responses itself; this loop only dispatches on the outcome.
+            let dispatch = if crate::autonomy::current_turn_input(&self.root_turn_gate)
+                .is_some_and(|turn| !turn.initial_work())
+            {
+                DisambiguationDispatch::Proceed(input.to_string())
+            } else {
+                self.resolve_disambiguation(input).await?
+            };
+            let input_to_run = match dispatch {
+                DisambiguationDispatch::Terminal(response) => return Ok(response),
+                DisambiguationDispatch::RecheckSkill {
+                    skill_id,
+                    enriched_input,
+                    disambiguation_epoch,
+                    state_generation,
+                } => {
+                    return self
+                        .recheck_skill_disambiguation(
+                            &skill_id,
+                            &enriched_input,
+                            disambiguation_epoch,
+                            state_generation,
+                        )
+                        .await;
+                }
+                DisambiguationDispatch::Proceed(input) => input,
+            };
 
-        self.run_loop_internal(&input_to_run).await
+            // Box the large turn pipeline before nesting child polling on the caller's test or host thread stack.
+            Box::pin(self.run_loop_internal(&input_to_run)).await
+        })
     }
 
     /// Generate a localized response using the router LLM
@@ -9772,7 +12195,8 @@ Respond in JSON format:
     /// This method re-runs the skill's disambiguation pass.
     /// If fields are still missing, it returns the new clarification question and keeps pending_skill_id set.
     /// If all fields are present (Clear), it executes the skill and returns the response.
-    async fn recheck_skill_disambiguation(
+    /// Task invalidation keeps manager state protected rather than clearing a possibly replaced exchange.
+    async fn recheck_skill_disambiguation_inner(
         &self,
         skill_id: &str,
         enriched_input: &str,
@@ -9815,8 +12239,10 @@ Respond in JSON format:
             if current_state_generation != expected_state_generation
                 || self.disambiguation_epoch.load(Ordering::SeqCst) != expected_disambiguation_epoch
             {
-                disambiguator.clear_pending().await;
-                *self.pending_skill_id.write() = None;
+                if crate::autonomy::current_execution().is_none() {
+                    disambiguator.clear_pending().await;
+                    *self.pending_skill_id.write() = None;
+                }
                 return Err(AgentError::Other(
                     "State or reset ownership changed during skill disambiguation recheck"
                         .to_string(),
@@ -9846,9 +12272,7 @@ Respond in JSON format:
                     // Keep pending_skill_id set (do NOT clear it).
                     // The next turn will resolve this new clarification and
                     // re-enter this method until all fields are present.
-                    self.memory
-                        .add_message(ChatMessage::user(enriched_input))
-                        .await?;
+                    self.commit_rechecked_skill_input(enriched_input).await?;
                     self.memory
                         .add_message(ChatMessage::assistant(&question.question))
                         .await?;
@@ -9868,6 +12292,8 @@ Respond in JSON format:
                         }),
                     );
                     drop(admission);
+                    self.park_task_clarification(enriched_input, &response)
+                        .await?;
                     self.finish_turn_if_root(&response).await?;
                     return Ok(response);
                 }
@@ -9885,15 +12311,13 @@ Respond in JSON format:
                     *self.pending_skill_id.write() = None;
                     drop(admission);
                     let skill_response = self.execute_skill_by_id(skill_id, &re_enriched).await?;
-                    self.memory
-                        .add_message(ChatMessage::user(&re_enriched))
-                        .await?;
+                    self.commit_rechecked_skill_input(&re_enriched).await?;
                     return self
                         .handle_skill_response(
                             &re_enriched,
                             skill_id,
                             skill_response,
-                            &HashMap::new(),
+                            &crate::autonomy::interaction::prepared_context(),
                         )
                         .await;
                 }
@@ -9910,15 +12334,13 @@ Respond in JSON format:
                     *self.pending_skill_id.write() = None;
                     drop(admission);
                     let skill_response = self.execute_skill_by_id(skill_id, &re_enriched).await?;
-                    self.memory
-                        .add_message(ChatMessage::user(&re_enriched))
-                        .await?;
+                    self.commit_rechecked_skill_input(&re_enriched).await?;
                     return self
                         .handle_skill_response(
                             &re_enriched,
                             skill_id,
                             skill_response,
-                            &HashMap::new(),
+                            &crate::autonomy::interaction::prepared_context(),
                         )
                         .await;
                 }
@@ -9991,15 +12413,19 @@ Respond in JSON format:
         *self.pending_skill_id.write() = None;
         drop(admission);
         let skill_response = self.execute_skill_by_id(skill_id, enriched_input).await?;
-        self.memory
-            .add_message(ChatMessage::user(enriched_input))
-            .await?;
-        self.handle_skill_response(enriched_input, skill_id, skill_response, &HashMap::new())
-            .await
+        self.commit_rechecked_skill_input(enriched_input).await?;
+        self.handle_skill_response(
+            enriched_input,
+            skill_id,
+            skill_response,
+            &crate::autonomy::interaction::prepared_context(),
+        )
+        .await
     }
 
     /// Handle skill routing result: output processing, memory, transitions.
-    /// Returns a fully formed AgentResponse for skill-routed requests.
+    /// Original script binding covers output/reflection publication but ends before deliberate state-transition evaluation.
+    /// Already acknowledged memory effects are not rolled back if a trusted generation change is detected afterward.
     async fn handle_skill_response(
         &self,
         processed_input: &str,
@@ -10007,21 +12433,44 @@ Respond in JSON format:
         skill_response: String,
         input_context: &HashMap<String, Value>,
     ) -> Result<AgentResponse> {
-        let output_data = self.process_output(&skill_response, input_context).await?;
-        let final_response = output_data.content;
-
-        self.memory
-            .add_message(ChatMessage::assistant(&final_response))
+        let guard = self.task_skill_finishing_guard();
+        if let Some(guard) = &guard {
+            guard.validate()?;
+        }
+        let final_response =
+            ai_agents_llm::scope_invocation_evidence(guard.iter().cloned().collect(), async {
+                let output_data = self.process_output(&skill_response, input_context).await?;
+                if let Some(guard) = &guard {
+                    guard.validate()?;
+                }
+                let content = output_data.content;
+                self.memory
+                    .add_message(ChatMessage::assistant(&content))
+                    .await?;
+                if let Some(guard) = &guard {
+                    guard.validate()?;
+                }
+                self.check_memory_compression().await?;
+                if let Some(guard) = &guard {
+                    guard.validate()?;
+                }
+                Ok::<_, AgentError>(content)
+            })
             .await?;
-
-        self.check_memory_compression().await?;
+        if let Some(execution) = crate::autonomy::current_execution() {
+            execution.owner.skill_finishing.lock().remove(&self.info.id);
+        }
 
         self.increment_turn();
-        self.evaluate_transitions(processed_input, &final_response)
-            .await?;
-
-        let response = AgentResponse::new(final_response)
+        let response = AgentResponse::new(final_response.clone())
             .with_metadata("skill_id", serde_json::json!(skill_id));
+        crate::autonomy::location::scope_state_return(
+            crate::autonomy::location::TaskStateReturn::SkillFinish {
+                response: response.clone(),
+            },
+            self.evaluate_transitions(processed_input, &final_response),
+        )
+        .await?;
         self.finish_turn_if_root(&response).await?;
         Ok(response)
     }
@@ -10033,6 +12482,29 @@ Respond in JSON format:
         processed_input: &str,
         input_context: &HashMap<String, Value>,
         auto_detected: bool,
+    ) -> Result<AgentResponse> {
+        let plan = self.generate_plan(processed_input).await?;
+        Box::pin(self.continue_plan_and_execute(
+            processed_input,
+            input_context,
+            auto_detected,
+            plan,
+            0,
+            None,
+        ))
+        .await
+    }
+
+    /// Adopts a frozen plan only after required review, preserving the reflection attempt and completed prior effects across pauses.
+    /// A review resumes this boundary without rerouting, regenerating the proposal or resetting the root user commit.
+    async fn continue_plan_and_execute(
+        &self,
+        processed_input: &str,
+        input_context: &HashMap<String, Value>,
+        auto_detected: bool,
+        mut plan: Plan,
+        first_attempt: u32,
+        mut reviewed: Option<crate::autonomy::interaction::TaskInteraction>,
     ) -> Result<AgentResponse> {
         let effective = self.get_effective_reasoning_config();
         let plan_reflection = effective
@@ -10046,18 +12518,86 @@ Respond in JSON format:
             1
         };
 
-        let mut plan = self.generate_plan(processed_input).await?;
-        info!(
-            plan_id = %plan.id,
-            steps = plan.steps.len(),
-            "Plan generated"
-        );
-
         let mut plan_result = String::new();
-
-        for attempt in 0..max_attempts {
+        for attempt in first_attempt..max_attempts {
+            if reviewed.is_none()
+                && crate::autonomy::current_turn_input(&self.root_turn_gate).is_some()
+                && crate::autonomy::current_execution().is_some_and(|execution| {
+                    execution
+                        .lifecycle_profile()
+                        .supervision
+                        .as_ref()
+                        .is_some_and(|policy| {
+                            policy.plan_changes
+                                == Some(crate::autonomy::ReviewPolicy::RequireApproval)
+                        })
+                })
+            {
+                let mut approval = ai_agents_hitl::ApprovalRequest::new(
+                    ApprovalTrigger::condition("plan_supervision", &plan.id),
+                    "Review the proposed plan before applying it",
+                )
+                .with_context(HashMap::from([(
+                    "plan".into(),
+                    serde_json::to_value(&plan)?,
+                )]));
+                approval.timeout = self.task_review_timeout();
+                self.park_task_interaction(
+                    crate::autonomy::interaction::TaskInteractionKind::PlanReview {
+                        plan: plan.clone(),
+                        attempt,
+                        processed_input: processed_input.into(),
+                        input_context: input_context.clone(),
+                        auto_detected,
+                        reasoning_config: serde_json::to_value(&effective)?,
+                    },
+                    Some(approval),
+                    None,
+                )
+                .await?;
+                return Err(AgentError::Config(
+                    "required plan supervision did not retain its proposal".into(),
+                ));
+            }
+            let accepted_review = reviewed.take();
+            if let Some(review) = &accepted_review {
+                match self.validate_task_plan_review(review) {
+                    Err(AgentError::HITLTimeout) => {
+                        return self.finish_expired_task_response().await;
+                    }
+                    other => other?,
+                }
+            }
+            if let Some(execution) = crate::autonomy::current_execution() {
+                execution.update(|payload| {
+                    payload.evidence.records.push(crate::autonomy::TaskEvidenceRecord {
+                        run_id: execution.run_id.clone(), sequence: payload.evidence.records.len() as u64,
+                        stage: payload.stage.clone(), attempt: Some(format!("{}:{attempt}", plan.id)), origin: "runtime.plan.adopt".into(),
+                        data: serde_json::json!({"objective_revision":payload.objective_revision,"plan":plan}),
+                    });
+                    Ok(())
+                }).await?;
+            }
+            if let Some(review) = &accepted_review {
+                match self.validate_task_plan_review(review) {
+                    Err(AgentError::HITLTimeout) => {
+                        return self.finish_expired_task_response().await;
+                    }
+                    other => other?,
+                }
+            }
             *self.current_plan.write() = Some(plan.clone());
             plan_result = self.execute_plan(&mut plan).await?;
+            if let Some(execution) = crate::autonomy::current_execution() {
+                execution.update(|payload| {
+                    payload.evidence.records.push(crate::autonomy::TaskEvidenceRecord {
+                        run_id: execution.run_id.clone(), sequence: payload.evidence.records.len() as u64,
+                        stage: payload.stage.clone(), attempt: Some(format!("{}:{attempt}", plan.id)), origin: "runtime.plan.result".into(),
+                        data: serde_json::json!({"objective_revision":payload.objective_revision,"plan":plan,"result":plan_result}),
+                    });
+                    Ok(())
+                }).await?;
+            }
 
             info!(
                 plan_status = ?plan.status,
@@ -10105,9 +12645,6 @@ Respond in JSON format:
 
         self.check_memory_compression().await?;
         self.increment_turn();
-        self.evaluate_transitions(processed_input, &final_content)
-            .await?;
-
         let reasoning_metadata =
             ReasoningMetadata::new(ReasoningMode::PlanAndExecute).with_auto_detected(auto_detected);
 
@@ -10116,6 +12653,18 @@ Respond in JSON format:
             serde_json::to_value(&reasoning_metadata).unwrap_or_default(),
         );
 
+        if crate::autonomy::current_turn_input(&self.root_turn_gate).is_some() {
+            crate::autonomy::location::scope_state_return(
+                crate::autonomy::location::TaskStateReturn::PlanFinish {
+                    response: response.clone(),
+                },
+                Box::pin(self.evaluate_transitions(processed_input, &final_content)),
+            )
+            .await?;
+        } else {
+            self.evaluate_transitions(processed_input, &final_content)
+                .await?;
+        }
         self.finish_turn_if_root(&response).await?;
         Ok(response)
     }
@@ -10187,6 +12736,7 @@ Respond in JSON format:
     //
     // This is the only place where a winning draft is allowed to become runtime state.
     // Prompt and native tool calls remain inert until this method commits the draft into the shared executor path.
+    // Task drafts seed the existing loop before tools can suspend; rejected route review skips only that original transition check.
     //
     async fn commit_main_response_draft(
         &self,
@@ -10195,30 +12745,91 @@ Respond in JSON format:
         draft: MainResponseDraft,
         reasoning_mode: ReasoningMode,
         auto_detected: bool,
+        skip_tool_transition: bool,
     ) -> Result<AgentResponse> {
         self.commit_root_user_message(processed_input).await?;
+        if let Some(execution) = crate::autonomy::current_execution()
+            && ai_agents_core::autonomy::InvocationAdmission::execution_stopped(execution.as_ref())
+        {
+            return Err(AgentError::Other(
+                "task draft admission expired during history acknowledgement".into(),
+            ));
+        }
         match draft {
             MainResponseDraft::Text {
                 raw_content,
                 thinking,
             } => {
-                self.finish_text_response_from_model(CommittedTextResponse {
-                    processed_input,
-                    input_context,
-                    answer: raw_content,
-                    reasoning_mode,
-                    auto_detected,
-                    iterations: 1,
-                    thinking_content: thinking,
-                    all_tool_calls: Vec::new(),
-                })
+                self.finish_text_response_from_model(
+                    CommittedTextResponse {
+                        processed_input,
+                        input_context,
+                        answer: raw_content,
+                        reasoning_mode,
+                        auto_detected,
+                        iterations: 1,
+                        thinking_content: thinking,
+                        all_tool_calls: Vec::new(),
+                    },
+                    self.get_state_llm()?,
+                )
                 .await
             }
             MainResponseDraft::ToolCalls {
                 raw_content,
                 calls,
-                thinking: _,
+                thinking,
             } => {
+                if crate::autonomy::current_execution().is_some() {
+                    let mut state = crate::autonomy::TaskLoopState {
+                        version: 1,
+                        processed_input: processed_input.into(),
+                        input_context: input_context.clone(),
+                        reasoning_mode,
+                        auto_detected,
+                        iterations: 1,
+                        all_tool_calls: vec![],
+                        thinking_content: thinking,
+                        native_exchanges: self.task_native_expectations(),
+                        deferred_final: None,
+                    };
+                    let position = crate::autonomy::location::TaskStateReturn::BeforeCalls {
+                        saved: Box::new(crate::autonomy::interaction::TaskModelCalls {
+                            state: Box::new(state.clone()),
+                            content: raw_content.clone(),
+                            calls: calls.clone(),
+                        }),
+                    };
+                    let work = crate::autonomy::location::scope_state_return(
+                        position,
+                        Box::pin(self.handle_tool_calls(
+                            processed_input,
+                            &raw_content,
+                            calls,
+                            &mut state.all_tool_calls,
+                            None,
+                        )),
+                    );
+                    let outcome = if skip_tool_transition {
+                        crate::autonomy::interaction::scope_skipped_tool_transition(work).await
+                    } else {
+                        work.await
+                    };
+                    return match outcome {
+                        Err(AgentError::TaskSuspended(id)) => {
+                            Box::pin(self.retain_task_loop(state)).await?;
+                            Err(AgentError::TaskSuspended(id))
+                        }
+                        Err(error) => Err(error),
+                        Ok(ToolCallOutcome::Rejected(response)) => {
+                            self.finish_turn_if_root(&response).await?;
+                            Ok(response)
+                        }
+                        Ok(ToolCallOutcome::Continue | ToolCallOutcome::TransitionFired) => {
+                            Box::pin(self.run_committed_task_loop(state)).await
+                        }
+                    };
+                }
                 let mut all_tool_calls = Vec::new();
                 match self
                     .handle_tool_calls(
@@ -10246,32 +12857,29 @@ Respond in JSON format:
     //
     // Tool drafts need a committed continuation after function results are written.
     // Redispatch depth suppresses duplicate root lifecycle work during that continuation.
+    // The scope must unwind on cancellation before the root can clean up or a later turn can start.
     //
     async fn continue_after_committed_tool_draft(
         &self,
         processed_input: &str,
     ) -> Result<AgentResponse> {
-        *self.redispatch_depth.write() += 1;
-        if let Some(context) = self.active_turn_context.write().as_mut() {
-            context.enter_redispatch();
-        }
-        let result = Box::pin(self.run_loop_internal(processed_input)).await;
-        *self.redispatch_depth.write() -= 1;
-        if let Some(context) = self.active_turn_context.write().as_mut() {
-            context.exit_redispatch();
-        }
+        let result = {
+            let _redispatch = RedispatchScope::new(self);
+            Box::pin(self.run_loop_internal(processed_input)).await
+        };
         let response = result?;
         self.finish_turn_if_root(&response).await?;
         Ok(response)
     }
 
     //
-    // Shared committed text finalization for normal responses and winning text drafts.
-    // Keep output processing, reflection, transitions, hooks, and maintenance behind this commit boundary.
+    // Shared committed text finalization owns output processing, reflection, transitions, hooks and maintenance.
+    // Reflection uses the main loop's retained provider rather than rebinding it after a tool-driven state transition.
     //
     async fn finish_text_response_from_model(
         &self,
         response: CommittedTextResponse<'_>,
+        llm: Arc<dyn LLMProvider>,
     ) -> Result<AgentResponse> {
         let CommittedTextResponse {
             processed_input,
@@ -10281,7 +12889,7 @@ Respond in JSON format:
             auto_detected,
             iterations,
             thinking_content,
-            all_tool_calls,
+            mut all_tool_calls,
         } = response;
         let output_data = self.process_output(&answer, input_context).await?;
         let mut final_content = if output_data.metadata.rejected {
@@ -10292,7 +12900,6 @@ Respond in JSON format:
         } else {
             output_data.content
         };
-        let llm = self.get_state_llm()?;
         let reflection_metadata;
         (final_content, reflection_metadata) = self
             .run_reflection(&*llm, processed_input, final_content)
@@ -10300,12 +12907,31 @@ Respond in JSON format:
         final_content =
             self.format_response_with_thinking(thinking_content.as_deref(), &final_content);
         let final_content = {
-            let result = self
-                .post_loop_processing(processed_input, final_content)
-                .await?;
-            self.apply_post_loop_result(processed_input, result)
-                .await?
-                .content
+            let position = crate::autonomy::location::TaskStateReturn::ModelFinish {
+                state: Box::new(crate::autonomy::location::TaskModelFinal {
+                    processed_input: processed_input.into(),
+                    input_context: input_context.clone(),
+                    content: final_content.clone(),
+                    all_tool_calls: all_tool_calls.clone(),
+                    reasoning_mode: reasoning_mode.clone(),
+                    auto_detected,
+                    iterations,
+                    thinking: thinking_content.clone(),
+                    reflection_metadata: reflection_metadata.clone(),
+                    finalize_on_resume: false,
+                    response_metadata: None,
+                }),
+            };
+            let result = crate::autonomy::location::scope_state_return(
+                position,
+                Box::pin(self.post_loop_processing(processed_input, final_content)),
+            )
+            .await?;
+            let applied = self.apply_post_loop_result(processed_input, result).await?;
+            if let Some(calls) = applied.tool_calls {
+                all_tool_calls = calls;
+            }
+            applied.content
         };
         let response = self.build_agent_response(AgentResponseParts {
             content: final_content,
@@ -10320,10 +12946,7 @@ Respond in JSON format:
         Ok(response)
     }
 
-    //
-    // Auto reasoning uses this path after the judge wins with a deeper mode.
-    // It intentionally uses committed message building instead of the draft overlay.
-    //
+    // Starts the winning reasoning loop on committed history; the stateful driver also owns exact task suspension.
     async fn run_committed_response_loop_with_reasoning(
         &self,
         processed_input: &str,
@@ -10332,76 +12955,25 @@ Respond in JSON format:
         auto_detected: bool,
     ) -> Result<AgentResponse> {
         self.commit_root_user_message(processed_input).await?;
-        let llm = self.get_state_llm()?;
-        let mut iterations = 0u32;
-        let mut all_tool_calls = Vec::new();
-        let mut thinking_content = None;
-        loop {
-            let effective_max = if reasoning_mode != ReasoningMode::None {
-                let rc = self.get_effective_reasoning_config();
-                self.max_iterations.min(rc.max_iterations)
-            } else {
-                self.max_iterations
-            };
-            if iterations >= effective_max {
-                return Err(AgentError::Other(format!(
-                    "Max iterations ({}) exceeded",
-                    effective_max
-                )));
-            }
-            iterations += 1;
-            *self.iteration_count.write() = iterations;
-            let protocol = self.main_tool_protocol(llm.as_ref(), false).await?;
-            let mut messages = self
-                .build_messages_internal(true, None, protocol.choice.is_none())
-                .await?;
-            self.inject_reasoning_prompt(&mut messages, &reasoning_mode, iterations == 1);
-            self.hooks.on_llm_start(&messages).await;
-            let llm_start = Instant::now();
-            let response = self
-                .complete_main_llm_with_recovery(Arc::clone(&llm), &messages, &protocol)
-                .await?;
-            let llm_duration_ms = llm_start.elapsed().as_millis() as u64;
-            self.hooks.on_llm_complete(&response, llm_duration_ms).await;
-            let content = response.content.trim();
-            if let Some(tool_calls) = self.parse_main_tool_calls(content, &protocol)? {
-                match self
-                    .handle_tool_calls(
-                        processed_input,
-                        content,
-                        tool_calls,
-                        &mut all_tool_calls,
-                        None,
-                    )
-                    .await?
-                {
-                    ToolCallOutcome::Continue | ToolCallOutcome::TransitionFired => continue,
-                    ToolCallOutcome::Rejected(resp) => {
-                        self.finish_turn_if_root(&resp).await?;
-                        return Ok(resp);
-                    }
-                }
-            }
-            let (extracted_thinking, answer) = self.extract_thinking(content);
-            if extracted_thinking.is_some() {
-                thinking_content = extracted_thinking;
-            }
-            return self
-                .finish_text_response_from_model(CommittedTextResponse {
-                    processed_input,
-                    input_context,
-                    answer,
-                    reasoning_mode,
-                    auto_detected,
-                    iterations,
-                    thinking_content,
-                    all_tool_calls,
-                })
-                .await;
-        }
+        Box::pin(
+            self.run_committed_task_loop(crate::autonomy::TaskLoopState {
+                version: 1,
+                processed_input: processed_input.into(),
+                input_context: input_context.clone(),
+                reasoning_mode,
+                auto_detected,
+                iterations: 0,
+                all_tool_calls: Vec::new(),
+                thinking_content: None,
+                native_exchanges: Vec::new(),
+                deferred_final: None,
+            }),
+        )
+        .await
     }
 
-    /// Handle tool calls: check transitions, execute tools in parallel, handle HITL rejection.
+    /// Commits a batch once and drains admitted calls before ordered result publication or exact task suspension.
+    /// Out-of-order completed task results remain in the checkpoint instead of being replayed to fill a native history gap.
     ///
     /// Shared by the blocking and streaming loops. `events` collects streaming chunks in emission order when the caller
     /// is a stream; the blocking loop passes `None`. Tool start events are pushed before execution so the collected order
@@ -10415,14 +12987,20 @@ Respond in JSON format:
         mut events: Option<&mut Vec<StreamChunk>>,
     ) -> Result<ToolCallOutcome> {
         let include_tool_events = self.streaming.include_tool_events;
+
         // Check if a transition should fire before executing the LLM's tool call.
         // If a transition fires, on_enter actions handle the tool call correctly
         // (with proper URLs from YAML), so skip the LLM's tool call.
         let transition_content = native_readable_projection(content)
             .map_err(|error| AgentError::LLM(error.to_string()))?;
-        let transition_fired = self
-            .evaluate_transitions(processed_input, &transition_content)
-            .await?;
+        let transition_fired = if crate::autonomy::interaction::skip_tool_transition()
+            || crate::autonomy::interaction::regenerating_model()
+        {
+            false
+        } else {
+            self.evaluate_transitions(processed_input, &transition_content)
+                .await?
+        };
         if transition_fired {
             self.memory
                 .add_message(ChatMessage::assistant(
@@ -10452,7 +13030,48 @@ Respond in JSON format:
                 events.push(StreamChunk::tool_start(&tool_call.id, &tool_call.name));
             }
         }
-        let results = self.execute_tools_parallel(&tool_calls).await;
+        let results =
+            crate::autonomy::scope_task_batch(self.execute_tools_parallel(&tool_calls)).await;
+        if let Some(execution) = crate::autonomy::current_execution() {
+            let approvals = execution.take_parked_approvals(&self.info.id);
+            if !approvals.is_empty() {
+                let mut state = crate::autonomy::TaskBatchState {
+                    version: 1,
+                    content: content.into(),
+                    calls: tool_calls,
+                    results: results
+                        .into_iter()
+                        .map(|(_, result)| match result {
+                            Err(AgentError::TaskSuspended(_)) => None,
+                            result => Some(result.map_err(|error| error.to_string())),
+                        })
+                        .collect(),
+                    appended: 0,
+                    approvals,
+                    loop_state: None,
+                    authorized: Vec::new(),
+                    rejected: false,
+                    location: None,
+                    interaction: None,
+                    executor_cursors: {
+                        let mut cursors = execution.parked_executor_cursors.lock();
+                        let keys: Vec<_> = cursors
+                            .keys()
+                            .filter(|(runtime, _)| runtime == &self.info.id)
+                            .cloned()
+                            .collect();
+                        keys.into_iter()
+                            .filter_map(|key| cursors.remove(&key))
+                            .collect()
+                    },
+                };
+                self.append_task_batch_prefix(&mut state, all_tool_calls)
+                    .await?;
+                let id = state.approvals[0].request_id.clone();
+                execution.retain_batch(&self.info.id, state);
+                return Err(AgentError::TaskSuspended(id));
+            }
+        }
         let mut rejection = None;
 
         for ((_id, result), tool_call) in results.into_iter().zip(tool_calls.iter()) {
@@ -10631,7 +13250,16 @@ Respond in JSON format:
         self.run_context_extractors(processed_input).await?;
 
         let transitioned = self.evaluate_transitions(processed_input, &content).await?;
+        Box::pin(self.post_transition_processing(processed_input, content, transitioned)).await
+    }
 
+    /// Post-transition regeneration starts after the selected transition and actions, never by repeating extractors or incrementing the root twice.
+    async fn post_transition_processing(
+        &self,
+        processed_input: &str,
+        content: String,
+        transitioned: bool,
+    ) -> Result<PostLoopResult> {
         if !transitioned {
             self.memory
                 .add_message(ChatMessage::assistant(&content))
@@ -10640,8 +13268,8 @@ Respond in JSON format:
             return Ok(PostLoopResult::NoTransition(content));
         }
 
-        // Check if we should skip re-generation after this transition.
-        if !self.should_regenerate_after_transition() {
+        // An owned scope exit must be evaluated before any unrelated destination-state model work can manufacture completion.
+        if self.automatic_scope_ended() || !self.should_regenerate_after_transition() {
             self.memory
                 .add_message(ChatMessage::assistant(&content))
                 .await?;
@@ -10650,6 +13278,18 @@ Respond in JSON format:
                 content,
                 regenerated: false,
             });
+        }
+
+        // A regenerating destination handles this same input, so its declared task adopts the completed transition without replaying it.
+        if crate::autonomy::current_execution().is_none() {
+            let mut prepared = ProcessData::new(processed_input);
+            prepared.context = self
+                .active_turn_context
+                .read()
+                .as_ref()
+                .map(|context| context.input_context.clone())
+                .unwrap_or_default();
+            self.promote_automatic_state(&prepared).await?;
         }
 
         // Check if the new state needs full dispatch.
@@ -10674,6 +13314,27 @@ Respond in JSON format:
         // Re-generate in the new state context so the LLM can reference on_enter results.
         // If the LLM responds with a tool call, execute it in a mini-loop so the
         // result is not returned as raw JSON text.
+        if crate::autonomy::current_execution().is_some()
+            && let Some(crate::autonomy::location::TaskStateReturn::ModelFinish { state }) =
+                crate::autonomy::location::current_state_return()
+        {
+            let response = Box::pin(
+                self.run_committed_task_loop(crate::autonomy::TaskLoopState {
+                    version: 1,
+                    processed_input: processed_input.into(),
+                    input_context: state.input_context.clone(),
+                    reasoning_mode: ReasoningMode::None,
+                    auto_detected: false,
+                    iterations: 0,
+                    all_tool_calls: state.all_tool_calls.clone(),
+                    thinking_content: None,
+                    native_exchanges: self.task_native_expectations(),
+                    deferred_final: Some(state),
+                }),
+            )
+            .await?;
+            return Ok(PostLoopResult::TaskRegenerated(response));
+        }
         let new_llm = self.get_state_llm()?;
         let mut final_content;
 
@@ -10822,16 +13483,23 @@ Respond in JSON format:
     /// Consume a PostLoopResult. NeedsRedispatch re-enters run_loop_internal.
     /// The user message is already in memory - redispatch_depth suppresses re-adding it.
     ///
-    /// Shared by the blocking and streaming loops. The streaming loop emits `content` only when `regenerated` is true,
-    /// because otherwise the consumer already received the same text as deltas.
+    /// Shared by blocking and streaming; a redispatch scope must unwind if either owning path is dropped.
+    /// The streaming loop emits `content` only when `regenerated` is true, since otherwise the consumer already received the same text as deltas.
     async fn apply_post_loop_result(
         &self,
         processed_input: &str,
         result: PostLoopResult,
     ) -> Result<AppliedPostLoop> {
         match result {
+            PostLoopResult::TaskRegenerated(response) => Ok(AppliedPostLoop {
+                content: response.content,
+                tool_calls: response.tool_calls,
+                transitioned: true,
+                regenerated: true,
+            }),
             PostLoopResult::NoTransition(content) => Ok(AppliedPostLoop {
                 content,
+                tool_calls: None,
                 transitioned: false,
                 regenerated: false,
             }),
@@ -10840,6 +13508,7 @@ Respond in JSON format:
                 regenerated,
             } => Ok(AppliedPostLoop {
                 content,
+                tool_calls: None,
                 transitioned: true,
                 regenerated,
             }),
@@ -10858,25 +13527,22 @@ Respond in JSON format:
                     // Nothing new for the consumer to see, so the streaming loop must not emit an empty chunk.
                     return Ok(AppliedPostLoop {
                         content,
+                        tool_calls: None,
                         transitioned: true,
                         regenerated: false,
                     });
-                }
-                *self.redispatch_depth.write() += 1;
-                if let Some(context) = self.active_turn_context.write().as_mut() {
-                    context.enter_redispatch();
                 }
                 info!(
                     depth = current_depth + 1,
                     "Re-dispatching for new state after transition"
                 );
-                let resp = Box::pin(self.run_loop_internal(processed_input)).await;
-                *self.redispatch_depth.write() -= 1;
-                if let Some(context) = self.active_turn_context.write().as_mut() {
-                    context.exit_redispatch();
-                }
+                let resp = {
+                    let _redispatch = RedispatchScope::new(self);
+                    Box::pin(self.run_loop_internal(processed_input)).await
+                };
                 resp.map(|r| AppliedPostLoop {
                     content: r.content,
+                    tool_calls: None,
                     transitioned: true,
                     regenerated: true,
                 })
@@ -10924,8 +13590,8 @@ Respond in JSON format:
         response
     }
 
-    // Handle delegation: forward user input to a registry agent.
-    // Captures agent-local auxiliary roles without changing root ownership or child turn providers.
+    // A delegated task captures prepared input and stable child identity before any child effect can suspend.
+    // Resume skips preparation and start hooks; captured predecessor retirement must precede new child history, even after a dependency-only pause.
     async fn handle_delegated_state(
         &self,
         input: &str,
@@ -10948,7 +13614,20 @@ Respond in JSON format:
             .map(|sm| sm.current())
             .unwrap_or_else(|| "unknown".to_string());
 
-        self.hooks.on_delegate_start(delegate_id, &state_name).await;
+        let execution = crate::autonomy::current_execution();
+        let retained = self.retained_composition_frame()?;
+        if let Some(frame) = &retained {
+            if frame.input != input
+                || frame.delegate_id != delegate_id
+                || frame.definition != serde_json::to_value(state_def)?
+            {
+                return Err(AgentError::Config(
+                    "delegated composition binding changed".into(),
+                ));
+            }
+        } else {
+            self.hooks.on_delegate_start(delegate_id, &state_name).await;
+        }
         let start = Instant::now();
 
         let delegate = registry.get(delegate_id).ok_or_else(|| {
@@ -10960,8 +13639,10 @@ Respond in JSON format:
 
         // Prepare input based on delegate_context mode.
         let context_mode = state_def.delegate_context.clone().unwrap_or_default();
-        let effective_input = self
-            .observe_purpose(
+        let effective_input = if let Some(frame) = &retained {
+            frame.delegate_input.clone()
+        } else {
+            self.observe_purpose(
                 ObservationPurpose::OrchestrationRouting,
                 crate::orchestration::context::prepare_delegate_input(
                     input,
@@ -10975,11 +13656,104 @@ Respond in JSON format:
                     .as_deref(),
                 ),
             )
-            .await?;
+            .await?
+        };
 
-        let response = delegate
-            .chat_with_actor_context(&effective_input, self.outbound_actor_context())
+        let frame = if let Some(frame) = retained {
+            Some(frame)
+        } else if let Some(execution) = &execution {
+            let turn = crate::autonomy::current_turn_input(&self.root_turn_gate)
+                .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
+            let id = uuid::Uuid::new_v4().to_string();
+            self.commit_root_user_message(input).await?;
+            delegate.reject_task_ancestor()?;
+            let admission = execution.message_admission.lock().await;
+            let mut frame = crate::autonomy::DelegateFrame {
+                version: 1,
+                id: id.clone(),
+                runtime_id: self.info.id.clone(),
+                input: input.into(),
+                input_context: self.context_manager.get_all(),
+                delegate_id: delegate_id.into(),
+                delegate_runtime_id: delegate.info().id,
+                delegate_input: effective_input.clone(),
+                definition: serde_json::to_value(state_def)?,
+                actor: self.outbound_actor_context(),
+                parent_actor: current_turn_actor_context(),
+                source: turn.source,
+                child_operation: format!("delegate:{id}"),
+                user_message_committed: self.root_user_message_committed.load(Ordering::SeqCst),
+                native_exchanges: self.task_native_expectations(),
+                dispatch: crate::autonomy::composition::CompositionDispatch::Delegate,
+                children: Vec::new(),
+                calls: Vec::new(),
+                cursor: Value::Null,
+                expires_at: None,
+                parent_operation: crate::autonomy::current_child_operation(),
+                required: crate::autonomy::child_required(),
+                waiting_for: None,
+                predecessors: Vec::new(),
+            };
+            frame.waiting_for = execution.composition_dependency(&frame)?;
+            Box::pin(execution.retain_delegate_frame(frame.clone(), registry.clone())).await?;
+            drop(admission);
+            Some(frame)
+        } else {
+            None
+        };
+        if let (Some(execution), Some(frame)) = (&execution, &frame)
+            && execution.wait_message_dependency(frame).await?
+        {
+            return Err(AgentError::TaskSuspended(frame.id.clone()));
+        }
+        let child_turn = Box::pin(delegate.chat_with_actor_context(
+            &effective_input,
+            frame.as_ref().map_or_else(
+                || self.outbound_actor_context(),
+                |frame| frame.actor.clone(),
+            ),
+        ));
+        let response = if let Some(frame) = &frame {
+            crate::autonomy::scope_child_invocation(
+                frame.child_operation.clone(),
+                frame.delegate_runtime_id.clone(),
+                child_turn,
+            )
+            .await?
+        } else {
+            child_turn.await?
+        };
+        if let Some(execution) = &execution {
+            if let Some(reason) = execution.stop_reason() {
+                return Err(AgentError::Other(reason));
+            }
+            let runtime = crate::autonomy::TaskRuntimeCheckpoint::between_turns(
+                self.save_state_full().await?,
+            )?;
+            let operation = crate::autonomy::current_child_operation();
+            Box::pin(execution.update(|payload| {
+                if let Some(operation) = &operation {
+                    let child = payload
+                        .children
+                        .iter_mut()
+                        .find(|child| child.child_id == *operation)
+                        .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
+                    if let Some(pending) = child.pending.take() {
+                        payload.consumed_request_ids.push(pending.id);
+                    }
+                    child.runtime = runtime;
+                } else {
+                    if let Some(pending) = payload.pending.take() {
+                        payload.consumed_request_ids.push(pending.id);
+                    }
+                    payload.runtime = runtime;
+                    payload.pause_reason = None;
+                }
+                Ok(())
+            }))
             .await?;
+            execution.delegate_frames.lock().remove(&self.info.id);
+        }
 
         let duration_ms = start.elapsed().as_millis() as u64;
         self.hooks
@@ -11010,7 +13784,7 @@ Respond in JSON format:
         // post_loop_processing records the assistant turn and evaluates transitions.
         // apply_post_loop_result handles NeedsRedispatch by re-entering run_loop_internal.
         let post_result = self
-            .post_loop_processing(
+            .post_composed_processing(
                 input,
                 format!("[Delegated to {}]: {}", delegate_id, response.content),
             )
@@ -11042,8 +13816,8 @@ Respond in JSON format:
         Ok(result)
     }
 
-    // Handle concurrent execution: run multiple registry agents in parallel and aggregate.
-    // Captures agent-local auxiliary roles without changing root ownership or child turn providers.
+    // Captures prepared concurrent input and stable slots before child admission; safe resume skips preparation and completed work.
+    // Aggregation and parent finalization run only after the saved child cursor is fully settled.
     async fn handle_concurrent_state(
         &self,
         input: &str,
@@ -11057,13 +13831,12 @@ Respond in JSON format:
             )
         })?;
 
-        // Render input template if provided, otherwise use the raw input.
-        // Uses direct minijinja rendering (same approach as pipeline) so variables
-        // are top-level: {{ user_input }}, not {{ context.user_input }}.
-        // Enrich input with parent conversation history when context_mode is set.
+        let retained = self.retained_composition_frame()?;
         let context_mode = config.context_mode.clone().unwrap_or_default();
-        let context_input = self
-            .observe_purpose(
+        let context_input = if let Some(frame) = &retained {
+            frame.delegate_input.clone()
+        } else {
+            self.observe_purpose(
                 ObservationPurpose::OrchestrationRouting,
                 crate::orchestration::context::prepare_delegate_input(
                     input,
@@ -11077,14 +13850,32 @@ Respond in JSON format:
                     .as_deref(),
                 ),
             )
-            .await?;
+            .await?
+        };
 
-        let effective_input = if let Some(ref tmpl) = config.input {
+        let effective_input = if let Some(frame) = &retained {
+            frame.delegate_input.clone()
+        } else if let Some(ref tmpl) = config.input {
             render_concurrent_template(tmpl, &context_input, &self.build_context_with_overlays())
                 .unwrap_or_else(|_| context_input.clone())
         } else {
             context_input
         };
+        let frame = Box::pin(
+            self.prepare_composition_frame(
+                input,
+                &effective_input,
+                crate::autonomy::composition::CompositionDispatch::Concurrent,
+                serde_json::to_value(config)?,
+                &config
+                    .agents
+                    .iter()
+                    .map(|agent| agent.id().to_string())
+                    .collect::<Vec<_>>(),
+                serde_json::json!({}),
+            ),
+        )
+        .await?;
 
         let start = Instant::now();
 
@@ -11104,25 +13895,30 @@ Respond in JSON format:
             None
         };
 
-        let result = self
-            .observe_purpose(
-                ObservationPurpose::OrchestrationAggregation,
-                scope_actor_context(
-                    self.outbound_actor_context(),
-                    crate::orchestration::concurrent_with_llms(
-                        registry,
-                        &effective_input,
-                        &config.agents,
-                        &config.aggregation,
-                        providers.as_refs(),
-                        config.min_required,
-                        config.timeout_ms,
-                        config.on_partial_failure.clone(),
-                        vote_parallelism,
-                    ),
+        let work = Box::pin(self.observe_purpose(
+            ObservationPurpose::OrchestrationAggregation,
+            scope_actor_context(
+                self.outbound_actor_context(),
+                crate::orchestration::concurrent_with_llms(
+                    registry,
+                    &effective_input,
+                    &config.agents,
+                    &config.aggregation,
+                    providers.as_refs(),
+                    config.min_required,
+                    config.timeout_ms,
+                    config.on_partial_failure.clone(),
+                    vote_parallelism,
                 ),
-            )
-            .await?;
+            ),
+        ));
+        let result = if frame.is_some() {
+            crate::autonomy::composition::scope_composition(self.info.id.clone(), Box::pin(work))
+                .await?
+        } else {
+            work.await?
+        };
+        Box::pin(self.retire_composition_pending()).await?;
 
         let duration_ms = start.elapsed().as_millis() as u64;
         let agent_ids: Vec<String> = config.agents.iter().map(|a| a.id().to_string()).collect();
@@ -11167,7 +13963,7 @@ Respond in JSON format:
         self.commit_root_user_message(input).await?;
 
         let post_result = self
-            .post_loop_processing(input, result.response.content.clone())
+            .post_composed_processing(input, result.response.content.clone())
             .await?;
         let final_content = self
             .apply_post_loop_result(input, post_result)
@@ -11195,8 +13991,8 @@ Respond in JSON format:
         Ok(response)
     }
 
-    // Handle group chat: run a multi-turn multi-agent conversation.
-    // Captures agent-local auxiliary roles without changing root ownership or child turn providers.
+    // Saves prepared group input and its participant catalog before conversation work can park.
+    // Speaker, transcript and termination cursors preserve completed turns without repeating parent preparation.
     async fn handle_group_chat_state(
         &self,
         input: &str,
@@ -11212,6 +14008,7 @@ Respond in JSON format:
 
         let start = Instant::now();
 
+        let retained = self.retained_composition_frame()?;
         let speaker = crate::orchestration::role_provider(
             &self.llm_registry,
             ai_agents_llm::LLMRole::OrchestrationSpeaker,
@@ -11223,10 +14020,11 @@ Respond in JSON format:
             None,
         )?;
 
-        // Enrich input with parent conversation history when context_mode is set.
         let context_mode = config.context_mode.clone().unwrap_or_default();
-        let context_input = self
-            .observe_purpose(
+        let context_input = if let Some(frame) = &retained {
+            frame.delegate_input.clone()
+        } else {
+            self.observe_purpose(
                 ObservationPurpose::OrchestrationRouting,
                 crate::orchestration::context::prepare_delegate_input(
                     input,
@@ -11240,34 +14038,66 @@ Respond in JSON format:
                     .as_deref(),
                 ),
             )
-            .await?;
+            .await?
+        };
 
         // Render input template if provided, otherwise use the raw user message as topic.
-        let effective_topic = if let Some(ref tmpl) = config.input {
+        let effective_topic = if let Some(frame) = &retained {
+            frame.delegate_input.clone()
+        } else if let Some(ref tmpl) = config.input {
             render_concurrent_template(tmpl, &context_input, &self.build_context_with_overlays())
                 .unwrap_or_else(|_| context_input.clone())
         } else {
             context_input
         };
 
-        let result = self
-            .observe_purpose(
-                ObservationPurpose::OrchestrationConversation,
-                scope_actor_context(
-                    self.outbound_actor_context(),
-                    crate::orchestration::group_chat_with_llms(
-                        registry,
-                        &effective_topic,
-                        config,
-                        crate::orchestration::GroupLLMs {
-                            speaker: speaker.as_deref(),
-                            consensus: consensus.as_deref(),
-                        },
-                        Some(&*self.hooks),
-                    ),
+        let mut registry_ids = config
+            .participants
+            .iter()
+            .map(|participant| participant.id.clone())
+            .collect::<Vec<_>>();
+        for id in config
+            .manager
+            .as_ref()
+            .and_then(|manager| manager.agent.as_ref())
+            .into_iter()
+            .chain(config.debate.as_ref().map(|debate| &debate.synthesizer))
+        {
+            if registry.contains(id) && !registry_ids.contains(id) {
+                registry_ids.push(id.clone());
+            }
+        }
+        let frame = Box::pin(self.prepare_composition_frame(
+            input,
+            &effective_topic,
+            crate::autonomy::composition::CompositionDispatch::GroupChat,
+            serde_json::to_value(config)?,
+            &registry_ids,
+            serde_json::json!({}),
+        ))
+        .await?;
+        let work = Box::pin(self.observe_purpose(
+            ObservationPurpose::OrchestrationConversation,
+            scope_actor_context(
+                self.outbound_actor_context(),
+                crate::orchestration::group_chat_with_llms(
+                    registry,
+                    &effective_topic,
+                    config,
+                    crate::orchestration::GroupLLMs {
+                        speaker: speaker.as_deref(),
+                        consensus: consensus.as_deref(),
+                    },
+                    Some(&*self.hooks),
                 ),
-            )
-            .await?;
+            ),
+        ));
+        let result = if frame.is_some() {
+            crate::autonomy::composition::scope_composition(self.info.id.clone(), work).await?
+        } else {
+            work.await?
+        };
+        Box::pin(self.retire_composition_pending()).await?;
 
         let duration_ms = start.elapsed().as_millis() as u64;
 
@@ -11306,7 +14136,7 @@ Respond in JSON format:
         self.commit_root_user_message(input).await?;
 
         let post_result = self
-            .post_loop_processing(input, result.response.content.clone())
+            .post_composed_processing(input, result.response.content.clone())
             .await?;
         let final_content = self
             .apply_post_loop_result(input, post_result)
@@ -11335,8 +14165,8 @@ Respond in JSON format:
         Ok(response)
     }
 
-    // Handle pipeline: run agents sequentially with per-stage input templates.
-    // Captures agent-local auxiliary roles without changing root ownership or child turn providers.
+    // Captures prepared pipeline input and stable stage slots before execution; resume uses its acknowledged stage cursor.
+    // Completed stage hooks and template preparation are not repeated when a later child is parked.
     async fn handle_pipeline_state(
         &self,
         input: &str,
@@ -11352,6 +14182,7 @@ Respond in JSON format:
 
         let start = Instant::now();
 
+        let retained = self.retained_composition_frame()?;
         let stages: Vec<crate::orchestration::PipelineStage> = config
             .stages
             .iter()
@@ -11364,10 +14195,11 @@ Respond in JSON format:
             })
             .collect();
 
-        // Enrich input with parent conversation history when context_mode is set.
         let context_mode = config.context_mode.clone().unwrap_or_default();
-        let context_input = self
-            .observe_purpose(
+        let context_input = if let Some(frame) = &retained {
+            frame.delegate_input.clone()
+        } else {
+            self.observe_purpose(
                 ObservationPurpose::OrchestrationRouting,
                 crate::orchestration::context::prepare_delegate_input(
                     input,
@@ -11381,25 +14213,49 @@ Respond in JSON format:
                     .as_deref(),
                 ),
             )
-            .await?;
+            .await?
+        };
 
-        let context_values = self.build_context_with_overlays();
-        let result = self
-            .observe_purpose(
-                ObservationPurpose::OrchestrationRouting,
-                scope_actor_context(
-                    self.outbound_actor_context(),
-                    crate::orchestration::pipeline(
-                        registry,
-                        &context_input,
-                        &stages,
-                        config.timeout_ms,
-                        Some(&*self.hooks),
-                        Some(&context_values),
-                    ),
+        let context_values = if let Some(frame) = &retained {
+            serde_json::from_value(frame.cursor["context"].clone())?
+        } else {
+            self.build_context_with_overlays()
+        };
+        let frame = Box::pin(
+            self.prepare_composition_frame(
+                input,
+                &context_input,
+                crate::autonomy::composition::CompositionDispatch::Pipeline,
+                serde_json::to_value(config)?,
+                &stages
+                    .iter()
+                    .map(|stage| stage.agent_id.clone())
+                    .collect::<Vec<_>>(),
+                serde_json::json!({"context":context_values}),
+            ),
+        )
+        .await?;
+        let work = self.observe_purpose(
+            ObservationPurpose::OrchestrationRouting,
+            scope_actor_context(
+                self.outbound_actor_context(),
+                crate::orchestration::pipeline(
+                    registry,
+                    &context_input,
+                    &stages,
+                    config.timeout_ms,
+                    Some(&*self.hooks),
+                    Some(&context_values),
                 ),
-            )
-            .await?;
+            ),
+        );
+        let result = if frame.is_some() {
+            crate::autonomy::composition::scope_composition(self.info.id.clone(), Box::pin(work))
+                .await?
+        } else {
+            work.await?
+        };
+        Box::pin(self.retire_composition_pending()).await?;
 
         let duration_ms = start.elapsed().as_millis() as u64;
 
@@ -11437,7 +14293,7 @@ Respond in JSON format:
         self.commit_root_user_message(input).await?;
 
         let post_result = self
-            .post_loop_processing(input, result.response.content.clone())
+            .post_composed_processing(input, result.response.content.clone())
             .await?;
         let final_content = self
             .apply_post_loop_result(input, post_result)
@@ -11464,8 +14320,8 @@ Respond in JSON format:
         Ok(response)
     }
 
-    // Handle handoff: LLM-directed agent-to-agent control transfer.
-    // Keeps handoff decisions and delegate summary on separate auxiliary roles.
+    // Captures prepared handoff input and per-turn target slots before dispatch; saved decisions and child results are not repeated on resume.
+    // The handoff evaluator and context summary retain separate captured auxiliary roles.
     async fn handle_handoff_state(
         &self,
         input: &str,
@@ -11479,6 +14335,7 @@ Respond in JSON format:
             )
         })?;
 
+        let retained = self.retained_composition_frame()?;
         let llm = self.role_llm(ai_agents_llm::LLMRole::OrchestrationHandoff, None, || {
             self.llm_registry
                 .get("router")
@@ -11487,10 +14344,11 @@ Respond in JSON format:
 
         let start = Instant::now();
 
-        // Enrich input with parent conversation history when context_mode is set.
         let context_mode = config.context_mode.clone().unwrap_or_default();
-        let context_input = self
-            .observe_purpose(
+        let context_input = if let Some(frame) = &retained {
+            frame.delegate_input.clone()
+        } else {
+            self.observe_purpose(
                 ObservationPurpose::OrchestrationRouting,
                 crate::orchestration::context::prepare_delegate_input(
                     input,
@@ -11504,33 +14362,71 @@ Respond in JSON format:
                     .as_deref(),
                 ),
             )
-            .await?;
+            .await?
+        };
 
-        // Render input template if provided, otherwise forward the raw user message.
-        let effective_input = if let Some(ref tmpl) = config.input {
+        // Saved input is already rendered and cannot be interpreted as a fresh template on resume.
+        let effective_input = if let Some(frame) = &retained {
+            frame.delegate_input.clone()
+        } else if let Some(ref tmpl) = config.input {
             render_concurrent_template(tmpl, &context_input, &self.build_context_with_overlays())
                 .unwrap_or_else(|_| context_input.clone())
         } else {
             context_input
         };
 
-        let result = self
-            .observe_purpose(
-                ObservationPurpose::OrchestrationRouting,
-                scope_actor_context(
-                    self.outbound_actor_context(),
-                    crate::orchestration::handoff(
-                        registry,
-                        &effective_input,
-                        &config.initial_agent,
-                        &config.available_agents,
-                        config.max_handoffs,
-                        llm.as_ref(),
-                        Some(&*self.hooks),
-                    ),
+        let mut targets = vec![config.initial_agent.clone()];
+        for id in &config.available_agents {
+            if !targets.contains(id) {
+                targets.push(id.clone());
+            }
+        }
+        let count = (config.max_handoffs as usize)
+            .checked_add(1)
+            .and_then(|turns| turns.checked_mul(targets.len()))
+            .ok_or(crate::autonomy::TaskRunStorageError::CheckpointTooLarge)?;
+        if crate::autonomy::current_execution().is_some()
+            && count > crate::autonomy::MAX_TASK_CHECKPOINT_RECORDS
+        {
+            return Err(crate::autonomy::TaskRunStorageError::CheckpointTooLarge.into());
+        }
+        let registry_ids = if crate::autonomy::current_execution().is_some() {
+            (0..=config.max_handoffs)
+                .flat_map(|_| targets.iter().cloned())
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let frame = Box::pin(self.prepare_composition_frame(
+            input,
+            &effective_input,
+            crate::autonomy::composition::CompositionDispatch::Handoff,
+            serde_json::to_value(config)?,
+            &registry_ids,
+            serde_json::json!({"targets":targets}),
+        ))
+        .await?;
+        let work = Box::pin(self.observe_purpose(
+            ObservationPurpose::OrchestrationRouting,
+            scope_actor_context(
+                self.outbound_actor_context(),
+                crate::orchestration::handoff(
+                    registry,
+                    &effective_input,
+                    &config.initial_agent,
+                    &config.available_agents,
+                    config.max_handoffs,
+                    llm.as_ref(),
+                    Some(&*self.hooks),
                 ),
-            )
-            .await?;
+            ),
+        ));
+        let result = if frame.is_some() {
+            crate::autonomy::composition::scope_composition(self.info.id.clone(), work).await?
+        } else {
+            work.await?
+        };
+        Box::pin(self.retire_composition_pending()).await?;
 
         let duration_ms = start.elapsed().as_millis() as u64;
 
@@ -11568,7 +14464,7 @@ Respond in JSON format:
         self.commit_root_user_message(input).await?;
 
         let post_result = self
-            .post_loop_processing(input, result.response.content.clone())
+            .post_composed_processing(input, result.response.content.clone())
             .await?;
         let final_content = self
             .apply_post_loop_result(input, post_result)
@@ -11596,11 +14492,12 @@ Respond in JSON format:
         Ok(response)
     }
 
-    // run_loop_internal: blocking (non-streaming) agent pipeline.
+    // Shares the blocking turn pipeline across ordinary roots and owned task participants, capturing local loop state before a suspended batch unwinds.
+    // Boxed composition dispatch keeps nested participants from multiplying large future stack frames.
     async fn run_loop_internal(&self, input: &str) -> Result<AgentResponse> {
         self.begin_root_turn();
-        // Resolve actor_id from context, reload facts if actor changed, bump counter.
-        self.pre_turn_session_lifecycle().await;
+        // Actor loading and callbacks share the admitted run's original lifetime before input processing begins.
+        self.pre_turn_session_lifecycle().await?;
 
         let input_data = self.process_input(input).await?;
         self.update_active_turn_context(&input_data.content, input_data.context.clone());
@@ -11617,6 +14514,9 @@ Respond in JSON format:
                 .rejection_reason
                 .unwrap_or_else(|| "Input rejected".to_string());
             warn!(reason = %reason, "Input rejected");
+            if let Some(execution) = crate::autonomy::current_execution() {
+                execution.stop("input_rejected");
+            }
             let response = AgentResponse::new(reason);
             self.finish_turn_if_root(&response).await?;
             return Ok(response);
@@ -11624,41 +14524,82 @@ Respond in JSON format:
 
         let processed_input = &input_data.content;
 
-        if let Some(response) = self.try_pre_response_transition(processed_input).await? {
+        if let Some(response) = crate::autonomy::location::scope_state_return(
+            crate::autonomy::location::TaskStateReturn::Prepared {
+                data: input_data.clone(),
+            },
+            Box::pin(self.try_pre_response_transition(processed_input)),
+        )
+        .await?
+        {
             return Ok(response);
         }
+        Box::pin(self.run_accepted_input(input_data)).await
+    }
 
-        // Handle orchestration states (delegate, concurrent, group_chat, pipeline, handoff).
-        if let Some(ref sm) = self.state_machine
-            && let Some(def) = sm.current_definition()
-        {
-            if let Some(ref delegate_id) = def.delegate {
-                return self
-                    .handle_delegated_state(processed_input, delegate_id, &def)
-                    .await;
+    /// Continues an accepted input after a saved transition without repeating processing or semantic transition selection.
+    /// Erasure isolates optional orchestration construction from the enclosing input pipeline's nested polling frame.
+    fn run_accepted_input(
+        &self,
+        input_data: ProcessData,
+    ) -> Pin<Box<dyn Future<Output = Result<AgentResponse>> + Send + '_>> {
+        Box::pin(async move {
+            self.promote_automatic_state(&input_data).await?;
+            let processed_input = &input_data.content;
+            if self.automatic_scope_ended() {
+                let response = AgentResponse::new("");
+                self.commit_root_user_message(processed_input).await?;
+                self.finish_turn_if_root(&response).await?;
+                return Ok(response);
             }
-            if let Some(ref concurrent_config) = def.concurrent {
-                return self
-                    .handle_concurrent_state(processed_input, concurrent_config)
+            // Controller continuation works from committed aggregate history, not by rerunning completed initial child flows.
+            if !crate::autonomy::current_turn_input(&self.root_turn_gate)
+                .is_some_and(|turn| !turn.initial_work())
+                && let Some(ref sm) = self.state_machine
+                && let Some(def) = sm.current_definition()
+            {
+                if let Some(ref delegate_id) = def.delegate {
+                    return Box::pin(self.handle_delegated_state(
+                        processed_input,
+                        delegate_id,
+                        &def,
+                    ))
                     .await;
-            }
-            if let Some(ref group_chat_config) = def.group_chat {
-                return self
-                    .handle_group_chat_state(processed_input, group_chat_config)
+                }
+                if let Some(ref concurrent_config) = def.concurrent {
+                    return Box::pin(
+                        self.handle_concurrent_state(processed_input, concurrent_config),
+                    )
                     .await;
-            }
-            if let Some(ref pipeline_config) = def.pipeline {
-                return self
-                    .handle_pipeline_state(processed_input, pipeline_config)
+                }
+                if let Some(ref group_chat_config) = def.group_chat {
+                    return Box::pin(
+                        self.handle_group_chat_state(processed_input, group_chat_config),
+                    )
                     .await;
+                }
+                if let Some(ref pipeline_config) = def.pipeline {
+                    return Box::pin(self.handle_pipeline_state(processed_input, pipeline_config))
+                        .await;
+                }
+                if let Some(ref handoff_config) = def.handoff {
+                    return Box::pin(self.handle_handoff_state(processed_input, handoff_config))
+                        .await;
+                }
             }
-            if let Some(ref handoff_config) = def.handoff {
-                return self
-                    .handle_handoff_state(processed_input, handoff_config)
-                    .await;
-            }
-        }
 
+            crate::autonomy::interaction::scope_prepared_input(
+                input_data.clone(),
+                Box::pin(self.run_prepared_input(input_data)),
+            )
+            .await
+        })
+    }
+
+    // Keeps the model, skill and planning driver out of declared-state parents' recursive polling frames.
+    // Input preparation and root ownership stay in the caller; the prepared data is consumed without rerouting the user input.
+    async fn run_prepared_input(&self, input_data: ProcessData) -> Result<AgentResponse> {
+        let processed_input = &input_data.content;
         //
         // The speculative future is boxed to keep the runtime future size manageable.
         // Removing the box can overflow small test stacks because this function is recursive through redispatch.
@@ -11669,12 +14610,16 @@ Respond in JSON format:
             return Ok(response);
         }
 
-        match self.try_skill_route(processed_input).await? {
+        match Box::pin(self.try_skill_route(processed_input)).await? {
             SkillRouteResult::Response { skill_id, content } => {
                 self.commit_root_user_message(processed_input).await?;
-                return self
-                    .handle_skill_response(processed_input, &skill_id, content, &input_data.context)
-                    .await;
+                return Box::pin(self.handle_skill_response(
+                    processed_input,
+                    &skill_id,
+                    content,
+                    &input_data.context,
+                ))
+                .await;
             }
             SkillRouteResult::NeedsClarification {
                 response,
@@ -11692,6 +14637,8 @@ Respond in JSON format:
                         .await?;
                 }
                 drop(admission);
+                self.park_task_clarification(processed_input, &response)
+                    .await?;
                 self.finish_turn_if_root(&response).await?;
                 return Ok(response);
             }
@@ -11713,137 +14660,21 @@ Respond in JSON format:
 
         if matches!(reasoning_mode, ReasoningMode::PlanAndExecute) {
             self.commit_root_user_message(processed_input).await?;
-            return self
-                .handle_plan_and_execute(processed_input, &input_data.context, auto_detected)
-                .await;
-        }
-
-        self.commit_root_user_message(processed_input).await?;
-
-        let mut iterations = 0u32;
-        let mut all_tool_calls: Vec<ToolCall> = Vec::new();
-        let mut thinking_content: Option<String> = None;
-
-        let llm = self.get_state_llm()?;
-
-        loop {
-            // When reasoning is active, cap iterations at the reasoning-specific limit.
-            let effective_max = if reasoning_mode != ReasoningMode::None {
-                let rc = self.get_effective_reasoning_config();
-                self.max_iterations.min(rc.max_iterations)
-            } else {
-                self.max_iterations
-            };
-
-            if iterations >= effective_max {
-                let err = AgentError::Other(format!("Max iterations ({}) exceeded", effective_max));
-                self.hooks.on_error(&err).await;
-                error!(iterations = iterations, "Max iterations exceeded");
-                return Err(err);
-            }
-            iterations += 1;
-            *self.iteration_count.write() = iterations;
-
-            debug!(iteration = iterations, max = effective_max, "LLM call");
-
-            let protocol = self.main_tool_protocol(llm.as_ref(), false).await?;
-            let mut messages = self
-                .build_messages_internal(true, None, protocol.choice.is_none())
-                .await?;
-            self.inject_reasoning_prompt(&mut messages, &reasoning_mode, iterations == 1);
-
-            self.hooks.on_llm_start(&messages).await;
-            let llm_start = Instant::now();
-            let response = self
-                .complete_main_llm_with_recovery(Arc::clone(&llm), &messages, &protocol)
-                .await?;
-
-            let llm_duration_ms = llm_start.elapsed().as_millis() as u64;
-            self.hooks.on_llm_complete(&response, llm_duration_ms).await;
-
-            let content = response.content.trim();
-
-            if let Some(tool_calls) = self.parse_main_tool_calls(content, &protocol)? {
-                match self
-                    .handle_tool_calls(
-                        processed_input,
-                        content,
-                        tool_calls,
-                        &mut all_tool_calls,
-                        None,
-                    )
-                    .await?
-                {
-                    ToolCallOutcome::Continue | ToolCallOutcome::TransitionFired => continue,
-                    ToolCallOutcome::Rejected(resp) => {
-                        self.finish_turn_if_root(&resp).await?;
-                        return Ok(resp);
-                    }
-                }
-            }
-
-            let (extracted_thinking, answer) = self.extract_thinking(content);
-            if extracted_thinking.is_some() {
-                thinking_content = extracted_thinking;
-            }
-
-            let output_data = self.process_output(&answer, &input_data.context).await?;
-
-            let mut final_content = if output_data.metadata.rejected {
-                output_data
-                    .metadata
-                    .rejection_reason
-                    .unwrap_or_else(|| answer.to_string())
-            } else {
-                output_data.content
-            };
-
-            // Run reflection (blocking LLM calls for retries)
-            let reflection_metadata;
-            (final_content, reflection_metadata) = self
-                .run_reflection(&*llm, processed_input, final_content)
-                .await?;
-
-            final_content =
-                self.format_response_with_thinking(thinking_content.as_deref(), &final_content);
-
-            // Post-loop: memory, transitions, post-transition re-generation.
-            // apply_post_loop_result handles NeedsRedispatch by re-entering
-            // run_loop_internal so the new state's full dispatch activates.
-            let final_content = {
-                let result = self
-                    .post_loop_processing(processed_input, final_content)
-                    .await?;
-                self.apply_post_loop_result(processed_input, result)
-                    .await?
-                    .content
-            };
-
-            let reflected = reflection_metadata.is_some();
-            let reasoning_mode_debug = format!("{:?}", reasoning_mode);
-
-            let response = self.build_agent_response(AgentResponseParts {
-                content: final_content,
-                all_tool_calls,
-                reasoning_mode,
+            return Box::pin(self.handle_plan_and_execute(
+                processed_input,
+                &input_data.context,
                 auto_detected,
-                iterations,
-                thinking: thinking_content,
-                reflection_metadata,
-            });
-
-            self.finish_turn_if_root(&response).await?;
-
-            let tool_call_count = response.tool_calls.as_ref().map(|tc| tc.len()).unwrap_or(0);
-            info!(
-                tool_calls = tool_call_count,
-                response_len = response.content.len(),
-                reasoning_mode = %reasoning_mode_debug,
-                reflected = reflected,
-                "Chat completed"
-            );
-            return Ok(response);
+            ))
+            .await;
         }
+
+        Box::pin(self.run_committed_response_loop_with_reasoning(
+            processed_input,
+            &input_data.context,
+            reasoning_mode,
+            auto_detected,
+        ))
+        .await
     }
 
     async fn generate_buffered_streaming_draft(
@@ -11987,7 +14818,13 @@ Respond in JSON format:
         loop {
             if let Some(candidate) = transition_candidate.take() {
                 if self
-                    .approve_transition_target(&candidate.from_state, candidate.target())
+                    .approve_transition_target(
+                        &candidate.from_state,
+                        candidate.target(),
+                        &candidate.reason,
+                        None,
+                        None,
+                    )
                     .await?
                 {
                     // Drop the stale stream future before transition side effects or redispatch reuse the provider.
@@ -12123,6 +14960,7 @@ Respond in JSON format:
                         stream_draft.draft,
                         ReasoningMode::None,
                         false,
+                        false,
                     )
                     .await?;
                 let chunks = if response.content == raw_draft_content {
@@ -12222,8 +15060,11 @@ Respond in JSON format:
 
         Box::pin(async_stream::stream! {
             self.begin_root_turn();
-            // Parity with non-stream: resolve actor from context and load facts if changed.
-            self.pre_turn_session_lifecycle().await;
+            // Preserve the blocking path's actor-load failure and owned-tail contract before emitting any content.
+            if let Err(error) = self.pre_turn_session_lifecycle().await {
+                yield StreamChunk::error(error.to_string());
+                return;
+            }
 
             let input_data = match self.process_input(input).await {
                 Ok(data) => data,
@@ -12274,7 +15115,10 @@ Respond in JSON format:
                     crate::optimization::StreamingOptimizationPolicy::Disabled
                 )
             {
-                match self.try_pre_response_transition(processed_input).await {
+                match crate::autonomy::location::scope_state_return(
+                    crate::autonomy::location::TaskStateReturn::Prepared { data: input_data.clone() },
+                    self.try_pre_response_transition(processed_input),
+                ).await {
                     Ok(Some(response)) => {
                         yield StreamChunk::content(&response.content);
                         record_runtime_stream_final(&terminal, response);
@@ -12314,6 +15158,11 @@ Respond in JSON format:
                         return;
                     }
                 }
+            }
+
+            if let Err(error) = self.promote_automatic_state(&input_data).await {
+                yield StreamChunk::error(error.to_string());
+                return;
             }
 
             // Handle orchestration states in streaming mode.
@@ -12805,8 +15654,11 @@ Respond in JSON format:
         &self.skills
     }
 
-    /// Clears conversation and pending runtime ownership through one reset contract.
+    /// Clears conversation and pending ownership only when no foreground task reserves the runtime.
     async fn reset_runtime_state(&self) -> Result<()> {
+        self.check_autonomy_access()?;
+        let _mutations = self.autonomy_mutations.read().await;
+        self.check_autonomy_access()?;
         let _admission = self.disambiguation_admission.write().await;
         if self.state_transition_reserved.load(Ordering::SeqCst) {
             return Err(AgentError::Other(
@@ -12814,6 +15666,7 @@ Respond in JSON format:
             ));
         }
         self.disambiguation_epoch.fetch_add(1, Ordering::SeqCst);
+        *self.pending_automatic_input.write() = None;
         *self.pending_skill_id.write() = None;
         if let Some(disambiguator) = self.disambiguation_manager.as_ref() {
             disambiguator.clear_pending().await;
@@ -12888,17 +15741,83 @@ Respond in JSON format:
         ctx
     }
 
-    /// Send a HITL check result through the approval flow and return the full ApprovalResult.
+    /// Preserves ordinary approval waits; opted-in executable batches transfer control before hooks or host interaction.
+    /// Live waits remain bounded by cancellation/time, while only an acknowledged exact checkpoint establishes a safe pause.
+    /// Explicit reject/policy-only task profiles cannot satisfy a still-required human approval, including during resumed work.
+    /// Parking pins the actually reviewed tool and control/state generations on the live owner rather than recreating authority from a receipt.
     async fn request_hitl_approval(&self, check_result: HITLCheckResult) -> Result<ApprovalResult> {
         let Some(request) = check_result.into_request() else {
             return Ok(ApprovalResult::Approved);
         };
 
+        // Profile auto-if-policy never approves a request that the current policy/HITL boundary still requires a human to review.
+        if crate::autonomy::current_execution().is_some_and(|execution| {
+            matches!(
+                execution.task_interaction_policy(),
+                Some(
+                    crate::autonomy::InteractionAction::Reject
+                        | crate::autonomy::InteractionAction::AutoIfPolicy
+                )
+            )
+        }) {
+            return Ok(ApprovalResult::Rejected {
+                reason: Some("Task profile does not authorize required human approval".into()),
+            });
+        }
+        if let Some(result) = crate::autonomy::suspension::take_resumed_approval(&request)? {
+            return Ok(result);
+        }
+        if let Some(execution) = crate::autonomy::current_execution()
+            && execution.pauses_approval(&self.info.id)
+        {
+            let review = crate::autonomy::suspension::message_request()
+                .and_then(|call| {
+                    self.tools
+                        .resolve(&call.requested_name)
+                        .map(|resolved| (call, resolved))
+                })
+                .map(|(call, resolved)| {
+                    let snapshot = self.runtime_safety_snapshot();
+                    Arc::new(RetainedToolReview {
+                        tool: resolved.tool,
+                        tools: self.tools.clone(),
+                        name: call.requested_name,
+                        control: self.runtime_control.clone(),
+                        control_version: snapshot.version,
+                        state: self.state_machine.clone(),
+                        generation: self.state_machine.as_ref().map(|state| state.generation()),
+                    }) as Arc<dyn ai_agents_core::autonomy::TaskFinalAdmission>
+                });
+            let id = execution.park_approval(&self.info.id, &request, review)?;
+            return Err(AgentError::TaskSuspended(id));
+        }
         self.hooks.on_approval_requested(&request).await;
 
         let timeout = request.timeout;
 
-        let raw_result = if let Some(duration) = timeout {
+        let raw_result = if let Some(execution) = crate::autonomy::current_execution() {
+            let duration = timeout.map_or(execution.remaining_duration(), |duration| {
+                duration.min(execution.remaining_duration())
+            });
+            let waiting = async {
+                let approval = self.approval_handler.request_approval(request.clone());
+                tokio::pin!(approval);
+                loop {
+                    tokio::select! { result = &mut approval => return result, _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {
+                        if ai_agents_core::autonomy::InvocationAdmission::execution_stopped(execution.as_ref()) { return ApprovalResult::Rejected { reason: Some("task approval wait cancelled or expired".into()) }; }
+                    } }
+                }
+            };
+            match tokio::time::timeout(duration, waiting).await {
+                Ok(result) => result,
+                Err(_) => {
+                    if execution.remaining_duration().is_zero() {
+                        execution.stop("time_violation");
+                    }
+                    ApprovalResult::timeout()
+                }
+            }
+        } else if let Some(duration) = timeout {
             match tokio::time::timeout(
                 duration,
                 self.approval_handler.request_approval(request.clone()),
@@ -13064,13 +15983,26 @@ Respond in JSON format:
         all_results
     }
 
-    /// Streams one serialized root turn and releases its owned gate guard at Done or when the stream is dropped.
+    /// Streams one serialized ordinary turn or automatic task operation through its actual ownership boundary.
     ///
-    /// The captured immutable identity stack is restored for every inner poll and export with an `Arc` clone, so nested hooks and orchestration calls detect same-runtime reentry without rebuilding ancestry. The inner stream is drained after Done before ownership is released.
+    /// Ordinary streams restore the immutable identity stack on every poll and drain the inner stream after Done before releasing their gate.
+    /// Automatic entry exchanges that gate for its live task reservation before controller work; Done ends the operation, not a paused task's ownership.
     pub async fn chat_stream<'a>(
         &'a self,
         input: &'a str,
     ) -> Result<Pin<Box<dyn Stream<Item = StreamChunk> + Send + 'a>>> {
+        if self.automatic_host().is_some() {
+            let mut events = self.automatic_event_stream(input, None, true).await?;
+            return Ok(Box::pin(async_stream::stream! {
+                while let Some(event) = events.next().await {
+                    match event {
+                        AgentStreamEvent::Chunk(chunk) => yield chunk,
+                        AgentStreamEvent::Final(_) => { yield StreamChunk::Done {}; return; }
+                        AgentStreamEvent::Task(_) => {}
+                    }
+                }
+            }));
+        }
         let RootTurnAdmission {
             guard: root_turn_guard,
             identity_stack,
@@ -13138,13 +16070,17 @@ Respond in JSON format:
         Ok(stream)
     }
 
-    /// Streams one serialized root turn and releases its owned gate guard at the authoritative terminal event or on drop.
+    /// Streams one serialized root dispatch under ordinary ownership or a promoted controller's acknowledged operation custody.
     ///
-    /// The captured immutable identity stack is restored for every inner poll and export with an `Arc` clone. The event API shares and drains the legacy execution stream so cleanup, nested-call detection, cancellation, and side effects cannot diverge before the gate is released.
+    /// Ordinary event delivery shares and drains the legacy execution stream before gate release, preserving cleanup and nested-call detection.
+    /// Automatic delivery additionally projects bounded task events; dispatch Final carries truthful task status and does not imply completion of a paused objective.
     pub async fn chat_stream_events<'a>(
         &'a self,
         input: &'a str,
     ) -> Result<Pin<Box<dyn Stream<Item = AgentStreamEvent> + Send + 'a>>> {
+        if self.automatic_host().is_some() {
+            return self.automatic_event_stream(input, None, false).await;
+        }
         let RootTurnAdmission {
             guard,
             identity_stack,
@@ -13177,6 +16113,11 @@ Respond in JSON format:
         input: &'a str,
         actor_context: crate::TurnActorContext,
     ) -> Result<Pin<Box<dyn Stream<Item = AgentStreamEvent> + Send + 'a>>> {
+        if self.automatic_host().is_some() {
+            return self
+                .automatic_event_stream(input, Some(actor_context), false)
+                .await;
+        }
         let RootTurnAdmission {
             guard,
             identity_stack,
@@ -13334,16 +16275,36 @@ impl ToolInvoker for RuntimeAgent {
 #[async_trait]
 impl Agent for RuntimeAgent {
     /// Runs one blocking external root turn with task-local ownership visible through finalization, hooks, orchestration, and export.
+    /// Boxing the ordinary driver keeps its unused polling frame out of recursive participant entry without moving work to another task.
     async fn chat(&self, input: &str) -> Result<AgentResponse> {
+        if let Some(execution) = crate::autonomy::current_execution()
+            && !current_runtime_gate_identity_stack()
+                .iter()
+                .any(|gate| Arc::ptr_eq(gate, &self.root_turn_gate))
+        {
+            let result = self
+                .run_task_participant(input, None, execution.clone())
+                .await;
+            if result.is_err()
+                && !matches!(&result, Err(AgentError::TaskSuspended(_)))
+                && crate::autonomy::child_required()
+            {
+                execution.stop("required_child_failure");
+            }
+            return result;
+        }
+        if self.automatic_host().is_some() {
+            return Box::pin(self.automatic_chat(input, None)).await;
+        }
         let RootTurnAdmission {
             guard,
             identity_stack,
         } = self.acquire_root_turn().await?;
         let result = scope_runtime_gate_identity_stack(&identity_stack, async {
             let result = if let Some(context) = self.build_observation_context(None) {
-                with_observation_context(context, self.run_loop(input)).await
+                with_observation_context(context, Box::pin(self.run_loop(input))).await
             } else {
-                self.run_loop(input).await
+                Box::pin(self.run_loop(input)).await
             };
             self.export_observability_if_configured().await;
             result
@@ -13615,6 +16576,7 @@ mod tests {
     }
 
     /// Collects one event stream into (content chunks joined, all chunks, Final).
+    // These ordinary parity fixtures reject task activation instead of silently discarding a new lifecycle event.
     async fn collect_stream_events(
         agent: &RuntimeAgent,
         input: &str,
@@ -13632,6 +16594,7 @@ mod tests {
                     }
                     chunks.push(chunk);
                 }
+                AgentStreamEvent::Task(_) => panic!("ordinary fixture unexpectedly entered a task"),
                 AgentStreamEvent::Final(response) => final_response = Some(response),
             }
         }
@@ -13936,6 +16899,7 @@ mod tests {
     /// Defines a prompt skill whose provider call proves committed execution.
     fn confirmation_skill() -> SkillDefinition {
         SkillDefinition {
+            autonomy: None,
             id: "send_report".to_string(),
             description: "Send a report after clarification".to_string(),
             trigger: "When the user asks to send a report".to_string(),
@@ -14063,6 +17027,7 @@ mod tests {
     }
 
     #[tokio::test]
+    // Ordinary confirmation must terminate its own dispatch without accidentally activating task work.
     async fn streaming_state_confirmation_ends_the_turn_before_redispatch() {
         let (agent, observed) = state_disambiguation_agent(
             vec![
@@ -14100,6 +17065,7 @@ mod tests {
                     panic!("unexpected stream error: {message}")
                 }
                 AgentStreamEvent::Chunk(_) => {}
+                AgentStreamEvent::Task(_) => panic!("ordinary fixture unexpectedly entered a task"),
             }
         }
         let confirmation = confirmation.expect("confirmation must finalize");
@@ -15937,17 +18903,21 @@ states:
                 .unwrap(),
         );
         let agent = runtime_storage_agent().with_storage(storage.clone());
-        agent.set_session_metadata(ai_agents_core::SessionMetadata {
-            tags: vec!["initial".into()],
-            ..Default::default()
-        });
+        agent
+            .set_session_metadata(ai_agents_core::SessionMetadata {
+                tags: vec!["initial".into()],
+                ..Default::default()
+            })
+            .unwrap();
         agent.chat("persist this turn").await.unwrap();
         agent.save_session("session").await.unwrap();
 
-        agent.set_session_metadata(ai_agents_core::SessionMetadata {
-            tags: vec!["updated".into()],
-            ..Default::default()
-        });
+        agent
+            .set_session_metadata(ai_agents_core::SessionMetadata {
+                tags: vec!["updated".into()],
+                ..Default::default()
+            })
+            .unwrap();
         agent.save_session("session").await.unwrap();
         assert!(
             agent
@@ -17778,6 +20748,7 @@ states:
     }
 
     #[tokio::test]
+    // A default-off event stream retains its ordinary single-Final protocol with no task lifecycle output.
     async fn stream_events_emit_one_authoritative_final_without_legacy_done() {
         let agent = AgentBuilder::new()
             .system_prompt("You are a test assistant.")
@@ -17798,6 +20769,7 @@ states:
                 }
                 AgentStreamEvent::Final(response) => final_responses.push(response),
                 AgentStreamEvent::Chunk(_) => {}
+                AgentStreamEvent::Task(_) => panic!("ordinary fixture unexpectedly entered a task"),
             }
         }
 
@@ -17814,6 +20786,7 @@ states:
     }
 
     #[tokio::test]
+    // Ordinary provisional output cannot replace the processed authoritative response or activate a task.
     async fn stream_final_content_includes_output_processing_after_provisional_chunks() {
         let yaml = r#"
 name: ProcessedStreamAgent
@@ -17847,6 +20820,7 @@ streaming:
                 }
                 AgentStreamEvent::Final(response) => final_content = Some(response.content),
                 AgentStreamEvent::Chunk(_) => {}
+                AgentStreamEvent::Task(_) => panic!("ordinary fixture unexpectedly entered a task"),
             }
         }
 
@@ -17858,6 +20832,7 @@ streaming:
     }
 
     #[tokio::test]
+    // Ordinary tool progress stays distinct from an opt-in task lifecycle while preserving final call evidence.
     async fn stream_events_preserve_tool_progress_and_final_tool_calls() {
         let agent = AgentBuilder::new()
             .system_prompt("Use the echo tool once, then answer.")
@@ -17891,6 +20866,7 @@ streaming:
                 }
                 AgentStreamEvent::Final(response) => final_response = Some(response),
                 AgentStreamEvent::Chunk(_) => {}
+                AgentStreamEvent::Task(_) => panic!("ordinary fixture unexpectedly entered a task"),
             }
         }
 
@@ -20999,6 +23975,7 @@ hitl:
     }
 
     #[tokio::test]
+    // A denied ordinary operation keeps its established event finalization without claiming task execution.
     async fn tool_hitl_rejection_preserves_legacy_error_but_finalizes_event_stream() {
         let mock = mock_with_response(r#"{"tool":"echo","arguments":{"message":"hello"}}"#);
         let yaml = r#"
@@ -21030,6 +24007,7 @@ hitl:
                 AgentStreamEvent::Chunk(StreamChunk::Error { .. }) => error_seen = true,
                 AgentStreamEvent::Final(response) => final_response = Some(response),
                 AgentStreamEvent::Chunk(_) => {}
+                AgentStreamEvent::Task(_) => panic!("ordinary fixture unexpectedly entered a task"),
             }
         }
 
@@ -21081,6 +24059,156 @@ states:
         assert_eq!(response.content, "Billing state response");
         assert_eq!(call_counter.call_count(), 1);
         assert_eq!(agent.actor_facts().len(), 0);
+    }
+
+    // Exercises cancellation after committed pre-response routing has entered the nested provider.
+    async fn assert_redispatch_drop_restores_next_turn(streaming: bool) {
+        let first_started = Arc::new(tokio::sync::Notify::new());
+        let first_dropped = Arc::new(AtomicBool::new(false));
+        let responses = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider = FirstCallLockingProvider {
+            lock: Arc::new(tokio::sync::Mutex::new(())),
+            first_started: Arc::clone(&first_started),
+            first_dropped: Arc::clone(&first_dropped),
+            committed_after_drop: Arc::new(AtomicBool::new(false)),
+            calls: AtomicU64::new(0),
+        };
+        let yaml = r#"
+name: CancelledRedispatch
+system_prompt: "Route before answering."
+runtime:
+  optimization:
+    enabled: true
+    pre_response_deterministic_transitions: true
+states:
+  initial: greeting
+  states:
+    greeting:
+      prompt: "Route billing requests."
+      transitions:
+        - to: billing
+          guard:
+            context:
+              topic:
+                eq: billing
+          timing: pre_response
+    billing:
+      prompt: "Answer billing requests."
+"#;
+        let agent = Arc::new(
+            AgentBuilder::from_yaml(yaml)
+                .unwrap()
+                .llm(Arc::new(provider))
+                .hooks(Arc::new(ResponseCountingHooks {
+                    responses: Arc::clone(&responses),
+                }))
+                .build()
+                .unwrap(),
+        );
+        agent
+            .set_context("topic", serde_json::json!("billing"))
+            .unwrap();
+
+        if streaming {
+            let mut stream = agent.chat_stream_events("first").await.unwrap();
+            assert!(futures::poll!(stream.next()).is_pending());
+            first_started.notified().await;
+            drop(stream);
+        } else {
+            let active = Arc::clone(&agent);
+            let turn = tokio::spawn(async move { active.chat("first").await });
+            tokio::time::timeout(Duration::from_secs(5), first_started.notified())
+                .await
+                .expect("nested provider was not reached");
+            turn.abort();
+            assert!(turn.await.unwrap_err().is_cancelled());
+        }
+
+        assert!(first_dropped.load(Ordering::SeqCst));
+        assert!(agent.root_turn_gate.try_lock().is_ok());
+        assert_eq!(*agent.redispatch_depth.read(), 0);
+        assert!(agent.active_turn_context.read().is_none());
+        assert!(!agent.root_user_message_committed.load(Ordering::SeqCst));
+        let response = tokio::time::timeout(Duration::from_secs(5), agent.chat("second"))
+            .await
+            .expect("next turn was blocked")
+            .unwrap();
+        assert_eq!(response.content, "Committed technical response.");
+        assert_eq!(responses.load(Ordering::SeqCst), 1);
+        let messages = agent.memory.get_messages(None).await.unwrap();
+        let users: Vec<_> = messages
+            .iter()
+            .filter(|message| message.role == ai_agents_core::Role::User)
+            .map(|message| message.content.as_str())
+            .collect();
+        assert_eq!(users, ["first", "second"]);
+    }
+
+    // Aborting a nested blocking turn must restore the next independent root turn.
+    #[tokio::test]
+    async fn redispatch_drop_restores_next_blocking_turn() {
+        assert_redispatch_drop_restores_next_turn(false).await;
+    }
+
+    // Dropping the owning event stream must release nested and root bookkeeping.
+    #[tokio::test]
+    async fn redispatch_drop_restores_next_turn_after_stream_drop() {
+        assert_redispatch_drop_restores_next_turn(true).await;
+    }
+
+    // Both remaining redispatch helpers must unwind the runtime and mirrored context depth.
+    #[tokio::test]
+    async fn nested_redispatch_helpers_release_depth_when_dropped() {
+        for tool_draft in [false, true] {
+            let first_started = Arc::new(tokio::sync::Notify::new());
+            let first_dropped = Arc::new(AtomicBool::new(false));
+            let provider = FirstCallLockingProvider {
+                lock: Arc::new(tokio::sync::Mutex::new(())),
+                first_started: Arc::clone(&first_started),
+                first_dropped: Arc::clone(&first_dropped),
+                committed_after_drop: Arc::new(AtomicBool::new(false)),
+                calls: AtomicU64::new(0),
+            };
+            let agent = AgentBuilder::new()
+                .system_prompt("Test nested redispatch cleanup.")
+                .llm(Arc::new(provider))
+                .build()
+                .unwrap();
+            agent.begin_root_turn();
+            {
+                let future = async {
+                    if tool_draft {
+                        agent.continue_after_committed_tool_draft("first").await?;
+                    } else {
+                        agent
+                            .apply_post_loop_result("first", PostLoopResult::NeedsRedispatch)
+                            .await?;
+                    }
+                    Ok::<(), AgentError>(())
+                };
+                let mut future = Box::pin(future);
+                assert!(futures::poll!(future.as_mut()).is_pending());
+                first_started.notified().await;
+            }
+            assert!(first_dropped.load(Ordering::SeqCst));
+            assert_eq!(*agent.redispatch_depth.read(), 0);
+            assert_eq!(
+                agent
+                    .active_turn_context
+                    .read()
+                    .as_ref()
+                    .unwrap()
+                    .redispatch_depth,
+                0
+            );
+            agent.end_root_turn();
+            assert!(agent.active_turn_context.read().is_none());
+            agent.chat("second").await.unwrap();
+            let messages = agent.memory.get_messages(None).await.unwrap();
+            assert!(messages.iter().any(|message| {
+                message.role == ai_agents_core::Role::User && message.content == "second"
+            }));
+        }
     }
 
     #[tokio::test]
@@ -24983,6 +28111,7 @@ observability:
             .unwrap()
     }
 
+    // Actor parity fixtures consume only ordinary authoritative output; a task event would change the tested contract.
     async fn collect_actor_stream_final(
         agent: &RuntimeAgent,
         input: &str,
@@ -25001,6 +28130,7 @@ observability:
                     panic!("unexpected stream error: {message}")
                 }
                 AgentStreamEvent::Chunk(_) => {}
+                AgentStreamEvent::Task(_) => panic!("ordinary fixture unexpectedly entered a task"),
             }
         }
         final_response.expect("Final")
@@ -25318,7 +28448,9 @@ skills:
             .llm(Arc::new(mock_with_response("ok")))
             .build()
             .unwrap();
-        agent.register_context_provider("counter", provider);
+        agent
+            .register_context_provider("counter", provider)
+            .unwrap();
         agent
     }
 
@@ -25445,7 +28577,9 @@ skills:
         let provider = Arc::new(FailOnceContextProvider {
             attempts: std::sync::atomic::AtomicUsize::new(0),
         });
-        agent.register_context_provider("flaky", provider.clone());
+        agent
+            .register_context_provider("flaky", provider.clone())
+            .unwrap();
 
         assert!(agent.chat("first").await.is_err());
         assert_eq!(calls.call_count(), 0);
@@ -25481,7 +28615,7 @@ skills:
         );
         assert_eq!(calls.call_count(), 1);
 
-        agent.remove_context("voice");
+        agent.remove_context("voice").unwrap();
         let error = agent.chat("third").await.unwrap_err();
         assert!(
             error

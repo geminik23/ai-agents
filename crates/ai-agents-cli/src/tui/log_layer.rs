@@ -3,7 +3,7 @@
 //
 
 use chrono::Utc;
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::Sender;
 use tracing::field::{Field, Visit};
 use tracing::{Event, Level, Subscriber};
 use tracing_subscriber::layer::{Context, Layer};
@@ -21,12 +21,12 @@ pub struct LogEntry {
 
 /// Tracing layer that sends log events through the AppMessage channel.
 pub struct TuiLogLayer {
-    tx: UnboundedSender<AppMessage>,
+    tx: Sender<AppMessage>,
     min_level: Level,
 }
 
 impl TuiLogLayer {
-    pub fn new(tx: UnboundedSender<AppMessage>, min_level: Level) -> Self {
+    pub fn new(tx: Sender<AppMessage>, min_level: Level) -> Self {
         Self { tx, min_level }
     }
 }
@@ -48,7 +48,8 @@ impl<S: Subscriber> Layer<S> for TuiLogLayer {
             timestamp: Utc::now(),
         };
 
-        let _ = self.tx.send(AppMessage::Log(entry));
+        // Logs are lossy display hints, never task outcomes or controls; a full screen queue cannot stall execution.
+        let _ = self.tx.try_send(AppMessage::Log(entry));
     }
 }
 

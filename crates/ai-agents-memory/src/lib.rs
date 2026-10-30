@@ -23,6 +23,12 @@ pub use token_budget::{MemoryBudgetState, MemoryTokenBudget, OverflowStrategy, T
 /// Extended memory trait that preserves the original interface.
 #[async_trait]
 pub trait Memory: ai_agents_core::Memory {
+    /// Declares preserved message provenance and managed admission for every internal provider call.
+    /// Custom implementations default to unsupported rather than letting a task silently bypass its ledger.
+    fn supports_task_admission(&self) -> bool {
+        false
+    }
+
     async fn get_context(&self) -> ai_agents_core::Result<ConversationContext> {
         let messages = self.get_messages(None).await?;
         Ok(ConversationContext::with_messages(messages))

@@ -1,0 +1,30 @@
+name: SkillTask
+version: "1.0.0"
+description: "Selected-skill task entry and one-time scripted preparation"
+
+# Ordinary input selects a skill once; retained continuation does not repeat selection or the completed script.
+# Flow: semantic skill routing -> admitted script -> controller question -> same task continuation.
+# Usage (offline): sh examples/eval/mocked/run_mocked_evals.sh --category autonomy
+# Customize the scripted prompt and completion predicate first; ordinary input and explicit skill tasks use the same installed skill.
+# The default skill strategy runs the script once, then continues without replaying its completed prompt.
+system_prompt: Produce a verified report for the selected research request.
+llms:
+  main: {provider: openai, model: gpt-5.4-mini}
+  router: {provider: openai, model: gpt-5.4-nano}
+llm: {default: main, router: router}
+tools: []
+# Selection is semantic, but recursion prevention, ownership and completed-prefix retention are deterministic.
+skills:
+  - id: research
+    description: Research a report
+    trigger: The user requests research
+    autonomy:
+      enabled: true
+      mode: skill_until_complete
+      objective_template: '{{ user_input }}'
+      max_turns: 4  # Work-cycle allowance; resolved default: 30.
+      max_llm_calls: 6  # Script and continuation share the limit; resolved default: 60.
+      completion: {response_contains: verified report}
+      premature_finish: {action: ask_user, on_unavailable: stop}
+    steps:
+      - prompt: 'Prepare the research report for {{ user_input }}'

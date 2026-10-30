@@ -1,0 +1,39 @@
+name: FileArtifactTask
+version: "1.0.0"
+description: "Produce a file artifact and validate its actual content"
+
+# The no-key eval supplies eval.workspace and the Rust host.file_report adapter; normal hosts must bind an authorized output path.
+# Flow: candidate report -> scoped file write -> authorized existence/content observations -> repair or completion.
+# A present file is not sufficient, and the custom validator cannot read ambient files directly.
+# Usage (offline): sh examples/eval/mocked/run_mocked_evals.sh --category autonomy
+# Prerequisites: installed host.file_report, authorized output path and an explicit one-path host ceiling.
+# Customize the report schema in the Rust adapter and its output path first; YAML cannot create either authority.
+system_prompt: Write a report containing a string title and exactly two numeric rows; use the installed validation feedback to repair it.
+llm: {provider: openai, model: gpt-5.4-mini}
+tools: [file_write, file_info, file_read]
+# Repair overwrites only after an authorized read; the eval overlay adds its workspace without removing policy checks.
+tool_security:
+  enabled: true
+  fail_closed: true
+  tools:
+    file_write: {write_paths: [], overwrite_existing: true, require_read_before_write: true, allow_without_confirmation: true}
+    file_info: {read_paths: [], allow_without_confirmation: true}
+    file_read: {read_paths: [], allow_without_confirmation: true}
+autonomy:
+  enabled: true
+  max_turns: 6  # Work-cycle allowance; resolved default: 30.
+  max_llm_calls: 16  # Shared admitted calls; resolved default: 60.
+  max_declared_write_paths: 1  # Optional distinct-target cap; no cap by default, and a real host ceiling is required.
+  validation:
+    checks:
+      - id: artifact
+        adapter: builtin.artifact
+        config: {path: '{{ eval.workspace }}/report.json'}
+      - id: content
+        adapter: host.file_report
+        config: {path: '{{ eval.workspace }}/report.json'}
+  completion:
+    all:
+      - artifact_exists: '{{ eval.workspace }}/report.json'
+      - validator_passed: content
+# See report_records.yaml for a non-filesystem artifact using the same controller and host extension boundary.

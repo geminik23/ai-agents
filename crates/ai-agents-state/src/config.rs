@@ -1,4 +1,4 @@
-use ai_agents_core::{AgentError, Result};
+use ai_agents_core::{AgentError, Result, autonomy::AutonomyOverride};
 use ai_agents_disambiguation::StateDisambiguationOverride;
 use ai_agents_process::ProcessConfig;
 use ai_agents_reasoning::{ReasoningConfig, ReflectionConfig};
@@ -36,6 +36,9 @@ pub struct StateConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct StateDefinition {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub autonomy: Option<AutonomyOverride>,
+
     #[serde(default)]
     pub prompt: Option<String>,
 

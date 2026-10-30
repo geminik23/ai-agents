@@ -180,6 +180,37 @@ impl LLMProvider for ObservedLLMProvider {
         }
     }
 
+    fn manages_invocation_admission(&self) -> bool {
+        self.inner.manages_invocation_admission()
+    }
+
+    fn priced_capability_identity(&self) -> Option<String> {
+        self.inner.priced_capability_identity()
+    }
+    fn request_cost_bound(
+        &self,
+        request: &ai_agents_core::autonomy::ProviderRequest<'_>,
+    ) -> std::result::Result<Option<ai_agents_core::autonomy::ProviderCostBound>, LLMError> {
+        self.inner.request_cost_bound(request)
+    }
+    fn settle_request_cost(
+        &self,
+        bound: &ai_agents_core::autonomy::ProviderCostBound,
+        response: &LLMResponse,
+    ) -> std::result::Result<Option<ai_agents_core::autonomy::ProviderCostSettlement>, LLMError>
+    {
+        self.inner.settle_request_cost(bound, response)
+    }
+
+    fn settle_stream_request_cost(
+        &self,
+        bound: &ai_agents_core::autonomy::ProviderCostBound,
+        usage: Option<&ai_agents_core::TokenUsage>,
+    ) -> std::result::Result<Option<ai_agents_core::autonomy::ProviderCostSettlement>, LLMError>
+    {
+        self.inner.settle_stream_request_cost(bound, usage)
+    }
+
     fn configured_tool_choice(&self) -> Option<ToolChoice> {
         self.inner.configured_tool_choice()
     }
@@ -274,8 +305,119 @@ impl Tool for ObservedTool {
         self.inner.classify_call(args)
     }
 
+    fn task_question(&self, args: &Value) -> ai_agents_core::Result<Option<Value>> {
+        self.inner.task_question(args)
+    }
+
+    fn task_question_result(
+        &self,
+        args: &Value,
+        answer: &Value,
+    ) -> ai_agents_core::Result<ToolResult> {
+        self.inner.task_question_result(args, answer)
+    }
+
+    /// Resumed answers retain execution timing without creating observations during pure answer preflight.
+    async fn execute_task_question(
+        &self,
+        args: Value,
+        answer: Value,
+        ctx: ToolExecutionContext,
+    ) -> ToolResult {
+        if !self.manager.config().latency.track_tools {
+            return self.inner.execute_task_question(args, answer, ctx).await;
+        }
+        let mut span = self.manager.start_span(
+            EventType::ToolCall {
+                tool_id: self.inner.id().to_string(),
+            },
+            current_purpose(),
+        );
+        if self.manager.config().privacy.include_tool_args {
+            span.set_payload(serde_json::json!({"args":args.clone()}));
+        }
+        let result = self.inner.execute_task_question(args, answer, ctx).await;
+        if !result.success {
+            span.set_error(ObservationError::new("tool_error", result.output.clone()));
+        }
+        if self.manager.config().privacy.include_tool_outputs {
+            span.set_payload(serde_json::json!({"output":result.output.clone()}));
+        }
+        result
+    }
+
+    fn manages_task_todos(&self) -> bool {
+        self.inner.manages_task_todos()
+    }
+
+    fn prepare_write_footprint(
+        &self,
+        args: &Value,
+        ctx: &ToolExecutionContext,
+        max_targets: usize,
+    ) -> ai_agents_core::Result<Option<ai_agents_core::autonomy::ToolWriteAdmission>> {
+        self.inner.prepare_write_footprint(args, ctx, max_targets)
+    }
+
+    fn prepare_question_write_footprint(
+        &self,
+        args: &Value,
+        ctx: &ToolExecutionContext,
+        max_targets: usize,
+    ) -> ai_agents_core::Result<Option<ai_agents_core::autonomy::ToolWriteAdmission>> {
+        self.inner
+            .prepare_question_write_footprint(args, ctx, max_targets)
+    }
+
+    fn declared_write_footprint(
+        &self,
+        args: &Value,
+        ctx: &ToolExecutionContext,
+        max_targets: usize,
+    ) -> ai_agents_core::Result<Option<ai_agents_core::autonomy::ToolWriteFootprint>> {
+        self.inner.declared_write_footprint(args, ctx, max_targets)
+    }
+
     fn policy_bindings(&self) -> ToolPolicyBindings {
         self.inner.policy_bindings()
+    }
+
+    fn supports_task_messages(&self) -> bool {
+        self.inner.supports_task_messages()
+    }
+
+    /// Task transfer retains instrumentation without turning a safe suspension into a tool error.
+    async fn execute_task(
+        &self,
+        args: Value,
+        ctx: ToolExecutionContext,
+    ) -> ai_agents_core::Result<ToolResult> {
+        if !self.manager.config().latency.track_tools {
+            return self.inner.execute_task(args, ctx).await;
+        }
+        let mut span = self.manager.start_span(
+            EventType::ToolCall {
+                tool_id: self.inner.id().to_string(),
+            },
+            current_purpose(),
+        );
+        if self.manager.config().privacy.include_tool_args {
+            span.set_payload(serde_json::json!({"args":args.clone()}));
+        }
+        let result = self.inner.execute_task(args, ctx).await;
+        match &result {
+            Ok(output) => {
+                if !output.success {
+                    span.set_error(ObservationError::new("tool_error", output.output.clone()));
+                }
+                if self.manager.config().privacy.include_tool_outputs {
+                    span.set_payload(serde_json::json!({"output":output.output.clone()}));
+                }
+            }
+            Err(ai_agents_core::AgentError::TaskSuspended(_)) => {}
+            Err(error) => span.set_error(ObservationError::new("tool_error", error.to_string())),
+        }
+        result
     }
 
     async fn execute(&self, args: Value, ctx: ToolExecutionContext) -> ToolResult {

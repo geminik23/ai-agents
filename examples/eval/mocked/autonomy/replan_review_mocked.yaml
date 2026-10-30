@@ -1,0 +1,33 @@
+name: Bounded Replan Review
+agent: ../../../yaml/autonomy/controlled_analysis.yaml
+# Flow: non-advancing draft -> one managed planner call -> exact host review -> continue or reject.
+# A plan is advisory state, not permission to skip the original completion gate or refund either call.
+settings: {timeout_per_turn_ms: 10000, retries: 0}
+fixtures:
+  llm:
+    mode: mock
+    responses:
+      - Unverified draft.
+      - '{"steps":[{"id":"verify","description":"Verify the report","action_type":"think","action_target":"reason","dependencies":[]}]}'
+      - verified report
+scenarios:
+  - id: reviewed-replan-preserves-gate-and-cumulative-calls
+    steps:
+      - !task
+        operation: {action: run, objective: Produce a verified report., profile: replan}
+        assert: {task: {status: paused, pending_kind: approval, counters: {path: llm_attempts, eq: 2}, progress: {path: replans, eq: 1}}}
+      - !task
+        operation: {action: resume, response: {kind: approval, decision: {status: approved}}}
+        assert: {task: {status: completed, same_run: true, counters: {path: llm_attempts, eq: 3}, progress: {path: replans, eq: 1}, event_result_parity: true}}
+  - id: rejected-replan-never-executes-followup-work
+    steps:
+      - !task
+        operation: {action: run, objective: Produce a verified report., profile: replan}
+        assert: {task: {status: paused, pending_kind: approval, counters: {path: llm_attempts, eq: 2}}}
+      - !task
+        operation: {action: resume, response: {kind: approval, decision: {status: rejected, reason: Do not change the plan.}}}
+        assert:
+          all:
+            - not: {task: {status: completed}}
+            - task: {same_run: true, counters: {path: llm_attempts, eq: 2}}
+            - llm_request: {count: 0}

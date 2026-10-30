@@ -110,13 +110,84 @@ impl SpanContext {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn updated_tags_leave_captured_spans_and_outer_scopes_unchanged() {
+        assert!(!update_observation_tags(HashMap::new()));
+        with_observation_context(
+            SpanContext::new_root("root").with_tag("stage", "first"),
+            async {
+                let captured = current_observation_context().unwrap();
+                assert!(update_observation_tags(HashMap::from([(
+                    "stage".into(),
+                    "second".into()
+                )])));
+                assert_eq!(captured.tags["stage"], "first");
+                assert_eq!(
+                    current_observation_context().unwrap().tags["stage"],
+                    "second"
+                );
+                with_updated_observation_context(
+                    |context| context.child().with_tag("stage", "nested"),
+                    async {
+                        update_observation_tags(HashMap::from([(
+                            "stage".into(),
+                            "nested-next".into(),
+                        )]));
+                        assert_eq!(
+                            current_observation_context().unwrap().tags["stage"],
+                            "nested-next"
+                        );
+                    },
+                )
+                .await;
+                assert_eq!(
+                    current_observation_context().unwrap().tags["stage"],
+                    "second"
+                );
+            },
+        )
+        .await;
+        assert!(current_observation_context().is_none());
+    }
+
+    #[tokio::test]
+    async fn interleaved_child_scopes_do_not_share_mutable_tags() {
+        let root = SpanContext::new_root("root");
+        let observe = |label: &'static str| {
+            with_observation_context(root.child(), async move {
+                update_observation_tags(HashMap::from([("stage".into(), label.into())]));
+                tokio::task::yield_now().await;
+                current_observation_context().unwrap().tags["stage"].clone()
+            })
+        };
+        let (left, right) = tokio::join!(observe("left"), observe("right"));
+        assert_eq!(left, "left");
+        assert_eq!(right, "right");
+        assert!(current_observation_context().is_none());
+    }
+}
+
 tokio::task_local! {
-    static OBSERVATION_CONTEXT: SpanContext;
+    static OBSERVATION_CONTEXT: std::cell::RefCell<SpanContext>;
 }
 
 /// Returns a clone of the current task-local observation context.
 pub fn current_observation_context() -> Option<SpanContext> {
-    OBSERVATION_CONTEXT.try_with(Clone::clone).ok()
+    OBSERVATION_CONTEXT
+        .try_with(|context| context.borrow().clone())
+        .ok()
+}
+
+/// Updates labels only in the current logical scope; previously captured contexts and started spans remain immutable.
+/// This changes observation attribution, never execution ownership, permission or resource accounting.
+pub fn update_observation_tags(tags: HashMap<String, String>) -> bool {
+    OBSERVATION_CONTEXT
+        .try_with(|context| context.borrow_mut().tags.extend(tags))
+        .is_ok()
 }
 
 /// Runs a future with the supplied task-local observation context.
@@ -124,7 +195,9 @@ pub async fn with_observation_context<F, T>(context: SpanContext, future: F) -> 
 where
     F: Future<Output = T>,
 {
-    OBSERVATION_CONTEXT.scope(context, future).await
+    OBSERVATION_CONTEXT
+        .scope(std::cell::RefCell::new(context), future)
+        .await
 }
 
 /// Runs a future with the current context but a different purpose label.
@@ -135,7 +208,9 @@ where
     let mut context =
         current_observation_context().unwrap_or_else(|| SpanContext::new_root("unknown"));
     context.purpose = purpose;
-    OBSERVATION_CONTEXT.scope(context, future).await
+    OBSERVATION_CONTEXT
+        .scope(std::cell::RefCell::new(context), future)
+        .await
 }
 
 /// Runs a future after applying a transformation to the current context.
@@ -145,5 +220,7 @@ where
     U: FnOnce(SpanContext) -> SpanContext,
 {
     let context = current_observation_context().unwrap_or_else(|| SpanContext::new_root("unknown"));
-    OBSERVATION_CONTEXT.scope(update(context), future).await
+    OBSERVATION_CONTEXT
+        .scope(std::cell::RefCell::new(update(context)), future)
+        .await
 }

@@ -1,0 +1,17 @@
+name: Unrelated State Exit Is Not Success
+agent: ../../../yaml/autonomy/unrelated_exit.yaml
+# Flow: scoped candidate -> abandoned destination -> acknowledged incomplete; the second reply must stay unused.
+settings: {timeout_per_turn_ms: 10000, retries: 0}
+fixtures:
+  llm: {mode: mock, responses: [Candidate work., This destination must not execute.]}
+scenarios:
+  - id: unrelated-scope-exit-cannot-satisfy-the-objective
+    turns:
+      - input: Resolve the case.
+        stream: true
+        assert:
+          all:
+            - task: {status: incomplete, counters: {path: llm_attempts, eq: 1}, event_result_parity: true}
+            - state: abandoned
+            - llm_request: {count: 1}
+            - response_not_contains: This destination must not execute.

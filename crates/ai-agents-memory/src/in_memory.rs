@@ -115,7 +115,12 @@ impl ai_agents_core::Memory for InMemoryStore {
 }
 
 #[async_trait]
-impl Memory for InMemoryStore {}
+impl Memory for InMemoryStore {
+    /// This store preserves message metadata and performs no internal provider work.
+    fn supports_task_admission(&self) -> bool {
+        true
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -127,6 +132,7 @@ mod tests {
 
     fn make_message(content: &str) -> ChatMessage {
         ChatMessage {
+            provenance: None,
             role: Role::User,
             content: content.to_string(),
             name: None,

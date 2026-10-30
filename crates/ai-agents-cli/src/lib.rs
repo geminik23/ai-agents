@@ -5,12 +5,17 @@ pub mod metadata;
 pub mod question;
 pub mod repl;
 pub mod run;
+pub(crate) mod session;
 pub(crate) mod stream_reconcile;
 pub(crate) mod stream_terminal;
+pub mod task;
 pub mod tui;
 
 pub use approval::CliApprovalHandler;
-pub use cli::{Cli, Command, EvalArgs, RunArgs, ValidateArgs};
+pub use cli::{
+    Cli, Command, EvalArgs, RunArgs, TaskAgentArgs, TaskArgs, TaskCommand, TaskIdArgs,
+    TaskRevisionArgs, TaskRunArgs, ValidateArgs,
+};
 pub use metadata::{CliOverrides, ResolvedCliMetadata};
 pub use question::{CliQuestionHandler, TuiQuestionHandler};
 pub use repl::{CliRepl, CliReplConfig, CommandResult, PromptStyle, ReplMode};

@@ -39,13 +39,14 @@ cargo run -p ai-agents-cli -- run agent.yaml
 
 ## Commands
 
-The CLI has three subcommands:
+The published CLI provides `run`, `eval` and `validate`. The development checkout additionally provides an unreleased `task` command family:
 
 | Command    | Description                                      |
 | ---------- | ------------------------------------------------ |
 | `run`      | Load an agent YAML and start an interactive REPL |
 | `eval`     | Run declarative scenario suites against an agent |
 | `validate` | Check a YAML file for errors without starting    |
+| `task` | Development-only task execution and scoped journal management |
 
 ### `run`
 
@@ -70,6 +71,89 @@ ai-agents-cli validate <agent.yaml>
 Parses and validates the YAML spec. Fixed framework-owned configuration objects reject unknown fields, so typos such as `max_iteratons` fail validation; documented provider-specific keys under `llm` remain available through the provider extension map. Returns exit code `0` on success and `1` on failure.
 
 ---
+
+## Development task CLI
+
+These commands describe the development tree, not the published 1.1.1 CLI. They run the existing general-purpose task controller; they do not install a coding-specific loop, scheduler, daemon or production restart host. A selected profile must be enabled, and ordinary chat remains unchanged when autonomy is omitted or disabled.
+
+```sh
+cargo run -p ai-agents-cli -- task run agent.yaml "Research the requested topic"
+cargo run -p ai-agents-cli -- task run agent.yaml "Research the requested topic" --profile research
+cargo run -p ai-agents-cli -- task run agent.yaml "Produce a report" --non-interactive --json
+cargo run -p ai-agents-cli -- task list agent.yaml --json
+cargo run -p ai-agents-cli -- task show agent.yaml RUN_ID --json
+cargo run -p ai-agents-cli -- task cancel agent.yaml RUN_ID --revision REVISION --json
+cargo run -p ai-agents-cli -- task resume agent.yaml RUN_ID
+```
+
+`task run` uses the same YAML/base-directory, providers, tools, MCP, spawner, context and actor preparation as ordinary execution. Add `--context KEY=VALUE` repeatedly, `--context-file PATH`, or `--actor ID` as needed. `--profile ID` selects an existing profile rather than granting capabilities or enabling a disabled one. `--non-interactive` exposes no stdin response endpoint; it does not reject tool-free or no-storage tasks that can complete normally.
+
+The agent must declare meaningful task limits and completion gates. For a minimal protocol demonstration, append the following to an otherwise valid provider-configured agent:
+
+```yaml
+autonomy:
+  enabled: true
+  mode: until_complete
+  max_turns: 4
+  max_llm_calls: 8
+  completion: {response_not_empty: true}
+```
+
+This deliberately weak demonstration gate proves only that a response exists, not research quality, ticket resolution or report correctness. Real profiles should use the appropriate tool/state/context, artifact/validation or judge evidence. Todo, filesystem and command tools are not universal prerequisites. The `--profile research` example additionally requires that named profile in the agent's `autonomy.profiles` map.
+
+### Interactive decisions and plain REPL
+
+An interactive foreground process retains its original runtime, runner and store while servicing approvals, questions, explicit Continue, capacity, stage/plan review and supported external/observation responses. It displays the exact run/revision/request to which a response applies. Free-text questions accept text; choice questions accept declared labels or one-based option numbers, with comma-separated numbers for multiple selection. Enter uses a configured question default only when one exists. EOF is never a default answer, approval or Continue. Approvals accept explicit `yes`/`no` or reviewed argument changes as `{"changes": {...}}`; modified arguments still pass current policy and final admission. Bare `stop` and `cancel` are host controls, not model instructions.
+
+Existing `run` also consumes automatic state/selected-skill task entry in the **plain REPL**:
+
+```sh
+cargo run -p ai-agents-cli -- run agent.yaml --plain
+cargo run -p ai-agents-cli -- run agent.yaml --plain --stream
+```
+
+The development TUI also services these workflows through the same foreground driver; use `--plain` for line-oriented interaction. See [development task TUI](@/docs/cli.md#development-task-tui) for the terminal controls. Task lifecycle streaming is distinct from provider token streaming, and a dispatch `Final` with a paused task is not task completion.
+
+| REPL command | Meaning |
+| --- | --- |
+| `/task run OBJECTIVE` | Explicit task using the same configured host |
+| `/task run --profile ID OBJECTIVE` | Explicit selection of an enabled profile |
+| `/task list` | Current scoped task metadata; during work, only actual foreground participants |
+| `/task show RUN` | Bounded default-redacted snapshot |
+| `/task resume RUN REV REQUEST ANSWER` | Explicit answer to the exact advertised interaction |
+| `/task cancel RUN REV` | Exact-revision cancellation request or retained-pause cleanup |
+| `/task stop RUN REV [REASON]` | Stop a safe pause without executing pending work |
+| `/task objective RUN REV NEW_OBJECTIVE` | Revise a safe objective boundary, preserving usage and requiring explicit continuation |
+| `/task limits RUN REV JSON` | Revise numeric limits within host ceilings; never refill consumed counters |
+
+Controls apply while the foreground session retains the run. A plain reply uses the identity of the displayed prompt; explicit `/task resume` never refreshes a stale revision or substitutes a different request. Syntax errors are rejected without invoking a task control. Ordinary callback approval/question input and task typed responses share one stdin reader but not authority. Task control remains available while work is retained even when ordinary convenience commands are disabled.
+
+Ordinary composing parents can wait for independently hosted child tasks. Their questions are serviced before the parent returns; independent child decisions do not overwrite one another. Children already inside a task instead retain the controller's coordinating request, sibling state and single completion owner. Answering a child does not restart the parent or replay completed siblings.
+
+### Output, cancellation and exit
+
+`--json` emits bounded default-redacted task events followed, on normal delivery, by a safe result record containing run ID, revision, status and counters. Exact local questions and necessary review fields go to stderr, not JSON exports; they may contain sensitive data and should not be captured as diagnostics. Raw checkpoints, native history and owner tokens are not exported. Plain output includes the final response and actual task status. Missing measurements remain unavailable rather than zero or Pass.
+
+| Exit code for `task run` / `task resume` | Meaning |
+| --- | --- |
+| `0` | Completed |
+| `1` | Failed, Cancelled, Incomplete, LimitReached or RecoveryRequired |
+| `2` | Configuration, validation, storage, usage or command I/O error |
+| `3` | Reserved for an actually acknowledged prepared durable pause that survives process exit; the default CLI cannot produce this |
+
+`list`, `show` and `cancel` report command/config/storage success separately from the task's status. A successful remote `cancel` records a request, not remote termination. Its receipt distinguishes `requested`, `acknowledged` and `already_terminal`; store-only callers cannot certify live cleanup. Obtain the exact revision from an authorized observation rather than retrying arbitrary revisions after an error.
+
+Ctrl+C or `/quit` during work requests shutdown and keeps polling the original operation and controls until their actual result or protected failure is returned. Completion can legitimately win a cancellation race. EOF withdraws input delivery; supported stop/fail policies or typed unavailable cleanup handle unserviceable volatile pauses without executing pending work. Broken output also closes ordinary callbacks rather than leaving them waiting. A slow consumer applies bounded backpressure during normal operation; once shutdown begins, display delivery is suppressed/drained so it cannot block execution settlement. Interrupted output may therefore lack a final JSON record; the process reports its actual result through the exit code and a concise stderr diagnostic when available. A second Ctrl+C forces exit with cleanup explicitly unconfirmed. Timeout, drop and process termination never prove rollback or exactly-once external effects.
+
+### Storage and restart limits
+
+No-storage and retained in-memory runs can complete or pause/resume in the same process. `task list/show/cancel` instead open an **existing configured SQLite task journal** through an authorized agent/actor/configuration scope, without constructing providers, reading provider credentials, starting MCP/spawner services, adopting an owner or consuming a pending decision. File/Redis session snapshots are not task journals. A different actor/configuration is not a substitute for the original scope. Storage paths keep their existing interpretation; relative skill/child definitions use the agent YAML's base directory.
+
+The declarative scope includes the normalized agent declaration and loaded skills. Execution verifies the definitions actually prepared by the builder rather than trusting a filename or an independent reread. This namespace is not caller authentication, opaque implementation binding or reconstruction authority. Protect the configuration and database using the host's normal access controls.
+
+The default CLI has no production reconstruction host or portable restart-clock binding. Explicit durable requests are rejected before task execution; `task resume` in a new process returns a clear unsupported-capability error before provider construction. SQLite existence and session `/save`/`/load` do not make a task restartable. Use retained in-process controls, or the explicitly prepared [Rust restoration APIs](@/docs/rust-api.md#automatic-state-and-skill-tasks-development-only) with an actual host binding. Arbitrary in-flight stack restoration and automatic abandoned-owner takeover remain unsupported.
+
+The development `eval` command also accepts typed `!task` steps and task assertions through the configured controller. Stock integrations use this CLI directly; domain suites with named Rust adapters use the fixed host route documented by the mocked helper. Development report schema 3, foreground participant controls, migration and timeout/cleanup behavior are described in [task evaluation](@/docs/evaluation.md#development-task-evaluation-foundation). Custom host executables can install the same domain bindings with `EvalHost`; the helper's fixed marker is not a plugin loader. See the [task walkthrough](@/docs/task-autonomy.md). These development evaluation features do not install default production task reconstruction.
 
 ## Eval Options
 
@@ -279,6 +363,22 @@ Once inside the REPL, these slash commands are available (unless `--no-builtins`
 When running on an interactive terminal, the CLI launches a ratatui-based TUI with an alternate-screen interface.
 Use `--plain` to skip the TUI and use the traditional line REPL instead.
 
+### Development task TUI
+
+This section describes the development checkout, not the published 1.1.1 CLI. The TUI uses the same checked YAML/base-directory, actor scope, configured runtime/runner/store and controller as the plain REPL. `/task run [--profile ID] OBJECTIVE` starts explicit work; ordinary input can enter enabled state/selected-skill tasks without enabling provider token streaming. Omitted or disabled autonomy preserves ordinary chat.
+
+`F10` toggles the task view: run/revision/status, readable objective/profile/stage, optional canonical todos, historical tri-state validation, domain progress/stagnation/replan observations, file or non-file artifact references, cumulative usage and stored active-time/original-expiry facts. `Ctrl+Up/Down` selects an observed run, and `Ctrl+PageUp/PageDown` scrolls its details. These are observations, not fresh completion proofs or UI-enforced clocks. Missing measurements remain unavailable, not zero or Pass. Authoritative final answers return to chat; hiding the task view does not cancel execution.
+
+Pending decisions use the exact displayed task run/revision/request, or a distinct ordinary callback identity. Questions support declared choices, multiple selection and free text. Other typed decisions present their bound instructions for approval/rejection or argument changes, Continue, capacity revisions, stage/plan review, external signals, observations and installed-host restoration review. Use `PageUp/PageDown` to scroll long review text. `Esc` or the modal Cancel action hides a task decision without answering; `Ctrl+P` restores its draft. Select Use default explicitly when desired. A restoration review is separate from the original pending answer. Configured ordinary approval styles remain effective; they do not auto-approve required task reviews or override automatic policy denial.
+
+The same `/task resume/cancel/stop/objective/limits` exact-target syntax remains available after hiding a modal. `/task list` and `/task show RUN` inspect observed session runs while idle, and actual foreground participants during work; the standalone CLI provides store-only journal management. New chat/run input does not replace retained work. Invalid or stale decisions are rejected without rebinding to a newer request, and actor/session mutations cannot replace a retained task.
+
+The first `Ctrl+C` or `/quit` requests foreground shutdown and keeps polling the original operations. A second explicit quit forces exit with cleanup unconfirmed. Input loss closes ordinary callbacks and follows the task's existing unavailable policy. Cancellation requested, cleanup acknowledged, stored terminal metadata and protected recovery are distinct. Completion may win a cancellation race. Terminal restoration also runs on setup/draw/error paths, but never proves rollback or task cleanup.
+
+Input and ordinary callback queues are bounded (16 and 32); display/control delivery uses bounded queues of 32. Tick/resize are coalesced by the event loop and log hints may be dropped under pressure. Chat history is display-only (up to 256 entries and 32 KiB content), previews and local task details are bounded, and truncation never changes the exact retained result or checkpoint. Local objectives, question/default text and host-selected review context are trusted UI data, not safe log/export payloads. JSON task snapshots retain default redaction. Slow or closed display delivery must not block shutdown settlement.
+
+Session save/load does not reconstruct tasks. Default production new-process restart remains unsupported; an embedding Rust host must explicitly supply the existing prepared reconstruction contract. Low-level Rust TUI integrations now pass bounded `tokio::sync::mpsc::Sender` values to app/question/log constructors; modal constructors initialize review scrolling, while direct modal literals must include `review_scroll`.
+
 ### Layout
 
 The TUI has four zones:
@@ -311,12 +411,15 @@ Press the same key again to close a panel. Press `Esc` to close all panels.
 | Key             | Action |
 | --------------- | ------ |
 | `Enter`         | Send message |
-| `Ctrl+C`        | Quit |
+| `Ctrl+C`        | Request shutdown and await settlement; a second quit forces exit with cleanup unconfirmed |
 | `Ctrl+L`        | Clear chat display |
 | `Ctrl+S`        | Quick save session |
 | `PageUp/Down`   | Scroll chat history |
-| `Esc`           | Close completion/panels, resolve a question modal with its default, or hide current streaming display |
+| `Esc`           | Close completion/panels or hide a task decision/display without approval or cancellation |
 | `F1` - `F9`     | Toggle side panels |
+| `F10`           | Toggle task evidence/todo/validation/artifact view |
+| `Ctrl+P`        | Reopen the exact pending decision and draft |
+| `PageUp/Down` in modal | Scroll local review text |
 | `Ctrl+T`        | Cycle color theme |
 | `/`             | Start a slash command (opens completion popup) |
 

@@ -1,0 +1,26 @@
+# Eval host: task-domain-evals
+name: Real Isolated File Artifact
+agent: ../../../yaml/autonomy/artifact_generation.yaml
+settings: {timeout_per_turn_ms: 10000, retries: 0}
+fixtures:
+  workspace_policy: {read_tools: [file_info, file_read], write_tools: [file_write]}
+  llm:
+    mode: mock
+    responses:
+      - The file report is complete.
+      - '{"tool":"file_write","arguments":{"path":"{{ eval.workspace }}/report.json","content":"{\"title\":17,\"rows\":[1]}","dry_run":false}}'
+      - The malformed report is present.
+      - '{"tool":"file_write","arguments":{"path":"{{ eval.workspace }}/report.json","content":"{\"title\":\"Verified\",\"rows\":[1,2]}","overwrite":true,"dry_run":false}}'
+      - The actual isolated report now satisfies the requested schema.
+scenarios:
+  - id: missing-and-malformed-files-cannot-establish-completion
+    steps:
+      - !task
+        operation: {action: run, objective: Create a valid report artifact.}
+        assert:
+          all:
+            - task: {status: completed, counters: {path: turns, eq: 3}, checks: [{id: artifact, outcome: pass}, {id: content, outcome: pass}], event_result_parity: true}
+            - tool_called: {id: file_write, count: 2, executed: true, success: true, args_executed: {path: dry_run, eq: false}}
+            - tool_called: {id: file_read, source_in: [task], executed: true, success: true, result_path: {path: content, eq: '{"title":"Verified","rows":[1,2]}'}}
+            - response_contains: requested schema
+            - tool_not_called: command

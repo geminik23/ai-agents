@@ -189,12 +189,14 @@ mod tests {
     fn test_messages_to_prompt() {
         let messages = vec![
             ChatMessage {
+                provenance: None,
                 role: Role::System,
                 content: "You are helpful.".to_string(),
                 name: None,
                 timestamp: None,
             },
             ChatMessage {
+                provenance: None,
                 role: Role::User,
                 content: "Hello".to_string(),
                 name: None,
