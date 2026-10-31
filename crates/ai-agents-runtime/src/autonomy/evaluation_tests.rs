@@ -655,7 +655,7 @@ async fn validation_driver_binds_cached_requests_and_external_signals() {
             journal: &journal,
             limits: Default::default(),
             cancellation: &cancel,
-            deadline: chrono::Utc::now() + chrono::Duration::seconds(2),
+            deadline: Some(chrono::Utc::now() + chrono::Duration::seconds(2)),
         };
         let result = driver.drive(check, &ctx).await;
         assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
@@ -696,7 +696,7 @@ async fn validation_driver_binds_cached_requests_and_external_signals() {
         journal: &journal,
         limits: Default::default(),
         cancellation: &cancel,
-        deadline: chrono::Utc::now() + chrono::Duration::seconds(2),
+        deadline: Some(chrono::Utc::now() + chrono::Duration::seconds(2)),
     };
     let wait = match driver.drive(check, &ctx).await.unwrap() {
         ValidationDriverOutcome::AwaitExternal(w) => w,
@@ -754,7 +754,7 @@ async fn validation_driver_failed_journal_never_invokes() {
         journal: &journal,
         limits: Default::default(),
         cancellation: &cancel,
-        deadline: chrono::Utc::now() + chrono::Duration::seconds(2),
+        deadline: Some(chrono::Utc::now() + chrono::Duration::seconds(2)),
     };
     assert!(driver.drive(check, &ctx).await.is_err());
     assert_eq!(executor.calls.load(Ordering::SeqCst), 0);

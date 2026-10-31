@@ -39,6 +39,7 @@
 - Task validation: development-only tri-state checks, tool/fallback/child observation continuation and external signals preserve post-turn controller progress; fixed host permits and single logical journal charges survive re-pause, without adding a second executor or inferring completion from unavailable evidence
 
 ### Changed
+- Rust task time compatibility: development validation drives and final publications accept absent aggregate deadlines without bypassing live evidence, cancellation, conditional ownership or original operation bounds; existing finite defaults remain unchanged
 - Code agent workflow: request guidance after incomplete checks and allow explicit model output and checker time limits for the selected workspace
 - Task validation: allow an exact command check to specify its attempt timeout within the host and tool policy limits
 - Evaluation compatibility: development report schema 3 separates participant control results from parent turns, retains acknowledged evidence after interrupted foreground work and rejects task controls in chat-only JSONL

@@ -142,6 +142,7 @@ impl SqliteStorage {
             .collect()
     }
 
+    // Fresh backend UTC samples cover snapshot validation and both proof checks; failed final admission rolls the SQL update back.
     pub(super) async fn task_mutate(
         &self,
         key: &TaskRunKey,
@@ -160,7 +161,7 @@ impl SqliteStorage {
             .map_err(persistence)?
             .ok_or(TaskRunStorageError::NotFound)?;
         let previous = decode(row)?;
-        let next = previous.transition(mutation, chrono::Utc::now())?;
+        let next = previous.transition_with_clock(mutation, || Ok(chrono::Utc::now()))?;
         let affected = sqlx::query("UPDATE task_runs SET revision = ?, status = ?, owner_token = ?, cancel_requested = ?, snapshot_json = ?, updated_at = ? WHERE agent_id = ? AND run_id = ? AND revision = ?")
             .bind(next.revision as i64).bind(status_text(next.status)?).bind(&next.owner_token).bind(next.cancel_requested)
             .bind(serde_json::to_string(&next)?).bind(next.updated_at.to_rfc3339())
@@ -169,7 +170,7 @@ impl SqliteStorage {
         if affected != 1 {
             return Err(TaskRunStorageError::Conflict.into());
         }
-        mutation.validate_final_deadline(chrono::Utc::now())?;
+        mutation.validate_final_deadline_with_clock(|| Ok(chrono::Utc::now()))?;
         transaction.commit().await.map_err(persistence)?;
         Ok(next)
     }

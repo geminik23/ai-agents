@@ -1366,7 +1366,7 @@ async fn restore_corrupt_manifest_references_reject_before_claim() {
             status: TaskRunStatus::Paused,
             payload: serde_json::to_value(payload).unwrap(),
             release: true,
-            deadline: std::time::Instant::now() + std::time::Duration::from_secs(30),
+            deadline: Some(std::time::Instant::now() + std::time::Duration::from_secs(30)),
             expires_at: None,
             evidence: None,
         };

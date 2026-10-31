@@ -227,7 +227,7 @@ async fn host_evidence_backend_guards_reject_late_proof_without_consuming_revisi
             payload: running.payload.clone(),
             release: true,
             expires_at: None,
-            deadline: std::time::Instant::now() + std::time::Duration::from_secs(30),
+            deadline: Some(std::time::Instant::now() + std::time::Duration::from_secs(30)),
             evidence: Some(guard.clone()),
         };
         mutation
@@ -324,7 +324,7 @@ async fn host_evidence_direct_driver_rejects_forged_targets_and_stale_cached_res
             journal: &MemoryJournal,
             limits: Default::default(),
             cancellation: &cancellation,
-            deadline: chrono::Utc::now() + chrono::Duration::seconds(10),
+            deadline: Some(chrono::Utc::now() + chrono::Duration::seconds(10)),
         };
         if scenario == "source" {
             source.change();

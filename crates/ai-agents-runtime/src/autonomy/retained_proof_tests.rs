@@ -102,7 +102,7 @@ async fn evaluate(
                 journal: &Journal,
                 limits: Default::default(),
                 cancellation: &cancellation,
-                deadline: chrono::Utc::now() + chrono::Duration::seconds(10),
+                deadline: Some(chrono::Utc::now() + chrono::Duration::seconds(10)),
             },
         )
         .await
@@ -502,7 +502,7 @@ async fn retained_proof_cached_publication_rejects_replaced_inputs() {
                     journal: &Journal,
                     limits: Default::default(),
                     cancellation: &cancellation,
-                    deadline: chrono::Utc::now() + chrono::Duration::seconds(10),
+                    deadline: Some(chrono::Utc::now() + chrono::Duration::seconds(10)),
                 }
             )
             .await
@@ -657,7 +657,7 @@ async fn retained_proof_pending_batch_rechecks_pinned_inputs_before_effects() {
             journal: &journal,
             limits: Default::default(),
             cancellation: &cancellation,
-            deadline: chrono::Utc::now() + chrono::Duration::seconds(10),
+            deadline: Some(chrono::Utc::now() + chrono::Duration::seconds(10)),
         };
         assert!(state.drive(check, &context).await.is_err());
         assert_eq!(executor.calls.load(Ordering::SeqCst), 1);

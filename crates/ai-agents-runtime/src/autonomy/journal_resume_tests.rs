@@ -159,7 +159,7 @@ async fn contract(storage: Arc<dyn ai_agents_core::AgentStorage>) {
         journal: &journal,
         limits: Default::default(),
         cancellation: &cancellation,
-        deadline: chrono::Utc::now() + chrono::Duration::seconds(10),
+        deadline: Some(chrono::Utc::now() + chrono::Duration::seconds(10)),
     };
     for _ in 0..2 {
         assert!(matches!(

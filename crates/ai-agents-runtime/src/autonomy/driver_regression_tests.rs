@@ -159,7 +159,7 @@ async fn validator_publication_uses_post_mutation_scope_without_relabelling_old_
                     journal: &journal,
                     limits: Default::default(),
                     cancellation: &cancellation,
-                    deadline: chrono::Utc::now() + chrono::Duration::seconds(2),
+                    deadline: Some(chrono::Utc::now() + chrono::Duration::seconds(2)),
                 },
             )
             .await
@@ -280,7 +280,7 @@ async fn driver_retries_publication_and_never_collects_unacknowledged_result() {
             journal: &journal,
             limits: Default::default(),
             cancellation: &cancellation,
-            deadline: chrono::Utc::now() + chrono::Duration::seconds(2),
+            deadline: Some(chrono::Utc::now() + chrono::Duration::seconds(2)),
         };
         assert!(state.drive(check, &ctx).await.is_err());
         assert!(state.drive(check, &ctx).await.is_err());
@@ -362,8 +362,10 @@ async fn driver_rechecks_cancellation_and_deadline_after_journal() {
             journal: &journal,
             limits: Default::default(),
             cancellation: &cancellation,
-            deadline: chrono::Utc::now()
-                + chrono::Duration::milliseconds(if expired { 20 } else { 2000 }),
+            deadline: Some(
+                chrono::Utc::now()
+                    + chrono::Duration::milliseconds(if expired { 20 } else { 2000 }),
+            ),
         };
         assert!(state.drive(check, &ctx).await.is_err());
         assert_eq!(exec.calls.load(Ordering::SeqCst), 0);
@@ -465,7 +467,7 @@ async fn driver_restores_batch_cursor_and_enforces_configured_batch_limit() {
             journal: &journal,
             limits: Default::default(),
             cancellation: &cancel,
-            deadline: chrono::Utc::now() + chrono::Duration::seconds(2),
+            deadline: Some(chrono::Utc::now() + chrono::Duration::seconds(2)),
         };
         assert!(state.drive(check, &ctx).await.is_err());
         if max == 1 {
@@ -520,7 +522,7 @@ async fn driver_enforces_configured_round_limit() {
         journal: &journal,
         limits: Default::default(),
         cancellation: &cancel,
-        deadline: chrono::Utc::now() + chrono::Duration::seconds(2),
+        deadline: Some(chrono::Utc::now() + chrono::Duration::seconds(2)),
     };
     assert!(state.drive(check, &ctx).await.is_err());
     assert_eq!(exec.calls.load(Ordering::SeqCst), 1);

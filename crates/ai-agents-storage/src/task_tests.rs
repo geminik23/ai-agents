@@ -409,6 +409,394 @@ async fn task_sqlite_restart_preserves_claim_and_actor_deletion_is_atomic() {
     storage.close().await;
 }
 
+#[derive(Debug)]
+struct FinalAdmissionGuard {
+    calls: std::sync::atomic::AtomicUsize,
+    reject_at: std::sync::atomic::AtomicUsize,
+}
+
+impl TaskFinalAdmission for FinalAdmissionGuard {
+    fn validate(&self) -> ai_agents_core::Result<()> {
+        use std::sync::atomic::Ordering;
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        if call >= self.reject_at.load(Ordering::SeqCst) {
+            return Err(TaskRunStorageError::InvalidCheckpoint.into());
+        }
+        Ok(())
+    }
+}
+
+// Time-free publication still requires current live proof, the original owner, an exact revision and no cancellation.
+async fn optional_final_deadline_contract(storage: Arc<dyn AgentStorage>, checks: usize) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
+    for status in [TaskRunStatus::Completed, TaskRunStatus::Paused] {
+        let original = snapshot("optional-final", &format!("{status:?}"));
+        storage.create_task_run(&original).await.unwrap();
+        let running = storage
+            .mutate_task_run(
+                &original.key,
+                &TaskRunMutation::Claim {
+                    expected_revision: 0,
+                    owner_token: "owner".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let guard = Arc::new(FinalAdmissionGuard {
+            calls: AtomicUsize::new(0),
+            reject_at: AtomicUsize::new(0),
+        });
+        let mut mutation = TaskRunMutation::FinalCheckpoint {
+            expected_revision: running.revision,
+            owner_token: "owner".into(),
+            status,
+            payload: json!({"exact": "successor"}),
+            release: true,
+            deadline: None,
+            expires_at: None,
+            evidence: Some(guard.clone()),
+        };
+        assert_error(
+            storage.mutate_task_run(&original.key, &mutation).await,
+            TaskRunStorageError::InvalidCheckpoint,
+        );
+        assert_eq!(guard.calls.load(Ordering::SeqCst), 1);
+        let retained = storage.load_task_run(&original.key).await.unwrap().unwrap();
+        assert_eq!(
+            serde_json::to_value(&retained).unwrap(),
+            serde_json::to_value(&running).unwrap()
+        );
+
+        guard.reject_at.store(usize::MAX, Ordering::SeqCst);
+        // Expiry from either clock remains binding even when the other clock has no limit.
+        if let TaskRunMutation::FinalCheckpoint { deadline, .. } = &mut mutation {
+            *deadline = Some(Instant::now() - Duration::from_secs(1));
+        }
+        assert_error(
+            storage.mutate_task_run(&original.key, &mutation).await,
+            TaskRunStorageError::AdmissionExpired,
+        );
+        if let TaskRunMutation::FinalCheckpoint {
+            deadline,
+            expires_at,
+            ..
+        } = &mut mutation
+        {
+            *deadline = None;
+            *expires_at = Some(chrono::Utc::now() - chrono::Duration::seconds(1));
+        }
+        assert_error(
+            storage.mutate_task_run(&original.key, &mutation).await,
+            TaskRunStorageError::AdmissionExpired,
+        );
+        if let TaskRunMutation::FinalCheckpoint {
+            expires_at,
+            expected_revision,
+            ..
+        } = &mut mutation
+        {
+            *expires_at = None;
+            *expected_revision = running.revision - 1;
+        }
+        assert_error(
+            storage.mutate_task_run(&original.key, &mutation).await,
+            TaskRunStorageError::Conflict,
+        );
+        if let TaskRunMutation::FinalCheckpoint {
+            expected_revision,
+            owner_token,
+            ..
+        } = &mut mutation
+        {
+            *expected_revision = running.revision;
+            *owner_token = "wrong".into();
+        }
+        assert_error(
+            storage.mutate_task_run(&original.key, &mutation).await,
+            TaskRunStorageError::Conflict,
+        );
+        if let TaskRunMutation::FinalCheckpoint { owner_token, .. } = &mut mutation {
+            *owner_token = "owner".into();
+        }
+        guard.calls.store(0, Ordering::SeqCst);
+        let saved = storage
+            .mutate_task_run(&original.key, &mutation)
+            .await
+            .unwrap();
+        assert_eq!(guard.calls.load(Ordering::SeqCst), checks);
+        assert_eq!(saved.revision, running.revision + 1);
+        assert_eq!(saved.status, status);
+        assert!(saved.owner_token.is_none());
+        assert_eq!(saved.payload, json!({"exact": "successor"}));
+    }
+
+    let original = snapshot("optional-final", "cancelled");
+    storage.create_task_run(&original).await.unwrap();
+    let running = storage
+        .mutate_task_run(
+            &original.key,
+            &TaskRunMutation::Claim {
+                expected_revision: 0,
+                owner_token: "owner".into(),
+            },
+        )
+        .await
+        .unwrap();
+    let cancelled = storage
+        .mutate_task_run(
+            &original.key,
+            &TaskRunMutation::RequestCancel {
+                expected_revision: running.revision,
+            },
+        )
+        .await
+        .unwrap();
+    for status in [TaskRunStatus::Completed, TaskRunStatus::Paused] {
+        assert_error(
+            storage
+                .mutate_task_run(
+                    &original.key,
+                    &TaskRunMutation::FinalCheckpoint {
+                        expected_revision: cancelled.revision,
+                        owner_token: "owner".into(),
+                        status,
+                        payload: json!({"must_not_commit": true}),
+                        release: true,
+                        deadline: None,
+                        expires_at: None,
+                        evidence: None,
+                    },
+                )
+                .await,
+            TaskRunStorageError::InvalidCheckpoint,
+        );
+    }
+    let retained = storage.load_task_run(&original.key).await.unwrap().unwrap();
+    assert_eq!(
+        serde_json::to_value(&retained).unwrap(),
+        serde_json::to_value(&cancelled).unwrap()
+    );
+
+    // SQLite's second proof check must roll back the already staged SQL update, not publish a stale successor.
+    if checks > 1 {
+        let guard = Arc::new(FinalAdmissionGuard {
+            calls: AtomicUsize::new(0),
+            reject_at: AtomicUsize::new(checks - 1),
+        });
+        let original = snapshot("optional-final", "late-proof");
+        storage.create_task_run(&original).await.unwrap();
+        let running = storage
+            .mutate_task_run(
+                &original.key,
+                &TaskRunMutation::Claim {
+                    expected_revision: 0,
+                    owner_token: "owner".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_error(
+            storage
+                .mutate_task_run(
+                    &original.key,
+                    &TaskRunMutation::FinalCheckpoint {
+                        expected_revision: running.revision,
+                        owner_token: "owner".into(),
+                        status: TaskRunStatus::Completed,
+                        payload: json!({"must_not_commit": true}),
+                        release: true,
+                        deadline: None,
+                        expires_at: None,
+                        evidence: Some(guard.clone()),
+                    },
+                )
+                .await,
+            TaskRunStorageError::InvalidCheckpoint,
+        );
+        assert_eq!(guard.calls.load(Ordering::SeqCst), checks);
+        let retained = storage.load_task_run(&original.key).await.unwrap().unwrap();
+        assert_eq!(
+            serde_json::to_value(&retained).unwrap(),
+            serde_json::to_value(&running).unwrap()
+        );
+    }
+}
+
+#[tokio::test]
+async fn task_memory_optional_final_deadline_preserves_admission() {
+    optional_final_deadline_contract(Arc::new(crate::InMemoryTaskStorage::default()), 1).await;
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn task_sqlite_optional_final_deadline_preserves_admission() {
+    optional_final_deadline_contract(
+        Arc::new(crate::SqliteStorage::in_memory().await.unwrap()),
+        2,
+    )
+    .await;
+}
+
+#[derive(Debug)]
+struct ExpiringFinalGuard {
+    expiry: chrono::DateTime<chrono::Utc>,
+    calls: std::sync::atomic::AtomicUsize,
+    expire_on: usize,
+}
+
+impl TaskFinalAdmission for ExpiringFinalGuard {
+    // Cross the actual UTC cut inside the selected backend guard, rather than asserting a machine-speed threshold.
+    fn validate(&self) -> ai_agents_core::Result<()> {
+        let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        if call == self.expire_on {
+            let guard = std::time::Instant::now();
+            while chrono::Utc::now() < self.expiry {
+                assert!(
+                    guard.elapsed() < std::time::Duration::from_secs(5),
+                    "fixture clock failed to reach expiry"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+        Ok(())
+    }
+}
+
+// A UTC-only cut must be rechecked after the last live proof callback, including SQLite's second precommit check.
+async fn final_utc_only_guard_expiry_contract(storage: Arc<dyn AgentStorage>, expire_on: usize) {
+    let original = snapshot("utc-only-final", "expires-in-guard");
+    storage.create_task_run(&original).await.unwrap();
+    let running = storage
+        .mutate_task_run(
+            &original.key,
+            &TaskRunMutation::Claim {
+                expected_revision: 0,
+                owner_token: "owner".into(),
+            },
+        )
+        .await
+        .unwrap();
+    let expiry = chrono::Utc::now() + chrono::Duration::seconds(1);
+    let guard = Arc::new(ExpiringFinalGuard {
+        expiry,
+        calls: std::sync::atomic::AtomicUsize::new(0),
+        expire_on,
+    });
+    let result = storage
+        .mutate_task_run(
+            &original.key,
+            &TaskRunMutation::FinalCheckpoint {
+                expected_revision: running.revision,
+                owner_token: "owner".into(),
+                status: TaskRunStatus::Completed,
+                payload: json!({"must_not_commit": true}),
+                release: true,
+                deadline: None,
+                expires_at: Some(expiry),
+                evidence: Some(guard.clone()),
+            },
+        )
+        .await;
+    assert_eq!(
+        guard.calls.load(std::sync::atomic::Ordering::SeqCst),
+        expire_on
+    );
+    assert_error(result, TaskRunStorageError::AdmissionExpired);
+    let retained = storage.load_task_run(&original.key).await.unwrap().unwrap();
+    assert_eq!(
+        serde_json::to_value(&retained).unwrap(),
+        serde_json::to_value(&running).unwrap()
+    );
+}
+
+#[tokio::test]
+async fn task_memory_final_utc_only_expiry_during_guard_cannot_commit() {
+    final_utc_only_guard_expiry_contract(Arc::new(crate::InMemoryTaskStorage::default()), 1).await;
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn task_sqlite_final_utc_only_expiry_during_guard_cannot_commit() {
+    final_utc_only_guard_expiry_contract(
+        Arc::new(crate::SqliteStorage::in_memory().await.unwrap()),
+        2,
+    )
+    .await;
+}
+
+// A controlled backend clock covers advances before and during proof admission without sleeping or changing the process clock.
+#[test]
+fn final_admission_resamples_the_backend_clock_without_rebinding_its_domain() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    for scenario in ["valid", "before_guard", "during_guard", "clock_error"] {
+        let original = snapshot("controlled-clock", scenario);
+        let now = original.updated_at;
+        let running = original
+            .transition(
+                &TaskRunMutation::Claim {
+                    expected_revision: 0,
+                    owner_token: "owner".into(),
+                },
+                now,
+            )
+            .unwrap();
+        let expiry = now + chrono::Duration::seconds(60);
+        let guard = Arc::new(FinalAdmissionGuard {
+            calls: AtomicUsize::new(0),
+            reject_at: AtomicUsize::new(usize::MAX),
+        });
+        let mutation = TaskRunMutation::FinalCheckpoint {
+            expected_revision: running.revision,
+            owner_token: "owner".into(),
+            status: TaskRunStatus::Completed,
+            payload: json!({"exact": "clock-bound"}),
+            release: true,
+            deadline: None,
+            expires_at: Some(expiry),
+            evidence: Some(guard.clone()),
+        };
+        let samples = std::cell::Cell::new(0);
+        let result = running.transition_with_clock(&mutation, || {
+            let sample = samples.get();
+            samples.set(sample + 1);
+            if scenario == "clock_error" && sample == 2 {
+                return Err(TaskRunStorageError::InvalidCheckpoint.into());
+            }
+            if (scenario == "before_guard" && sample == 1)
+                || (scenario == "during_guard" && sample == 2)
+            {
+                Ok(expiry)
+            } else {
+                Ok(now)
+            }
+        });
+        if scenario == "valid" {
+            let next = result.unwrap();
+            assert_eq!(next.status, TaskRunStatus::Completed);
+            assert_eq!(next.updated_at, now);
+        } else {
+            assert_error(
+                result,
+                if scenario == "clock_error" {
+                    TaskRunStorageError::InvalidCheckpoint
+                } else {
+                    TaskRunStorageError::AdmissionExpired
+                },
+            );
+        }
+        assert_eq!(
+            guard.calls.load(Ordering::SeqCst),
+            usize::from(scenario != "before_guard")
+        );
+        assert_eq!(
+            samples.get(),
+            if scenario == "before_guard" { 2 } else { 3 }
+        );
+    }
+}
+
 #[tokio::test]
 async fn task_unsupported_defaults_never_return_empty_success() {
     let storage = ai_agents_core::NoopStorage;

@@ -208,7 +208,7 @@ async fn journal_contract(storage: Arc<dyn ai_agents_core::AgentStorage>) {
         journal: &journal,
         limits: Default::default(),
         cancellation: &cancel,
-        deadline: chrono::Utc::now() + chrono::Duration::seconds(2),
+        deadline: Some(chrono::Utc::now() + chrono::Duration::seconds(2)),
     };
     assert!(matches!(
         driver.drive(check, &ctx).await.unwrap(),
@@ -309,7 +309,7 @@ async fn builtin_judge_and_gate_use_frozen_aliases_and_strict_scores() {
         journal: &journal,
         limits: Default::default(),
         cancellation: &cancel,
-        deadline: chrono::Utc::now() + chrono::Duration::seconds(2),
+        deadline: Some(chrono::Utc::now() + chrono::Duration::seconds(2)),
     };
     driver.drive(check, &ctx).await.unwrap();
     evidence.collect_validation(&driver).unwrap();

@@ -2773,6 +2773,7 @@ impl AutonomyRunner {
 
     /// Binds one check to its frozen host target and the shared ledger without resetting a retained attempt or its deadline.
     /// Erasure keeps optional observation future construction out of nested runtime turn polling frames.
+    /// Original run and composition monotonic bounds remain inherited throughout validation, independently of the optional UTC drive deadline.
     #[allow(clippy::too_many_arguments)]
     fn validate<'a>(
         &'a self,
@@ -2828,6 +2829,7 @@ impl AutonomyRunner {
             }
             let snapshot = execution.load_owned().await?;
             let payload: TaskCheckpointPayload = serde_json::from_value(snapshot.payload)?;
+            let monotonic_anchor = std::time::Instant::now();
             let millis = payload
                 .limits
                 .max_active_time_seconds
@@ -2855,8 +2857,14 @@ impl AutonomyRunner {
                 validator: check.check.adapter.clone(),
                 contract_version: check.adapter.descriptor().contract_version,
             };
-            match driver
-                .drive(
+            // The driver also retains the original monotonic run/composition cut; UTC projection must not renew it after journal waits.
+            let monotonic_deadline = monotonic_anchor
+                .checked_add(execution.remaining_duration())
+                .ok_or_else(|| AgentError::Config("validation deadline overflow".into()))?;
+            let bounds = ai_agents_llm::InvocationBounds::new(deadline.into(), monotonic_deadline);
+            match ai_agents_llm::scope_invocation_bounds(
+                Some(bounds),
+                driver.drive(
                     check,
                     &ValidationDriveContext {
                         scope,
@@ -2866,10 +2874,11 @@ impl AutonomyRunner {
                         journal,
                         limits: ValidationDriverLimits::default(),
                         cancellation: &cancellation,
-                        deadline,
+                        deadline: Some(deadline),
                     },
-                )
-                .await?
+                ),
+            )
+            .await?
             {
                 ValidationDriverOutcome::Complete(_) => {
                     bound.extensions.ensure_targets_current(scope)?;

@@ -1151,9 +1151,11 @@ impl RunExecution {
                 evidence: self.final_evidence.read().clone(),
                 payload: serde_json::to_value(payload)?,
                 release: true,
-                deadline: Instant::now()
-                    .checked_add(self.remaining_duration())
-                    .ok_or_else(|| AgentError::Config("final deadline overflow".into()))?,
+                deadline: Some(
+                    Instant::now()
+                        .checked_add(self.remaining_duration())
+                        .ok_or_else(|| AgentError::Config("final deadline overflow".into()))?,
+                ),
             }
         };
         let saved = self

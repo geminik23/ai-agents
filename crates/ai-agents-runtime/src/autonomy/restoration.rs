@@ -1521,7 +1521,7 @@ impl AutonomyRunner {
             status: TaskRunStatus::Paused,
             payload: serde_json::to_value(&payload)?,
             release: true,
-            deadline,
+            deadline: Some(deadline),
             expires_at: payload.clocks.expires_at,
             evidence: None,
         };

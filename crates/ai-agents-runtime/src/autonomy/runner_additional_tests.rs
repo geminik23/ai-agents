@@ -88,9 +88,11 @@ async fn expired_final_contract(storage: Arc<dyn AgentStorage>) {
                 release: true,
                 expires_at: None,
                 evidence: None,
-                deadline: std::time::Instant::now()
-                    .checked_sub(std::time::Duration::from_secs(1))
-                    .unwrap(),
+                deadline: Some(
+                    std::time::Instant::now()
+                        .checked_sub(std::time::Duration::from_secs(1))
+                        .unwrap(),
+                ),
             },
         )
         .await

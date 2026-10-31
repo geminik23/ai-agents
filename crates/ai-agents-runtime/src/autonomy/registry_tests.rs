@@ -295,7 +295,7 @@ async fn bounded_replanning_uses_existing_planner_without_reset_or_replay() {
         journal: &journal,
         limits: Default::default(),
         cancellation: &cancel,
-        deadline: chrono::Utc::now() + chrono::Duration::seconds(2),
+        deadline: Some(chrono::Utc::now() + chrono::Duration::seconds(2)),
     };
     driver.drive(&check, &ctx).await.unwrap();
     driver.drive(&check, &ctx).await.unwrap();

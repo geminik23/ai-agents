@@ -160,7 +160,8 @@ pub enum TaskRunMutation {
         status: TaskRunStatus,
         payload: Value,
         release: bool,
-        deadline: std::time::Instant,
+        /// None removes only the monotonic time bound; evidence, ownership, revision and cancellation checks still apply.
+        deadline: Option<std::time::Instant>,
         expires_at: Option<DateTime<Utc>>,
         evidence: Option<std::sync::Arc<dyn TaskFinalAdmission>>,
     },
@@ -201,16 +202,27 @@ pub enum TaskRunMutation {
 }
 
 impl TaskRunMutation {
-    /// Completion and safe pause recheck original clocks inside backend admission; supplied live guards also protect reconstruction pauses.
-    /// Ordinary pauses supply no completion guard, while host controls retain their independent time bounds.
+    /// Validates final admission against a supplied UTC sample and elapsed monotonic time in that same clock domain.
+    /// Backends with a live UTC clock use validate_final_deadline_with_clock to also observe wall-clock advances during guards.
     pub fn validate_final_deadline(&self, now: DateTime<Utc>) -> Result<()> {
+        let sampled_at = std::time::Instant::now();
+        self.validate_final_deadline_with_clock(|| projected_admission_time(now, sampled_at))
+    }
+
+    /// Samples the backend's clock before and after live evidence admission, including UTC-only publications with no monotonic cut.
+    /// Absent time bounds never skip evidence, and a callback cannot renew the original expiry or replace the backend's clock domain.
+    pub fn validate_final_deadline_with_clock(
+        &self,
+        mut clock: impl FnMut() -> Result<DateTime<Utc>>,
+    ) -> Result<()> {
+        let now = clock()?;
         let bounds = match self {
             Self::FinalCheckpoint {
                 status: TaskRunStatus::Completed | TaskRunStatus::Paused,
                 deadline,
                 expires_at,
                 ..
-            } => Some((Some(*deadline), *expires_at)),
+            } => Some((*deadline, *expires_at)),
             Self::HostControl {
                 deadline,
                 expires_at,
@@ -236,15 +248,28 @@ impl TaskRunMutation {
         } = self
         {
             evidence.validate()?;
-            // Pure host guards are cooperative rather than preemptible; a late return cannot authorize a commit past the fixed monotonic bound.
-            if bounds.is_some_and(|(deadline, _)| {
+            // Pure host guards are cooperative rather than preemptible; resample the same clock before accepting their result.
+            let now = clock()?;
+            if bounds.is_some_and(|(deadline, expiry)| {
                 deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline)
+                    || expiry.is_some_and(|expiry| now >= expiry)
             }) {
                 return Err(TaskRunStorageError::AdmissionExpired.into());
             }
         }
         Ok(())
     }
+}
+
+// Legacy point-sample APIs preserve their caller's clock domain while charging all intervening validation and guard work.
+fn projected_admission_time(
+    now: DateTime<Utc>,
+    sampled_at: std::time::Instant,
+) -> Result<DateTime<Utc>> {
+    let elapsed = chrono::Duration::from_std(sampled_at.elapsed())
+        .map_err(|_| TaskRunStorageError::AdmissionExpired)?;
+    now.checked_add_signed(elapsed)
+        .ok_or_else(|| TaskRunStorageError::AdmissionExpired.into())
 }
 
 // The same compact JSON serializer enforces the exact byte cap without allocating a second copy of sensitive recovery data.
@@ -324,8 +349,35 @@ impl TaskRunSnapshot {
         }
     }
 
-    /// Applies one state transition under the atomic backend boundary, copying recovery data once only after that mutation's authority checks.
+    /// Applies a transition using the caller's UTC sample while accounting for time spent validating the existing checkpoint.
     pub fn transition(&self, mutation: &TaskRunMutation, now: DateTime<Utc>) -> Result<Self> {
+        let sampled_at = std::time::Instant::now();
+        self.transition_with_admission(mutation, now, || {
+            mutation
+                .validate_final_deadline_with_clock(|| projected_admission_time(now, sampled_at))
+        })
+    }
+
+    /// Applies a conditional backend transition with fresh samples from its own UTC clock across validation and live evidence callbacks.
+    /// The metadata timestamp and final admission share a clock domain without requiring a fabricated monotonic deadline.
+    pub fn transition_with_clock(
+        &self,
+        mutation: &TaskRunMutation,
+        mut clock: impl FnMut() -> Result<DateTime<Utc>>,
+    ) -> Result<Self> {
+        let now = clock()?;
+        self.transition_with_admission(mutation, now, || {
+            mutation.validate_final_deadline_with_clock(&mut clock)
+        })
+    }
+
+    // Share transition authority and payload checks while letting the backend resample final admission after snapshot validation.
+    fn transition_with_admission(
+        &self,
+        mutation: &TaskRunMutation,
+        now: DateTime<Utc>,
+        admit: impl FnOnce() -> Result<()>,
+    ) -> Result<Self> {
         use TaskRunStorageError::*;
         self.validate()?;
         let expected = match mutation {
@@ -367,7 +419,7 @@ impl TaskRunSnapshot {
         if self.status.is_terminal() {
             return Err(NotResumable.into());
         }
-        mutation.validate_final_deadline(now)?;
+        admit()?;
         // Payload-replacing mutations need no copy of the old recovery tree, and rejected mutations need no copy of the proposed tree.
         let mut next = Self {
             schema_version: self.schema_version,

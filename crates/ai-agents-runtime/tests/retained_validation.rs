@@ -18,6 +18,21 @@ impl ValidationJournal for Journal {
     }
 }
 
+struct CancellingJournal {
+    cancellation: Arc<AtomicBool>,
+    cancel_after_admission: bool,
+}
+
+#[async_trait]
+impl ValidationJournal for CancellingJournal {
+    async fn checkpoint(&self, state: &ValidationDriverState) -> ai_agents_core::Result<()> {
+        if self.cancel_after_admission && state.in_flight.is_some() {
+            self.cancellation.store(true, Ordering::SeqCst);
+        }
+        Ok(())
+    }
+}
+
 struct Sequence(AdapterDescriptor);
 impl AutonomyValidator for Sequence {
     fn descriptor(&self) -> &AdapterDescriptor {
@@ -141,6 +156,19 @@ fn fixture(
     Arc<AtomicUsize>,
     Arc<tokio::sync::Notify>,
 ) {
+    fixture_with_timeout(steps, Some(10))
+}
+
+fn fixture_with_timeout(
+    steps: &[&str],
+    timeout_seconds: Option<u64>,
+) -> (
+    RuntimeObservationExecutor,
+    BoundAutonomyProfile,
+    EvaluationScope,
+    Arc<AtomicUsize>,
+    Arc<tokio::sync::Notify>,
+) {
     let mut registry = AutonomyExtensions::builtins();
     registry
         .register_validator(Arc::new(Sequence(AdapterDescriptor {
@@ -192,7 +220,7 @@ fn fixture(
             .unwrap(),
     );
     let profile: AutonomyProfile = serde_json::from_value(json!({"validation":{"checks":[{
-        "id":"check", "adapter":"host.sequence", "timeout_seconds":10, "config":{"steps":steps}
+        "id":"check", "adapter":"host.sequence", "timeout_seconds":timeout_seconds, "config":{"steps":steps}
     }]}, "progress":{"config":{"signals":[{"id":"count","validator":"check","path":"metrics.count","comparison":"increase"}]}}})).unwrap();
     let bound = agent
         .autonomy_extensions()
@@ -245,6 +273,95 @@ fn fixture(
     )
 }
 
+// Deadline-free SDK validation still uses actual tool admission, cancellation and inherited invocation bounds.
+#[tokio::test]
+async fn retained_sdk_validation_without_drive_or_check_deadline_preserves_admission() {
+    for scenario in [
+        "complete",
+        "cancelled",
+        "cancel_after_ack",
+        "cancel_in_flight",
+        "drive_expiry",
+        "inherited_expiry",
+    ] {
+        let steps = if scenario == "cancel_in_flight" {
+            vec!["pending_mutation"]
+        } else {
+            vec!["read"]
+        };
+        let (executor, bound, scope, calls, started) = fixture_with_timeout(&steps, None);
+        let check = &bound.checks[0];
+        let identity = EvidenceIdentity {
+            key: scope.key.clone(),
+            objective_revision: 0,
+            cycle: 1,
+            sequence: 1,
+            stage: None,
+            attempt: Some("attempt".into()),
+            config_identity: check.config_identity.clone(),
+            target: None,
+            target_revision: None,
+            mutation_generation: 0,
+            validation_dependencies: BTreeMap::new(),
+        };
+        let mut state = ValidationDriverState::new(check, identity).unwrap();
+        let evidence = EvaluationEvidence::default();
+        let flag = Arc::new(AtomicBool::new(scenario == "cancelled"));
+        let cancellation = ToolCancellationToken::new(flag.clone(), None);
+        let journal = CancellingJournal {
+            cancellation: flag.clone(),
+            cancel_after_admission: scenario == "cancel_after_ack",
+        };
+        let canceller = (scenario == "cancel_in_flight").then(|| {
+            tokio::spawn(async move {
+                started.notified().await;
+                flag.store(true, Ordering::SeqCst);
+            })
+        });
+        let context = ValidationDriveContext {
+            scope: &scope,
+            evidence: &evidence,
+            extensions: &bound.extensions,
+            executor: &executor,
+            journal: &journal,
+            limits: Default::default(),
+            cancellation: &cancellation,
+            deadline: (scenario == "drive_expiry")
+                .then(|| chrono::Utc::now() - chrono::Duration::seconds(1)),
+        };
+        let inherited = (scenario == "inherited_expiry").then(|| {
+            ai_agents_llm::InvocationBounds::new(
+                std::time::SystemTime::now() + std::time::Duration::from_secs(10),
+                std::time::Instant::now() - std::time::Duration::from_millis(1),
+            )
+        });
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            ai_agents_llm::scope_invocation_bounds(inherited, state.drive(check, &context)),
+        )
+        .await
+        .expect("validation fixture exceeded its hang guard");
+        if let Some(canceller) = canceller {
+            canceller.await.unwrap();
+        }
+        if scenario == "complete" {
+            assert!(
+                matches!(result.unwrap(), ValidationDriverOutcome::Complete(result) if result.outcome == GateOutcome::Pass)
+            );
+            assert!(state.publication_acknowledged());
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+        } else {
+            assert!(result.is_err());
+            if scenario == "cancel_in_flight" {
+                assert_eq!(calls.load(Ordering::SeqCst), 1);
+                assert!(state.in_flight.is_some());
+            } else {
+                assert_eq!(calls.load(Ordering::SeqCst), 0);
+            }
+        }
+    }
+}
+
 // Managed reads use the actual runtime clock; stale audit metrics cannot enter explicit progress.
 #[tokio::test]
 async fn retained_sdk_real_mutations_invalidate_reads_but_fresh_reads_complete() {
@@ -283,7 +400,7 @@ async fn retained_sdk_real_mutations_invalidate_reads_but_fresh_reads_complete()
                     journal: &Journal,
                     limits: Default::default(),
                     cancellation: &cancellation,
-                    deadline: chrono::Utc::now() + chrono::Duration::seconds(10),
+                    deadline: Some(chrono::Utc::now() + chrono::Duration::seconds(10)),
                 },
             )
             .await
@@ -330,7 +447,7 @@ async fn retained_sdk_real_mutations_invalidate_reads_but_fresh_reads_complete()
             journal: &Journal,
             limits: Default::default(),
             cancellation: &cancellation,
-            deadline: chrono::Utc::now() + chrono::Duration::seconds(10),
+            deadline: Some(chrono::Utc::now() + chrono::Duration::seconds(10)),
         };
         assert!(audit.drive(check, &context).await.is_err());
         retained.drive(check, &context).await.unwrap();
@@ -389,7 +506,7 @@ async fn retained_sdk_dropped_mutation_invalidates_cached_read() {
         journal: &Journal,
         limits: Default::default(),
         cancellation: &cancellation,
-        deadline: chrono::Utc::now() + chrono::Duration::seconds(10),
+        deadline: Some(chrono::Utc::now() + chrono::Duration::seconds(10)),
     };
     state.drive(check, &context).await.unwrap();
     let request = ValidationObservationRequest::Tool {

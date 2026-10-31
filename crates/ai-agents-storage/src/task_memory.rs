@@ -97,6 +97,7 @@ impl AgentStorage for InMemoryTaskStorage {
         Ok(summaries)
     }
 
+    /// Samples final admission under the mutation lock after checkpoint validation and after any live evidence callback.
     async fn mutate_task_run(
         &self,
         key: &TaskRunKey,
@@ -110,7 +111,7 @@ impl AgentStorage for InMemoryTaskStorage {
             .get(key)
             .and_then(Option::as_ref)
             .ok_or(TaskRunStorageError::NotFound)?;
-        let next = previous.transition(mutation, chrono::Utc::now())?;
+        let next = previous.transition_with_clock(mutation, || Ok(chrono::Utc::now()))?;
         runs.insert(key.clone(), Some(next.clone()));
         Ok(next)
     }

@@ -1346,7 +1346,7 @@ impl AutonomyRunner {
                     status: TaskRunStatus::Paused,
                     payload: serde_json::to_value(&payload)?,
                     release: true,
-                    deadline,
+                    deadline: Some(deadline),
                     expires_at: payload.clocks.expires_at,
                     evidence: Some(final_guard),
                 }
@@ -1519,7 +1519,7 @@ impl AutonomyRunner {
             status: TaskRunStatus::Paused,
             payload: serde_json::to_value(payload)?,
             release: true,
-            deadline,
+            deadline: Some(deadline),
             expires_at: execution.expiry(),
             evidence: Some(Arc::new(RestorePublication { guards })),
         };

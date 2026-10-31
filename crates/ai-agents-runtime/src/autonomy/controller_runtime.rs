@@ -100,9 +100,11 @@ impl AutonomyRunner {
                     release: true,
                     expires_at: execution.expiry(),
                     evidence: None,
-                    deadline: std::time::Instant::now()
-                        .checked_add(execution.remaining_duration())
-                        .ok_or_else(|| AgentError::Config("pause deadline overflow".into()))?,
+                    deadline: Some(
+                        std::time::Instant::now()
+                            .checked_add(execution.remaining_duration())
+                            .ok_or_else(|| AgentError::Config("pause deadline overflow".into()))?,
+                    ),
                 },
             )
             .await

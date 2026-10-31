@@ -721,7 +721,7 @@ fn retained_boundary_receipt_does_not_reauthorize_committed_write() {
         status: TaskRunStatus::Completed,
         payload: previous.payload.clone(),
         release: true,
-        deadline: std::time::Instant::now() - std::time::Duration::from_secs(1),
+        deadline: Some(std::time::Instant::now() - std::time::Duration::from_secs(1)),
         expires_at: Some(chrono::Utc::now() - chrono::Duration::seconds(1)),
         evidence: Some(Arc::new(NoRecheck)),
     };

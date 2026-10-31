@@ -635,6 +635,7 @@ impl AutonomyRunner {
     }
 
     /// A host-stop terminal checkpoint retains usage and exact settled histories and never publishes task completion.
+    /// Cleanup has no execution deadline; backend ownership, cancellation and revision admission still protect publication.
     pub(super) async fn acknowledge_paused_cleanup(
         &self,
         admitted: &TaskRunSnapshot,
@@ -680,7 +681,7 @@ impl AutonomyRunner {
                 release: true,
                 expires_at: None,
                 evidence: None,
-                deadline: std::time::Instant::now(),
+                deadline: None,
             }
         } else {
             TaskRunMutation::AcknowledgeCancel {
