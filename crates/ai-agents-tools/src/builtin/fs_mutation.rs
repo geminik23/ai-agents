@@ -761,6 +761,11 @@ impl Tool for PatchTool {
                     Ok(snapshot) => snapshot,
                     Err(error) => return ToolResult::error(format!("Read error: {}", error)),
                 };
+                if !input.dry_run
+                    && let Err(error) = validate_replacement_permissions(&snapshot.permissions)
+                {
+                    return ToolResult::error(format!("Patch preflight error: {}", error));
+                }
                 let content = match String::from_utf8(snapshot.bytes.clone()) {
                     Ok(content) => content,
                     Err(error) => {
@@ -918,6 +923,7 @@ enum PatchRollback {
     RemoveCreated {
         path: PathBuf,
         written: Vec<u8>,
+        written_metadata: fs::Metadata,
     },
 }
 
@@ -967,13 +973,16 @@ fn apply_patch_transaction(outputs: &[PatchApply]) -> Result<(), String> {
                 if let Err(error) = verify_expected_state(path, expected, "pre-apply") {
                     return fail_patch_transaction(error, &rollbacks, &created_directories);
                 }
-                if let Err(error) = atomic_write(path, content.as_bytes()) {
-                    return fail_patch_transaction(
-                        format!("Patch write error: {}", error),
-                        &rollbacks,
-                        &created_directories,
-                    );
-                }
+                let written_metadata = match atomic_write(path, content.as_bytes()) {
+                    Ok(metadata) => metadata,
+                    Err(error) => {
+                        return fail_patch_transaction(
+                            format!("Patch write error: {}", error),
+                            &rollbacks,
+                            &created_directories,
+                        );
+                    }
+                };
                 let written = content.as_bytes().to_vec();
                 match expected {
                     ExpectedPathState::Present(original) => {
@@ -998,6 +1007,7 @@ fn apply_patch_transaction(outputs: &[PatchApply]) -> Result<(), String> {
                         rollbacks.push(PatchRollback::RemoveCreated {
                             path: path.clone(),
                             written,
+                            written_metadata,
                         });
                     }
                 }
@@ -1013,7 +1023,14 @@ fn fail_patch_transaction(
     created_directories: &[PathBuf],
 ) -> Result<(), String> {
     match rollback_patch(rollbacks, created_directories) {
-        Ok(()) => Err(format!("{}; no patch changes were retained", error)),
+        Ok(()) if rollbacks.is_empty() && created_directories.is_empty() => Err(format!(
+            "{}; no target changes required rollback; any reported temporary artifacts may remain",
+            error
+        )),
+        Ok(()) => Err(format!(
+            "{}; patch rollback restored file contents and permissions where applicable; other metadata may have changed",
+            error
+        )),
         Err(rollback_error) => Err(format!(
             "{}; partial patch application may remain because rollback failed: {}",
             error, rollback_error
@@ -1043,17 +1060,26 @@ fn rollback_patch(
             PatchRollback::RestoreDelete { path, original } => {
                 verify_absent(path, "rollback").and_then(|_| restore_file_snapshot(path, original))
             }
-            PatchRollback::RemoveCreated { path, written } => {
-                verify_present_content(path, written, "rollback").and_then(|_| {
-                    fs::remove_file(path).map_err(|error| {
-                        format!(
-                            "Patch rollback remove error for {}: {}",
-                            path.display(),
-                            error
-                        )
-                    })
+            PatchRollback::RemoveCreated {
+                path,
+                written,
+                written_metadata,
+            } => verify_present_content_and_permissions(
+                path,
+                written,
+                &written_metadata.permissions(),
+                "rollback",
+            )
+            .and_then(|_| verify_created_identity(path, written_metadata))
+            .and_then(|_| {
+                fs::remove_file(path).map_err(|error| {
+                    format!(
+                        "Patch rollback remove error for {}: {}",
+                        path.display(),
+                        error
+                    )
                 })
-            }
+            }),
         };
         if let Err(error) = result {
             errors.push(error);
@@ -1066,6 +1092,33 @@ fn rollback_patch(
         Ok(())
     } else {
         Err(errors.join("; "))
+    }
+}
+
+// Check created-file identity where available before rollback removes the path.
+fn verify_created_identity(path: &Path, expected: &fs::Metadata) -> Result<(), String> {
+    let current = fs::symlink_metadata(path).map_err(|error| {
+        format!(
+            "Patch rollback conflict for {}: created file metadata is unavailable: {}",
+            path.display(),
+            error
+        )
+    })?;
+    let same = current.file_type().is_file();
+    #[cfg(unix)]
+    let same = {
+        use std::os::unix::fs::MetadataExt;
+        same && current.dev() == expected.dev() && current.ino() == expected.ino()
+    };
+    #[cfg(not(unix))]
+    let _ = expected;
+    if same {
+        Ok(())
+    } else {
+        Err(format!(
+            "Patch rollback conflict for {}: created file was replaced",
+            path.display()
+        ))
     }
 }
 
@@ -1089,14 +1142,19 @@ fn verify_expected_state(
 }
 
 fn verify_absent(path: &Path, stage: &str) -> Result<(), String> {
-    if path.exists() {
-        Err(format!(
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Ok(_) => Err(format!(
             "Patch {} conflict for {}: expected path to be absent",
             stage,
             path.display()
-        ))
-    } else {
-        Ok(())
+        )),
+        Err(error) => Err(format!(
+            "Patch {} conflict for {}: absence could not be verified: {}",
+            stage,
+            path.display(),
+            error
+        )),
     }
 }
 
@@ -1170,20 +1228,15 @@ fn verify_present_content_and_permissions(
 }
 
 fn restore_file_snapshot(path: &Path, snapshot: &FileSnapshot) -> Result<(), String> {
-    atomic_write(path, &snapshot.bytes).map_err(|error| {
-        format!(
-            "Patch rollback restore error for {}: {}",
-            path.display(),
-            error
-        )
-    })?;
-    fs::set_permissions(path, snapshot.permissions.clone()).map_err(|error| {
-        format!(
-            "Patch rollback permission restore error for {}: {}",
-            path.display(),
-            error
-        )
-    })
+    atomic_write_with_permissions(path, &snapshot.bytes, Some(&snapshot.permissions))
+        .map(|_| ())
+        .map_err(|error| {
+            format!(
+                "Patch rollback restore error for {}: {}",
+                path.display(),
+                error
+            )
+        })
 }
 
 fn permissions_match(left: &fs::Permissions, right: &fs::Permissions) -> bool {
@@ -1377,43 +1430,94 @@ fn enforce_read_before_write(
     }
 }
 
-// Preserve ordinary Unix permission bits before writing; refuse special bits rather than silently changing privilege semantics.
-fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+// Special bits cannot be restored safely when replacement may change the owning user or group.
+fn validate_replacement_permissions(permissions: &fs::Permissions) -> std::io::Result<()> {
     #[cfg(unix)]
-    let original_mode = {
+    {
         use std::os::unix::fs::PermissionsExt;
-        match fs::metadata(path) {
-            Ok(metadata) => {
-                let mode = metadata.permissions().mode();
-                if mode & 0o7000 != 0 {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::PermissionDenied,
-                        "atomic replacement of files with special permission bits is unsupported",
-                    ));
-                }
-                Some(mode & 0o777)
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(error) => return Err(error),
+        if permissions.mode() & 0o7000 != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "atomic replacement of files with special permission bits is unsupported",
+            ));
         }
-    };
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    }
+    #[cfg(not(unix))]
+    let _ = permissions;
+    Ok(())
+}
+
+// Existing-file replacements start private even when the process umask permits broader access.
+fn create_atomic_temp(parent: &Path, restricted: bool) -> std::io::Result<(fs::File, PathBuf)> {
     let temp = parent.join(format!(".{}.tmp", Uuid::new_v4()));
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(if restricted { 0o600 } else { 0o666 });
+    }
+    #[cfg(not(unix))]
+    let _ = restricted;
+    Ok((options.open(&temp)?, temp))
+}
+
+// Preserve ordinary Unix mode bits without exposing an initially broader temporary file.
+fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<fs::Metadata> {
+    #[cfg(unix)]
+    let original = match fs::metadata(path) {
+        Ok(metadata) => Some(metadata.permissions()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+    #[cfg(not(unix))]
+    let original: Option<fs::Permissions> = None;
+    atomic_write_with_permissions(path, bytes, original.as_ref())
+}
+
+// A deleted-file rollback supplies its saved permissions before any original bytes are written.
+fn atomic_write_with_permissions(
+    path: &Path,
+    bytes: &[u8],
+    permissions: Option<&fs::Permissions>,
+) -> std::io::Result<fs::Metadata> {
+    if let Some(permissions) = permissions {
+        validate_replacement_permissions(permissions)?;
+    }
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let (mut file, temp) = create_atomic_temp(parent, permissions.is_some())?;
     let result = (|| {
-        let mut file = fs::File::create(&temp)?;
-        #[cfg(unix)]
-        if let Some(mode) = original_mode {
-            use std::os::unix::fs::PermissionsExt;
-            file.set_permissions(fs::Permissions::from_mode(mode))?;
+        if let Some(permissions) = permissions {
+            file.set_permissions(permissions.clone())?;
         }
         file.write_all(bytes)?;
         file.sync_all()?;
-        fs::rename(&temp, path)
+        let metadata = file.metadata()?;
+        drop(file);
+        fs::rename(&temp, path)?;
+        Ok(metadata)
     })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temp);
+    match result {
+        Ok(metadata) => Ok(metadata),
+        Err(error) => Err(cleanup_failed_atomic_temp(&temp, error)),
     }
-    result
+}
+
+// Keep failed cleanup visible because an uncommitted temporary file can still contain data.
+fn cleanup_failed_atomic_temp(temp: &Path, error: std::io::Error) -> std::io::Error {
+    match fs::remove_file(temp) {
+        Ok(()) => error,
+        Err(cleanup) if cleanup.kind() == std::io::ErrorKind::NotFound => error,
+        Err(cleanup) => std::io::Error::new(
+            error.kind(),
+            format!(
+                "{}; failed to remove temporary file {}: {}; partial data may remain",
+                error,
+                temp.display(),
+                cleanup
+            ),
+        ),
+    }
 }
 
 fn validate_safe_target(path: &Path) -> Result<(), String> {
@@ -3202,6 +3306,45 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[test]
+    fn atomic_temp_creation_is_private_under_permissive_umask() {
+        use std::os::unix::fs::PermissionsExt;
+
+        const CHILD: &str = "AI_AGENTS_ATOMIC_TEMP_UMASK_TEST";
+        if std::env::var_os(CHILD).is_some() {
+            let dir = tempdir().unwrap();
+            fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
+            let (private, private_path) = create_atomic_temp(dir.path(), true).unwrap();
+            assert_eq!(private.metadata().unwrap().permissions().mode() & 0o077, 0);
+            assert_eq!(fs::metadata(private_path).unwrap().len(), 0);
+            let (new_file, _) = create_atomic_temp(dir.path(), false).unwrap();
+            let ordinary = fs::File::create(dir.path().join("ordinary.txt")).unwrap();
+            assert_eq!(
+                new_file.metadata().unwrap().permissions().mode() & 0o777,
+                ordinary.metadata().unwrap().permissions().mode() & 0o777
+            );
+            return;
+        }
+        let output = std::process::Command::new("/bin/sh")
+            .args([
+                "-c",
+                "umask 000; exec \"$1\" --exact builtin::fs_mutation::tests::atomic_temp_creation_is_private_under_permissive_umask --nocapture",
+                "sh",
+            ])
+            .arg(std::env::current_exe().unwrap())
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn file_edit_preserves_existing_executable_mode() {
         use std::os::unix::fs::PermissionsExt;
@@ -4325,7 +4468,8 @@ mod tests {
             },
         ];
         let error = apply_patch_transaction(&outputs).unwrap_err();
-        assert!(error.contains("no patch changes were retained"));
+        assert!(error.contains("patch rollback restored file contents and permissions"));
+        assert!(error.contains("other metadata may have changed"));
         assert_eq!(fs::read_to_string(&first).unwrap(), "old\n");
         #[cfg(unix)]
         {
@@ -4336,6 +4480,194 @@ mod tests {
             );
         }
         assert!(!invalid_parent.join("child.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn patch_delete_rollback_restores_private_bytes_and_reports_metadata_limits() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("private.txt");
+        let link = dir.path().join("link.txt");
+        let invalid_parent = dir.path().join("blocker");
+        fs::write(&path, "private data\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::hard_link(&path, &link).unwrap();
+        fs::write(&invalid_parent, "blocker\n").unwrap();
+        let outputs = vec![
+            PatchApply::Delete {
+                path: path.clone(),
+                expected: read_file_snapshot(&path).unwrap(),
+            },
+            PatchApply::Write {
+                path: invalid_parent.join("child"),
+                content: "new\n".into(),
+                expected: ExpectedPathState::Absent,
+            },
+        ];
+        let error = apply_patch_transaction(&outputs).unwrap_err();
+        assert!(error.contains("patch rollback restored file contents and permissions"));
+        assert!(error.contains("other metadata may have changed"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "private data\n");
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(fs::read_to_string(&link).unwrap(), "private data\n");
+        assert_ne!(
+            fs::metadata(&path).unwrap().ino(),
+            fs::metadata(&link).unwrap().ino()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn patch_created_file_rollback_preserves_external_permission_changes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("created.txt");
+        fs::write(&path, "created\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let written_metadata = fs::metadata(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+        let error = rollback_patch(
+            &[PatchRollback::RemoveCreated {
+                path: path.clone(),
+                written: b"created\n".to_vec(),
+                written_metadata,
+            }],
+            &[],
+        )
+        .unwrap_err();
+        assert!(error.contains("permissions changed"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "created\n");
+        assert_eq!(
+            fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn patch_created_file_rollback_preserves_same_content_replacement() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("created.txt");
+        let replacement = dir.path().join("replacement.txt");
+        fs::write(&path, "created\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let written_metadata = fs::metadata(&path).unwrap();
+        fs::write(&replacement, "created\n").unwrap();
+        fs::set_permissions(&replacement, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::rename(&replacement, &path).unwrap();
+        let error = rollback_patch(
+            &[PatchRollback::RemoveCreated {
+                path: path.clone(),
+                written: b"created\n".to_vec(),
+                written_metadata,
+            }],
+            &[],
+        )
+        .unwrap_err();
+        assert!(error.contains("created file was replaced"));
+        assert_eq!(fs::read_to_string(path).unwrap(), "created\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn patch_delete_rollback_preserves_a_dangling_symlink() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("target.txt");
+        fs::write(&path, "original\n").unwrap();
+        let original = read_file_snapshot(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink("missing-target", &path).unwrap();
+        let error = rollback_patch(
+            &[PatchRollback::RestoreDelete {
+                path: path.clone(),
+                original,
+            }],
+            &[],
+        )
+        .unwrap_err();
+        assert!(error.contains("rollback conflict"));
+        assert!(
+            fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[test]
+    fn atomic_temp_cleanup_failure_is_reported() {
+        let dir = tempdir().unwrap();
+        let original = std::io::Error::other("write failed");
+        let error = cleanup_failed_atomic_temp(dir.path(), original);
+        assert!(error.to_string().contains("write failed"));
+        assert!(error.to_string().contains("partial data may remain"));
+        assert!(dir.path().is_dir());
+    }
+
+    #[test]
+    fn patch_delete_rollback_does_not_overwrite_an_external_replacement() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("target.txt");
+        fs::write(&path, "original\n").unwrap();
+        let original = read_file_snapshot(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+        fs::write(&path, "external\n").unwrap();
+        let error = rollback_patch(
+            &[PatchRollback::RestoreDelete {
+                path: path.clone(),
+                original,
+            }],
+            &[],
+        )
+        .unwrap_err();
+        assert!(error.contains("rollback conflict"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "external\n");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn patch_special_mode_delete_is_rejected_before_earlier_writes() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let dir = tempdir().unwrap();
+        let first = dir.path().join("first.txt");
+        let special = dir.path().join("special.txt");
+        fs::write(&first, "old\n").unwrap();
+        fs::write(&special, "protected\n").unwrap();
+        fs::set_permissions(&special, fs::Permissions::from_mode(0o1700)).unwrap();
+        let inode = fs::metadata(&first).unwrap().ino();
+        let patch = concat!(
+            "--- a/first.txt\n+++ b/first.txt\n@@ -1,1 +1,1 @@\n-old\n+new\n",
+            "--- a/special.txt\n+++ /dev/null\n@@ -1,1 +0,0 @@\n-protected\n"
+        );
+        let result = PatchTool::new()
+            .execute(
+                serde_json::json!({
+                    "base_path": dir.path().to_string_lossy(),
+                    "patch": patch,
+                    "allow_delete": true,
+                    "dry_run": false
+                }),
+                mutation_context("patch", dir.path()),
+            )
+            .await;
+        assert!(!result.success);
+        assert!(result.output.contains("special permission bits"));
+        assert_eq!(fs::read_to_string(&first).unwrap(), "old\n");
+        assert_eq!(fs::metadata(&first).unwrap().ino(), inode);
+        assert_eq!(fs::read_to_string(&special).unwrap(), "protected\n");
+        assert_eq!(
+            fs::metadata(&special).unwrap().permissions().mode() & 0o7777,
+            0o1700
+        );
     }
 
     #[test]

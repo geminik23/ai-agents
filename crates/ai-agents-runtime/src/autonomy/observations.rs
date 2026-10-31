@@ -6,7 +6,7 @@ use serde_json::Value;
 
 impl EvaluationEvidence {
     /// Uses acknowledged executor records and attempt identity, never a requested operation relabeled with a replacement's result.
-    /// Changed command operands or conflicting host-reported exit fields cannot prove the original fixed validation.
+    /// Changed command operands or an explicitly bound timeout cannot prove the original validation, even through direct command gates.
     pub fn collect_validation(&mut self, state: &ValidationDriverState) -> Result<()> {
         if !state.publication_acknowledged() {
             return Err(AgentError::Persistence(
@@ -172,7 +172,7 @@ impl EvaluationEvidence {
     }
 }
 
-// Policy normalization may add defaults, but changing cwd, argv or environment changes the operation whose exit code was observed.
+// Policy normalization may add defaults, but changing an explicitly requested timeout or other operands changes the validated operation.
 fn command_operands_match(requested: &Value, executed: &Value) -> bool {
     requested.get("command").and_then(Value::as_str)
         == executed.get("command").and_then(Value::as_str)
@@ -182,6 +182,9 @@ fn command_operands_match(requested: &Value, executed: &Value) -> bool {
             == executed.get("argv").unwrap_or(&serde_json::json!([]))
         && requested.get("env").unwrap_or(&serde_json::json!({}))
             == executed.get("env").unwrap_or(&serde_json::json!({}))
+        && requested
+            .get("timeout_ms")
+            .is_none_or(|timeout| executed.get("timeout_ms") == Some(timeout))
 }
 
 impl ProgressObservation {

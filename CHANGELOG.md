@@ -39,6 +39,8 @@
 - Task validation: development-only tri-state checks, tool/fallback/child observation continuation and external signals preserve post-turn controller progress; fixed host permits and single logical journal charges survive re-pause, without adding a second executor or inferring completion from unavailable evidence
 
 ### Changed
+- Code agent workflow: request guidance after incomplete checks and allow explicit model output and checker time limits for the selected workspace
+- Task validation: allow an exact command check to specify its attempt timeout within the host and tool policy limits
 - Evaluation compatibility: development report schema 3 separates participant control results from parent turns, retains acknowledged evidence after interrupted foreground work and rejects task controls in chat-only JSONL
 - Rust evaluation compatibility: scenario and turn literals add empty interaction collections; existing typed task fields, task-step variants and lifecycle categories retain their owning module paths
 - TUI integration compatibility: low-level question, log and app constructors use bounded senders; modal literals include review scrolling and constructors remain the preferred interface
@@ -63,7 +65,7 @@
 - Rust configuration compatibility: typed autonomy fields, validation driver bounds and objective-bound todo identities require affected struct literals to be updated; these development additions are not the published stable API
 
 ### Fixed
-- File mutation: preserve ordinary Unix permission bits and refuse special permission bits during atomic replacement
+- File mutation: preserve ordinary Unix modes with private temporary files, reject special-bit patch targets and report incomplete rollback or cleanup honestly
 - Command output: preserve bounded error tails and structured exit results when command logs exceed output limits
 - File editing: show accurate authorized previews and mismatch hints, and refuse writes when the effect cannot be reported
 - Default agent logging: omit message, response, tool argument and tool or skill failure text while preserving trusted hook records

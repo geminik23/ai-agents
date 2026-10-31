@@ -12,7 +12,9 @@
 // For a real workspace, set absolute WORKSPACE and CHECKER paths and a workspace-relative SOURCE path.
 // cargo run --manifest-path examples/Cargo.toml -p example-code-agent --bin code-agent-setup --offline -- check-workspace "$WORKSPACE" "$SOURCE" "$CHECKER" openai gpt-5.4-mini
 // cargo run --manifest-path examples/Cargo.toml -p example-code-agent --bin code-agent-setup --offline -- run-workspace --trust-checker --share-source "$WORKSPACE" "$SOURCE" "$CHECKER" openai gpt-5.4-mini
-// The optional final argument is a workspace-relative instruction file; use /task run in the interactive session.
+// Optionally supply a workspace-relative instruction file and --max-output-tokens N or --checker-timeout-ms N.
+// Output tokens default to 2000 and checker timeout to 30000 ms; other applicable limits still apply.
+// Use /task run in the interactive session.
 // check-workspace does not contact a provider; run-workspace requires explicit trust and code-sharing consent.
 // The supplied checker runs with host permissions and must provide its own independent tests and isolation.
 
@@ -22,29 +24,73 @@ mod workspace_agent;
 
 use std::path::Path;
 
-// CLI paths are host input; the optional instruction file is relative to the selected workspace.
+// CLI paths are host input; the instruction snapshot and output limit are explicitly selected.
 fn workspace_setup(
     args: &[String],
 ) -> Result<workspace_agent::WorkspaceSetup, Box<dyn std::error::Error>> {
-    match args {
-        [root, source, checker, provider, model] => workspace_agent::prepare(
-            Path::new(root),
-            Path::new(source),
-            Path::new(checker),
-            provider,
-            model,
-            None,
-        ),
-        [root, source, checker, provider, model, instructions] => workspace_agent::prepare(
-            Path::new(root),
-            Path::new(source),
-            Path::new(checker),
-            provider,
-            model,
-            Some(Path::new(instructions)),
-        ),
-        _ => Err("expected WORKSPACE SOURCE CHECKER PROVIDER MODEL [INSTRUCTIONS]".into()),
+    let [root, source, checker, provider, model, rest @ ..] = args else {
+        return Err("expected WORKSPACE SOURCE CHECKER PROVIDER MODEL [INSTRUCTIONS] [--max-output-tokens N] [--checker-timeout-ms N]".into());
+    };
+    let mut instructions = None;
+    let mut max_output_tokens = None;
+    let mut checker_timeout_ms = None;
+    let mut positional_only = false;
+    let mut remaining = rest.iter();
+    while let Some(arg) = remaining.next() {
+        if !positional_only && arg == "--" {
+            positional_only = true;
+        } else if !positional_only && arg == "--max-output-tokens" {
+            if max_output_tokens.is_some() {
+                return Err("--max-output-tokens may be supplied only once".into());
+            }
+            let value = remaining
+                .next()
+                .ok_or("--max-output-tokens needs a value")?;
+            let value: u32 = value
+                .parse()
+                .map_err(|_| "invalid --max-output-tokens value")?;
+            if value == 0 {
+                return Err("--max-output-tokens must be positive".into());
+            }
+            max_output_tokens = Some(value);
+        } else if !positional_only && arg == "--checker-timeout-ms" {
+            if checker_timeout_ms.is_some() {
+                return Err("--checker-timeout-ms may be supplied only once".into());
+            }
+            let value = remaining
+                .next()
+                .ok_or("--checker-timeout-ms needs a value")?;
+            let value: u64 = value
+                .parse()
+                .map_err(|_| "invalid --checker-timeout-ms value")?;
+            if value == 0 || value > ai_agents::MAX_TOOL_TIMEOUT_MS {
+                return Err(
+                    "--checker-timeout-ms must be positive and within the tool timeout limit"
+                        .into(),
+                );
+            }
+            checker_timeout_ms = Some(value);
+        } else if instructions.is_some() {
+            return Err("unexpected workspace argument".into());
+        } else {
+            instructions = Some(Path::new(arg));
+        }
     }
+    let mut setup = workspace_agent::prepare(
+        Path::new(root),
+        Path::new(source),
+        Path::new(checker),
+        provider,
+        model,
+        instructions,
+    )?;
+    if let Some(tokens) = max_output_tokens {
+        setup.set_max_output_tokens(tokens)?;
+    }
+    if let Some(timeout) = checker_timeout_ms {
+        setup.set_checker_timeout_ms(timeout)?;
+    }
+    Ok(setup)
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -59,6 +105,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!(
                 "Workspace configuration validated without constructing a provider or running the checker."
             );
+            println!("Maximum model output tokens: {}", setup.max_output_tokens());
+            println!("Checker timeout: {} ms", setup.checker_timeout_ms());
             println!(
                 "This does not certify checker independence, isolation, credentials or task completion."
             );
@@ -121,7 +169,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
         _ => {
-            return Err("usage: code-agent-setup prepare NEW_ABSOLUTE_PATH | check-config WORKSPACE CARGO RUSTC | verify WORKSPACE CARGO RUSTC | run-offline WORKSPACE CARGO RUSTC | check-workspace WORKSPACE SOURCE CHECKER PROVIDER MODEL [INSTRUCTIONS] | run-workspace --trust-checker --share-source WORKSPACE SOURCE CHECKER PROVIDER MODEL [INSTRUCTIONS]".into());
+            return Err("usage: code-agent-setup prepare NEW_ABSOLUTE_PATH | check-config WORKSPACE CARGO RUSTC | verify WORKSPACE CARGO RUSTC | run-offline WORKSPACE CARGO RUSTC | check-workspace WORKSPACE SOURCE CHECKER PROVIDER MODEL [INSTRUCTIONS] [--max-output-tokens N] [--checker-timeout-ms N] | run-workspace --trust-checker --share-source WORKSPACE SOURCE CHECKER PROVIDER MODEL [INSTRUCTIONS] [--max-output-tokens N] [--checker-timeout-ms N]".into());
         }
     }
     Ok(())

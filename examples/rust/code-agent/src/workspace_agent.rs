@@ -37,6 +37,7 @@ pub struct WorkspaceSetup {
     checker_bytes: Vec<u8>,
     argv: Vec<String>,
     command: String,
+    checker_timeout_ms: Option<u64>,
 }
 
 // Resolve each workspace component without following a symlink or allowing parent traversal.
@@ -211,10 +212,73 @@ pub fn prepare(
         checker_bytes,
         argv,
         command,
+        checker_timeout_ms: None,
     })
 }
 
 impl WorkspaceSetup {
+    // The host must choose a positive output limit supported by its selected provider and model.
+    pub fn set_max_output_tokens(&mut self, tokens: u32) -> Result<()> {
+        if tokens == 0 {
+            return Err("maximum output tokens must be positive".into());
+        }
+        match &mut self.spec.llm {
+            LLMConfigOrSelector::Config(config) => config.max_tokens = tokens,
+            _ => return Err("workspace example needs a direct provider configuration".into()),
+        }
+        self.spec.validate()?;
+        Ok(())
+    }
+
+    // Keep the validation request, policy and fixed approval bound to the same host-selected timeout.
+    pub fn set_checker_timeout_ms(&mut self, timeout: u64) -> Result<()> {
+        if timeout == 0 || timeout > ai_agents::MAX_TOOL_TIMEOUT_MS {
+            return Err(
+                "checker timeout must be positive and within the tool timeout limit".into(),
+            );
+        }
+        let policy = self
+            .spec
+            .tool_security
+            .tools
+            .get_mut("command")
+            .ok_or("missing command policy")?;
+        policy.timeout_ms = Some(timeout);
+        let checks = self
+            .spec
+            .autonomy
+            .defaults
+            .validation
+            .as_mut()
+            .and_then(|validation| validation.checks.as_mut())
+            .ok_or("missing validation check")?;
+        let config = checks
+            .first_mut()
+            .and_then(|check| check.config.as_mut())
+            .and_then(serde_json::Value::as_object_mut)
+            .ok_or("missing validation configuration")?;
+        config.insert("timeout_ms".into(), json!(timeout));
+        self.checker_timeout_ms = Some(timeout);
+        self.spec.validate()?;
+        Ok(())
+    }
+
+    pub fn checker_timeout_ms(&self) -> u64 {
+        self.spec
+            .tool_security
+            .tools
+            .get("command")
+            .and_then(|policy| policy.timeout_ms)
+            .unwrap_or(self.spec.tool_security.default_timeout_ms)
+    }
+
+    pub fn max_output_tokens(&self) -> u32 {
+        match &self.spec.llm {
+            LLMConfigOrSelector::Config(config) => config.max_tokens,
+            _ => unreachable!("workspace setup requires a direct provider configuration"),
+        }
+    }
+
     pub fn builder(&self) -> AgentBuilder {
         AgentBuilder::from_spec(self.spec.clone())
     }
@@ -222,6 +286,10 @@ impl WorkspaceSetup {
     // A fixed host-only validation binding cannot become an ordinary model-callable command grant.
     pub fn extensions(&self) -> ai_agents::Result<AutonomyExtensions> {
         let mut extensions = AutonomyExtensions::builtins();
+        let mut arguments = json!({"command":self.command,"cwd":self.root});
+        if let Some(timeout) = self.checker_timeout_ms {
+            arguments["timeout_ms"] = json!(timeout);
+        }
         extensions.register_host_validation(HostValidationBinding {
             id: "workspace-checker".into(),
             validator: "builtin.command".into(),
@@ -229,7 +297,7 @@ impl WorkspaceSetup {
             profile: None,
             scope: "task".into(),
             tool: "command".into(),
-            arguments: json!({"command":self.command,"cwd":self.root}),
+            arguments,
             require_approval: true,
         })?;
         Ok(extensions)
@@ -290,6 +358,8 @@ impl CommandRunner for CheckerRunner {
 // The existing CLI owns foreground controls; ordinary chat is blocked to avoid unverified edit claims.
 pub async fn run(setup: WorkspaceSetup) -> Result<()> {
     println!("Selected source: {}", setup.source_file().display());
+    println!("Maximum model output tokens: {}", setup.max_output_tokens());
+    println!("Checker timeout: {} ms", setup.checker_timeout_ms());
     println!(
         "The selected source, instruction snapshot, task messages and checker output may be sent to the chosen provider and may incur costs."
     );
@@ -297,6 +367,9 @@ pub async fn run(setup: WorkspaceSetup) -> Result<()> {
         "The external checker runs with host permissions; you are responsible for its independence, isolation and cleanup."
     );
     println!("Only /task commands are enabled; command execution and edits require approval.");
+    println!(
+        "Checker output is not automatically sent to the model; provide relevant details when asked."
+    );
     println!(
         "Atomic edits preserve ordinary Unix mode bits, not ownership, ACLs or extended attributes."
     );

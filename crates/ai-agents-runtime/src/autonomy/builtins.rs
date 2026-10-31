@@ -15,6 +15,8 @@ struct CommandConfig {
     #[serde(default)]
     expected_exit: i32,
     #[serde(default)]
+    timeout_ms: Option<u64>,
+    #[serde(default)]
     host_binding: Option<String>,
 }
 #[derive(Deserialize, Default)]
@@ -92,7 +94,7 @@ impl AutonomyValidator for BuiltinValidator {
     fn descriptor(&self) -> &AdapterDescriptor {
         &self.descriptor
     }
-    /// Framework-owned built-in config remains strict; custom adapters own only their config maps.
+    /// Framework-owned built-in config remains strict; command timeouts must fit the shared executor's accepted range.
     fn validate_config(&self, config: &Value) -> Result<()> {
         bounded_value(config, 16_384)?;
         match self.kind.as_str() {
@@ -101,6 +103,13 @@ impl AutonomyValidator for BuiltinValidator {
                     .map_err(|_| AgentError::Config("invalid command validator config".into()))?;
                 if config.command.trim().is_empty() {
                     return Err(AgentError::Config("empty validation command".into()));
+                }
+                if config.timeout_ms.is_some_and(|timeout| {
+                    timeout == 0 || timeout > ai_agents_core::MAX_TOOL_TIMEOUT_MS
+                }) {
+                    return Err(AgentError::Config(
+                        "invalid validation command timeout".into(),
+                    ));
                 }
             }
             "diagnostics" => {
@@ -139,6 +148,7 @@ impl AutonomyValidator for BuiltinValidator {
         Ok(())
     }
     /// Denied, unavailable, partial and stale observations cannot become passing validation.
+    /// A configured command timeout belongs to the same original operation as its command and working directory.
     /// A truncated command envelope remains incomplete and cannot establish whether the original response was valid.
     fn evaluate(&self, input: &ValidationInput<'_>) -> Result<ValidationDecision> {
         self.validate_config(input.config)?;
@@ -234,7 +244,14 @@ impl AutonomyValidator for BuiltinValidator {
                         && record
                             .executed_arguments
                             .get("env")
-                            .is_none_or(|v| v.as_object().is_some_and(serde_json::Map::is_empty));
+                            .is_none_or(|v| v.as_object().is_some_and(serde_json::Map::is_empty))
+                        && config.timeout_ms.is_none_or(|timeout| {
+                            record
+                                .executed_arguments
+                                .get("timeout_ms")
+                                .and_then(Value::as_u64)
+                                == Some(timeout)
+                        });
                     let eligible = unchanged
                         && command_output_consistent(&output)
                         && super::evidence::executed(record)
@@ -340,10 +357,14 @@ impl AutonomyValidator for BuiltinValidator {
             }
             "command" => {
                 let config: CommandConfig = serde_json::from_value(input.config.clone())?;
+                let mut arguments = json!({"command":config.command,"cwd":config.cwd.unwrap_or_else(|| ".".into())});
+                if let Some(timeout) = config.timeout_ms {
+                    arguments["timeout_ms"] = json!(timeout);
+                }
                 ValidationObservationRequest::Tool {
                     id: "observe".into(),
                     tool: "command".into(),
-                    arguments: json!({"command":config.command,"cwd":config.cwd.unwrap_or_else(|| ".".into())}),
+                    arguments,
                     host_binding: config.host_binding,
                 }
             }
@@ -389,5 +410,38 @@ impl AutonomyValidator for BuiltinValidator {
         Ok(vec![serde_json::from_value(
             result.metrics["artifact"].clone(),
         )?])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // An absent timeout preserves existing validation while explicit values stay within executor bounds.
+    #[test]
+    fn command_validator_checks_optional_timeout_bounds() {
+        let validator = BuiltinValidator::new("command");
+        assert!(
+            validator
+                .validate_config(&json!({"command":"check"}))
+                .is_ok()
+        );
+        assert!(
+            validator
+                .validate_config(&json!({"command":"check","timeout_ms":45000}))
+                .is_ok()
+        );
+        assert!(
+            validator
+                .validate_config(&json!({"command":"check","timeout_ms":0}))
+                .is_err()
+        );
+        assert!(
+            validator
+                .validate_config(
+                    &json!({"command":"check","timeout_ms":ai_agents_core::MAX_TOOL_TIMEOUT_MS + 1})
+                )
+                .is_err()
+        );
     }
 }

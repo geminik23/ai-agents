@@ -101,6 +101,10 @@ fn workspace_check_is_provider_free_and_live_mode_requires_explicit_consent() {
         .arg(&checker)
         .arg("openai")
         .arg("offline-test")
+        .arg("--max-output-tokens")
+        .arg("4096")
+        .arg("--checker-timeout-ms")
+        .arg("45000")
         .output()
         .unwrap();
     assert!(
@@ -111,6 +115,48 @@ fn workspace_check_is_provider_free_and_live_mode_requires_explicit_consent() {
     assert!(
         String::from_utf8_lossy(&checked.stdout)
             .contains("without constructing a provider or running the checker")
+    );
+    assert!(String::from_utf8_lossy(&checked.stdout).contains("Maximum model output tokens: 4096"));
+    assert!(String::from_utf8_lossy(&checked.stdout).contains("Checker timeout: 45000 ms"));
+    assert!(!marker.exists());
+    for flag in ["--max-output-tokens", "--checker-timeout-ms"] {
+        let invalid = Command::new(executable)
+            .env_clear()
+            .arg("check-workspace")
+            .arg(&workspace)
+            .arg("source.rs")
+            .arg(&checker)
+            .arg("openai")
+            .arg("offline-test")
+            .arg(flag)
+            .arg("0")
+            .output()
+            .unwrap();
+        assert!(!invalid.status.success());
+        assert!(String::from_utf8_lossy(&invalid.stderr).contains("must be positive"));
+        assert!(!marker.exists());
+    }
+    std::fs::write(
+        workspace.join("-instructions.md"),
+        "Read the selected file.\n",
+    )
+    .unwrap();
+    let named_instruction = Command::new(executable)
+        .env_clear()
+        .arg("check-workspace")
+        .arg(&workspace)
+        .arg("source.rs")
+        .arg(&checker)
+        .arg("openai")
+        .arg("offline-test")
+        .arg("--")
+        .arg("-instructions.md")
+        .output()
+        .unwrap();
+    assert!(
+        named_instruction.status.success(),
+        "{}",
+        String::from_utf8_lossy(&named_instruction.stderr)
     );
     assert!(!marker.exists());
     for flags in [vec![], vec!["--trust-checker"]] {

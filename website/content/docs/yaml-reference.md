@@ -58,7 +58,7 @@ Built-in adapter configuration is strict:
 
 | Adapter | `config` fields | Evidence contract |
 |---|---|---|
-| `builtin.command` | required `command`; optional `cwd`, `host_binding`; `expected_exit: 0` | Exact authorized command result; approved replacement argv/cwd/env cannot validate the original command |
+| `builtin.command` | required `command`; optional `cwd`, `host_binding`, positive `timeout_ms`; `expected_exit: 0` | Exact authorized command result; approved replacement argv/cwd/env or configured timeout cannot validate the original command |
 | `builtin.diagnostics` | optional `path`, `severity`, `host_binding`; severity is `error`, `warning`, `info`, `hint` or `all` | Available, complete, fresh observations; no host capability is a preflight refusal, not an empty diagnostic result |
 | `builtin.judge` | required nonempty `criteria`; optional `llm`, `pass_threshold` | Managed semantic quality; declared alias and all calls share actual admission |
 | `builtin.evidence` | required `assertion` path matcher; optional upstream `validator` | Pure current context or eligible upstream metrics; no ambient I/O |
@@ -66,6 +66,8 @@ Built-in adapter configuration is strict:
 | Custom named adapter | installed implementation's validated config | Versioned pure callback returning results, managed observation requests or a typed external wait |
 
 The optional validation shortcuts are `required`, `commands: [string]`, `diagnostics: {enabled, fail_on_error}` and `judge: {enabled, llm, pass_threshold, criteria}`. They do not create separate executors. Prefer named checks when referring to exact IDs, schedules and dependencies.
+
+A command check's optional `timeout_ms` is part of its exact requested operation and must be positive and within the tool timeout range. When a fixed host binding is used, include the same value in its authorized arguments. The command and shared executor still apply the current policy, classification, recovery and task/check deadlines, so a stricter effective limit can shorten the attempt. Omitting it retains the command tool's existing 30000 ms request default; changing only the policy ceiling does not increase that default.
 
 Each lifecycle stage has required `id`; optional `instruction`, `completion`, `commands`, `validation`, `suggested_tools`, `required_before_tools`, `retry_on_failure`, `on_failure_stage`, and `max_fix_cycles`. Stages are required by default. Suggested tools do not grant them; required-before-tool constraints are enforced. Repair targets must name an existing earlier stage and their cycle allowance is bounded. A passing task gate cannot skip required validation/review stages. This is ordered lifecycle control, not a DAG language.
 

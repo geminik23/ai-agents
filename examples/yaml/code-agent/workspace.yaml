@@ -10,6 +10,8 @@ description: "Host-bound code task for one selected workspace file and a trusted
 # Set WORKSPACE, SOURCE and CHECKER to those paths before using these commands from the repository root:
 #   cargo run --manifest-path examples/Cargo.toml -p example-code-agent --bin code-agent-setup --offline -- check-workspace "$WORKSPACE" "$SOURCE" "$CHECKER" openai gpt-5.4-mini
 #   cargo run --manifest-path examples/Cargo.toml -p example-code-agent --bin code-agent-setup --offline -- run-workspace --trust-checker --share-source "$WORKSPACE" "$SOURCE" "$CHECKER" openai gpt-5.4-mini
+# Optionally append --max-output-tokens N and --checker-timeout-ms N for the selected model and checker.
+# Omitted output and checker settings use 2000 tokens and 30000 ms; other applicable limits still apply.
 # In the interactive session, use /task run followed by the requested objective.
 # Configuration checks never construct a provider; a live run sends selected content to the chosen provider and may cost money.
 # NOTE: The host does not sandbox commands, prove checker independence or protect an untrusted project.
@@ -83,5 +85,7 @@ autonomy:
         config: {command: code-agent-host-binding-required, cwd: ., host_binding: workspace-checker}
   # An incomplete or unavailable check never establishes task completion.
   completion: {validator_passed: acceptance}
-  # Stop incomplete if the model ends before the check passes; default: continue.
-  premature_finish: {action: summarize_and_stop}
+  # Ask for guidance when a failed or declined check reaches the controller as incomplete.
+  # A checker unavailable during admission can instead return an error and require host cleanup.
+  # The host does not automatically send checker output to the model; provide relevant details explicitly.
+  premature_finish: {action: ask_user, on_unavailable: stop}
