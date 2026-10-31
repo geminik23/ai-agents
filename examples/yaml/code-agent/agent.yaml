@@ -1,0 +1,84 @@
+name: CodeAgentSetup
+version: "1.0.0"
+description: "Host-bound command-only code task for an isolated Rust sample project"
+
+# Development-only code task; Rust binds the workspace, tool policies and verifier.
+# Flow: prepare sample project -> bind paths and instructions -> run offline task -> verify actual effects.
+# The offline provider uses scripted replies, not live model reasoning.
+# Prerequisites: Linux/WSL, cached Rust dependencies, and trusted co-located cargo and rustc binaries.
+# Set CARGO_BIN and RUSTC_BIN to the absolute paths printed by rustup which cargo and rustup which rustc.
+# Usage from the repository root; choose a new /tmp path if this one already exists:
+#   cargo run --manifest-path examples/Cargo.toml -p example-code-agent --bin code-agent-setup --offline -- prepare /tmp/code-agent-sample
+#   cargo run --manifest-path examples/Cargo.toml -p example-code-agent --bin code-agent-setup --offline -- check-config /tmp/code-agent-sample "$CARGO_BIN" "$RUSTC_BIN"
+#   cargo run --manifest-path examples/Cargo.toml -p example-code-agent --bin code-agent-setup --offline -- run-offline /tmp/code-agent-sample "$CARGO_BIN" "$RUSTC_BIN"
+# NOTE: This sample-only host is not an OS sandbox or a production restart host.
+# NOTE: Its verifier accepts only the original source or its exact reviewed correction.
+# The offline host supplies its own provider; config validation does not construct one.
+# Omitted tool_choice keeps legacy prompt-JSON; tool_choice: none would disable tool calls.
+llm: {provider: openai, model: gpt-5.4-mini}
+
+# The host supplies one instruction snapshot and canonical paths; no discovery or refresh is automatic.
+# Runtime values are required here; required defaults to false and no value is supplied by default.
+context:
+  instruction_snapshot:
+    type: runtime
+    required: true
+  workspace_root:
+    type: runtime
+    required: true
+  source_file:
+    type: runtime
+    required: true
+
+# Project instructions guide the model but cannot expand the host's tool permissions.
+system_prompt: |
+  Inspect the relevant source before editing, change only the requested behavior, and rely on current validation evidence.
+  Authorized workspace: {{ context.workspace_root }}
+  Only editable source file: {{ context.source_file }}
+  Project instructions supplied by the host:
+  {{ context.instruction_snapshot }}
+
+# Limit the task to reading, editing and the host's fixed validation command.
+# Omitted top-level tools grant no ordinary model-callable tools.
+# The offline run makes a real sample-project edit and starts a local process.
+tools: [file_read, file_edit, command]
+
+# Empty write and cwd grants deny execution until the host binds exact paths.
+# An empty read filter alone is not a deny-all rule; do not run this file without the host.
+# This disposable sample skips default approval, but policy and final admission still apply.
+tool_security:
+  enabled: true      # Enforce tool policy; default: false.
+  fail_closed: true  # Reject missing policy bindings; default: false.
+  tools:
+    file_read: {read_paths: []}
+    # Require a prior file read before an edit; default: false.
+    # The host permits this sample edit without confirmation; default: false.
+    file_edit: {read_paths: [], write_paths: [], require_read_before_write: true, allow_without_confirmation: true}
+    command:
+      # Both lists default to empty; the host binds an exact argv and working directory.
+      allowed_commands: []
+      working_dirs: []
+      deny_shell: true        # Reject shell syntax; default: true.
+      deny_interactive: true  # Reject interactive commands; default: true.
+      timeout_ms: 30000       # Bound one attempt in ms; unset uses global 30000.
+      max_output_chars: 16000 # Bound model-visible output; tool default: 20000.
+      # No environment is inherited automatically; this allows no requested variables by default.
+      env_passthrough: []
+      allow_without_confirmation: true # Skip default approval for this fixed command; default: false.
+
+# Opt in to a bounded profile; the host still starts the task explicitly.
+# Omitted settings keep their resolved framework defaults.
+autonomy:
+  enabled: true        # Enable this task profile; default: false.
+  max_turns: 8         # Maximum work cycles; resolved default: 30.
+  max_llm_calls: 20    # Shared model-call allowance; resolved default: 60.
+  max_command_calls: 8 # Shared command allowance; resolved default: 10.
+  # Checks are absent by default; the host replaces this placeholder with the exact verifier recipe.
+  validation:
+    checks:
+      - id: acceptance
+        adapter: builtin.command
+        config: {command: code-agent-host-binding-required, cwd: .}
+  # No completion gate is configured by default; require a passing check and an executed edit here.
+  # The Rust host separately verifies the edit's mutation receipt.
+  completion: {all: [{validator_passed: acceptance}, {tool_called: {id: file_edit, executed: true, success: true}}]}

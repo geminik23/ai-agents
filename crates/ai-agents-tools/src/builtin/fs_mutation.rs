@@ -1377,11 +1377,35 @@ fn enforce_read_before_write(
     }
 }
 
+// Preserve ordinary Unix permission bits before writing; refuse special bits rather than silently changing privilege semantics.
 fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    #[cfg(unix)]
+    let original_mode = {
+        use std::os::unix::fs::PermissionsExt;
+        match fs::metadata(path) {
+            Ok(metadata) => {
+                let mode = metadata.permissions().mode();
+                if mode & 0o7000 != 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "atomic replacement of files with special permission bits is unsupported",
+                    ));
+                }
+                Some(mode & 0o777)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        }
+    };
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let temp = parent.join(format!(".{}.tmp", Uuid::new_v4()));
     let result = (|| {
         let mut file = fs::File::create(&temp)?;
+        #[cfg(unix)]
+        if let Some(mode) = original_mode {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(fs::Permissions::from_mode(mode))?;
+        }
         file.write_all(bytes)?;
         file.sync_all()?;
         fs::rename(&temp, path)
@@ -3175,6 +3199,91 @@ mod tests {
 
     fn result_json(result: &ToolResult) -> Value {
         serde_json::from_str(&result.output).unwrap()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn file_edit_preserves_existing_executable_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("script.sh");
+        fs::write(&path, "old\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        let result = FileEditTool::new()
+            .execute(
+                serde_json::json!({
+                    "path": path.to_string_lossy(),
+                    "old_text": "old",
+                    "new_text": "new",
+                    "dry_run": false
+                }),
+                mutation_context("file_edit", dir.path()),
+            )
+            .await;
+        assert!(result.success, "{}", result.output);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "new\n");
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn file_edit_refuses_existing_special_mode_without_mutation() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("special.txt");
+        fs::write(&path, "old\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o1700)).unwrap();
+        let result = FileEditTool::new()
+            .execute(
+                serde_json::json!({
+                    "path": path.to_string_lossy(),
+                    "old_text": "old",
+                    "new_text": "new",
+                    "dry_run": false
+                }),
+                mutation_context("file_edit", dir.path()),
+            )
+            .await;
+        assert!(!result.success);
+        assert!(result.output.contains("special permission bits"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "old\n");
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o7777,
+            0o1700
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn file_write_preserves_existing_private_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("private.txt");
+        fs::write(&path, "old\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let result = FileWriteTool::new()
+            .execute(
+                serde_json::json!({
+                    "path": path.to_string_lossy(),
+                    "content": "new\n",
+                    "overwrite": true,
+                    "dry_run": false
+                }),
+                mutation_context("file_write", dir.path()),
+            )
+            .await;
+        assert!(result.success, "{}", result.output);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "new\n");
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     #[tokio::test]

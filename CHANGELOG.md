@@ -3,6 +3,7 @@
 ## Unreleased
 
 ### Added
+- Code agent example: run the scripted sample or connect a selected workspace file and provider to an approved host-owned checker
 - Task evaluation: development typed operations and foreground child decisions share configured hosts, exact continuation, isolated domain bindings and bounded redacted results without replacing the parent's response
 - Task observability: development task lifecycle facts carry run, profile and stage attribution through existing aggregation without replacing authoritative invocation accounting
 - Task TUI: development terminal sessions share task hosting and exact human decisions with the plain frontend, show bounded task evidence and retain original work through acknowledged shutdown
@@ -62,6 +63,7 @@
 - Rust configuration compatibility: typed autonomy fields, validation driver bounds and objective-bound todo identities require affected struct literals to be updated; these development additions are not the published stable API
 
 ### Fixed
+- File mutation: preserve ordinary Unix permission bits and refuse special permission bits during atomic replacement
 - Command output: preserve bounded error tails and structured exit results when command logs exceed output limits
 - File editing: show accurate authorized previews and mismatch hints, and refuse writes when the effect cannot be reported
 - Default agent logging: omit message, response, tool argument and tool or skill failure text while preserving trusted hook records

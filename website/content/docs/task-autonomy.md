@@ -48,6 +48,8 @@ Changing a profile, stage order or completion policy normally requires YAML chan
 
 No profile universally requires tools, todos, filesystem access or SQLite. A requested capability must actually be installed. Registration, model-call source labels and approval do not bypass scope, policy, resource admission or current implementation bindings.
 
+The development `yaml/code-agent/agent.yaml` and `rust/code-agent` host provide a scripted offline task against a reviewed sample project. A separate `workspace.yaml` profile binds an explicitly selected workspace file, provider and host-only checker. The workspace profile requires approval for edits and checker execution, but the host cannot certify the checker, prevent concurrent untrusted replacement or sandbox the process. The caller must supply an independent trusted checker and any required isolation. Live model use sends selected content to the provider and may incur cost; see the examples catalog for consent and setup requirements.
+
 ## 2. Bind application meaning, not a new framework gate
 
 A support gate such as `completion: {validator_passed: records}` is meaningful only after an actual `host.records` implementation has been installed. The application owns ticket state, source identity, report schema or world revision; the controller owns evidence eligibility and completion.
