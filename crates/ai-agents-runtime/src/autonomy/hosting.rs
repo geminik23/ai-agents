@@ -229,6 +229,8 @@ pub enum TaskHostPrompt {
     Approval {
         message: String,
         context: Value,
+        /// The exact retained trigger is trusted-host review data, not an execution permit.
+        trigger: Value,
     },
     Question(ai_agents_tools::QuestionRequest),
     Continue,
@@ -598,6 +600,7 @@ impl AutonomyRunner {
 }
 
 // Only known framework prompt schemas are projected; traversal preserves the outer response identity and never copies executable cursor state.
+// The retained trigger lets a trusted host review the exact request without turning it into new authority.
 fn prompt(pending: &TaskPendingRequest, settings: &AutonomyProfile) -> Result<TaskHostPrompt> {
     let mut leaf = pending.clone();
     for _ in 0..32 {
@@ -620,6 +623,7 @@ fn prompt(pending: &TaskPendingRequest, settings: &AutonomyProfile) -> Result<Ta
             return Ok(TaskHostPrompt::Approval {
                 message: approval.message,
                 context: approval.context,
+                trigger: approval.trigger,
             });
         }
         if value.get("proposal").is_some() {

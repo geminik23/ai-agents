@@ -336,8 +336,17 @@ impl Tool for FileWriteTool {
         let version = if input.dry_run {
             None
         } else {
-            if let Err(error) = atomic_write(&path, input.content.as_bytes()) {
-                return ToolResult::error(format!("Write error: {}", error));
+            if exists {
+                if let Err(error) = atomic_write(&path, input.content.as_bytes()) {
+                    return ToolResult::error(format!("Write error: {}", error));
+                }
+            } else if let Err(error) = atomic_create(&path, input.content.as_bytes()) {
+                let message = format!("Write error: {}", error.error);
+                return if error.uncertain {
+                    ToolResult::error_with_uncertain_effect(message)
+                } else {
+                    ToolResult::error(message)
+                };
             }
             match file_version_evidence(&path, input.content.as_bytes()) {
                 Ok(version) => {
@@ -1460,6 +1469,78 @@ fn create_atomic_temp(parent: &Path, restricted: bool) -> std::io::Result<(fs::F
     #[cfg(not(unix))]
     let _ = restricted;
     Ok((options.open(&temp)?, temp))
+}
+
+// A published destination or a failed temporary cleanup must remain distinct from a known no-effect failure.
+#[derive(Debug)]
+struct AtomicCreateError {
+    error: std::io::Error,
+    uncertain: bool,
+}
+
+// Publish a complete new file without replacing an entry created after the caller's existence check.
+// Filesystems that cannot link the temporary file fail closed instead of falling back to replacement.
+fn atomic_create(path: &Path, bytes: &[u8]) -> Result<fs::Metadata, AtomicCreateError> {
+    atomic_create_with_cleanup(path, bytes, |temp| fs::remove_file(temp))
+}
+
+// Injecting cleanup also makes the post-publication failure boundary testable without changing filesystem permissions.
+fn atomic_create_with_cleanup(
+    path: &Path,
+    bytes: &[u8],
+    cleanup: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> Result<fs::Metadata, AtomicCreateError> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let (mut file, temp) =
+        create_atomic_temp(parent, false).map_err(|error| AtomicCreateError {
+            error,
+            uncertain: false,
+        })?;
+    let result = (|| {
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        let metadata = file.metadata()?;
+        drop(file);
+        fs::hard_link(&temp, path)?;
+        Ok(metadata)
+    })();
+    match result {
+        Ok(metadata) => match cleanup(&temp) {
+            Ok(()) => Ok(metadata),
+            Err(error) => Err(AtomicCreateError {
+                error: std::io::Error::new(
+                    error.kind(),
+                    format!(
+                        "destination was created but temporary-file cleanup failed for {:?}: {error}",
+                        temp
+                    ),
+                ),
+                uncertain: true,
+            }),
+        },
+        Err(error) => match cleanup(&temp) {
+            Ok(()) => Err(AtomicCreateError {
+                error,
+                uncertain: false,
+            }),
+            Err(cleanup) if cleanup.kind() == std::io::ErrorKind::NotFound => {
+                Err(AtomicCreateError {
+                    error,
+                    uncertain: false,
+                })
+            }
+            Err(cleanup) => Err(AtomicCreateError {
+                error: std::io::Error::new(
+                    error.kind(),
+                    format!(
+                        "{error}; temporary-file cleanup failed for {:?}: {cleanup}",
+                        temp
+                    ),
+                ),
+                uncertain: true,
+            }),
+        },
+    }
 }
 
 // Preserve ordinary Unix mode bits without exposing an initially broader temporary file.
@@ -3399,6 +3480,44 @@ mod tests {
             fs::metadata(&path).unwrap().permissions().mode() & 0o7777,
             0o1700
         );
+    }
+
+    #[test]
+    fn atomic_create_never_replaces_an_entry_created_before_publication() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("new.txt");
+        fs::write(&path, "user content").unwrap();
+        let error = atomic_create(&path, b"agent content").unwrap_err();
+        assert_eq!(error.error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert!(!error.uncertain);
+        assert_eq!(fs::read(&path).unwrap(), b"user content");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn atomic_create_reports_uncertainty_when_cleanup_fails_after_publication() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("new.txt");
+        let error = atomic_create_with_cleanup(&path, b"published content", |_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "fixture cleanup failure",
+            ))
+        })
+        .unwrap_err();
+        assert!(error.uncertain);
+        assert!(error.error.to_string().contains("destination was created"));
+        assert_eq!(fs::read(&path).unwrap(), b"published content");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn atomic_create_publishes_complete_content_and_cleans_temporary_entry() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("new.txt");
+        atomic_create(&path, b"complete content").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"complete content");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
     #[cfg(unix)]

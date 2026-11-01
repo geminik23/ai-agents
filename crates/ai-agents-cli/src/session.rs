@@ -410,6 +410,14 @@ impl FrontendSession {
         rx.await.context("output flush was not acknowledged")
     }
 
+    // Host-only observations must not prevent foreground shutdown; dropping them does not cancel task work.
+    pub(crate) async fn observe<T>(&mut self, observation: impl Future<Output = T>) -> Option<T> {
+        tokio::select! {
+            result = observation => Some(result),
+            _ = &mut self.interrupt => None,
+        }
+    }
+
     pub(crate) async fn next_line(&mut self) -> Result<Option<String>> {
         if let Some(line) = self.queued.pop_front() {
             return Ok(Some(line));
@@ -858,10 +866,24 @@ fn diagnostic(text: String, json_mode: bool) -> Output {
 fn render_task_prompt(prompt: &TaskPrompt) -> String {
     let i = &prompt.interaction;
     let description = match &i.prompt {
-        TaskHostPrompt::Approval { message, context } => {
+        TaskHostPrompt::Approval {
+            message,
+            context,
+            trigger,
+        } => {
+            let review = json!({"trigger":trigger,"context":context});
+            let unavailable = match serde_json::to_string_pretty(&review) {
+                Ok(text) => text.chars().count() > 16_384,
+                Err(_) => true,
+            };
             format!(
-                "Approval: {message}\n{}\nEnter yes / no, or JSON {{\"changes\":{{...}}}}",
-                approval_context(context)
+                "Approval: {message}\n{}{}\nEnter yes / no, or JSON {{\"changes\":{{...}}}}",
+                approval_context(&review),
+                if unavailable {
+                    "\n[approval is unavailable: reject, stop or cancel]"
+                } else {
+                    ""
+                },
             )
         }
         TaskHostPrompt::Question(q) => format!(
@@ -1136,6 +1158,19 @@ fn respond(
         }
     }
 }
+// Local approval requires the whole retained trigger and context to fit the displayed review.
+fn require_complete_approval(
+    context: &Value,
+    trigger: &Value,
+    result: &ApprovalResult,
+) -> Result<()> {
+    let review = serde_json::to_string_pretty(&json!({"trigger":trigger,"context":context}))?;
+    if review.chars().count() > 16_384 && !matches!(result, ApprovalResult::Rejected { .. }) {
+        bail!("approval details exceed the review limit; reject, stop or cancel instead");
+    }
+    Ok(())
+}
+
 fn response_operation(prompt: &TaskPrompt, line: &str) -> Result<TaskStreamOperation> {
     let i = &prompt.interaction;
     let base = |input| TaskStreamOperation::Resume {
@@ -1197,6 +1232,16 @@ fn response_operation(prompt: &TaskPrompt, line: &str) -> Result<TaskStreamOpera
                 target_revision: value["target_revision"].as_str().map(str::to_owned),
                 payload: value.get("payload").cloned().unwrap_or(Value::Null),
             }))
+        }
+        TaskHostPrompt::Approval {
+            context, trigger, ..
+        } => {
+            let result = approval(line)?;
+            require_complete_approval(context, trigger, &result)?;
+            base(TaskResumeInput::Approval {
+                request_id: i.request_id.clone(),
+                result,
+            })
         }
         TaskHostPrompt::ValidationObservation => {
             if let Ok(result) = approval(line) {
@@ -1533,6 +1578,32 @@ mod tests {
             );
             assert!(output.try_recv().is_err());
         }
+    }
+
+    #[tokio::test]
+    async fn interrupt_stops_host_observation_before_task_admission() {
+        let (mut io, _input, _output) = FrontendSession::embedded();
+        io.interrupt = Box::pin(async { Ok(()) });
+        let result = io.observe(std::future::pending::<()>()).await;
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn truncated_approval_cannot_be_accepted_or_modified() {
+        let context = json!({});
+        let trigger =
+            json!({"type":"tool","name":"file_write","args":{"content":"x".repeat(20_000)}});
+        assert!(
+            require_complete_approval(&context, &trigger, &ApprovalResult::approved()).is_err()
+        );
+        assert!(
+            require_complete_approval(&context, &trigger, &ApprovalResult::rejected(None)).is_ok()
+        );
+        let small = json!({"type":"tool","name":"file_edit","args":{"path":"source.rs"}});
+        assert!(require_complete_approval(&context, &small, &ApprovalResult::approved()).is_ok());
+        assert!(
+            approval_context(&json!({"trigger":small,"context":context})).contains("source.rs")
+        );
     }
 
     #[test]

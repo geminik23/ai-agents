@@ -104,6 +104,9 @@ fn workspace_check_is_provider_free_and_live_mode_requires_explicit_consent() {
         .arg("offline-test")
         .arg("--file")
         .arg("second.rs")
+        .arg("--new-file")
+        .arg("created.rs")
+        .arg("--assume-exclusive-workspace")
         .arg("--allow-discovery")
         .arg("--max-output-tokens")
         .arg("4096")
@@ -120,8 +123,12 @@ fn workspace_check_is_provider_free_and_live_mode_requires_explicit_consent() {
         String::from_utf8_lossy(&checked.stdout)
             .contains("without constructing a provider or running the checker")
     );
-    assert!(String::from_utf8_lossy(&checked.stdout).contains("Selected source files: 2"));
+    assert!(String::from_utf8_lossy(&checked.stdout).contains("Selected source files: 3"));
+    assert!(!workspace.join("created.rs").exists());
     assert!(String::from_utf8_lossy(&checked.stdout).contains("Workspace discovery enabled: true"));
+    assert!(
+        String::from_utf8_lossy(&checked.stdout).contains("Cooperative revision assumed: true")
+    );
     assert!(String::from_utf8_lossy(&checked.stdout).contains("Maximum model output tokens: 4096"));
     assert!(String::from_utf8_lossy(&checked.stdout).contains("Checker timeout: 45000 ms"));
     assert!(!marker.exists());
@@ -172,6 +179,33 @@ fn workspace_check_is_provider_free_and_live_mode_requires_explicit_consent() {
     assert!(
         String::from_utf8_lossy(&duplicate.stderr).contains("must not be selected more than once")
     );
+    assert!(!marker.exists());
+    let existing_new_file = Command::new(executable)
+        .env_clear()
+        .arg("check-workspace")
+        .arg(&workspace)
+        .args(["source.rs"])
+        .arg(&checker)
+        .args(["openai", "offline-test", "--new-file", "second.rs"])
+        .output()
+        .unwrap();
+    assert!(!existing_new_file.status.success());
+    assert!(String::from_utf8_lossy(&existing_new_file.stderr).contains("already exists"));
+    let read_only_create = Command::new(executable)
+        .env_clear()
+        .arg("check-read-only")
+        .arg(&workspace)
+        .args([
+            "source.rs",
+            "openai",
+            "offline-test",
+            "--new-file",
+            "created.rs",
+        ])
+        .output()
+        .unwrap();
+    assert!(!read_only_create.status.success());
+    assert!(!workspace.join("created.rs").exists());
     assert!(!marker.exists());
     for flag in ["--max-output-tokens", "--checker-timeout-ms"] {
         let invalid = Command::new(executable)

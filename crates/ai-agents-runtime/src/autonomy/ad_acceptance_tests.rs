@@ -148,6 +148,91 @@ fn runner(agent: Arc<RuntimeAgent>, cap: u32) -> (AutonomyRunner, Arc<ScopedTask
     (runner, store)
 }
 
+struct CleanupResultTool {
+    uncertain: bool,
+}
+
+#[async_trait]
+impl ai_agents_core::Tool for CleanupResultTool {
+    fn id(&self) -> &str {
+        "cleanup_result"
+    }
+    fn name(&self) -> &str {
+        "cleanup_result"
+    }
+    fn description(&self) -> &str {
+        "Report a fixture tool failure"
+    }
+    fn input_schema(&self) -> serde_json::Value {
+        serde_json::json!({"type":"object"})
+    }
+    async fn execute(
+        &self,
+        _: serde_json::Value,
+        _: ai_agents_core::ToolExecutionContext,
+    ) -> ai_agents_core::ToolResult {
+        if self.uncertain {
+            ai_agents_core::ToolResult::error_with_uncertain_effect(
+                "fixture cleanup not acknowledged",
+            )
+        } else {
+            ai_agents_core::ToolResult::error("known effect-free fixture error")
+        }
+    }
+}
+
+// A returned cleanup uncertainty retains the same owner and reservation as an interrupted tool effect.
+#[tokio::test]
+async fn returned_uncertain_tool_effect_cannot_become_task_completion() {
+    let provider = Provider::new(
+        &[r#"{"tool":"cleanup_result","arguments":{}}"#, "done"],
+        false,
+    );
+    let agent = Arc::new(
+        crate::AgentBuilder::new()
+            .system_prompt("Use the tool.")
+            .llm(provider.clone())
+            .tool(Arc::new(CleanupResultTool { uncertain: true }))
+            .build()
+            .unwrap(),
+    );
+    let (runner, store) = runner(agent.clone(), 4);
+    let result = runner.run("perform the task", None).await.unwrap();
+    assert_eq!(result.run.status, TaskRunStatus::RecoveryRequired);
+    assert!(agent.chat("foreign").await.is_err());
+    let snapshot = store.load(&result.run.key.run_id).await.unwrap().unwrap();
+    let payload: crate::autonomy::TaskCheckpointPayload =
+        serde_json::from_value(snapshot.payload).unwrap();
+    assert!(
+        payload
+            .reservations
+            .iter()
+            .any(|item| item.state == TaskEffectState::Uncertain)
+    );
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+}
+
+// A normal returned tool error remains eligible for the existing controller policy rather than forcing recovery.
+#[tokio::test]
+async fn known_effect_free_tool_error_does_not_force_recovery() {
+    let provider = Provider::new(
+        &[r#"{"tool":"cleanup_result","arguments":{}}"#, "done"],
+        false,
+    );
+    let agent = Arc::new(
+        crate::AgentBuilder::new()
+            .system_prompt("Use the tool.")
+            .llm(provider.clone())
+            .tool(Arc::new(CleanupResultTool { uncertain: false }))
+            .build()
+            .unwrap(),
+    );
+    let (runner, _store) = runner(agent, 4);
+    let result = runner.run("perform the task", None).await.unwrap();
+    assert_eq!(result.run.status, TaskRunStatus::Completed);
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+}
+
 // The ordinary same-actor freshness policy remains configured, but task completion additionally requires run-owned settlement.
 fn relationship_agent(mode: &str, main: Arc<Provider>, router: Arc<Provider>) -> RuntimeAgent {
     crate::AgentBuilder::from_yaml(&format!("name: Actor\nsystem_prompt: support\nllm:\n  default: default\n  router: router\nruntime:\n  optimization:\n    enabled: true\n    post_turn:\n      relationships:\n        mode: {mode}\n        await_before_next_turn: same_actor\nmemory:\n  relationships:\n    enabled: true\n    auto_update:\n      enabled: true\n      llm: router\n    persistence:\n      enabled: false\ntools: []\n")).unwrap().llm(main).llm_alias("router", router).auto_configure_features().unwrap().build().unwrap()

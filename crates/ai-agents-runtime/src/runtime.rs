@@ -6537,6 +6537,7 @@ impl RuntimeAgent {
     /// Reserves each actual task attempt after policy admission and rechecks original observation bounds and pinned host proof before first poll.
     /// Expiry before invocation settles as non-invocation; returned effects settle factually before continuing restrictions decide result eligibility.
     /// An ineligible acknowledged result cannot retry, fall back or supply completion credit, but its consumption and actual result remain auditable.
+    /// A returned uncertainty marker keeps effect custody even when the tool future itself completed.
     async fn execute_resolved_tool_once(
         &self,
         tool: Arc<dyn ai_agents_core::Tool>,
@@ -6783,17 +6784,21 @@ impl RuntimeAgent {
                         return Err(AgentError::TaskSuspended(id));
                     }
                     let result = result.unwrap_or_else(|error| ToolResult::error(error.to_string()));
+                    // A tool may report unfinished cleanup after returning; this can only narrow eligibility and retain effect custody.
+                    let effect_uncertain = invoked.load(Ordering::SeqCst) && result.has_uncertain_effect();
                     // Preserve the actual returned effect separately from its eligibility; a late ACK cannot renew this invocation.
                     let result_eligible = crate::autonomy::invocation::check_dispatched_invocation().is_ok()
                         && !self.runtime_control.emergency_deny.load(Ordering::SeqCst)
                         && (!managed || std::time::Instant::now() < invocation_deadline);
                     if let (Some(execution), Some(attempt)) = (&execution, &attempt) {
                         let settlement = if invoked.load(Ordering::SeqCst) { serde_json::to_value(&result)? } else { serde_json::json!({"not_invoked":true}) };
-                        Box::pin(execution.settle(attempt, settlement, false)).await?;
-                        execution.retire_completed_message(&self.info.id, attempt);
+                        Box::pin(execution.settle(attempt, settlement, effect_uncertain)).await?;
+                        if !effect_uncertain {
+                            execution.retire_completed_message(&self.info.id, attempt);
+                        }
                     }
-                    if let Some(custody) = &effect_custody { custody.store(false, Ordering::SeqCst); }
-                    let eligible = crate::autonomy::invocation::check_dispatched_invocation().is_ok()
+                    if !effect_uncertain && let Some(custody) = &effect_custody { custody.store(false, Ordering::SeqCst); }
+                    let eligible = !effect_uncertain && crate::autonomy::invocation::check_dispatched_invocation().is_ok()
                         && !self.runtime_control.emergency_deny.load(Ordering::SeqCst)
                         && (!managed || std::time::Instant::now() < invocation_deadline)
                         && result_eligible;

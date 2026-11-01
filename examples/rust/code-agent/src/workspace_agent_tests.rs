@@ -275,6 +275,7 @@ fn runner_with_extensions(
 ) -> AutonomyRunner {
     let mut builder = setup
         .builder()
+        .unwrap()
         .llm(provider)
         .auto_configure_features()
         .unwrap()
@@ -396,6 +397,7 @@ async fn workspace_configuration_is_narrow_and_provider_free() {
     assert!(matches!(denied, SecurityCheckResult::Block { .. }));
     setup
         .builder()
+        .unwrap()
         .auto_configure_features()
         .unwrap()
         .autonomy_extensions(setup.extensions().unwrap());
@@ -790,10 +792,409 @@ impl ai_agents::AgentHooks for WorkspaceRevision {
         Some(vec![])
     }
     async fn on_tool_execution_record(&self, record: &ai_agents::tools::ToolExecutionRecord) {
-        if record.canonical_id == "file_edit" && record.executed {
+        if matches!(record.canonical_id.as_str(), "file_edit" | "file_write") && record.executed {
             self.0.fetch_add(1, Ordering::SeqCst);
         }
     }
+}
+
+// A task can create and repair a selected new file while preserving the Git index and user work.
+#[tokio::test]
+async fn selected_new_file_and_repair_report_dirty_baseline() {
+    use ai_agents_cli::CliTaskObserver;
+    let sandbox = Sandbox::new();
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&sandbox.root)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git fixture failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    };
+    git(&["init", "--quiet"]);
+    git(&["add", "--", "source.rs", "protected.rs"]);
+    git(&[
+        "-c",
+        "user.name=Fixture",
+        "-c",
+        "user.email=fixture@example.invalid",
+        "-c",
+        "core.hooksPath=/dev/null",
+        "commit",
+        "--quiet",
+        "--no-gpg-sign",
+        "-m",
+        "fixture baseline",
+    ]);
+    fs::write(
+        &sandbox.source,
+        "#[path = \"feature.rs\"] mod feature;\npub fn value() -> i32 { 1 } // staged user note\n",
+    )
+    .unwrap();
+    git(&["add", "--", "source.rs"]);
+    let staged = git(&["--no-pager", "show", ":source.rs"]);
+    fs::write(&sandbox.source, "#[path = \"feature.rs\"] mod feature;\npub fn value() -> i32 { 1 } // staged user note + unstaged note\n").unwrap();
+    fs::write(&sandbox.outside, "unselected user change\n").unwrap();
+    fs::write(
+        sandbox.root.join("user-untracked.txt"),
+        "untracked user content\n",
+    )
+    .unwrap();
+    let feature = sandbox.root.join("feature.rs");
+    let mut setup = prepare_files_with_new(
+        &sandbox.root,
+        &[PathBuf::from("source.rs")],
+        &[PathBuf::from("feature.rs")],
+        &sandbox.checker,
+        "openai",
+        "offline-test",
+        None,
+    )
+    .unwrap();
+    setup.assume_exclusive_workspace().unwrap();
+    let harness = sandbox.parent.join("checker/acceptance.rs");
+    fs::write(&harness, format!("#[path = {:?}] mod candidate;\n#[test] fn expected_feature() {{ assert_eq!(candidate::value(), 4); }}\n", sandbox.source)).unwrap();
+    let checker = setup.checker.as_ref().unwrap();
+    // The checker fixture owns its harness and keeps the fixed executable unchanged.
+    assert_eq!(checker.bytes, checker_snapshot(&sandbox.checker).unwrap());
+    let revision = setup.guard.as_ref().unwrap().clone();
+    let extensions = setup.extensions().unwrap();
+    let provider = Arc::new(Provider::new(VecDeque::from([
+        json!({"tool":"file_read","arguments":{"path":sandbox.source}}).to_string(),
+        json!({"tool":"file_edit","arguments":{"path":sandbox.source,"old_text":"{ 1 }","new_text":"{ 1 + feature::delta() }"}}).to_string(),
+        json!({"tool":"file_write","arguments":{"path":feature,"content":"pub fn delta() -> i32 { 2 }\n"}}).to_string(),
+        json!({"tool":"file_read","arguments":{"path":feature}}).to_string(),
+        json!({"tool":"file_edit","arguments":{"path":feature,"old_text":"missing text","new_text":"replacement"}}).to_string(),
+        "Ready for checking.".into(),
+        json!({"tool":"file_read","arguments":{"path":feature}}).to_string(),
+        json!({"tool":"file_edit","arguments":{"path":feature,"old_text":"{ 2 }","new_text":"{ 3 }"}}).to_string(),
+        "Repair ready.".into(),
+        "Second task ready.".into(),
+    ])));
+    let runner = runner_with_extensions(&setup, provider.clone(), extensions, None);
+    let report = crate::workspace_report::WorkspaceReport::new(
+        sandbox.root.clone(),
+        setup.source_files().to_vec(),
+    );
+    report.before_task().await.unwrap();
+    let first = runner
+        .run("Add the feature and make the independent check pass.", None)
+        .await
+        .unwrap();
+    assert_eq!(first.run.status, TaskRunStatus::Paused);
+    let prompt = runner
+        .task_interaction(&first.run.key.run_id, first.run.revision)
+        .await
+        .unwrap()
+        .unwrap();
+    match &prompt.prompt {
+        TaskHostPrompt::Approval { trigger, .. } => {
+            assert_eq!(trigger["name"], "file_edit");
+            assert_eq!(trigger["args"]["path"], json!(sandbox.source));
+            assert_eq!(trigger["args"]["new_text"], "{ 1 + feature::delta() }");
+        }
+        _ => panic!("expected the actual edit approval"),
+    }
+    let create = respond(&runner, first, ApprovalResult::Approved).await;
+    assert_eq!(create.run.status, TaskRunStatus::Paused);
+    let create_prompt = runner
+        .task_interaction(&create.run.key.run_id, create.run.revision)
+        .await
+        .unwrap()
+        .unwrap();
+    match &create_prompt.prompt {
+        TaskHostPrompt::Approval { trigger, .. } => {
+            assert_eq!(trigger["name"], "file_write");
+            assert_eq!(trigger["args"]["path"], json!(feature));
+            assert_eq!(trigger["args"]["content"], "pub fn delta() -> i32 { 2 }\n");
+        }
+        _ => panic!("expected the actual create approval"),
+    }
+    let mismatch = respond(&runner, create, ApprovalResult::Approved).await;
+    assert_eq!(mismatch.run.status, TaskRunStatus::Paused);
+    let first_check = respond(&runner, mismatch, ApprovalResult::Approved).await;
+    assert_eq!(first_check.run.status, TaskRunStatus::Paused);
+    let repair = respond(&runner, first_check, ApprovalResult::Approved).await;
+    assert_eq!(repair.run.status, TaskRunStatus::Paused);
+    let final_check = respond(&runner, repair, ApprovalResult::Approved).await;
+    assert_eq!(final_check.run.status, TaskRunStatus::Paused);
+    let done = respond(&runner, final_check, ApprovalResult::Approved).await;
+    assert_eq!(
+        done.run.status,
+        TaskRunStatus::Completed,
+        "{:?}",
+        done.run.stop_reason
+    );
+    let exits: Vec<_> = done
+        .run
+        .evidence
+        .tool_calls
+        .iter()
+        .filter(|entry| entry.record.canonical_id == "command" && entry.record.executed)
+        .map(|entry| {
+            serde_json::from_str::<serde_json::Value>(&entry.record.output).unwrap()["exit_code"]
+                .as_i64()
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(exits.len(), 2);
+    assert_ne!(exits[0], 0);
+    assert_eq!(exits[1], 0);
+    assert_eq!(revision.revision().unwrap(), "8");
+    assert_eq!(git(&["--no-pager", "show", ":source.rs"]), staged);
+    assert!(
+        fs::read_to_string(&sandbox.source)
+            .unwrap()
+            .contains("staged user note + unstaged note")
+    );
+    assert_eq!(
+        fs::read_to_string(&sandbox.outside).unwrap(),
+        "unselected user change\n"
+    );
+    assert_eq!(
+        fs::read_to_string(sandbox.root.join("user-untracked.txt")).unwrap(),
+        "untracked user content\n"
+    );
+    assert_eq!(
+        fs::read_to_string(&feature).unwrap(),
+        "pub fn delta() -> i32 { 3 }\n"
+    );
+    let text = report.after_task(Some(&done)).await.unwrap();
+    assert!(
+        text.contains("Before task: 1 staged, 2 unstaged, 1 untracked"),
+        "{text}"
+    );
+    assert!(
+        text.contains("Recorded actual mutation receipts: 3; executed commands: 2"),
+        "{text}"
+    );
+    assert!(
+        text.contains("Existing \"source.rs\": index 'M', worktree 'M'"),
+        "{text}"
+    );
+    assert!(text.contains("Selected \"feature.rs\": changed bytes or existence; matching recorded task mutation: true"), "{text}");
+    assert!(text.contains("do not attribute every change"));
+    assert!(
+        provider
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .flatten()
+            .all(|message| !message.content.contains("untracked user content"))
+    );
+    report.before_task().await.unwrap();
+    let second = runner
+        .run("Verify the completed feature again.", None)
+        .await
+        .unwrap();
+    assert_eq!(second.run.status, TaskRunStatus::Paused);
+    let second_done = respond(&runner, second, ApprovalResult::Approved).await;
+    assert_eq!(second_done.run.status, TaskRunStatus::Completed);
+    assert_ne!(done.run.key.run_id, second_done.run.key.run_id);
+    let second_report = report.after_task(Some(&second_done)).await.unwrap();
+    assert!(second_report.contains("unchanged bytes"), "{second_report}");
+    assert!(
+        second_report.contains("Recorded actual mutation receipts: 0; executed commands: 1"),
+        "{second_report}"
+    );
+    report.before_task().await.unwrap();
+    let unavailable = report.after_task(None).await.unwrap();
+    assert!(unavailable.contains("effects and cleanup are unconfirmed"));
+    drop(runner);
+    sandbox.cleanup();
+}
+
+// The actual foreground REPL consumes the same workspace host, exact approvals and local report.
+#[tokio::test]
+async fn workspace_foreground_process_creates_repairs_and_reports() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    if std::env::var_os("CODE_AGENT_FOREGROUND_FIXTURE").is_some() {
+        let root = PathBuf::from(std::env::var_os("CODE_AGENT_FIXTURE_ROOT").unwrap());
+        let checker = PathBuf::from(std::env::var_os("CODE_AGENT_FIXTURE_CHECKER").unwrap());
+        let source = root.join("source.rs");
+        let feature = root.join("feature.rs");
+        let mut setup = prepare_files_with_new(
+            &root,
+            &[PathBuf::from("source.rs")],
+            &[PathBuf::from("feature.rs")],
+            &checker,
+            "openai",
+            "offline-test",
+            None,
+        )
+        .unwrap();
+        setup.assume_exclusive_workspace().unwrap();
+        let provider = Arc::new(Provider::new(VecDeque::from([
+            json!({"tool":"file_read","arguments":{"path":source}}).to_string(),
+            json!({"tool":"file_edit","arguments":{"path":source,"old_text":"{ 1 }","new_text":"{ 1 + feature::delta() }"}}).to_string(),
+            json!({"tool":"file_write","arguments":{"path":feature,"content":"pub fn delta() -> i32 { 2 }\n"}}).to_string(),
+            "Ready for checking.".into(),
+            json!({"tool":"file_read","arguments":{"path":feature}}).to_string(),
+            json!({"tool":"file_edit","arguments":{"path":feature,"old_text":"{ 2 }","new_text":"{ 3 }"}}).to_string(),
+            "Repair ready.".into(),
+        ])));
+        let agent = setup
+            .builder()
+            .unwrap()
+            .llm(provider)
+            .auto_configure_features()
+            .unwrap()
+            .autonomy_extensions(setup.extensions().unwrap())
+            .approval_handler(CliApprovalHandler::from_metadata(None))
+            .task_interaction_delivery(true)
+            .build_task_host()
+            .await
+            .unwrap();
+        workspace_repl(&setup, agent).run().await.unwrap();
+        return;
+    }
+
+    let sandbox = Sandbox::new();
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&sandbox.root)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "fixture Git failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    };
+    git(&["init", "--quiet"]);
+    git(&["add", "--", "source.rs", "protected.rs"]);
+    git(&[
+        "-c",
+        "user.name=Fixture",
+        "-c",
+        "user.email=fixture@example.invalid",
+        "-c",
+        "core.hooksPath=/dev/null",
+        "commit",
+        "--quiet",
+        "--no-gpg-sign",
+        "-m",
+        "fixture baseline",
+    ]);
+    fs::write(
+        &sandbox.source,
+        "#[path = \"feature.rs\"] mod feature;\npub fn value() -> i32 { 1 } // staged\n",
+    )
+    .unwrap();
+    git(&["add", "--", "source.rs"]);
+    let staged = git(&["--no-pager", "show", ":source.rs"]);
+    fs::write(&sandbox.source, "#[path = \"feature.rs\"] mod feature;\npub fn value() -> i32 { 1 } // staged and unstaged\n").unwrap();
+    fs::write(&sandbox.outside, "unselected user work\n").unwrap();
+    fs::write(sandbox.root.join("user.txt"), "untracked user work\n").unwrap();
+    fs::write(sandbox.parent.join("checker/acceptance.rs"), format!("#[path = {:?}] mod candidate;\n#[test] fn feature() {{ assert_eq!(candidate::value(), 4); }}\n", sandbox.source)).unwrap();
+
+    let mut child = tokio::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "workspace_agent::tests::workspace_foreground_process_creates_repairs_and_reports",
+            "--nocapture",
+        ])
+        .env_clear()
+        .env("CODE_AGENT_FOREGROUND_FIXTURE", "1")
+        .env("CODE_AGENT_FIXTURE_ROOT", &sandbox.root)
+        .env("CODE_AGENT_FIXTURE_CHECKER", &sandbox.checker)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let output = child.stdout.take().unwrap();
+    let process = async {
+        input
+            .write_all(b"/task run Add the feature.\nyes\nyes\nyes\nyes\nyes\n")
+            .await
+            .unwrap();
+        let mut lines = tokio::io::BufReader::new(output).lines();
+        let mut captured = String::new();
+        let mut quit_sent = false;
+        while let Some(line) = lines.next_line().await.unwrap() {
+            if line.contains("Workspace report for task") && !quit_sent {
+                input.write_all(b"/quit\n").await.unwrap();
+                quit_sent = true;
+            }
+            captured.push_str(&line);
+            captured.push('\n');
+        }
+        let status = child.wait().await.unwrap();
+        (status, captured, quit_sent)
+    };
+    let (status, output, quit_sent) =
+        tokio::time::timeout(std::time::Duration::from_secs(90), process)
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "foreground timed out; fixture retained at {}",
+                    sandbox.parent.display()
+                )
+            });
+    assert!(
+        status.success(),
+        "foreground failed; fixture retained at {}: {output}",
+        sandbox.parent.display()
+    );
+    assert!(quit_sent, "no workspace report: {output}");
+    assert!(
+        output.contains("file_write") && output.contains("feature.rs"),
+        "{output}"
+    );
+    assert!(
+        output.contains("Before task: 1 staged, 2 unstaged, 1 untracked"),
+        "{output}"
+    );
+    assert!(
+        output.contains("Recorded actual mutation receipts: 3; executed commands: 2"),
+        "{output}"
+    );
+    assert!(
+        output.contains("matching recorded task mutation: true"),
+        "{output}"
+    );
+    assert_eq!(git(&["--no-pager", "show", ":source.rs"]), staged);
+    assert!(
+        fs::read_to_string(&sandbox.source)
+            .unwrap()
+            .contains("staged and unstaged")
+    );
+    assert_eq!(
+        fs::read_to_string(&sandbox.outside).unwrap(),
+        "unselected user work\n"
+    );
+    assert_eq!(
+        fs::read_to_string(sandbox.root.join("user.txt")).unwrap(),
+        "untracked user work\n"
+    );
+    assert_eq!(
+        fs::read_to_string(sandbox.root.join("feature.rs")).unwrap(),
+        "pub fn delta() -> i32 { 3 }\n"
+    );
+    sandbox.cleanup();
 }
 
 // The same fixed checker can provide bounded failure feedback when its actual live revision is bound.
@@ -1613,6 +2014,7 @@ async fn target_bound_feedback_rejects_late_provider_result() {
     let agent = Arc::new(
         setup
             .builder()
+            .unwrap()
             .llm(provider.clone())
             .auto_configure_features()
             .unwrap()
@@ -2001,6 +2403,7 @@ async fn checker_feedback_never_retries_or_leaks_to_fallback_provider() {
     let agent = Arc::new(
         setup
             .builder()
+            .unwrap()
             .llm_registry(registry)
             .auto_configure_features()
             .unwrap()
@@ -2056,6 +2459,7 @@ async fn checker_feedback_stops_before_dispatch_when_hook_mutates() {
     let agent = Arc::new(
         setup
             .builder()
+            .unwrap()
             .llm(provider.clone())
             .auto_configure_features()
             .unwrap()
@@ -2109,6 +2513,7 @@ async fn inline_edit_rejection_does_not_trigger_automatic_checker_feedback() {
     let agent = Arc::new(
         setup
             .builder()
+            .unwrap()
             .llm(provider.clone())
             .auto_configure_features()
             .unwrap()
@@ -2251,6 +2656,7 @@ async fn configured_host_retains_the_real_task_and_checker_binding() {
     let setup = sandbox.setup();
     let agent = setup
         .builder()
+        .unwrap()
         .llm(scripted_provider(&setup, &sandbox.source))
         .auto_configure_features()
         .unwrap()

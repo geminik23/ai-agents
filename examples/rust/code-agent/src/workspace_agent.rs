@@ -3,6 +3,8 @@
 // The checker is trusted host code; the caller must provide any required isolation and independent tests.
 
 use crate::code_agent_workspace::command_word;
+use crate::workspace_guard::WorkspaceGuard;
+use crate::workspace_report::WorkspaceReport;
 use ai_agents::AgentBuilder;
 use ai_agents::autonomy::{AutonomyExtensions, HostRevisionSource, HostValidationBinding};
 use ai_agents::context::ContextSource;
@@ -36,6 +38,9 @@ pub struct WorkspaceSetup {
     root: PathBuf,
     source: PathBuf,
     sources: Vec<PathBuf>,
+    new_files: Vec<PathBuf>,
+    guard: Option<Arc<WorkspaceGuard>>,
+    cooperative_revision: bool,
     discovery_enabled: bool,
     checker: Option<CheckerBinding>,
 }
@@ -66,6 +71,34 @@ fn selected_file(root: &Path, relative: &Path) -> Result<PathBuf> {
     }
     if !fs::symlink_metadata(&path)?.file_type().is_file() {
         return Err("selected path must be a regular file".into());
+    }
+    Ok(path)
+}
+
+// A proposed new file must have existing non-symlinked parents and must not already exist at setup.
+fn selected_new_file(root: &Path, relative: &Path) -> Result<PathBuf> {
+    if relative.as_os_str().is_empty() || relative.is_absolute() {
+        return Err("new files must use nonempty paths relative to the workspace".into());
+    }
+    let components: Vec<_> = relative.components().collect();
+    let mut path = root.to_path_buf();
+    for (index, component) in components.iter().enumerate() {
+        let Component::Normal(part) = component else {
+            return Err("new file paths must contain only normal components".into());
+        };
+        path.push(part);
+        if index + 1 == components.len() {
+            match fs::symlink_metadata(&path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+                Ok(_) => return Err("new file path already exists".into()),
+            }
+        } else {
+            let metadata = fs::symlink_metadata(&path)?;
+            if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+                return Err("new file parent must be an existing non-symlinked directory".into());
+            }
+        }
     }
     Ok(path)
 }
@@ -135,9 +168,31 @@ pub fn prepare_files(
     model: &str,
     instruction_file: Option<&Path>,
 ) -> Result<WorkspaceSetup> {
+    prepare_files_with_new(
+        root,
+        sources,
+        &[],
+        checker,
+        provider,
+        model,
+        instruction_file,
+    )
+}
+
+// New paths can be read and edited only after this host has acknowledged their actual creation.
+pub fn prepare_files_with_new(
+    root: &Path,
+    sources: &[PathBuf],
+    new_files: &[PathBuf],
+    checker: &Path,
+    provider: &str,
+    model: &str,
+    instruction_file: Option<&Path>,
+) -> Result<WorkspaceSetup> {
     prepare_workspace(
         root,
         sources,
+        new_files,
         Some(checker),
         provider,
         model,
@@ -153,13 +208,14 @@ pub fn prepare_read_only(
     model: &str,
     instruction_file: Option<&Path>,
 ) -> Result<WorkspaceSetup> {
-    prepare_workspace(root, sources, None, provider, model, instruction_file)
+    prepare_workspace(root, sources, &[], None, provider, model, instruction_file)
 }
 
 // Resolve both declarations through the same path and provider checks without giving the read-only mode a checker.
 fn prepare_workspace(
     root: &Path,
     sources: &[PathBuf],
+    new_files: &[PathBuf],
     checker: Option<&Path>,
     provider: &str,
     model: &str,
@@ -174,6 +230,9 @@ fn prepare_workspace(
     }
     if sources.is_empty() {
         return Err("at least one source file must be selected".into());
+    }
+    if !new_files.is_empty() && !cfg!(unix) {
+        return Err("new-file ownership is supported only on Unix".into());
     }
     let mut selected = Vec::with_capacity(sources.len());
     for source in sources {
@@ -192,6 +251,16 @@ fn prepare_workspace(
         selected.push(source);
     }
     let source = selected[0].clone();
+    let existing_count = selected.len();
+    let mut selected_new = Vec::with_capacity(new_files.len());
+    for relative in new_files {
+        let path = selected_new_file(&root, relative)?;
+        if selected.contains(&path) || selected_new.contains(&path) {
+            return Err("source files must not be selected more than once".into());
+        }
+        selected_new.push(path);
+    }
+    selected.extend(selected_new.iter().cloned());
     let checker = checker
         .map(|path| {
             let path = fs::canonicalize(path)?;
@@ -225,6 +294,8 @@ fn prepare_workspace(
         .map(|source| command_word(source))
         .collect::<Result<Vec<_>>>()?;
     let source_string = source_strings[0].clone();
+    let existing_strings = source_strings[..existing_count].to_vec();
+    let new_strings = source_strings[existing_count..].to_vec();
     let checker = checker
         .map(|(path, bytes)| {
             let mut argv = vec![command_word(&path)?, root_string.clone()];
@@ -265,6 +336,31 @@ fn prepare_workspace(
             .ok_or("missing file_edit policy")?;
         edit.read_paths = source_strings.clone();
         edit.write_paths = source_strings.clone();
+        if !selected_new.is_empty() {
+            let create_paths = selected_new
+                .iter()
+                .map(|path| command_word(path))
+                .collect::<Result<Vec<_>>>()?;
+            spec.tools
+                .as_mut()
+                .ok_or("missing tool grants")?
+                .push(serde_json::from_value(json!("file_write"))?);
+            spec.tool_security.tools.insert(
+                "file_write".into(),
+                serde_json::from_value(json!({
+                    "write_paths": create_paths,
+                    "overwrite_existing": false,
+                    "create_parent_dirs": false,
+                    "require_confirmation": true
+                }))?,
+            );
+        }
+        match spec.context.get_mut("create_files") {
+            Some(ContextSource::Runtime { default, .. }) => {
+                *default = Some(json!(serde_json::to_string(&new_strings)?));
+            }
+            _ => return Err("missing create_files context".into()),
+        }
         let policy = spec
             .tool_security
             .tools
@@ -291,7 +387,7 @@ fn prepare_workspace(
     for (key, value) in [
         ("workspace_root", root_string),
         ("source_file", source_string),
-        ("source_files", serde_json::to_string(&source_strings)?),
+        ("source_files", serde_json::to_string(&existing_strings)?),
         ("discovery_scope", "disabled".into()),
         ("instruction_snapshot", snapshot),
     ] {
@@ -303,18 +399,39 @@ fn prepare_workspace(
         }
     }
     spec.validate()?;
+    let guard = (!selected_new.is_empty())
+        .then(|| WorkspaceGuard::new(root.clone(), selected.clone(), selected_new.clone()));
     Ok(WorkspaceSetup {
         spec,
         task_iteration_policy,
         root,
         source,
         sources: selected,
+        new_files: selected_new,
+        guard,
+        cooperative_revision: false,
         discovery_enabled: false,
         checker,
     })
 }
 
 impl WorkspaceSetup {
+    // The caller is responsible for synchronizing every external checker input for the whole session.
+    pub fn assume_exclusive_workspace(&mut self) -> Result<()> {
+        if self.checker.is_none() {
+            return Err("read-only mode has no validation target".into());
+        }
+        if self.guard.is_none() {
+            self.guard = Some(WorkspaceGuard::new(
+                self.root.clone(),
+                self.sources.clone(),
+                self.new_files.clone(),
+            ));
+        }
+        self.cooperative_revision = true;
+        Ok(())
+    }
+
     // Explicit opt-in permits path discovery and content search under the root, but never widens file_read or write grants.
     pub fn enable_discovery(&mut self) -> Result<()> {
         let root = command_word(&self.root)?;
@@ -416,16 +533,27 @@ impl WorkspaceSetup {
         }
     }
 
-    pub fn builder(&self) -> AgentBuilder {
-        AgentBuilder::from_prepared_spec(PreparedAgentSpec::new(
+    pub fn builder(&self) -> Result<AgentBuilder> {
+        let builder = AgentBuilder::from_prepared_spec(PreparedAgentSpec::new(
             self.spec.clone(),
             self.task_iteration_policy.clone(),
-        ))
+        ));
+        Ok(match &self.guard {
+            Some(guard) => builder.tools(guard.registry()?),
+            None => builder,
+        })
     }
 
     // A fixed host-only validation binding cannot become an ordinary model-callable command grant.
     pub fn extensions(&self) -> ai_agents::Result<AutonomyExtensions> {
-        self.extensions_with_target(None)
+        let target = if self.cooperative_revision {
+            self.guard
+                .as_ref()
+                .map(|guard| ("workspace", guard.clone() as Arc<dyn HostRevisionSource>))
+        } else {
+            None
+        };
+        self.extensions_with_target(target)
     }
 
     // A cooperating embedding host may bind its own authoritative revision; the CLI does not invent one for ambient files.
@@ -482,6 +610,10 @@ impl WorkspaceSetup {
 
     pub fn discovery_enabled(&self) -> bool {
         self.discovery_enabled
+    }
+
+    pub fn cooperative_revision_enabled(&self) -> bool {
+        self.cooperative_revision
     }
 }
 
@@ -543,7 +675,7 @@ pub async fn run(setup: WorkspaceSetup) -> Result<()> {
             "The external checker runs with host permissions; you are responsible for its independence, isolation and cleanup."
         );
         println!(
-            "This CLI does not track external workspace revisions or separate pre-existing Git changes from agent edits."
+            "Per-task workspace observations do not certify external revisions or attribute every change."
         );
         println!("Eligible failed-check output may also be sent to the chosen provider.");
         println!("Only /task commands are enabled; command execution and edits require approval.");
@@ -568,8 +700,13 @@ pub async fn run(setup: WorkspaceSetup) -> Result<()> {
             "Atomic edits preserve ordinary Unix mode bits, not ownership, ACLs or extended attributes."
         );
     }
+    if setup.cooperative_revision {
+        println!(
+            "Cooperative revision: the caller must prevent external writes and keep checker inputs and dependencies immutable throughout this session; this host does not enforce those conditions."
+        );
+    }
     let agent = setup
-        .builder()
+        .builder()?
         .auto_configure_llms()?
         .auto_configure_features()?
         .autonomy_extensions(setup.extensions()?)
@@ -577,10 +714,21 @@ pub async fn run(setup: WorkspaceSetup) -> Result<()> {
         .task_interaction_delivery(true)
         .build_task_host()
         .await?;
+    workspace_repl(&setup, agent).run().await?;
+    Ok(())
+}
+
+// Both provider-backed and deterministic hosts use the same foreground driver and task observation boundary.
+fn workspace_repl(setup: &WorkspaceSetup, agent: ai_agents::RuntimeAgent) -> CliRepl {
     if let Some(runner) = setup.checker_runner() {
         agent.set_command_runner(runner);
     }
+    let observer = Arc::new(WorkspaceReport::new(
+        setup.root.clone(),
+        setup.sources.clone(),
+    ));
     CliRepl::new(agent)
+        .task_observer(observer)
         .welcome("Code Agent: explicitly selected workspace files")
         .hint("Start with /task run <objective>; approvals and cancellation stay in this session.")
         .on_command(|input, _| {
@@ -601,7 +749,4 @@ pub async fn run(setup: WorkspaceSetup) -> Result<()> {
                 CommandResult::Handled
             }
         })
-        .run()
-        .await?;
-    Ok(())
 }

@@ -43,6 +43,27 @@ impl ToolResult {
             metadata: None,
         }
     }
+
+    /// Reports an actual or possible side effect whose cleanup or settlement has not been established.
+    /// Managed task execution retains uncertainty rather than treating this as a harmless tool failure.
+    pub fn error_with_uncertain_effect(error: impl Into<String>) -> Self {
+        Self {
+            success: false,
+            output: error.into(),
+            metadata: Some(HashMap::from([(
+                "task_effect_uncertain".into(),
+                Value::Bool(true),
+            )])),
+        }
+    }
+
+    /// A tool can only make settlement more conservative; false or missing metadata is not proof of cleanup.
+    pub fn has_uncertain_effect(&self) -> bool {
+        self.metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("task_effect_uncertain"))
+            == Some(&Value::Bool(true))
+    }
 }
 
 /// Public descriptor for a registered tool.

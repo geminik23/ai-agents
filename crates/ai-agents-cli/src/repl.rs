@@ -2,7 +2,8 @@
 use std::io::{self, Write};
 
 use ai_agents::memory::{estimate_message_tokens, estimate_tokens};
-use ai_agents::{AgentResponse, RuntimeAgent};
+use ai_agents::{AgentResponse, RuntimeAgent, TaskRunResult};
+use async_trait::async_trait;
 use serde_json;
 
 #[cfg(test)]
@@ -28,6 +29,18 @@ pub enum CommandResult {
 }
 
 type CommandHandler = Box<dyn Fn(&str, &RuntimeAgent) -> CommandResult + Send + Sync>;
+
+/// An optional host observer for explicit foreground tasks; it does not authorize or finalize work.
+/// The preparation runs before each new task, while the result is the latest acknowledged root result when available.
+/// A missing result means the foreground operation failed or lost its acknowledgement, not that cleanup succeeded.
+#[async_trait]
+pub trait CliTaskObserver: Send + Sync {
+    /// Prepare per-task host observations before a new explicit task begins.
+    async fn before_task(&self) -> Result<(), String>;
+
+    /// Report the foreground outcome without changing its status or consuming retained decisions.
+    async fn after_task(&self, result: Option<&TaskRunResult>) -> Option<String>;
+}
 
 pub(crate) fn parse_relationship_perspective(
     value: &str,
@@ -112,6 +125,7 @@ pub struct CliRepl {
     agent: std::sync::Arc<RuntimeAgent>,
     config: CliReplConfig,
     command_handler: Option<CommandHandler>,
+    task_observer: Option<std::sync::Arc<dyn CliTaskObserver>>,
 }
 
 // Manual Debug impl because CommandHandler (a boxed closure) doesn't implement Debug.
@@ -138,6 +152,7 @@ impl CliRepl {
             agent: std::sync::Arc::new(agent),
             config: CliReplConfig::default(),
             command_handler: None,
+            task_observer: None,
         }
     }
 
@@ -193,6 +208,12 @@ impl CliRepl {
         F: Fn(&str, &RuntimeAgent) -> CommandResult + Send + Sync + 'static,
     {
         self.command_handler = Some(Box::new(handler));
+        self
+    }
+
+    /// Install a host observer for explicit task commands without affecting ordinary chat or other frontends.
+    pub fn task_observer(mut self, observer: std::sync::Arc<dyn CliTaskObserver>) -> Self {
+        self.task_observer = Some(observer);
         self
     }
 
@@ -272,6 +293,16 @@ impl CliRepl {
                 } else {
                     (None, rest)
                 };
+                if let Some(observer) = &self.task_observer {
+                    match io.observe(observer.before_task()).await {
+                        Some(Ok(())) => {}
+                        Some(Err(error)) => {
+                            eprintln!("Task preparation failed: {error}");
+                            continue;
+                        }
+                        None => break,
+                    }
+                }
                 let (tx, rx) = tokio::sync::mpsc::channel(32);
                 let result = io
                     .drive(
@@ -289,14 +320,19 @@ impl CliRepl {
                     .await;
                 let result = match result {
                     Ok(result) => result,
-                    Err(error)
-                        if !error.is::<crate::session::ProtectedSession>()
-                            && !io.output_closed() =>
-                    {
-                        eprintln!("[Error] {error}");
-                        continue;
+                    Err(error) => {
+                        if let Some(observer) = &self.task_observer
+                            && let Some(Some(report)) = io.observe(observer.after_task(None)).await
+                            && !io.output_suppressed()
+                        {
+                            let _ = io.write(report).await;
+                        }
+                        if !error.is::<crate::session::ProtectedSession>() && !io.output_closed() {
+                            eprintln!("[Error] {error}");
+                            continue;
+                        }
+                        return Err(error);
                     }
-                    Err(error) => return Err(error),
                 };
                 if result.quit && io.output_suppressed() {
                     eprintln!(
@@ -317,6 +353,16 @@ impl CliRepl {
                     if let Some(response) = &done.final_response {
                         io.write(self.response_text(response)).await?;
                     }
+                    if let Some(observer) = &self.task_observer
+                        && let Some(Some(report)) =
+                            io.observe(observer.after_task(Some(done))).await
+                    {
+                        io.write(report).await?;
+                    }
+                } else if let Some(observer) = &self.task_observer
+                    && let Some(Some(report)) = io.observe(observer.after_task(None)).await
+                {
+                    io.write(report).await?;
                 }
                 if result.quit {
                     break;
@@ -1515,6 +1561,132 @@ fn parse_save_load_args(input: &str) -> Option<(SaveScope, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct TaskObserver {
+        starts: std::sync::atomic::AtomicUsize,
+        results: std::sync::Mutex<Vec<(String, ai_agents::TaskRunStatus)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl CliTaskObserver for TaskObserver {
+        async fn before_task(&self) -> Result<(), String> {
+            self.starts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn after_task(&self, result: Option<&TaskRunResult>) -> Option<String> {
+            let run = &result.expect("acknowledged task result").run;
+            self.results
+                .lock()
+                .unwrap()
+                .push((run.key.run_id.clone(), run.status));
+            Some("observer report\n".into())
+        }
+    }
+
+    struct TaskProvider;
+
+    #[async_trait::async_trait]
+    impl ai_agents::llm::LLMProvider for TaskProvider {
+        async fn complete(
+            &self,
+            _: &[ai_agents::llm::ChatMessage],
+            _: Option<&ai_agents::llm::LLMConfig>,
+        ) -> Result<ai_agents::llm::LLMResponse, ai_agents::llm::LLMError> {
+            Ok(ai_agents::llm::LLMResponse::new(
+                "done",
+                ai_agents::llm::FinishReason::Stop,
+            ))
+        }
+
+        async fn complete_stream(
+            &self,
+            _: &[ai_agents::llm::ChatMessage],
+            _: Option<&ai_agents::llm::LLMConfig>,
+        ) -> Result<
+            Box<
+                dyn futures::Stream<
+                        Item = Result<ai_agents::llm::LLMChunk, ai_agents::llm::LLMError>,
+                    > + Unpin
+                    + Send,
+            >,
+            ai_agents::llm::LLMError,
+        > {
+            Err(ai_agents::llm::LLMError::Config("unexpected stream".into()))
+        }
+
+        fn provider_name(&self) -> &str {
+            "task-observer-test"
+        }
+        fn supports(&self, _: ai_agents::llm::LLMFeature) -> bool {
+            false
+        }
+    }
+
+    #[tokio::test]
+    async fn task_observer_sees_each_explicit_foreground_task_once() {
+        use crate::session::{FrontendSession, Input, Output};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use std::time::Duration;
+        let (io, input, mut output) = FrontendSession::embedded();
+        let agent = ai_agents::AgentBuilder::from_yaml("name: ObserverTest\nsystem_prompt: Answer.\ntools: []\nautonomy:\n  enabled: true\n  completion: {response_not_empty: true}\n")
+            .unwrap().llm(Arc::new(TaskProvider)).build_task_host().await.unwrap();
+        let observer = Arc::new(TaskObserver {
+            starts: AtomicUsize::new(0),
+            results: std::sync::Mutex::new(Vec::new()),
+        });
+        let driver = CliRepl::new(agent)
+            .task_observer(observer.clone())
+            .run_with_io(io);
+        let (text_tx, mut texts) = tokio::sync::mpsc::unbounded_channel();
+        let collector = tokio::spawn(async move {
+            while let Some(output) = output.recv().await {
+                match output {
+                    Output::Flush(ack) => {
+                        let _ = ack.send(());
+                    }
+                    Output::Text(text) => {
+                        let _ = text_tx.send(text);
+                    }
+                    _ => {}
+                }
+            }
+        });
+        let user = async {
+            for objective in ["first", "second"] {
+                input
+                    .send(Input::Line(format!("/task run {objective}")))
+                    .await
+                    .unwrap();
+                while let Some(text) = texts.recv().await {
+                    if text.contains("observer report") {
+                        break;
+                    }
+                }
+            }
+            input.send(Input::Line("/quit".into())).await.unwrap();
+        };
+        tokio::time::timeout(Duration::from_secs(40), async {
+            let (result, ()) = tokio::join!(driver, user);
+            result.unwrap();
+        })
+        .await
+        .expect("foreground tasks timed out");
+        collector.await.unwrap();
+        assert_eq!(observer.starts.load(Ordering::SeqCst), 2);
+        let results = observer.results.lock().unwrap();
+        assert_eq!(results.len(), 2);
+        assert_ne!(results[0].0, results[1].0);
+        assert!(
+            results
+                .iter()
+                .all(|(_, status)| *status == ai_agents::TaskRunStatus::Completed)
+        );
+    }
 
     #[test]
     fn terminal_error_is_not_followed_by_incomplete_eof_output() {

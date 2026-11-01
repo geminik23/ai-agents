@@ -4,6 +4,7 @@
 
 ### Added
 - Code agent example: run the scripted sample or connect selected workspace files and a provider to an approved host-owned checker
+- Foreground task observations: opt-in REPL hosts prepare per-task local observations and report acknowledged results without adding execution authority
 - Task evaluation: development typed operations and foreground child decisions share configured hosts, exact continuation, isolated domain bindings and bounded redacted results without replacing the parent's response
 - Task observability: development task lifecycle facts carry run, profile and stage attribution through existing aggregation without replacing authoritative invocation accounting
 - Task TUI: development terminal sessions share task hosting and exact human decisions with the plain frontend, show bounded task evidence and retain original work through acknowledged shutdown
@@ -40,14 +41,15 @@
 
 ### Changed
 - Task execution defaults: new autonomous tasks omit cumulative count and time limits unless explicitly configured or host-bounded; ordinary chat and saved finite limits retain their contracts
-- Code agent workflow: add a checker-free read-only task for selected files alongside scoped edits, optional discovery and bounded failed-check feedback
+- Code agent workflow: add checker-free read-only tasks, selected new-file creation, local per-task change observations and an explicitly cooperative revision option alongside scoped edits and bounded failed-check feedback
+- Rust task approval compatibility: development `TaskHostPrompt::Approval` patterns include the retained `trigger` field; exact trigger data is sensitive
 - Rust task time compatibility: development validation drives and final publications accept absent aggregate deadlines without bypassing live evidence, cancellation, conditional ownership or original explicit bounds
 - Code agent settings: choose model output and checker time limits while denied or unavailable checks still require guidance
 - Task validation: allow an exact command check to specify its attempt timeout within the host and tool policy limits
 - Evaluation compatibility: development report schema 3 separates participant control results from parent turns, retains acknowledged evidence after interrupted foreground work and rejects task controls in chat-only JSONL
 - Rust evaluation compatibility: scenario and turn literals add empty interaction collections; existing typed task fields, task-step variants and lifecycle categories retain their owning module paths
 - TUI integration compatibility: low-level question, log and app constructors use bounded senders; modal literals include review scrolling and constructors remain the preferred interface
-- Approval review: configured and host-selected context fields remain visible without tool-specific field filters, while automatic approval styles use the foreground bridge without raw terminal output
+- Approval review: development task approvals expose the exact retained trigger to trusted local hosts and refuse approval when the CLI review display is truncated; existing context fields remain visible without tool-specific filters
 - CLI command compatibility: development command matches include the task family while ordinary run, validation and evaluation retain their distinct result contracts
 - Rust task hosting: development automatic tasks retain shared runtime state and explicit host access; finish fluent configuration before publishing retained controller handles
 - Task validation names: development check IDs reserve the runtime journal namespace and reject collisions before ownership or execution
@@ -72,7 +74,7 @@
 - Task continuation: preserve legacy capacity-review identity and reject changed model-loop bindings before consuming pending work
 - Task allowance display: distinguish unbounded wall time and show cumulative command and model usage alongside configured limits
 - Native tool history: keep unsigned call and result batches intact during bounded memory retention and reject context overflow that cannot preserve them
-- File mutation: preserve ordinary Unix modes with private temporary files, reject special-bit patch targets and report incomplete rollback or cleanup honestly
+- File mutation: preserve ordinary Unix modes, publish new files without replacing a raced destination, and retain uncertain task effects after unacknowledged create cleanup
 - Command output: preserve bounded error tails and structured exit results when command logs exceed output limits
 - File editing: show accurate authorized previews and mismatch hints, and refuse writes when the effect cannot be reported
 - Default agent logging: omit message, response, tool argument and tool or skill failure text while preserving trusted hook records
