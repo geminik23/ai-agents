@@ -622,6 +622,7 @@ impl AutonomyRunner {
     /// Consumes only the frozen host decision and then reenters its controller, preserving original clocks and counted work.
     /// Capacity-driver bounds and logical custody are rechecked after claim/consumption acknowledgements, not reset by the host response.
     /// Host question UIs may return the standard structured free-text response; only an explicit usable answer is normalized to controller guidance.
+    /// Capacity feedback rechecks the original live target before claim, while cancellation remains available without that proof.
     pub(super) async fn resume_host_boundary(
         &self,
         snapshot: TaskRunSnapshot,
@@ -784,12 +785,55 @@ impl AutonomyRunner {
             } => Some(limit),
             _ => None,
         };
+
+        // Only an unconsumed feedback request needs its original target before a capacity continuation is claimed.
+        let resumes_feedback = state.driver.is_none()
+            && limit.is_some_and(|limit| {
+                limit.skill.is_none()
+                    && limit
+                        .model
+                        .as_ref()
+                        .map_or(limit.resume_turn, |model| model.iterations == 0)
+            });
+        if accepted
+            && resumes_feedback
+            && let Some(feedback) = payload
+                .controller_state
+                .get("untrusted_validation_feedback")
+                .filter(|value| !value.is_null())
+        {
+            let check_id = feedback
+                .get("check_id")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| AgentError::Config("validation feedback check missing".into()))?;
+            let identity: super::super::EvidenceIdentity =
+                serde_json::from_value(feedback.get("identity").cloned().ok_or_else(|| {
+                    AgentError::Config("validation feedback identity missing".into())
+                })?)?;
+            if bound.extensions.validation_target(check_id) != identity.target.as_deref() {
+                return Err(AgentError::Config(
+                    "validation feedback target binding changed".into(),
+                ));
+            }
+            bound
+                .extensions
+                .observation_admission(&[(check_id.to_string(), identity)])?
+                .validate()?;
+        }
         if let Some(skill) = limit.and_then(|limit| limit.skill.as_ref()) {
             self.agent.validate_capacity_skill(skill)?;
         }
         // A retained model cursor must match the live runtime before this response consumes the pending capacity review.
         if let Some(model) = limit.and_then(|limit| limit.model.as_ref()) {
             self.agent.checked_task_loop_policy(model)?;
+            if model.feedback_hook_completed
+                && payload
+                    .controller_state
+                    .get("untrusted_validation_feedback")
+                    .is_none_or(|value| value.is_null())
+            {
+                return Err(TaskRunStorageError::InvalidCheckpoint.into());
+            }
         }
         if let Some(driver) = &state.driver {
             if driver.expired() {

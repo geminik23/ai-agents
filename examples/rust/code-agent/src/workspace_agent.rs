@@ -4,7 +4,7 @@
 
 use crate::code_agent_workspace::command_word;
 use ai_agents::AgentBuilder;
-use ai_agents::autonomy::{AutonomyExtensions, HostValidationBinding};
+use ai_agents::autonomy::{AutonomyExtensions, HostRevisionSource, HostValidationBinding};
 use ai_agents::context::ContextSource;
 use ai_agents::spec::{AgentSpec, LLMConfigOrSelector, PreparedAgentSpec, TaskIterationPolicy};
 use ai_agents::tool_security::CommandRuleConfig;
@@ -20,6 +20,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 const YAML: &str = include_str!("../../../yaml/code-agent/workspace.yaml");
+const READ_ONLY_YAML: &str = include_str!("../../../yaml/code-agent/workspace-read-only.yaml");
 const CHECKER_LIMIT: u64 = 8 * 1024 * 1024;
 const INSTRUCTIONS_LIMIT: u64 = 64 * 1024;
 
@@ -36,11 +37,15 @@ pub struct WorkspaceSetup {
     source: PathBuf,
     sources: Vec<PathBuf>,
     discovery_enabled: bool,
-    checker: PathBuf,
-    checker_bytes: Vec<u8>,
+    checker: Option<CheckerBinding>,
+}
+
+struct CheckerBinding {
+    path: PathBuf,
+    bytes: Vec<u8>,
     argv: Vec<String>,
     command: String,
-    checker_timeout_ms: Option<u64>,
+    timeout_ms: Option<u64>,
 }
 
 // Resolve each workspace component without following a symlink or allowing parent traversal.
@@ -121,7 +126,7 @@ pub fn prepare(
     )
 }
 
-// Every selected source is explicitly host-authorized; discovery, symlink traversal and implicit root write access remain excluded.
+// Every selected editable source is explicitly host-authorized and the checker remains a fixed host operation.
 pub fn prepare_files(
     root: &Path,
     sources: &[PathBuf],
@@ -130,7 +135,37 @@ pub fn prepare_files(
     model: &str,
     instruction_file: Option<&Path>,
 ) -> Result<WorkspaceSetup> {
-    if !root.is_absolute() || !checker.is_absolute() {
+    prepare_workspace(
+        root,
+        sources,
+        Some(checker),
+        provider,
+        model,
+        instruction_file,
+    )
+}
+
+// A separate declaration removes edit and checker authority rather than inferring safety from the objective.
+pub fn prepare_read_only(
+    root: &Path,
+    sources: &[PathBuf],
+    provider: &str,
+    model: &str,
+    instruction_file: Option<&Path>,
+) -> Result<WorkspaceSetup> {
+    prepare_workspace(root, sources, None, provider, model, instruction_file)
+}
+
+// Resolve both declarations through the same path and provider checks without giving the read-only mode a checker.
+fn prepare_workspace(
+    root: &Path,
+    sources: &[PathBuf],
+    checker: Option<&Path>,
+    provider: &str,
+    model: &str,
+    instruction_file: Option<&Path>,
+) -> Result<WorkspaceSetup> {
+    if !root.is_absolute() || checker.is_some_and(|path| !path.is_absolute()) {
         return Err("workspace and checker must be absolute paths".into());
     }
     let root = fs::canonicalize(root)?;
@@ -150,18 +185,25 @@ pub fn prepare_files(
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            if fs::metadata(&source)?.permissions().mode() & 0o7000 != 0 {
+            if checker.is_some() && fs::metadata(&source)?.permissions().mode() & 0o7000 != 0 {
                 return Err("source files with special permission bits are unsupported".into());
             }
         }
         selected.push(source);
     }
     let source = selected[0].clone();
-    let checker = fs::canonicalize(checker)?;
-    if checker.starts_with(&root) {
-        return Err("the trusted checker must be outside the workspace".into());
-    }
-    let checker_bytes = checker_snapshot(&checker)?;
+    let checker = checker
+        .map(|path| {
+            let path = fs::canonicalize(path)?;
+            if path.starts_with(&root) {
+                return Err::<_, Box<dyn std::error::Error>>(
+                    "the trusted checker must be outside the workspace".into(),
+                );
+            }
+            let bytes = checker_snapshot(&path)?;
+            Ok((path, bytes))
+        })
+        .transpose()?;
     if provider.trim() != provider
         || provider.is_empty()
         || model.trim() != model
@@ -183,10 +225,26 @@ pub fn prepare_files(
         .map(|source| command_word(source))
         .collect::<Result<Vec<_>>>()?;
     let source_string = source_strings[0].clone();
-    let mut argv = vec![command_word(&checker)?, root_string.clone()];
-    argv.extend(source_strings.iter().cloned());
-    let command = argv.join(" ");
-    let (mut spec, task_iteration_policy) = PreparedAgentSpec::from_yaml_strict(YAML)?.into_parts();
+    let checker = checker
+        .map(|(path, bytes)| {
+            let mut argv = vec![command_word(&path)?, root_string.clone()];
+            argv.extend(source_strings.iter().cloned());
+            let command = argv.join(" ");
+            Ok::<_, Box<dyn std::error::Error>>(CheckerBinding {
+                path,
+                bytes,
+                argv,
+                command,
+                timeout_ms: None,
+            })
+        })
+        .transpose()?;
+    let yaml = if checker.is_some() {
+        YAML
+    } else {
+        READ_ONLY_YAML
+    };
+    let (mut spec, task_iteration_policy) = PreparedAgentSpec::from_yaml_strict(yaml)?.into_parts();
     match &mut spec.llm {
         LLMConfigOrSelector::Config(config) => {
             config.provider = provider.to_string();
@@ -199,32 +257,37 @@ pub fn prepare_files(
         .get_mut("file_read")
         .ok_or("missing file_read policy")?
         .read_paths = source_strings.clone();
-    let edit = spec
-        .tool_security
-        .tools
-        .get_mut("file_edit")
-        .ok_or("missing file_edit policy")?;
-    edit.read_paths = source_strings.clone();
-    edit.write_paths = source_strings.clone();
-    let policy = spec
-        .tool_security
-        .tools
-        .get_mut("command")
-        .ok_or("missing command policy")?;
-    policy.allowed_commands = vec![CommandRuleConfig { argv: argv.clone() }];
-    policy.working_dirs = vec![root_string.clone()];
-    let checks = spec
-        .autonomy
-        .defaults
-        .validation
-        .as_mut()
-        .and_then(|v| v.checks.as_mut())
-        .ok_or("missing validation check")?;
-    if checks.len() != 1 || checks[0].id != "acceptance" {
-        return Err("unexpected validation configuration".into());
+    if let Some(checker) = &checker {
+        let edit = spec
+            .tool_security
+            .tools
+            .get_mut("file_edit")
+            .ok_or("missing file_edit policy")?;
+        edit.read_paths = source_strings.clone();
+        edit.write_paths = source_strings.clone();
+        let policy = spec
+            .tool_security
+            .tools
+            .get_mut("command")
+            .ok_or("missing command policy")?;
+        policy.allowed_commands = vec![CommandRuleConfig {
+            argv: checker.argv.clone(),
+        }];
+        policy.working_dirs = vec![root_string.clone()];
+        let checks = spec
+            .autonomy
+            .defaults
+            .validation
+            .as_mut()
+            .and_then(|v| v.checks.as_mut())
+            .ok_or("missing validation check")?;
+        if checks.len() != 1 || checks[0].id != "acceptance" {
+            return Err("unexpected validation configuration".into());
+        }
+        checks[0].config = Some(
+            json!({"command":checker.command,"cwd":root_string,"host_binding":"workspace-checker"}),
+        );
     }
-    checks[0].config =
-        Some(json!({"command":command,"cwd":root_string,"host_binding":"workspace-checker"}));
     for (key, value) in [
         ("workspace_root", root_string),
         ("source_file", source_string),
@@ -248,10 +311,6 @@ pub fn prepare_files(
         sources: selected,
         discovery_enabled: false,
         checker,
-        checker_bytes,
-        argv,
-        command,
-        checker_timeout_ms: None,
     })
 }
 
@@ -302,6 +361,9 @@ impl WorkspaceSetup {
 
     // Keep the validation request, policy and fixed approval bound to the same host-selected timeout.
     pub fn set_checker_timeout_ms(&mut self, timeout: u64) -> Result<()> {
+        if self.checker.is_none() {
+            return Err("read-only mode has no checker".into());
+        }
         if timeout == 0 || timeout > ai_agents::MAX_TOOL_TIMEOUT_MS {
             return Err(
                 "checker timeout must be positive and within the tool timeout limit".into(),
@@ -328,18 +390,23 @@ impl WorkspaceSetup {
             .and_then(serde_json::Value::as_object_mut)
             .ok_or("missing validation configuration")?;
         config.insert("timeout_ms".into(), json!(timeout));
-        self.checker_timeout_ms = Some(timeout);
+        self.checker
+            .as_mut()
+            .expect("checker verified above")
+            .timeout_ms = Some(timeout);
         self.spec.validate()?;
         Ok(())
     }
 
-    pub fn checker_timeout_ms(&self) -> u64 {
-        self.spec
-            .tool_security
-            .tools
-            .get("command")
-            .and_then(|policy| policy.timeout_ms)
-            .unwrap_or(self.spec.tool_security.default_timeout_ms)
+    pub fn checker_timeout_ms(&self) -> Option<u64> {
+        self.checker.as_ref().map(|_| {
+            self.spec
+                .tool_security
+                .tools
+                .get("command")
+                .and_then(|policy| policy.timeout_ms)
+                .unwrap_or(self.spec.tool_security.default_timeout_ms)
+        })
     }
 
     pub fn max_output_tokens(&self) -> u32 {
@@ -358,31 +425,50 @@ impl WorkspaceSetup {
 
     // A fixed host-only validation binding cannot become an ordinary model-callable command grant.
     pub fn extensions(&self) -> ai_agents::Result<AutonomyExtensions> {
+        self.extensions_with_target(None)
+    }
+
+    // A cooperating embedding host may bind its own authoritative revision; the CLI does not invent one for ambient files.
+    pub fn extensions_with_target(
+        &self,
+        target: Option<(&str, Arc<dyn HostRevisionSource>)>,
+    ) -> ai_agents::Result<AutonomyExtensions> {
         let mut extensions = AutonomyExtensions::builtins();
-        let mut arguments = json!({"command":self.command,"cwd":self.root});
-        if let Some(timeout) = self.checker_timeout_ms {
-            arguments["timeout_ms"] = json!(timeout);
+        if let Some(checker) = &self.checker {
+            let mut arguments = json!({"command":checker.command,"cwd":self.root});
+            if let Some(timeout) = checker.timeout_ms {
+                arguments["timeout_ms"] = json!(timeout);
+            }
+            extensions.register_host_validation(HostValidationBinding {
+                id: "workspace-checker".into(),
+                validator: "builtin.command".into(),
+                version: 1,
+                profile: None,
+                scope: "task".into(),
+                tool: "command".into(),
+                arguments,
+                require_approval: true,
+            })?;
+            if let Some((name, source)) = target {
+                extensions.register_validation_target("acceptance", name, source)?;
+            }
+        } else if target.is_some() {
+            return Err(ai_agents::AgentError::Config(
+                "read-only mode has no validation target".into(),
+            ));
         }
-        extensions.register_host_validation(HostValidationBinding {
-            id: "workspace-checker".into(),
-            validator: "builtin.command".into(),
-            version: 1,
-            profile: None,
-            scope: "task".into(),
-            tool: "command".into(),
-            arguments,
-            require_approval: true,
-        })?;
         Ok(extensions)
     }
 
-    pub fn checker_runner(&self) -> Arc<dyn CommandRunner> {
-        Arc::new(CheckerRunner {
-            checker: self.checker.clone(),
-            expected: self.checker_bytes.clone(),
-            argv: self.argv.clone(),
-            cwd: self.root.to_string_lossy().into_owned(),
-            inner: ProcessCommandRunner,
+    pub fn checker_runner(&self) -> Option<Arc<dyn CommandRunner>> {
+        self.checker.as_ref().map(|checker| {
+            Arc::new(CheckerRunner {
+                checker: checker.path.clone(),
+                expected: checker.bytes.clone(),
+                argv: checker.argv.clone(),
+                cwd: self.root.to_string_lossy().into_owned(),
+                inner: ProcessCommandRunner,
+            }) as Arc<dyn CommandRunner>
         })
     }
 
@@ -444,28 +530,44 @@ pub async fn run(setup: WorkspaceSetup) -> Result<()> {
     }
     println!("Workspace discovery enabled: {}", setup.discovery_enabled());
     println!("Maximum model output tokens: {}", setup.max_output_tokens());
-    println!("Checker timeout: {} ms", setup.checker_timeout_ms());
+    if let Some(timeout) = setup.checker_timeout_ms() {
+        println!("Checker timeout: {timeout} ms");
+    } else {
+        println!("Read-only mode: no edit grant or checker is installed.");
+    }
     println!(
-        "Selected sources, instruction snapshot, task messages and bounded failed-check output may be sent to the chosen provider and may incur costs."
+        "Selected sources, instruction snapshot and task messages may be sent to the chosen provider and may incur costs."
     );
-    println!(
-        "The external checker runs with host permissions; you are responsible for its independence, isolation and cleanup."
-    );
-    println!("Only /task commands are enabled; command execution and edits require approval.");
-    println!(
-        "An eligible failed checker can send bounded untrusted output to the provider; rejected or unavailable checks require guidance."
-    );
+    if setup.checker.is_some() {
+        println!(
+            "The external checker runs with host permissions; you are responsible for its independence, isolation and cleanup."
+        );
+        println!(
+            "This CLI does not track external workspace revisions or separate pre-existing Git changes from agent edits."
+        );
+        println!("Eligible failed-check output may also be sent to the chosen provider.");
+        println!("Only /task commands are enabled; command execution and edits require approval.");
+        println!(
+            "An eligible failed checker can send bounded untrusted output to the provider; rejected or unavailable checks require guidance."
+        );
+    } else {
+        println!(
+            "Only /task commands are enabled; this read-only task cannot edit files or run a checker."
+        );
+    }
     if setup.discovery_enabled() {
         println!(
             "Workspace discovery may share file names and search matches outside the selected edit files."
         );
     }
-    println!(
-        "A feedback-bearing provider request is one-shot and does not use automatic retries or fallback."
-    );
-    println!(
-        "Atomic edits preserve ordinary Unix mode bits, not ownership, ACLs or extended attributes."
-    );
+    if setup.checker.is_some() {
+        println!(
+            "A feedback-bearing provider request is one-shot and does not use automatic retries or fallback."
+        );
+        println!(
+            "Atomic edits preserve ordinary Unix mode bits, not ownership, ACLs or extended attributes."
+        );
+    }
     let agent = setup
         .builder()
         .auto_configure_llms()?
@@ -475,9 +577,11 @@ pub async fn run(setup: WorkspaceSetup) -> Result<()> {
         .task_interaction_delivery(true)
         .build_task_host()
         .await?;
-    agent.set_command_runner(setup.checker_runner());
+    if let Some(runner) = setup.checker_runner() {
+        agent.set_command_runner(runner);
+    }
     CliRepl::new(agent)
-        .welcome("Code Agent: explicitly selected files, one host-owned checker")
+        .welcome("Code Agent: explicitly selected workspace files")
         .hint("Start with /task run <objective>; approvals and cancellation stay in this session.")
         .on_command(|input, _| {
             let allowed = input.starts_with("/task run ")

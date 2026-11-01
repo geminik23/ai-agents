@@ -252,7 +252,7 @@ fn scripted_provider(setup: &WorkspaceSetup, edit_path: &Path) -> Arc<Provider> 
     let responses = VecDeque::from([
         json!({"tool":"file_read","arguments":{"path":setup.source}}).to_string(),
         json!({"tool":"file_edit","arguments":{"path":edit_path,"old_text":"{ 1 }","new_text":"{ 1 + 1 }","dry_run":false}}).to_string(),
-        json!({"tool":"command","arguments":{"command":setup.command,"cwd":setup.root}}).to_string(),
+        json!({"tool":"command","arguments":{"command":setup.checker.as_ref().unwrap().command,"cwd":setup.root}}).to_string(),
         "The edit is ready for validation.".to_string(),
     ]);
     Arc::new(Provider::new(responses))
@@ -263,17 +263,29 @@ fn runner(setup: &WorkspaceSetup, edit_path: &Path) -> AutonomyRunner {
 }
 
 fn runner_with_provider(setup: &WorkspaceSetup, provider: Arc<Provider>) -> AutonomyRunner {
-    let agent = Arc::new(
-        setup
-            .builder()
-            .llm(provider)
-            .auto_configure_features()
-            .unwrap()
-            .autonomy_extensions(setup.extensions().unwrap())
-            .build()
-            .unwrap(),
-    );
-    agent.set_command_runner(setup.checker_runner());
+    runner_with_extensions(setup, provider, setup.extensions().unwrap(), None)
+}
+
+// Exercise the same workspace builder and runner with an explicitly installed live host target.
+fn runner_with_extensions(
+    setup: &WorkspaceSetup,
+    provider: Arc<Provider>,
+    extensions: AutonomyExtensions,
+    hooks: Option<Arc<dyn ai_agents::AgentHooks>>,
+) -> AutonomyRunner {
+    let mut builder = setup
+        .builder()
+        .llm(provider)
+        .auto_configure_features()
+        .unwrap()
+        .autonomy_extensions(extensions);
+    if let Some(hooks) = hooks {
+        builder = builder.hooks(hooks);
+    }
+    let agent = Arc::new(builder.build().unwrap());
+    if let Some(checker) = setup.checker_runner() {
+        agent.set_command_runner(checker);
+    }
     let store = Arc::new(
         ScopedTaskRunStore::in_memory(agent.info().id, None, "workspace-test.v1".into()).unwrap(),
     );
@@ -339,10 +351,10 @@ async fn workspace_configuration_is_narrow_and_provider_free() {
     assert!(setup.set_max_output_tokens(0).is_err());
     setup.set_max_output_tokens(4096).unwrap();
     assert_eq!(setup.max_output_tokens(), 4096);
-    assert_eq!(setup.checker_timeout_ms(), 30000);
+    assert_eq!(setup.checker_timeout_ms(), Some(30000));
     assert!(setup.set_checker_timeout_ms(0).is_err());
     setup.set_checker_timeout_ms(45000).unwrap();
-    assert_eq!(setup.checker_timeout_ms(), 45000);
+    assert_eq!(setup.checker_timeout_ms(), Some(45000));
     assert_eq!(
         setup
             .spec
@@ -465,18 +477,121 @@ async fn workspace_configuration_is_narrow_and_provider_free() {
     sandbox.cleanup();
 }
 
+// Read-only tasks use the same controller without installing mutation, command or checker authority.
+#[tokio::test]
+async fn read_only_workspace_answers_without_edit_or_checker() {
+    let sandbox = Sandbox::new();
+    let mut setup = prepare_read_only(
+        &sandbox.root,
+        &[PathBuf::from("source.rs")],
+        "openai",
+        "offline-test",
+        None,
+    )
+    .unwrap();
+    assert!(setup.checker_runner().is_none());
+    assert_eq!(setup.checker_timeout_ms(), None);
+    assert!(setup.set_checker_timeout_ms(30000).is_err());
+    assert!(setup.spec.autonomy.defaults.validation.is_none());
+    assert!(
+        !setup
+            .spec
+            .tools
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|tool| matches!(
+                tool.name(),
+                "file_edit" | "file_write" | "patch" | "command"
+            ))
+    );
+    setup.enable_discovery().unwrap();
+    let provider = Arc::new(Provider::new(VecDeque::from([
+        json!({"tool":"file_read","arguments":{"path":sandbox.source}}).to_string(),
+        "The selected function returns one.".into(),
+    ])));
+    let runner = runner_with_provider(&setup, provider.clone());
+    let done = runner
+        .run("Explain the selected function.", None)
+        .await
+        .unwrap();
+    assert_eq!(
+        done.run.status,
+        TaskRunStatus::Completed,
+        "{:?}",
+        done.run.stop_reason
+    );
+    assert!(
+        done.run
+            .evidence
+            .tool_calls
+            .iter()
+            .any(|entry| entry.record.canonical_id == "file_read" && entry.record.executed)
+    );
+    assert!(!done.run.evidence.tool_calls.iter().any(|entry| matches!(
+        entry.record.canonical_id.as_str(),
+        "file_edit" | "file_write" | "patch" | "command"
+    ) && entry.record.executed));
+    assert_eq!(
+        fs::read_to_string(&sandbox.source).unwrap(),
+        "pub fn value() -> i32 { 1 }\n"
+    );
+    assert!(!sandbox.parent.join("checker/acceptance-test").exists());
+    drop(runner);
+    sandbox.cleanup();
+}
+
+// A read-only objective or misleading model request cannot install edit authority.
+#[tokio::test]
+async fn read_only_workspace_denies_model_mutation() {
+    let sandbox = Sandbox::new();
+    let setup = prepare_read_only(
+        &sandbox.root,
+        &[PathBuf::from("source.rs")],
+        "openai",
+        "offline-test",
+        None,
+    )
+    .unwrap();
+    let provider = Arc::new(Provider::new(VecDeque::from([
+        json!({"tool":"file_edit","arguments":{"path":sandbox.source,"old_text":"{ 1 }","new_text":"{ 2 }","dry_run":false}}).to_string(),
+        "No edit was made.".into(),
+    ])));
+    let runner = runner_with_provider(&setup, provider);
+    let done = runner
+        .run("Explain the selected function.", None)
+        .await
+        .unwrap();
+    assert!(
+        !done
+            .run
+            .evidence
+            .tool_calls
+            .iter()
+            .any(|entry| entry.record.canonical_id == "file_edit" && entry.record.executed)
+    );
+    assert_eq!(
+        fs::read_to_string(&sandbox.source).unwrap(),
+        "pub fn value() -> i32 { 1 }\n"
+    );
+    assert!(!sandbox.parent.join("checker/acceptance-test").exists());
+    cancel_if_paused(&runner, &done).await;
+    drop(runner);
+    sandbox.cleanup();
+}
+
 #[tokio::test]
 async fn changed_checker_is_refused_before_any_process_runs() {
     let sandbox = Sandbox::new();
     let setup = sandbox.setup();
-    let checker = setup.checker_runner();
+    let checker = setup.checker_runner().expect("checker installed");
     assert!(checker.is_available());
     fs::write(&sandbox.checker, "#!/bin/sh\nexit 0\n").unwrap();
     assert!(!checker.is_available());
     let response = checker
         .run_command(
             CommandRequest {
-                argv: setup.argv.clone(),
+                argv: setup.checker.as_ref().unwrap().argv.clone(),
                 cwd: Some(setup.root.to_string_lossy().into_owned()),
                 ..Default::default()
             },
@@ -593,22 +708,23 @@ async fn failed_validation_allows_another_edit_and_fresh_checker_success() {
         interaction.prompt,
         TaskHostPrompt::Approval { .. }
     ));
-    let requests = provider.requests.lock().unwrap();
-    assert!(requests.iter().flatten().any(|message| {
-        message.role == ai_agents::Role::User
-            && message
-                .content
-                .contains("Untrusted output from a failed authorized validation check")
-            && message.content.contains("left: 3")
-    }));
-    assert!(
-        !requests
-            .iter()
-            .flatten()
-            .any(|message| message.role == ai_agents::Role::System
-                && message.content.contains("left: 3"))
-    );
-    drop(requests);
+    {
+        let requests = provider.requests.lock().unwrap();
+        assert!(requests.iter().flatten().any(|message| {
+            message.role == ai_agents::Role::User
+                && message
+                    .content
+                    .contains("Untrusted output from a failed authorized validation check")
+                && message.content.contains("left: 3")
+        }));
+        assert!(
+            !requests
+                .iter()
+                .flatten()
+                .any(|message| message.role == ai_agents::Role::System
+                    && message.content.contains("left: 3"))
+        );
+    }
     assert_eq!(
         fs::read_to_string(&sandbox.source).unwrap(),
         "pub fn value() -> i32 { 1 + 2 }\n"
@@ -653,6 +769,887 @@ async fn failed_validation_allows_another_edit_and_fresh_checker_success() {
     sandbox.cleanup();
 }
 
+// The fixture host owns revision changes; it does not claim to observe arbitrary filesystem writes.
+struct WorkspaceRevision(AtomicU64);
+impl ai_agents::autonomy::HostRevisionSource for WorkspaceRevision {
+    fn revision(&self) -> ai_agents::Result<String> {
+        let value = self.0.load(Ordering::SeqCst);
+        if value == u64::MAX {
+            return Err(ai_agents::AgentError::Config(
+                "fixture revision unavailable".into(),
+            ));
+        }
+        Ok(value.to_string())
+    }
+}
+
+// This isolated fixture observes its own edits; a real host must synchronize all relevant changes itself.
+#[async_trait]
+impl ai_agents::AgentHooks for WorkspaceRevision {
+    fn task_providers(&self) -> Option<Vec<Arc<dyn LLMProvider>>> {
+        Some(vec![])
+    }
+    async fn on_tool_execution_record(&self, record: &ai_agents::tools::ToolExecutionRecord) {
+        if record.canonical_id == "file_edit" && record.executed {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+}
+
+// The same fixed checker can provide bounded failure feedback when its actual live revision is bound.
+#[tokio::test]
+async fn target_bound_checker_failure_allows_fresh_repair() {
+    let sandbox = Sandbox::new();
+    let setup = sandbox.setup();
+    let revision = Arc::new(WorkspaceRevision(AtomicU64::new(1)));
+    let extensions = setup
+        .extensions_with_target(Some(("workspace", revision.clone())))
+        .unwrap();
+    let provider = Arc::new(Provider::new(VecDeque::from([
+        "Ready for checking.".into(),
+        json!({"tool":"file_read","arguments":{"path":sandbox.source}}).to_string(),
+        json!({"tool":"file_edit","arguments":{"path":sandbox.source,"old_text":"{ 1 }","new_text":"{ 1 + 1 }","dry_run":false}}).to_string(),
+        "Repair ready.".into(),
+    ])));
+    let runner =
+        runner_with_extensions(&setup, provider.clone(), extensions, Some(revision.clone()));
+    let first_check = runner
+        .run("Fix the selected function.", None)
+        .await
+        .unwrap();
+    assert_eq!(first_check.run.status, TaskRunStatus::Paused);
+    let edit = respond(&runner, first_check, ApprovalResult::Approved).await;
+    assert_eq!(edit.run.status, TaskRunStatus::Paused);
+    assert!(
+        provider
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .flatten()
+            .any(|message| {
+                message.role == ai_agents::Role::User
+                    && message
+                        .content
+                        .contains("Untrusted output from a failed authorized validation check")
+            })
+    );
+    let final_check = respond(&runner, edit, ApprovalResult::Approved).await;
+    assert_eq!(final_check.run.status, TaskRunStatus::Paused);
+    let done = respond(&runner, final_check, ApprovalResult::Approved).await;
+    assert_eq!(
+        done.run.status,
+        TaskRunStatus::Completed,
+        "{:?}",
+        done.run.stop_reason
+    );
+    assert_eq!(revision.0.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        fs::read_to_string(&sandbox.source).unwrap(),
+        "pub fn value() -> i32 { 1 + 1 }\n"
+    );
+    assert_eq!(
+        done.run
+            .evidence
+            .tool_calls
+            .iter()
+            .filter(|entry| entry.record.canonical_id == "command" && entry.record.executed)
+            .count(),
+        2
+    );
+    drop(runner);
+    sandbox.cleanup();
+}
+
+// A declared multi-stage profile uses the same fixed checker binding and cannot reuse a Pass after an edit.
+#[tokio::test]
+async fn actual_checker_pass_then_edit_requires_fresh_validation() {
+    let sandbox = Sandbox::new();
+    fs::write(&sandbox.source, "pub fn value() -> i32 { 1 + 1 }\n").unwrap();
+    let mut setup = sandbox.setup();
+    setup.spec.autonomy.defaults.lifecycle = Some(
+        serde_json::from_value(json!([
+            {"id":"baseline"}, {"id":"repair"}
+        ]))
+        .unwrap(),
+    );
+    setup.spec.autonomy.defaults.premature_finish = None;
+    setup
+        .spec
+        .autonomy
+        .defaults
+        .validation
+        .as_mut()
+        .unwrap()
+        .checks
+        .as_mut()
+        .unwrap()[0]
+        .schedule = Some(ai_agents::autonomy::ValidationSchedule::EachCycle);
+    setup.spec.validate().unwrap();
+    let revision = Arc::new(WorkspaceRevision(AtomicU64::new(1)));
+    let extensions = setup
+        .extensions_with_target(Some(("workspace", revision.clone())))
+        .unwrap();
+    let provider = Arc::new(Provider::new(VecDeque::from([
+        "Baseline ready.".into(),
+        json!({"tool":"file_read","arguments":{"path":sandbox.source}}).to_string(),
+        json!({"tool":"file_edit","arguments":{"path":sandbox.source,"old_text":"{ 1 + 1 }","new_text":"{ 1 + 3 }","dry_run":false}}).to_string(),
+        "Changed source ready.".into(),
+        json!({"tool":"file_read","arguments":{"path":sandbox.source}}).to_string(),
+        json!({"tool":"file_edit","arguments":{"path":sandbox.source,"old_text":"{ 1 + 3 }","new_text":"{ 2 }","dry_run":false}}).to_string(),
+        "Repair ready.".into(),
+    ])));
+    let runner = runner_with_extensions(&setup, provider, extensions, Some(revision.clone()));
+    let initial = runner
+        .run(
+            "Keep the function correct while applying the requested changes.",
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(initial.run.status, TaskRunStatus::Paused);
+    let broken_edit = respond(&runner, initial, ApprovalResult::Approved).await;
+    assert_eq!(broken_edit.run.status, TaskRunStatus::Paused);
+    let failed_check = respond(&runner, broken_edit, ApprovalResult::Approved).await;
+    assert_eq!(failed_check.run.status, TaskRunStatus::Paused);
+    let repair_edit = respond(&runner, failed_check, ApprovalResult::Approved).await;
+    assert_eq!(repair_edit.run.status, TaskRunStatus::Paused);
+    assert_ne!(repair_edit.run.status, TaskRunStatus::Completed);
+    let final_check = respond(&runner, repair_edit, ApprovalResult::Approved).await;
+    assert_eq!(final_check.run.status, TaskRunStatus::Paused);
+    let done = respond(&runner, final_check, ApprovalResult::Approved).await;
+    assert_eq!(
+        done.run.status,
+        TaskRunStatus::Completed,
+        "{:?}",
+        done.run.stop_reason
+    );
+    let exits: Vec<_> = done
+        .run
+        .evidence
+        .tool_calls
+        .iter()
+        .filter(|entry| entry.record.canonical_id == "command" && entry.record.executed)
+        .map(|entry| {
+            serde_json::from_str::<serde_json::Value>(&entry.record.output).unwrap()["exit_code"]
+                .as_i64()
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(exits.len(), 3);
+    assert_eq!(exits[0], 0);
+    assert_ne!(exits[1], 0);
+    assert_eq!(exits[2], 0);
+    assert_eq!(
+        fs::read_to_string(&sandbox.source).unwrap(),
+        "pub fn value() -> i32 { 2 }\n"
+    );
+    assert_eq!(revision.0.load(Ordering::SeqCst), 3);
+    drop(runner);
+    sandbox.cleanup();
+}
+
+struct SuccessfulCheckChangeHook {
+    revision: Arc<WorkspaceRevision>,
+    source: PathBuf,
+}
+
+// A cooperative host changes the source as the actual passing checker result is being published.
+#[async_trait]
+impl ai_agents::AgentHooks for SuccessfulCheckChangeHook {
+    fn task_providers(&self) -> Option<Vec<Arc<dyn LLMProvider>>> {
+        Some(vec![])
+    }
+    async fn on_tool_execution_record(&self, record: &ai_agents::tools::ToolExecutionRecord) {
+        if record.canonical_id == "command"
+            && record.executed
+            && serde_json::from_str::<serde_json::Value>(&record.output)
+                .ok()
+                .and_then(|output| output["exit_code"].as_i64())
+                == Some(0)
+        {
+            fs::write(&self.source, "pub fn value() -> i32 { 99 }\n").unwrap();
+            self.revision.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+}
+
+// A real checker Pass cannot complete against a cooperative host revision that changed before publication.
+#[tokio::test]
+async fn actual_checker_pass_rejects_concurrent_host_change() {
+    let sandbox = Sandbox::new();
+    fs::write(&sandbox.source, "pub fn value() -> i32 { 2 }\n").unwrap();
+    let setup = sandbox.setup();
+    let revision = Arc::new(WorkspaceRevision(AtomicU64::new(1)));
+    let extensions = setup
+        .extensions_with_target(Some(("workspace", revision.clone())))
+        .unwrap();
+    let provider = Arc::new(Provider::new(VecDeque::from(
+        ["Ready for checking.".into()],
+    )));
+    let hook = Arc::new(SuccessfulCheckChangeHook {
+        revision,
+        source: sandbox.source.clone(),
+    });
+    let runner = runner_with_extensions(&setup, provider, extensions, Some(hook));
+    let pending = runner
+        .run("Verify the selected function.", None)
+        .await
+        .unwrap();
+    assert_eq!(pending.run.status, TaskRunStatus::Paused);
+    let run_id = pending.run.key.run_id.clone();
+    let interaction = runner
+        .task_interaction(&run_id, pending.run.revision)
+        .await
+        .unwrap()
+        .unwrap();
+    let result = runner
+        .resume(
+            &run_id,
+            pending.run.revision,
+            TaskResumeInput::Approval {
+                request_id: interaction.request_id,
+                result: ApprovalResult::Approved,
+            },
+        )
+        .await;
+    if let Ok(done) = &result {
+        assert_ne!(done.run.status, TaskRunStatus::Completed);
+    }
+    let display = runner.task_display(&run_id).await.unwrap();
+    assert_ne!(display.summary.status, TaskRunStatus::Completed);
+    assert_eq!(
+        fs::read_to_string(&sandbox.source).unwrap(),
+        "pub fn value() -> i32 { 99 }\n"
+    );
+    if display.summary.status == TaskRunStatus::Paused {
+        let cancelled = runner
+            .cancel_task(&run_id, display.summary.revision)
+            .await
+            .unwrap();
+        assert_eq!(
+            cancelled.disposition,
+            ai_agents::CancellationDisposition::Acknowledged
+        );
+    } else {
+        assert!(
+            !display.locally_retained,
+            "fixture must retain files while cleanup is uncertain"
+        );
+    }
+    drop(runner);
+    sandbox.cleanup();
+}
+
+struct FeedbackTargetChangeHook {
+    revision: Arc<WorkspaceRevision>,
+    source: PathBuf,
+}
+
+// Simulate a cooperative external editor changing the checked input after feedback is prepared.
+#[async_trait]
+impl ai_agents::AgentHooks for FeedbackTargetChangeHook {
+    fn task_providers(&self) -> Option<Vec<Arc<dyn LLMProvider>>> {
+        Some(vec![])
+    }
+    async fn on_llm_start(&self, messages: &[ChatMessage]) {
+        if messages.iter().any(|message| {
+            message
+                .content
+                .contains("Untrusted output from a failed authorized validation check")
+        }) {
+            fs::write(&self.source, "pub fn value() -> i32 { 99 }\n").unwrap();
+            self.revision.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+}
+
+// A changed host revision stops stale feedback before the managed provider can observe it.
+#[tokio::test]
+async fn target_bound_checker_feedback_stops_after_host_revision_changes() {
+    let sandbox = Sandbox::new();
+    let setup = sandbox.setup();
+    let revision = Arc::new(WorkspaceRevision(AtomicU64::new(1)));
+    let extensions = setup
+        .extensions_with_target(Some(("workspace", revision.clone())))
+        .unwrap();
+    let provider = Arc::new(Provider::new(VecDeque::from([
+        "Ready for checking.".into(),
+        "must not run".into(),
+    ])));
+    let hook = Arc::new(FeedbackTargetChangeHook {
+        revision,
+        source: sandbox.source.clone(),
+    });
+    let runner = runner_with_extensions(&setup, provider.clone(), extensions, Some(hook));
+    let check = runner
+        .run("Fix the selected function.", None)
+        .await
+        .unwrap();
+    assert_eq!(check.run.status, TaskRunStatus::Paused);
+    let stopped = respond(&runner, check, ApprovalResult::Approved).await;
+    assert_ne!(stopped.run.status, TaskRunStatus::Completed);
+    assert_eq!(provider.requests.lock().unwrap().len(), 1);
+    assert_eq!(
+        fs::read_to_string(&sandbox.source).unwrap(),
+        "pub fn value() -> i32 { 99 }\n"
+    );
+    cancel_if_paused(&runner, &stopped).await;
+    drop(runner);
+    sandbox.cleanup();
+}
+
+struct FeedbackCapacityHook {
+    runtime: Mutex<std::sync::Weak<ai_agents::RuntimeAgent>>,
+    calls: AtomicU64,
+}
+
+// This cooperative hook uses the runtime's actual managed provider and shares the task's allowance.
+#[async_trait]
+impl ai_agents::AgentHooks for FeedbackCapacityHook {
+    fn task_providers(&self) -> Option<Vec<Arc<dyn LLMProvider>>> {
+        Some(vec![])
+    }
+    async fn on_llm_start(&self, messages: &[ChatMessage]) {
+        if messages.iter().any(|message| {
+            message
+                .content
+                .contains("Untrusted output from a failed authorized validation check")
+        }) {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let runtime = self.runtime.lock().unwrap().upgrade().unwrap();
+            let provider = runtime.llm_registry().get("default").unwrap();
+            let _ = provider.complete(messages, None).await;
+        }
+    }
+}
+
+// A changed target cannot consume a retained capacity response before the stale feedback is rejected.
+#[tokio::test]
+async fn target_bound_feedback_capacity_resume_preserves_stale_pause() {
+    let sandbox = Sandbox::new();
+    let mut setup = sandbox.setup();
+    setup.spec.autonomy.defaults.max_llm_calls =
+        Some(ai_agents::autonomy::AutonomyLimit::Finite(2));
+    setup.spec.autonomy.defaults.on_limit =
+        Some(serde_json::from_value(json!({"action":"pause_run"})).unwrap());
+    let revision = Arc::new(WorkspaceRevision(AtomicU64::new(1)));
+    let extensions = setup
+        .extensions_with_target(Some(("workspace", revision.clone())))
+        .unwrap();
+    let provider = Arc::new(Provider::new(VecDeque::from([
+        "Ready for checking.".into(),
+        "hook result".into(),
+        "must not run".into(),
+    ])));
+    let hook = Arc::new(FeedbackCapacityHook {
+        runtime: Mutex::new(std::sync::Weak::new()),
+        calls: AtomicU64::new(0),
+    });
+    let runner = runner_with_extensions(&setup, provider.clone(), extensions, Some(hook.clone()));
+    *hook.runtime.lock().unwrap() = Arc::downgrade(runner.runtime());
+    let check = runner
+        .run("Fix the selected function.", None)
+        .await
+        .unwrap();
+    assert_eq!(check.run.status, TaskRunStatus::Paused);
+    let capacity = respond(&runner, check, ApprovalResult::Approved).await;
+    assert_eq!(
+        capacity.run.status,
+        TaskRunStatus::Paused,
+        "{:?}",
+        capacity.run.stop_reason
+    );
+    assert_eq!(hook.calls.load(Ordering::SeqCst), 1);
+    let mut limits = capacity.run.limits.clone();
+    limits.max_llm_calls = Some(3);
+    let revised = runner
+        .revise_limits_paused(
+            &capacity.run.key.run_id,
+            capacity.run.revision,
+            limits,
+            "allow feedback",
+        )
+        .await
+        .unwrap();
+    revision.0.fetch_add(1, Ordering::SeqCst);
+    assert!(
+        runner
+            .resume(
+                &revised.run.key.run_id,
+                revised.run.revision,
+                TaskResumeInput::Continue
+            )
+            .await
+            .is_err()
+    );
+    let display = runner.task_display(&revised.run.key.run_id).await.unwrap();
+    assert_eq!(display.summary.status, TaskRunStatus::Paused);
+    assert_eq!(display.summary.revision, revised.run.revision);
+    assert_eq!(provider.requests.lock().unwrap().len(), 2);
+    revision.0.store(u64::MAX, Ordering::SeqCst);
+    assert!(
+        runner
+            .resume(
+                &revised.run.key.run_id,
+                revised.run.revision,
+                TaskResumeInput::Continue
+            )
+            .await
+            .is_err()
+    );
+    let cancelled = runner
+        .cancel_task(&revised.run.key.run_id, revised.run.revision)
+        .await
+        .unwrap();
+    assert_eq!(
+        cancelled.disposition,
+        ai_agents::CancellationDisposition::Acknowledged
+    );
+    drop(runner);
+    sandbox.cleanup();
+}
+
+// Once the feedback-bearing model call has completed, a later edit may legitimately advance the host revision.
+#[tokio::test]
+async fn feedback_capacity_after_edit_accepts_new_target_and_rechecks() {
+    let sandbox = Sandbox::new();
+    let mut setup = sandbox.setup();
+    setup.spec.autonomy.defaults.max_llm_calls =
+        Some(ai_agents::autonomy::AutonomyLimit::Finite(3));
+    setup.spec.autonomy.defaults.on_limit =
+        Some(serde_json::from_value(json!({"action":"pause_run"})).unwrap());
+    let revision = Arc::new(WorkspaceRevision(AtomicU64::new(1)));
+    let extensions = setup
+        .extensions_with_target(Some(("workspace", revision.clone())))
+        .unwrap();
+    let provider = Arc::new(Provider::new(VecDeque::from([
+        "Ready for checking.".into(),
+        json!({"tool":"file_read","arguments":{"path":sandbox.source}}).to_string(),
+        json!({"tool":"file_edit","arguments":{"path":sandbox.source,"old_text":"{ 1 }","new_text":"{ 2 }","dry_run":false}}).to_string(),
+        "Ready after the edit.".into(),
+    ])));
+    let runner = runner_with_extensions(&setup, provider, extensions, Some(revision.clone()));
+    let first_check = runner
+        .run("Fix the selected function.", None)
+        .await
+        .unwrap();
+    let edit = respond(&runner, first_check, ApprovalResult::Approved).await;
+    assert_eq!(edit.run.status, TaskRunStatus::Paused);
+    let capacity = respond(&runner, edit, ApprovalResult::Approved).await;
+    assert_eq!(capacity.run.status, TaskRunStatus::Paused);
+    assert_eq!(revision.0.load(Ordering::SeqCst), 2);
+    let mut limits = capacity.run.limits.clone();
+    limits.max_llm_calls = Some(4);
+    let revised = runner
+        .revise_limits_paused(
+            &capacity.run.key.run_id,
+            capacity.run.revision,
+            limits,
+            "continue after edit",
+        )
+        .await
+        .unwrap();
+    let final_check = runner
+        .resume(
+            &revised.run.key.run_id,
+            revised.run.revision,
+            TaskResumeInput::Continue,
+        )
+        .await
+        .unwrap();
+    assert_eq!(final_check.run.status, TaskRunStatus::Paused);
+    let done = respond(&runner, final_check, ApprovalResult::Approved).await;
+    assert_eq!(
+        done.run.status,
+        TaskRunStatus::Completed,
+        "{:?}",
+        done.run.stop_reason
+    );
+    assert_eq!(
+        fs::read_to_string(&sandbox.source).unwrap(),
+        "pub fn value() -> i32 { 2 }\n"
+    );
+    drop(runner);
+    sandbox.cleanup();
+}
+
+// Validator capacity after a completed feedback-driven edit must use the new check target, not the old feedback target.
+#[tokio::test]
+async fn feedback_then_edit_allows_fresh_validator_capacity_resume() {
+    let sandbox = Sandbox::new();
+    let mut setup = sandbox.setup();
+    setup.spec.autonomy.defaults.max_command_calls =
+        Some(ai_agents::autonomy::AutonomyLimit::Finite(1));
+    setup.spec.autonomy.defaults.on_limit =
+        Some(serde_json::from_value(json!({"action":"pause_run"})).unwrap());
+    let revision = Arc::new(WorkspaceRevision(AtomicU64::new(1)));
+    let extensions = setup
+        .extensions_with_target(Some(("workspace", revision.clone())))
+        .unwrap();
+    let provider = Arc::new(Provider::new(VecDeque::from([
+        "Ready for checking.".into(),
+        json!({"tool":"file_read","arguments":{"path":sandbox.source}}).to_string(),
+        json!({"tool":"file_edit","arguments":{"path":sandbox.source,"old_text":"{ 1 }","new_text":"{ 2 }","dry_run":false}}).to_string(),
+        "Ready after the edit.".into(),
+    ])));
+    let runner = runner_with_extensions(&setup, provider, extensions, Some(revision.clone()));
+    let first_check = runner
+        .run("Fix the selected function.", None)
+        .await
+        .unwrap();
+    let edit = respond(&runner, first_check, ApprovalResult::Approved).await;
+    let capacity = respond(&runner, edit, ApprovalResult::Approved).await;
+    assert_eq!(
+        capacity.run.status,
+        TaskRunStatus::Paused,
+        "{:?}",
+        capacity.run.stop_reason
+    );
+    assert_eq!(revision.0.load(Ordering::SeqCst), 2);
+    let mut limits = capacity.run.limits.clone();
+    limits.max_command_calls = Some(2);
+    let revised = runner
+        .revise_limits_paused(
+            &capacity.run.key.run_id,
+            capacity.run.revision,
+            limits,
+            "allow fresh checker",
+        )
+        .await
+        .unwrap();
+    let next = runner
+        .resume(
+            &revised.run.key.run_id,
+            revised.run.revision,
+            TaskResumeInput::Continue,
+        )
+        .await
+        .unwrap();
+    assert_eq!(next.run.status, TaskRunStatus::Paused);
+    let done = respond(&runner, next, ApprovalResult::Approved).await;
+    assert_eq!(
+        done.run.status,
+        TaskRunStatus::Completed,
+        "{:?}",
+        done.run.stop_reason
+    );
+    drop(runner);
+    sandbox.cleanup();
+}
+
+// Resuming a feedback provider after capacity must not repeat a completed on_llm_start hook.
+#[tokio::test]
+async fn feedback_capacity_resume_does_not_replay_hook() {
+    for target_bound in [false, true] {
+        let sandbox = Sandbox::new();
+        let mut setup = sandbox.setup();
+        setup.spec.autonomy.defaults.max_llm_calls =
+            Some(ai_agents::autonomy::AutonomyLimit::Finite(2));
+        setup.spec.autonomy.defaults.on_limit =
+            Some(serde_json::from_value(json!({"action":"pause_run"})).unwrap());
+        let revision = Arc::new(WorkspaceRevision(AtomicU64::new(1)));
+        let extensions = if target_bound {
+            setup
+                .extensions_with_target(Some(("workspace", revision)))
+                .unwrap()
+        } else {
+            setup.extensions().unwrap()
+        };
+        let provider = Arc::new(Provider::new(VecDeque::from([
+            "Ready for checking.".into(),
+            "hook result".into(),
+            "provider result".into(),
+        ])));
+        let hook = Arc::new(FeedbackCapacityHook {
+            runtime: Mutex::new(std::sync::Weak::new()),
+            calls: AtomicU64::new(0),
+        });
+        let runner = runner_with_extensions(&setup, provider, extensions, Some(hook.clone()));
+        *hook.runtime.lock().unwrap() = Arc::downgrade(runner.runtime());
+        let check = runner
+            .run("Fix the selected function.", None)
+            .await
+            .unwrap();
+        let capacity = respond(&runner, check, ApprovalResult::Approved).await;
+        assert_eq!(capacity.run.status, TaskRunStatus::Paused);
+        assert_eq!(hook.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            capacity.run.pending.as_ref().unwrap().reviewed_action["proposal"]["limit"]["model"]["feedback_hook_completed"],
+            true
+        );
+        let mut limits = capacity.run.limits.clone();
+        limits.max_llm_calls = Some(4);
+        let revised = runner
+            .revise_limits_paused(
+                &capacity.run.key.run_id,
+                capacity.run.revision,
+                limits,
+                "allow feedback",
+            )
+            .await
+            .unwrap();
+        let resumed = runner
+            .resume(
+                &revised.run.key.run_id,
+                revised.run.revision,
+                TaskResumeInput::Continue,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            hook.calls.load(Ordering::SeqCst),
+            1,
+            "completed feedback hook must not run again"
+        );
+        cancel_if_paused(&runner, &resumed).await;
+        drop(runner);
+        sandbox.cleanup();
+    }
+}
+
+struct FeedbackCapacityAndUnavailableHook {
+    runtime: Mutex<std::sync::Weak<ai_agents::RuntimeAgent>>,
+    revision: Arc<WorkspaceRevision>,
+    calls: AtomicU64,
+}
+
+// Finish a host callback, exhaust managed capacity, then lose its revision before the post-hook proof check.
+#[async_trait]
+impl ai_agents::AgentHooks for FeedbackCapacityAndUnavailableHook {
+    fn task_providers(&self) -> Option<Vec<Arc<dyn LLMProvider>>> {
+        Some(vec![])
+    }
+    async fn on_llm_start(&self, messages: &[ChatMessage]) {
+        if messages.iter().any(|message| {
+            message
+                .content
+                .contains("Untrusted output from a failed authorized validation check")
+        }) {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let runtime = self.runtime.lock().unwrap().upgrade().unwrap();
+            let provider = runtime.llm_registry().get("default").unwrap();
+            let _ = provider.complete(messages, None).await;
+            let _ = provider.complete(messages, None).await;
+            self.revision.0.store(u64::MAX, Ordering::SeqCst);
+        }
+    }
+}
+
+// A simultaneous capacity stop and temporarily unavailable proof must not replay an already completed hook.
+#[tokio::test]
+async fn feedback_capacity_with_unavailable_target_preserves_completed_hook() {
+    let sandbox = Sandbox::new();
+    let mut setup = sandbox.setup();
+    setup.spec.autonomy.defaults.max_llm_calls =
+        Some(ai_agents::autonomy::AutonomyLimit::Finite(2));
+    setup.spec.autonomy.defaults.on_limit =
+        Some(serde_json::from_value(json!({"action":"pause_run"})).unwrap());
+    let revision = Arc::new(WorkspaceRevision(AtomicU64::new(1)));
+    let extensions = setup
+        .extensions_with_target(Some(("workspace", revision.clone())))
+        .unwrap();
+    let provider = Arc::new(Provider::new(VecDeque::from([
+        "Ready for checking.".into(), "hook result".into(),
+        json!({"tool":"file_read","arguments":{"path":sandbox.source}}).to_string(),
+        json!({"tool":"file_edit","arguments":{"path":sandbox.source,"old_text":"{ 1 }","new_text":"{ 2 }","dry_run":false}}).to_string(),
+    ])));
+    let hook = Arc::new(FeedbackCapacityAndUnavailableHook {
+        runtime: Mutex::new(std::sync::Weak::new()),
+        revision: revision.clone(),
+        calls: AtomicU64::new(0),
+    });
+    let runner = runner_with_extensions(&setup, provider, extensions, Some(hook.clone()));
+    *hook.runtime.lock().unwrap() = Arc::downgrade(runner.runtime());
+    let check = runner
+        .run("Fix the selected function.", None)
+        .await
+        .unwrap();
+    let capacity = respond(&runner, check, ApprovalResult::Approved).await;
+    assert_eq!(
+        capacity.run.status,
+        TaskRunStatus::Paused,
+        "{:?}",
+        capacity.run.stop_reason
+    );
+    assert_eq!(hook.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        capacity.run.pending.as_ref().unwrap().reviewed_action["proposal"]["limit"]["model"]["feedback_hook_completed"],
+        true
+    );
+    revision.0.store(1, Ordering::SeqCst);
+    let mut limits = capacity.run.limits.clone();
+    limits.max_llm_calls = Some(4);
+    let revised = runner
+        .revise_limits_paused(
+            &capacity.run.key.run_id,
+            capacity.run.revision,
+            limits,
+            "continue after host recovery",
+        )
+        .await
+        .unwrap();
+    let resumed = runner
+        .resume(
+            &revised.run.key.run_id,
+            revised.run.revision,
+            TaskResumeInput::Continue,
+        )
+        .await
+        .unwrap();
+    assert_eq!(hook.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(resumed.run.status, TaskRunStatus::Paused);
+    cancel_if_paused(&runner, &resumed).await;
+    drop(runner);
+    sandbox.cleanup();
+}
+
+struct FeedbackTargetUnavailableHook(Arc<WorkspaceRevision>);
+
+// A lost host revision is not an empty or successful observation.
+#[async_trait]
+impl ai_agents::AgentHooks for FeedbackTargetUnavailableHook {
+    fn task_providers(&self) -> Option<Vec<Arc<dyn LLMProvider>>> {
+        Some(vec![])
+    }
+    async fn on_llm_start(&self, messages: &[ChatMessage]) {
+        if messages.iter().any(|message| {
+            message
+                .content
+                .contains("Untrusted output from a failed authorized validation check")
+        }) {
+            self.0.0.store(u64::MAX, Ordering::SeqCst);
+        }
+    }
+}
+
+// An unavailable source must stop before disclosing checker output to the provider.
+#[tokio::test]
+async fn target_bound_feedback_rejects_unavailable_revision() {
+    let sandbox = Sandbox::new();
+    let setup = sandbox.setup();
+    let revision = Arc::new(WorkspaceRevision(AtomicU64::new(1)));
+    let extensions = setup
+        .extensions_with_target(Some(("workspace", revision.clone())))
+        .unwrap();
+    let provider = Arc::new(Provider::new(VecDeque::from([
+        "Ready for checking.".into(),
+        "must not run".into(),
+    ])));
+    let runner = runner_with_extensions(
+        &setup,
+        provider.clone(),
+        extensions,
+        Some(Arc::new(FeedbackTargetUnavailableHook(revision))),
+    );
+    let check = runner
+        .run("Fix the selected function.", None)
+        .await
+        .unwrap();
+    let stopped = respond(&runner, check, ApprovalResult::Approved).await;
+    assert_ne!(stopped.run.status, TaskRunStatus::Completed);
+    assert_eq!(provider.requests.lock().unwrap().len(), 1);
+    cancel_if_paused(&runner, &stopped).await;
+    drop(runner);
+    sandbox.cleanup();
+}
+
+struct FeedbackChangingProvider {
+    revision: Arc<WorkspaceRevision>,
+    requests: AtomicU64,
+}
+
+// Change the host revision while the admitted feedback request is in flight.
+#[async_trait]
+impl LLMProvider for FeedbackChangingProvider {
+    async fn complete(
+        &self,
+        messages: &[ChatMessage],
+        _: Option<&LLMConfig>,
+    ) -> std::result::Result<LLMResponse, LLMError> {
+        self.requests.fetch_add(1, Ordering::SeqCst);
+        if messages.iter().any(|message| {
+            message
+                .content
+                .contains("Untrusted output from a failed authorized validation check")
+        }) {
+            self.revision.0.fetch_add(1, Ordering::SeqCst);
+            Ok(LLMResponse::new("late result", FinishReason::Stop))
+        } else {
+            Ok(LLMResponse::new("Ready for checking.", FinishReason::Stop))
+        }
+    }
+    async fn complete_stream(
+        &self,
+        _: &[ChatMessage],
+        _: Option<&LLMConfig>,
+    ) -> std::result::Result<
+        Box<dyn futures::Stream<Item = std::result::Result<LLMChunk, LLMError>> + Unpin + Send>,
+        LLMError,
+    > {
+        Err(LLMError::Config("unexpected stream".into()))
+    }
+    fn provider_name(&self) -> &str {
+        "feedback-changing-test"
+    }
+    fn supports(&self, _: LLMFeature) -> bool {
+        false
+    }
+}
+
+// The provider result is not admitted after its target changes during the call.
+#[tokio::test]
+async fn target_bound_feedback_rejects_late_provider_result() {
+    let sandbox = Sandbox::new();
+    let setup = sandbox.setup();
+    let revision = Arc::new(WorkspaceRevision(AtomicU64::new(1)));
+    let extensions = setup
+        .extensions_with_target(Some(("workspace", revision.clone())))
+        .unwrap();
+    let provider = Arc::new(FeedbackChangingProvider {
+        revision,
+        requests: AtomicU64::new(0),
+    });
+    let agent = Arc::new(
+        setup
+            .builder()
+            .llm(provider.clone())
+            .auto_configure_features()
+            .unwrap()
+            .autonomy_extensions(extensions)
+            .build()
+            .unwrap(),
+    );
+    agent.set_command_runner(setup.checker_runner().expect("checker installed"));
+    let store = Arc::new(
+        ScopedTaskRunStore::in_memory(agent.info().id, None, "feedback-late.v1".into()).unwrap(),
+    );
+    let runner = AutonomyRunner::try_new(
+        agent,
+        setup.spec.autonomy.clone(),
+        Default::default(),
+        store,
+        "feedback-late.v1".into(),
+    )
+    .unwrap();
+    let check = runner
+        .run("Fix the selected function.", None)
+        .await
+        .unwrap();
+    let stopped = respond(&runner, check, ApprovalResult::Approved).await;
+    assert_eq!(stopped.run.status, TaskRunStatus::RecoveryRequired);
+    assert_eq!(provider.requests.load(Ordering::SeqCst), 2);
+    assert!(
+        !stopped
+            .final_response
+            .as_ref()
+            .is_some_and(|response| response.content.contains("late result"))
+    );
+    // A returned provider call with rejected settlement is not proof of cleanup or safe fixture removal.
+    drop(runner);
+    assert!(sandbox.parent.exists());
+}
+
 // Discovery is an explicit broader read-only grant and does not widen direct file edits.
 #[tokio::test]
 async fn opted_in_workspace_discovery_executes_with_root_scope_but_keeps_edit_scope() {
@@ -694,17 +1691,13 @@ async fn opted_in_workspace_discovery_executes_with_root_scope_but_keeps_edit_sc
     sandbox.cleanup();
 }
 
-// Two explicitly selected files share one real checker while the pre-existing index, unstaged file and untracked file remain untouched.
+// Selected tracked and untracked files retain existing user changes and the index while one real checker validates all three.
 #[tokio::test]
 async fn selected_multifile_repairs_keep_dirty_workspace_and_require_fresh_check() {
     let sandbox = Sandbox::new();
     let second = sandbox.root.join("second.rs");
+    let third = sandbox.root.join("third.rs");
     let untracked = sandbox.root.join("untracked.txt");
-    fs::write(
-        &sandbox.source,
-        "pub fn value() -> i32 { 1 } // user note\n",
-    )
-    .unwrap();
     fs::write(&second, "pub fn value() -> i32 { 1 }\n").unwrap();
     let git = |args: &[&str]| {
         let output = std::process::Command::new("git")
@@ -713,6 +1706,9 @@ async fn selected_multifile_repairs_keep_dirty_workspace_and_require_fresh_check
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_TERMINAL_PROMPT", "0")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
             .output()
             .unwrap();
         assert!(
@@ -724,17 +1720,48 @@ async fn selected_multifile_repairs_keep_dirty_workspace_and_require_fresh_check
     };
     git(&["init", "--quiet"]);
     git(&["add", "--", "source.rs", "second.rs", "protected.rs"]);
+    git(&[
+        "-c",
+        "user.name=Fixture",
+        "-c",
+        "user.email=fixture@example.invalid",
+        "-c",
+        "core.hooksPath=/dev/null",
+        "commit",
+        "--quiet",
+        "--no-gpg-sign",
+        "-m",
+        "fixture baseline",
+    ]);
+    fs::write(
+        &sandbox.source,
+        "pub fn value() -> i32 { 1 } // staged user note\n",
+    )
+    .unwrap();
+    git(&["add", "--", "source.rs"]);
     let staged = ["source.rs", "second.rs", "protected.rs"]
         .map(|file| git(&["--no-pager", "show", &format!(":{file}")]));
+    fs::write(
+        &sandbox.source,
+        "pub fn value() -> i32 { 1 } // staged user note + unstaged note\n",
+    )
+    .unwrap();
     fs::write(&sandbox.outside, "unstaged user change\n").unwrap();
+    fs::write(
+        &third,
+        "pub fn value() -> i32 { 1 } // untracked user note\n",
+    )
+    .unwrap();
     fs::write(&untracked, "untracked user data\n").unwrap();
     let before = git(&["--no-optional-locks", "status", "--porcelain=v1"]);
+    assert!(String::from_utf8_lossy(&before).contains("MM source.rs"));
     assert!(String::from_utf8_lossy(&before).contains("protected.rs"));
+    assert!(String::from_utf8_lossy(&before).contains("?? third.rs"));
     assert!(String::from_utf8_lossy(&before).contains("untracked.txt"));
 
     let checker_root = sandbox.parent.join("checker");
     let harness = checker_root.join("multi_acceptance.rs");
-    fs::write(&harness, format!("#[path = {:?}] mod first;\n#[path = {:?}] mod second;\n#[test] fn expected_values() {{ assert_eq!(first::value(), 2); assert_eq!(second::value(), 3); }}\n", sandbox.source, second)).unwrap();
+    fs::write(&harness, format!("#[path = {:?}] mod first;\n#[path = {:?}] mod second;\n#[path = {:?}] mod third;\n#[test] fn expected_values() {{ assert_eq!(first::value(), 2); assert_eq!(second::value(), 3); assert_eq!(third::value(), 4); }}\n", sandbox.source, second, third)).unwrap();
     let rustc = fs::canonicalize(env!("CARGO"))
         .unwrap()
         .parent()
@@ -744,7 +1771,11 @@ async fn selected_multifile_repairs_keep_dirty_workspace_and_require_fresh_check
     fs::write(&sandbox.checker, format!("#!/bin/sh\nset -eu\nPATH=/usr/bin:/bin\nexport PATH\n'{}' --edition 2024 --test '{}' -o '{}'\nexec '{}' --test-threads=1\n", rustc.display(), harness.display(), binary.display(), binary.display())).unwrap();
     let setup = prepare_files(
         &sandbox.root,
-        &[PathBuf::from("source.rs"), PathBuf::from("second.rs")],
+        &[
+            PathBuf::from("source.rs"),
+            PathBuf::from("second.rs"),
+            PathBuf::from("third.rs"),
+        ],
         &sandbox.checker,
         "openai",
         "offline-test",
@@ -756,6 +1787,8 @@ async fn selected_multifile_repairs_keep_dirty_workspace_and_require_fresh_check
         json!({"tool":"file_edit","arguments":{"path":sandbox.source,"old_text":"{ 1 }","new_text":"{ 1 + 1 }","dry_run":false}}).to_string(),
         json!({"tool":"file_read","arguments":{"path":second}}).to_string(),
         json!({"tool":"file_edit","arguments":{"path":second,"old_text":"{ 1 }","new_text":"{ 1 + 3 }","dry_run":false}}).to_string(),
+        json!({"tool":"file_read","arguments":{"path":third}}).to_string(),
+        json!({"tool":"file_edit","arguments":{"path":third,"old_text":"{ 1 }","new_text":"{ 1 + 3 }","dry_run":false}}).to_string(),
         "First edit ready.".into(),
         json!({"tool":"file_read","arguments":{"path":second}}).to_string(),
         json!({"tool":"file_edit","arguments":{"path":second,"old_text":"{ 1 + 3 }","new_text":"{ 1 + 2 }","dry_run":false}}).to_string(),
@@ -763,13 +1796,15 @@ async fn selected_multifile_repairs_keep_dirty_workspace_and_require_fresh_check
     ])));
     let runner = runner_with_provider(&setup, provider.clone());
     let first = runner
-        .run("Fix both selected functions.", None)
+        .run("Fix all three selected functions.", None)
         .await
         .unwrap();
     assert_eq!(first.run.status, TaskRunStatus::Paused);
     let second_edit = respond(&runner, first, ApprovalResult::Approved).await;
     assert_eq!(second_edit.run.status, TaskRunStatus::Paused);
-    let first_check = respond(&runner, second_edit, ApprovalResult::Approved).await;
+    let third_edit = respond(&runner, second_edit, ApprovalResult::Approved).await;
+    assert_eq!(third_edit.run.status, TaskRunStatus::Paused);
+    let first_check = respond(&runner, third_edit, ApprovalResult::Approved).await;
     assert_eq!(first_check.run.status, TaskRunStatus::Paused);
     let repair = respond(&runner, first_check, ApprovalResult::Approved).await;
     assert_eq!(repair.run.status, TaskRunStatus::Paused);
@@ -784,11 +1819,15 @@ async fn selected_multifile_repairs_keep_dirty_workspace_and_require_fresh_check
     );
     assert_eq!(
         fs::read_to_string(&sandbox.source).unwrap(),
-        "pub fn value() -> i32 { 1 + 1 } // user note\n"
+        "pub fn value() -> i32 { 1 + 1 } // staged user note + unstaged note\n"
     );
     assert_eq!(
         fs::read_to_string(&second).unwrap(),
         "pub fn value() -> i32 { 1 + 2 }\n"
+    );
+    assert_eq!(
+        fs::read_to_string(&third).unwrap(),
+        "pub fn value() -> i32 { 1 + 3 } // untracked user note\n"
     );
     assert_eq!(
         fs::read_to_string(&sandbox.outside).unwrap(),
@@ -825,7 +1864,7 @@ async fn selected_multifile_repairs_keep_dirty_workspace_and_require_fresh_check
                 && entry.record.executed
                 && entry.record.success)
             .count(),
-        3
+        4
     );
     assert!(
         provider
@@ -880,23 +1919,24 @@ async fn failed_checker_feedback_is_bounded_and_does_not_retry_indefinitely() {
         .unwrap()
         .unwrap();
     assert!(matches!(pending.prompt, TaskHostPrompt::Question(_)));
-    let requests = provider.requests.lock().unwrap();
-    assert_eq!(requests.len(), 2);
-    let projected = requests
-        .iter()
-        .flatten()
-        .find(|message| {
-            message.role == ai_agents::Role::User
-                && message
-                    .content
-                    .starts_with("Untrusted output from a failed authorized validation check")
-        })
-        .expect("actual failed check output must reach the next model request");
-    let (_, body) = projected.content.split_once('\n').unwrap();
-    let body: serde_json::Value = serde_json::from_str(body).unwrap();
-    assert!(body["text"].as_str().unwrap().chars().count() <= 12);
-    assert_eq!(body["truncated"], true);
-    drop(requests);
+    {
+        let requests = provider.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        let projected = requests
+            .iter()
+            .flatten()
+            .find(|message| {
+                message.role == ai_agents::Role::User
+                    && message
+                        .content
+                        .starts_with("Untrusted output from a failed authorized validation check")
+            })
+            .expect("actual failed check output must reach the next model request");
+        let (_, body) = projected.content.split_once('\n').unwrap();
+        let body: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert!(body["text"].as_str().unwrap().chars().count() <= 12);
+        assert_eq!(body["truncated"], true);
+    }
     let checks = guidance
         .run
         .evidence
@@ -968,7 +2008,7 @@ async fn checker_feedback_never_retries_or_leaks_to_fallback_provider() {
             .build()
             .unwrap(),
     );
-    agent.set_command_runner(setup.checker_runner());
+    agent.set_command_runner(setup.checker_runner().expect("checker installed"));
     let store = Arc::new(
         ScopedTaskRunStore::in_memory(agent.info().id, None, "feedback-once.v1".into()).unwrap(),
     );
@@ -1026,7 +2066,7 @@ async fn checker_feedback_stops_before_dispatch_when_hook_mutates() {
             .unwrap(),
     );
     *hook.runtime.lock().unwrap() = Arc::downgrade(&agent);
-    agent.set_command_runner(setup.checker_runner());
+    agent.set_command_runner(setup.checker_runner().expect("checker installed"));
     let store = Arc::new(
         ScopedTaskRunStore::in_memory(agent.info().id, None, "feedback-stale.v1".into()).unwrap(),
     );
@@ -1077,7 +2117,7 @@ async fn inline_edit_rejection_does_not_trigger_automatic_checker_feedback() {
             .build()
             .unwrap(),
     );
-    agent.set_command_runner(setup.checker_runner());
+    agent.set_command_runner(setup.checker_runner().expect("checker installed"));
     let store = Arc::new(
         ScopedTaskRunStore::in_memory(agent.info().id, None, "inline-reject.v1".into()).unwrap(),
     );
@@ -1140,7 +2180,7 @@ async fn changed_checker_timeout_cannot_prove_the_original_command_exit() {
             .remove("host_binding");
         setup.spec.autonomy.defaults.completion = Some(
             serde_json::from_value(json!({
-                "command_exit": {"command": setup.command, "code": 0}
+                "command_exit": {"command": setup.checker.as_ref().unwrap().command, "code": 0}
             }))
             .unwrap(),
         );
@@ -1219,7 +2259,7 @@ async fn configured_host_retains_the_real_task_and_checker_binding() {
         .build_task_host()
         .await
         .unwrap();
-    agent.set_command_runner(setup.checker_runner());
+    agent.set_command_runner(setup.checker_runner().expect("checker installed"));
     let first = agent
         .run_task("Fix the selected function.", None)
         .await
@@ -1431,6 +2471,211 @@ async fn rejecting_checker_requests_guidance_without_retrying_it() {
         fs::read_to_string(&sandbox.source).unwrap(),
         "pub fn value() -> i32 { 1 + 1 }\n"
     );
+    drop(runner);
+    sandbox.cleanup();
+}
+
+// An exact answer resumes the retained objective without treating guidance as approval or replaying the prior edit.
+#[tokio::test]
+async fn workspace_question_resumes_without_replaying_edit_or_skipping_checker() {
+    let sandbox = Sandbox::new();
+    let setup = sandbox.setup();
+    let provider = scripted_provider(&setup, &sandbox.source);
+    provider
+        .responses
+        .lock()
+        .unwrap()
+        .push_back("Ready for the fixed check.".into());
+    let runner = runner_with_provider(&setup, provider);
+    let edit = runner
+        .run("Fix the selected function.", None)
+        .await
+        .unwrap();
+    let checker = respond(&runner, edit, ApprovalResult::Approved).await;
+    let question = respond(&runner, checker, ApprovalResult::Rejected { reason: None }).await;
+    assert_eq!(question.run.status, TaskRunStatus::Paused);
+    let interaction = runner
+        .task_interaction(&question.run.key.run_id, question.run.revision)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(interaction.prompt, TaskHostPrompt::Question(_)));
+    let next = runner
+        .resume(
+            &question.run.key.run_id,
+            question.run.revision,
+            TaskResumeInput::UserAnswer {
+                request_id: interaction.request_id,
+                answer: json!("Please request the fixed checker again."),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(next.run.status, TaskRunStatus::Paused);
+    let next_interaction = runner
+        .task_interaction(&next.run.key.run_id, next.run.revision)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        next_interaction.prompt,
+        TaskHostPrompt::Approval { .. }
+    ));
+    assert!(
+        !next
+            .run
+            .evidence
+            .tool_calls
+            .iter()
+            .any(|entry| entry.record.canonical_id == "command" && entry.record.executed)
+    );
+    let done = respond(&runner, next, ApprovalResult::Approved).await;
+    assert_eq!(
+        done.run.status,
+        TaskRunStatus::Completed,
+        "{:?}",
+        done.run.stop_reason
+    );
+    assert_eq!(
+        done.run
+            .evidence
+            .tool_calls
+            .iter()
+            .filter(|entry| entry.record.canonical_id == "file_edit"
+                && entry.record.executed
+                && entry.record.success)
+            .count(),
+        1
+    );
+    assert_eq!(
+        done.run
+            .evidence
+            .tool_calls
+            .iter()
+            .filter(|entry| entry.record.canonical_id == "command" && entry.record.executed)
+            .count(),
+        1
+    );
+    assert_eq!(
+        fs::read_to_string(&sandbox.source).unwrap(),
+        "pub fn value() -> i32 { 1 + 1 }\n"
+    );
+    drop(runner);
+    sandbox.cleanup();
+}
+
+// Stale approval and question responses cannot consume a pending decision or replay the completed edit.
+#[tokio::test]
+async fn workspace_rejects_stale_responses_without_replaying_completed_work() {
+    let sandbox = Sandbox::new();
+    let setup = sandbox.setup();
+    let provider = scripted_provider(&setup, &sandbox.source);
+    let runner = runner_with_provider(&setup, provider.clone());
+    let edit = runner
+        .run("Fix the selected function.", None)
+        .await
+        .unwrap();
+    assert_eq!(edit.run.status, TaskRunStatus::Paused);
+    let edit_id = edit.run.key.run_id.clone();
+    let edit_interaction = runner
+        .task_interaction(&edit_id, edit.run.revision)
+        .await
+        .unwrap()
+        .unwrap();
+    let requests = provider.requests.lock().unwrap().len();
+    assert!(
+        runner
+            .resume(
+                &edit_id,
+                edit.run.revision + 1,
+                TaskResumeInput::Approval {
+                    request_id: edit_interaction.request_id.clone(),
+                    result: ApprovalResult::Approved,
+                }
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        runner
+            .resume(
+                &edit_id,
+                edit.run.revision,
+                TaskResumeInput::Approval {
+                    request_id: "wrong-request".into(),
+                    result: ApprovalResult::Approved,
+                }
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(provider.requests.lock().unwrap().len(), requests);
+    assert_eq!(
+        fs::read_to_string(&sandbox.source).unwrap(),
+        "pub fn value() -> i32 { 1 }\n"
+    );
+    let checker = respond(&runner, edit, ApprovalResult::Approved).await;
+    let question = respond(&runner, checker, ApprovalResult::Rejected { reason: None }).await;
+    assert_eq!(question.run.status, TaskRunStatus::Paused);
+    let interaction = runner
+        .task_interaction(&edit_id, question.run.revision)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(interaction.prompt, TaskHostPrompt::Question(_)));
+    let requests = provider.requests.lock().unwrap().len();
+    assert!(
+        runner
+            .resume(
+                &edit_id,
+                question.run.revision + 1,
+                TaskResumeInput::UserAnswer {
+                    request_id: interaction.request_id.clone(),
+                    answer: json!("continue"),
+                }
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        runner
+            .resume(
+                &edit_id,
+                question.run.revision,
+                TaskResumeInput::UserAnswer {
+                    request_id: "wrong-request".into(),
+                    answer: json!("continue"),
+                }
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(provider.requests.lock().unwrap().len(), requests);
+    assert_eq!(
+        question
+            .run
+            .evidence
+            .tool_calls
+            .iter()
+            .filter(|entry| entry.record.canonical_id == "file_edit"
+                && entry.record.executed
+                && entry.record.success)
+            .count(),
+        1
+    );
+    assert!(
+        !question
+            .run
+            .evidence
+            .tool_calls
+            .iter()
+            .any(|entry| entry.record.canonical_id == "command" && entry.record.executed)
+    );
+    assert_eq!(
+        fs::read_to_string(&sandbox.source).unwrap(),
+        "pub fn value() -> i32 { 1 + 1 }\n"
+    );
+    cancel_if_paused(&runner, &question).await;
     drop(runner);
     sandbox.cleanup();
 }

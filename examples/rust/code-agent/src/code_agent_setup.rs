@@ -17,6 +17,9 @@
 // Use /task run in the interactive session.
 // check-workspace does not contact a provider; run-workspace requires explicit trust and code-sharing consent.
 // The supplied checker runs with host permissions and must provide its own independent tests and isolation.
+// For questions that do not require edits, omit the checker and explicitly select the read-only task:
+// cargo run --manifest-path examples/Cargo.toml -p example-code-agent --bin code-agent-setup --offline -- check-read-only "$WORKSPACE" "$SOURCE" openai gpt-5.4-mini
+// cargo run --manifest-path examples/Cargo.toml -p example-code-agent --bin code-agent-setup --offline -- run-read-only --share-source "$WORKSPACE" "$SOURCE" openai gpt-5.4-mini
 
 mod code_agent_run;
 mod code_agent_workspace;
@@ -27,9 +30,18 @@ use std::path::{Path, PathBuf};
 // CLI paths are host input; the instruction snapshot and output limit are explicitly selected.
 fn workspace_setup(
     args: &[String],
+    read_only: bool,
 ) -> Result<workspace_agent::WorkspaceSetup, Box<dyn std::error::Error>> {
-    let [root, source, checker, provider, model, rest @ ..] = args else {
-        return Err("expected WORKSPACE SOURCE CHECKER PROVIDER MODEL [INSTRUCTIONS] [--file PATH] [--allow-discovery] [--max-output-tokens N] [--checker-timeout-ms N]".into());
+    let (root, source, checker, provider, model, rest) = if read_only {
+        let [root, source, provider, model, rest @ ..] = args else {
+            return Err("expected WORKSPACE SOURCE PROVIDER MODEL [INSTRUCTIONS] [--file PATH] [--allow-discovery] [--max-output-tokens N]".into());
+        };
+        (root, source, None, provider, model, rest)
+    } else {
+        let [root, source, checker, provider, model, rest @ ..] = args else {
+            return Err("expected WORKSPACE SOURCE CHECKER PROVIDER MODEL [INSTRUCTIONS] [--file PATH] [--allow-discovery] [--max-output-tokens N] [--checker-timeout-ms N]".into());
+        };
+        (root, source, Some(checker), provider, model, rest)
     };
     let mut instructions = None;
     let mut sources = vec![PathBuf::from(source)];
@@ -89,24 +101,30 @@ fn workspace_setup(
             instructions = Some(Path::new(arg));
         }
     }
-    let mut setup = if sources.len() == 1 {
-        workspace_agent::prepare(
+    let mut setup = match checker {
+        None => workspace_agent::prepare_read_only(
+            Path::new(root),
+            &sources,
+            provider,
+            model,
+            instructions,
+        )?,
+        Some(checker) if sources.len() == 1 => workspace_agent::prepare(
             Path::new(root),
             Path::new(source),
             Path::new(checker),
             provider,
             model,
             instructions,
-        )?
-    } else {
-        workspace_agent::prepare_files(
+        )?,
+        Some(checker) => workspace_agent::prepare_files(
             Path::new(root),
             &sources,
             Path::new(checker),
             provider,
             model,
             instructions,
-        )?
+        )?,
     };
     if allow_discovery {
         setup.enable_discovery()?;
@@ -124,7 +142,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     match args.as_slice() {
         [action, rest @ ..] if action == "check-workspace" => {
-            let setup = workspace_setup(rest)?;
+            let setup = workspace_setup(rest, false)?;
             let _builder = setup
                 .builder()
                 .auto_configure_features()?
@@ -135,7 +153,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("Selected source files: {}", setup.source_files().len());
             println!("Workspace discovery enabled: {}", setup.discovery_enabled());
             println!("Maximum model output tokens: {}", setup.max_output_tokens());
-            println!("Checker timeout: {} ms", setup.checker_timeout_ms());
+            if let Some(timeout) = setup.checker_timeout_ms() {
+                println!("Checker timeout: {timeout} ms");
+            }
             println!(
                 "This does not certify checker independence, isolation, credentials or task completion."
             );
@@ -145,7 +165,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 && trust == "--trust-checker"
                 && share == "--share-source" =>
         {
-            let setup = workspace_setup(rest)?;
+            let setup = workspace_setup(rest, false)?;
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?
+                .block_on(workspace_agent::run(setup))?;
+        }
+        [action, rest @ ..] if action == "check-read-only" => {
+            let setup = workspace_setup(rest, true)?;
+            let _builder = setup
+                .builder()
+                .auto_configure_features()?
+                .autonomy_extensions(setup.extensions()?);
+            println!(
+                "Read-only configuration validated without constructing a provider or installing a checker."
+            );
+            println!("Selected source files: {}", setup.source_files().len());
+            println!("Workspace discovery enabled: {}", setup.discovery_enabled());
+            println!("Maximum model output tokens: {}", setup.max_output_tokens());
+        }
+        [action, share, rest @ ..] if action == "run-read-only" && share == "--share-source" => {
+            let setup = workspace_setup(rest, true)?;
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?
@@ -198,7 +238,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
         _ => {
-            return Err("usage: code-agent-setup prepare NEW_ABSOLUTE_PATH | check-config WORKSPACE CARGO RUSTC | verify WORKSPACE CARGO RUSTC | run-offline WORKSPACE CARGO RUSTC | check-workspace WORKSPACE SOURCE CHECKER PROVIDER MODEL [INSTRUCTIONS] [--file PATH] [--allow-discovery] [--max-output-tokens N] [--checker-timeout-ms N] | run-workspace --trust-checker --share-source WORKSPACE SOURCE CHECKER PROVIDER MODEL [INSTRUCTIONS] [--file PATH] [--allow-discovery] [--max-output-tokens N] [--checker-timeout-ms N]".into());
+            return Err("usage: code-agent-setup prepare NEW_ABSOLUTE_PATH | check-config WORKSPACE CARGO RUSTC | verify WORKSPACE CARGO RUSTC | run-offline WORKSPACE CARGO RUSTC | check-workspace WORKSPACE SOURCE CHECKER PROVIDER MODEL [INSTRUCTIONS] [--file PATH] [--allow-discovery] [--max-output-tokens N] [--checker-timeout-ms N] | run-workspace --trust-checker --share-source WORKSPACE SOURCE CHECKER PROVIDER MODEL [INSTRUCTIONS] [--file PATH] [--allow-discovery] [--max-output-tokens N] [--checker-timeout-ms N] | check-read-only WORKSPACE SOURCE PROVIDER MODEL [INSTRUCTIONS] [--file PATH] [--allow-discovery] [--max-output-tokens N] | run-read-only --share-source WORKSPACE SOURCE PROVIDER MODEL [INSTRUCTIONS] [--file PATH] [--allow-discovery] [--max-output-tokens N]".into());
         }
     }
     Ok(())

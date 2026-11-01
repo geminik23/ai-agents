@@ -77,14 +77,14 @@ pub(super) fn remaining_wall(
     )
 }
 
-// Only current acknowledged failed command evidence may be projected; denial, unknown, stale or modified requests never trigger retry.
+// Only current acknowledged failed command evidence may be projected; target-bound feedback also needs its live source at provider admission.
 fn validation_feedback(
     config: &ValidationFeedbackConfig,
     evidence: &EvaluationEvidence,
     scope: &EvaluationScope,
 ) -> Option<serde_json::Value> {
     let validation = latest_validation(&evidence.validations, &config.check_id, scope)?;
-    if validation.outcome != GateOutcome::Fail || validation.identity.target.is_some() {
+    if validation.outcome != GateOutcome::Fail {
         return None;
     }
     // A rejected or unavailable operation in this cycle always requires a human decision, even if the checker also failed.
@@ -113,6 +113,8 @@ fn validation_feedback(
             && observation.identity.attempt == validation.identity.attempt
             && observation.identity.cycle == validation.identity.cycle
             && observation.identity.config_identity == validation.identity.config_identity
+            && observation.identity.target == validation.identity.target
+            && observation.identity.target_revision == validation.identity.target_revision
             && observation.identity.eligible(scope, true, true)
     })?;
     let output: serde_json::Value = serde_json::from_str(&observed.value.record.output).ok()?;
@@ -3224,6 +3226,66 @@ impl AutonomyRunner {
             run,
             final_response,
         })
+    }
+}
+
+#[cfg(test)]
+mod feedback_tests {
+    use super::*;
+    use crate::autonomy::evaluation_tests::{identity, record, scope};
+    use serde_json::json;
+
+    // Feedback must come from the same live target and attempt as the failed fixed validation.
+    #[test]
+    fn feedback_matches_exact_host_target_and_rejects_stale_evidence() {
+        let mut scope = scope();
+        scope
+            .target_revisions
+            .insert("workspace".into(), "revision-1".into());
+        scope
+            .target_revisions
+            .insert("other".into(), "revision-1".into());
+        let mut evidence_identity = identity(&scope);
+        evidence_identity.target = Some("workspace".into());
+        evidence_identity.target_revision = Some("revision-1".into());
+        let mut evidence = EvaluationEvidence::default();
+        evidence.validations.push(ValidationResult {
+            check_id: "check".into(),
+            identity: evidence_identity.clone(),
+            outcome: GateOutcome::Fail,
+            reason: "failed".into(),
+            metrics: json!({}),
+            evidence_refs: vec![],
+        });
+        evidence.commands.push(ScopedObservation {
+            identity: evidence_identity,
+            complete: true,
+            value: CommandObservation {
+                check_id: "check".into(),
+                command: "verify".into(),
+                exit_code: Some(1),
+                termination: "exited".into(),
+                record: record(
+                    "command",
+                    json!({"command":"verify"}),
+                    json!({"combined_output":"failed"}),
+                ),
+            },
+        });
+        let config = ValidationFeedbackConfig {
+            enabled: true,
+            check_id: "check".into(),
+            max_output_chars: 32,
+            max_retries: 3,
+        };
+        assert!(validation_feedback(&config, &evidence, &scope).is_some());
+        evidence.commands[0].identity.target = Some("other".into());
+        assert!(validation_feedback(&config, &evidence, &scope).is_none());
+        evidence.commands[0].identity.target = Some("workspace".into());
+        scope
+            .target_revisions
+            .insert("workspace".into(), "revision-2".into());
+        assert!(validation_feedback(&config, &evidence, &scope).is_none());
     }
 }
 

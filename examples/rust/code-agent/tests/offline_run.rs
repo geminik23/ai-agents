@@ -125,6 +125,37 @@ fn workspace_check_is_provider_free_and_live_mode_requires_explicit_consent() {
     assert!(String::from_utf8_lossy(&checked.stdout).contains("Maximum model output tokens: 4096"));
     assert!(String::from_utf8_lossy(&checked.stdout).contains("Checker timeout: 45000 ms"));
     assert!(!marker.exists());
+    let read_only = Command::new(executable)
+        .env_clear()
+        .arg("check-read-only")
+        .arg(&workspace)
+        .arg("source.rs")
+        .arg("openai")
+        .arg("offline-test")
+        .arg("--file")
+        .arg("second.rs")
+        .arg("--allow-discovery")
+        .output()
+        .unwrap();
+    assert!(
+        read_only.status.success(),
+        "{}",
+        String::from_utf8_lossy(&read_only.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&read_only.stdout)
+            .contains("without constructing a provider or installing a checker")
+    );
+    assert!(!marker.exists());
+    let missing_consent = Command::new(executable)
+        .env_clear()
+        .args(["run-read-only"])
+        .arg(&workspace)
+        .args(["source.rs", "openai", "offline-test"])
+        .output()
+        .unwrap();
+    assert!(!missing_consent.status.success());
+    assert!(!marker.exists());
     let duplicate = Command::new(executable)
         .env_clear()
         .arg("check-workspace")

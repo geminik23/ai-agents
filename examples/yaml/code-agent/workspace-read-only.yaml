@@ -1,0 +1,38 @@
+name: CodeAgentWorkspaceReadOnly
+version: "1.0.0"
+description: "Host-bound read-only code task for explicitly selected workspace files"
+
+# The Rust host binds the workspace and provider without installing a checker or a mutation grant.
+# Flow: select files -> read or discover -> answer under a read-only grant.
+# Optional discovery shares additional path listings and search matches with the selected provider.
+# A nonempty answer completes this read-only task; it does not prove the answer is correct.
+llm: {provider: openai, model: gpt-5.4-mini}
+
+context:
+  workspace_root: {type: runtime, required: true}
+  source_file: {type: runtime, required: true}
+  source_files: {type: runtime, required: true}
+  discovery_scope: {type: runtime, required: true}
+  instruction_snapshot: {type: runtime, required: true}
+
+system_prompt: |
+  Answer the user's question using the authorized workspace information. Do not claim changes or checks were performed.
+  Authorized workspace: {{ context.workspace_root }}
+  Primary source file: {{ context.source_file }}
+  Only directly readable source files: {{ context.source_files }}
+  Optional path-listing and content-search scope: {{ context.discovery_scope }}
+  Instructions explicitly supplied by the host:
+  {{ context.instruction_snapshot }}
+
+tools: [file_read]
+tool_security:
+  enabled: true
+  fail_closed: true
+  tools:
+    # An empty read filter is not a deny-all rule; the host must bind the selected files.
+    file_read: {read_paths: []}
+
+autonomy:
+  enabled: true
+  hitl: {on_approval_required: pause_run, on_user_question: pause_run}
+  completion: {response_not_empty: true}

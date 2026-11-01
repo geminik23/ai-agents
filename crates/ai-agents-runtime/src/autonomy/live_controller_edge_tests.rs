@@ -83,6 +83,15 @@ async fn legacy_capacity_review_preserves_original_cursor_shape() {
         };
         let model = limit.model.as_ref().unwrap();
         assert!(agent.checked_task_loop_policy(model).is_ok());
+        assert!(
+            serde_json::to_value(model)
+                .unwrap()
+                .get("feedback_hook_completed")
+                .is_none()
+        );
+        let mut invalid_hook = model.as_ref().clone();
+        invalid_hook.feedback_hook_completed = true;
+        assert!(agent.checked_task_loop_policy(&invalid_hook).is_err());
         let mut mismatch = model.as_ref().clone();
         mismatch.task_iteration_policy = Some(crate::spec::TaskIterationPolicy::configured());
         assert!(agent.checked_task_loop_policy(&mismatch).is_err());

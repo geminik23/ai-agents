@@ -1055,11 +1055,12 @@ impl RuntimeAgent {
         })
     }
 
-    // A retained cursor must match the live prepared policy before any pending tool or state action can execute.
+    // A retained cursor must match the live prepared policy and feedback-hook position before any pending work can execute.
     pub(crate) fn checked_task_loop_policy(
         &self,
         state: &TaskLoopState,
     ) -> Result<crate::spec::TaskIterationPolicy> {
+        state.validate_policy_shape()?;
         match (state.version, state.task_iteration_policy.as_ref()) {
             (1, None)
                 if self.task_iteration_policy == crate::spec::TaskIterationPolicy::configured() =>
@@ -1081,9 +1082,15 @@ impl RuntimeAgent {
         use crate::autonomy::location::TaskStateReturn;
         match position {
             TaskStateReturn::BeforeCalls { saved } => {
+                if saved.state.feedback_hook_completed {
+                    return Err(crate::autonomy::TaskRunStorageError::InvalidCheckpoint.into());
+                }
                 self.checked_task_loop_policy(&saved.state)?;
             }
             TaskStateReturn::ModelContinue { state } => {
+                if state.feedback_hook_completed {
+                    return Err(crate::autonomy::TaskRunStorageError::InvalidCheckpoint.into());
+                }
                 self.checked_task_loop_policy(state)?;
             }
             TaskStateReturn::ModelFinish { state } => {
@@ -1107,6 +1114,7 @@ impl RuntimeAgent {
     /// The caller owns user commit; reflection retains this loop's provider and suspension never resets accumulated calls.
     /// Ordinary chat retains numeric defaults, while task loops enforce only source-proven or explicitly configured limits.
     /// Legacy cursors without provenance remain finite, and a new cursor cannot resume under a different prepared policy.
+    /// A completed feedback hook survives provider-capacity pauses without replaying its effects or advancing the provider iteration.
     pub(super) async fn run_committed_task_loop(
         &self,
         mut state: TaskLoopState,
@@ -1180,11 +1188,33 @@ impl RuntimeAgent {
             } else {
                 None
             };
+            let hook_completed = std::mem::take(&mut state.feedback_hook_completed);
+            if hook_completed && feedback_guard.is_none() {
+                return Err(AgentError::Config(
+                    "feedback hook cursor lacks its live feedback".into(),
+                ));
+            }
             let start = Instant::now();
             let response = if let Some(guard) = feedback_guard {
                 // Preserve the live freshness witness through hooks and the managed first poll; never retry or fall back with this disclosure.
-                ai_agents_llm::scope_invocation_evidence(vec![guard], async {
-                    self.hooks.on_llm_start(&messages).await;
+                ai_agents_llm::scope_invocation_evidence(vec![guard.clone()], async {
+                    if !hook_completed {
+                        self.hooks.on_llm_start(&messages).await;
+                        if let Some(execution) = crate::autonomy::current_execution()
+                            && execution.is_coordinator(&self.info.id)
+                            && crate::autonomy::current_child_operation().is_none()
+                        {
+                            // Retain the completed callback before rechecking proof; a simultaneous capacity stop must not replay its effects.
+                            let mut pending = state.clone();
+                            pending.iterations =
+                                pending.iterations.checked_sub(1).ok_or_else(|| {
+                                    AgentError::Config("feedback hook iteration underflow".into())
+                                })?;
+                            pending.feedback_hook_completed = true;
+                            *execution.capacity_model.lock() = Some(Box::new(pending));
+                        }
+                        guard.validate()?;
+                    }
                     self.complete_main_llm_once(llm.clone(), &messages, &protocol)
                         .await
                 })

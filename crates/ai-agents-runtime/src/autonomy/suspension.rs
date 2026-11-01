@@ -71,11 +71,22 @@ pub(crate) struct TaskLoopState {
     pub native_exchanges: Vec<TaskNativeExchange>,
     #[serde(default)]
     pub deferred_final: Option<Box<super::location::TaskModelFinal>>,
+    // A completed feedback hook is retained only for the first provider position after a capacity pause.
+    #[serde(default, skip_serializing_if = "feedback_hook_not_completed")]
+    pub feedback_hook_completed: bool,
+}
+
+// Omit the new marker from legacy cursor images unless it protects completed callback work.
+fn feedback_hook_not_completed(completed: &bool) -> bool {
+    !completed
 }
 
 impl TaskLoopState {
-    // A v1 cursor has no source witness; a v2 cursor must retain the policy it originally recorded.
+    // A v1 cursor has no source witness; the feedback marker only describes the first provider position.
     pub(crate) fn validate_policy_shape(&self) -> Result<()> {
+        if self.feedback_hook_completed && (self.iterations != 0 || self.deferred_final.is_some()) {
+            return Err(TaskRunStorageError::InvalidCheckpoint.into());
+        }
         if matches!(
             (self.version, &self.task_iteration_policy),
             (1, None) | (2, Some(_))
@@ -423,10 +434,9 @@ impl TaskBatchState {
             || self.results.len() != self.calls.len()
             || self.appended > self.calls.len()
             || self.results[..self.appended].iter().any(Option::is_none)
-            || self
-                .loop_state
-                .as_ref()
-                .is_some_and(|state| state.validate_policy_shape().is_err())
+            || self.loop_state.as_ref().is_some_and(|state| {
+                state.feedback_hook_completed || state.validate_policy_shape().is_err()
+            })
         {
             return Err(TaskRunStorageError::InvalidCheckpoint.into());
         }

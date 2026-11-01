@@ -40,7 +40,7 @@
 
 ### Changed
 - Task execution defaults: new autonomous tasks omit cumulative count and time limits unless explicitly configured or host-bounded; ordinary chat and saved finite limits retain their contracts
-- Code agent workflow: support explicitly selected multi-file edits, optional workspace discovery and bounded untrusted feedback from an approved failed checker
+- Code agent workflow: add a checker-free read-only task for selected files alongside scoped edits, optional discovery and bounded failed-check feedback
 - Rust task time compatibility: development validation drives and final publications accept absent aggregate deadlines without bypassing live evidence, cancellation, conditional ownership or original explicit bounds
 - Code agent settings: choose model output and checker time limits while denied or unavailable checks still require guidance
 - Task validation: allow an exact command check to specify its attempt timeout within the host and tool policy limits
@@ -68,6 +68,7 @@
 - Rust configuration compatibility: typed autonomy fields, validation driver bounds and objective-bound todo identities require affected struct literals to be updated; these development additions are not the published stable API
 
 ### Fixed
+- Task validation feedback: preserve host target revisions and completed hooks across one-shot feedback and capacity pauses without replay or stale provider results
 - Task continuation: preserve legacy capacity-review identity and reject changed model-loop bindings before consuming pending work
 - Task allowance display: distinguish unbounded wall time and show cumulative command and model usage alongside configured limits
 - Native tool history: keep unsigned call and result batches intact during bounded memory retention and reject context overflow that cannot preserve them

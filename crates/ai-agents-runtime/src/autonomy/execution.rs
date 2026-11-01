@@ -218,11 +218,10 @@ impl RunExecution {
     }
 
     /// Rechecks a selected failed validation against the same run, next cycle and current mutation generation before provider exposure.
-    /// External target revisions require a separate live binding and are never projected by this restricted feedback path.
+    /// Target revisions also require a separately retained live host admission at the provider boundary.
     pub(crate) fn validation_feedback_current(&self, identity: &EvidenceIdentity) -> bool {
         self.scope.read().as_ref().is_some_and(|scope| {
-            identity.target.is_none()
-                && !self.owner.work.unsettled()
+            !self.owner.work.unsettled()
                 && !self.participants.unsettled()
                 && identity.key == scope.key
                 && identity.objective_revision == scope.objective_revision

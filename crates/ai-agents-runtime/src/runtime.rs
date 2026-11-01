@@ -614,12 +614,13 @@ impl Drop for TaskBranchObservations {
     }
 }
 
-// The live owner and mutation clock prevent an earlier checker failure from authorizing a later stale model request.
+// The owner, mutation clock and actual host target must all remain current while feedback reaches the provider.
 struct ValidationFeedbackAdmission {
     execution: std::sync::Weak<crate::autonomy::RunExecution>,
     identity: crate::autonomy::EvidenceIdentity,
     mutation_clock: Arc<AtomicU64>,
     expected_epoch: u64,
+    target_admission: Arc<dyn ai_agents_core::autonomy::TaskFinalAdmission>,
 }
 
 impl std::fmt::Debug for ValidationFeedbackAdmission {
@@ -629,7 +630,7 @@ impl std::fmt::Debug for ValidationFeedbackAdmission {
 }
 
 impl ai_agents_core::autonomy::TaskFinalAdmission for ValidationFeedbackAdmission {
-    /// Live proof is checked at provider admission, first poll and settlement; it cannot grant a tool or user authorization.
+    /// Live owner, mutation and host target proof are checked at provider admission and settlement without granting authorization.
     fn validate(&self) -> Result<()> {
         let execution = self
             .execution
@@ -643,7 +644,7 @@ impl ai_agents_core::autonomy::TaskFinalAdmission for ValidationFeedbackAdmissio
                 "validation feedback became stale before provider dispatch".into(),
             ));
         }
-        Ok(())
+        self.target_admission.validate()
     }
 }
 
@@ -5353,7 +5354,7 @@ impl RuntimeAgent {
         self.observation_mutations.load(Ordering::Acquire)
     }
 
-    // Rebinds stored feedback to the live owner and mutation clock; serialized identities alone never authorize provider dispatch.
+    // Rebinds feedback to the live owner, mutation clock and actual selected host source before provider dispatch.
     fn task_validation_feedback_guard(
         &self,
     ) -> Result<Option<Arc<dyn ai_agents_core::autonomy::TaskFinalAdmission>>> {
@@ -5369,7 +5370,7 @@ impl RuntimeAgent {
         else {
             return Ok(None);
         };
-        let identity =
+        let identity: crate::autonomy::EvidenceIdentity =
             serde_json::from_value(feedback.get("identity").cloned().ok_or_else(|| {
                 AgentError::Config("validation feedback identity missing".into())
             })?)?;
@@ -5381,12 +5382,25 @@ impl RuntimeAgent {
             })?;
         let execution = crate::autonomy::current_execution()
             .ok_or_else(|| AgentError::Config("validation feedback has no live owner".into()))?;
+        let check_id = feedback
+            .get("check_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| AgentError::Config("validation feedback check missing".into()))?;
+        let extensions = self.autonomy_extensions();
+        if extensions.validation_target(check_id) != identity.target.as_deref() {
+            return Err(AgentError::Config(
+                "validation feedback target binding changed".into(),
+            ));
+        }
+        let target_admission =
+            extensions.observation_admission(&[(check_id.to_string(), identity.clone())])?;
         let guard: Arc<dyn ai_agents_core::autonomy::TaskFinalAdmission> =
             Arc::new(ValidationFeedbackAdmission {
                 execution: Arc::downgrade(&execution),
                 identity,
                 mutation_clock: self.observation_mutations.clone(),
                 expected_epoch: epoch,
+                target_admission,
             });
         guard.validate()?;
         Ok(Some(guard))
@@ -12988,6 +13002,7 @@ Respond in JSON format:
                         thinking_content: thinking,
                         native_exchanges: self.task_native_expectations(),
                         deferred_final: None,
+                        feedback_hook_completed: false,
                     };
                     let position = crate::autonomy::location::TaskStateReturn::BeforeCalls {
                         saved: Box::new(crate::autonomy::interaction::TaskModelCalls {
@@ -13184,6 +13199,7 @@ Respond in JSON format:
                 thinking_content: None,
                 native_exchanges: Vec::new(),
                 deferred_final: None,
+                feedback_hook_completed: false,
             }),
         )
         .await
@@ -13548,6 +13564,7 @@ Respond in JSON format:
                     thinking_content: None,
                     native_exchanges: self.task_native_expectations(),
                     deferred_final: Some(state),
+                    feedback_hook_completed: false,
                 }),
             )
             .await?;
