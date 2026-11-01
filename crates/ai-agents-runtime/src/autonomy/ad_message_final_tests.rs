@@ -20,7 +20,8 @@ async fn ad_final_successful_message_resume_rechecks_original_deadline_after_ack
                 json!({"tool":"send_agent_message", "phase":"settle"}),
             );
             let mut config = super::super::runner_tests::config(4);
-            config.defaults.max_tool_calls = Some(3);
+            config.defaults.max_tool_calls =
+                Some(ai_agents_core::autonomy::AutonomyLimit::Finite(3));
             config.defaults.hitl = Some(AutonomyHitlConfig {
                 on_approval_required: Some(InteractionAction::PauseRun),
                 on_user_question: Some(InteractionAction::PauseRun),

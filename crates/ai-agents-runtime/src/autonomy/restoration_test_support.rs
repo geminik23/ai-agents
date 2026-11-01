@@ -348,7 +348,7 @@ pub(super) async fn restore(
             let payload: Box<TaskCheckpointPayload> =
                 serde_json::from_value(snapshot.payload).unwrap();
             panic!(
-                "capture failed: {error}; identity={identity}; elapsed={:?}; host_now={:?}; updated_at={}; expiry={:?}; active_ms={}; interrupted_ms={}; max_active_s={}; work_budget={:?}",
+                "capture failed: {error}; identity={identity}; elapsed={:?}; host_now={:?}; updated_at={}; expiry={:?}; active_ms={}; interrupted_ms={}; max_active_s={:?}; work_budget={:?}",
                 capture_started.elapsed(),
                 host.now(),
                 snapshot.updated_at,

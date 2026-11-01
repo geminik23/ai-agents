@@ -59,8 +59,8 @@ async fn ad_maintenance_matching_price_settlement_uses_one_ledger() {
     let config = AutonomyConfig {
         defaults: AutonomyProfile {
             enabled: Some(true),
-            max_turns: Some(4),
-            max_llm_calls: Some(3),
+            max_turns: Some(ai_agents_core::autonomy::AutonomyLimit::Finite(4)),
+            max_llm_calls: Some(ai_agents_core::autonomy::AutonomyLimit::Finite(3)),
             max_cost_usd: Some(serde_json::from_value(serde_json::json!("0.000006")).unwrap()),
             completion: Some(CompletionGate::ResponseContains("done".into())),
             ..Default::default()
@@ -225,8 +225,8 @@ async fn ad_facts_relationships_and_actor_snapshot_memory_sqlite_matrix() {
             let config = AutonomyConfig {
                 defaults: AutonomyProfile {
                     enabled: Some(true),
-                    max_turns: Some(4),
-                    max_llm_calls: Some(4),
+                    max_turns: Some(ai_agents_core::autonomy::AutonomyLimit::Finite(4)),
+                    max_llm_calls: Some(ai_agents_core::autonomy::AutonomyLimit::Finite(4)),
                     completion: Some(CompletionGate::ResponseContains("done".into())),
                     ..Default::default()
                 },

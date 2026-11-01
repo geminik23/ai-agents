@@ -155,7 +155,9 @@ async fn fixture_kind(
             .unwrap(),
     );
     let mut config = super::runner_tests::config(8);
-    config.defaults.max_tool_calls = Some(if repeated { 6 } else { 3 });
+    config.defaults.max_tool_calls = Some(ai_agents_core::autonomy::AutonomyLimit::Finite(
+        if repeated { 6 } else { 3 },
+    ));
     config.defaults.hitl = Some(AutonomyHitlConfig {
         on_approval_required: Some(InteractionAction::PauseRun),
         on_user_question: Some(InteractionAction::PauseRun),

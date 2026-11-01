@@ -19,6 +19,8 @@ pub(crate) struct RunExecution {
     acknowledged: parking_lot::RwLock<TaskRunSnapshot>,
     limits: TaskRunLimits,
     pub(crate) expiry_projection: Option<Instant>,
+    pub(crate) inherited_projection: Option<Instant>,
+    inherited_utc: Option<chrono::DateTime<chrono::Utc>>,
     pub(crate) run_id: String,
     pub(crate) owner_token: String,
     pub(crate) revision: Arc<AtomicU64>,
@@ -53,6 +55,29 @@ pub(crate) struct RunExecution {
         parking_lot::RwLock<Option<(ai_agents_tools::TodoStore, ai_agents_tools::TodoRunBinding)>>,
 }
 
+// Sample UTC before the remaining parent allowance so descheduling can only shorten, never extend, the saved restriction.
+pub(crate) fn sample_inherited_deadline() -> Result<Option<(chrono::DateTime<chrono::Utc>, Instant)>>
+{
+    let Some(bound) = ai_agents_llm::current_invocation_bounds() else {
+        return Ok(None);
+    };
+    let utc = chrono::Utc::now();
+    let monotonic = Instant::now();
+    let remaining = bound.remaining();
+    if remaining.is_zero() {
+        return Err(TaskRunStorageError::AdmissionExpired.into());
+    }
+    let delta = chrono::Duration::from_std(remaining)
+        .map_err(|_| AgentError::Config("inherited task deadline overflow".into()))?;
+    let utc = utc
+        .checked_add_signed(delta)
+        .ok_or_else(|| AgentError::Config("inherited task deadline overflow".into()))?;
+    let monotonic = monotonic
+        .checked_add(remaining)
+        .ok_or_else(|| AgentError::Config("inherited task deadline overflow".into()))?;
+    Ok(Some((utc, monotonic)))
+}
+
 impl RunExecution {
     /// Called only after an acknowledged running claim; restart clocks cannot be refilled here.
     /// A fresh collector cannot certify a missing historical observation interval.
@@ -74,6 +99,29 @@ impl RunExecution {
         {
             owner.telemetry.mark_missing();
         }
+        // A resumed parent may impose a tighter bound; keep its monotonic cut and conservative UTC projection independently from wall revisions.
+        let sampled = sample_inherited_deadline()?;
+        let inherited_utc = match (
+            payload.clocks.inherited_expires_at,
+            sampled.map(|sample| sample.0),
+        ) {
+            (Some(old), Some(new)) => Some(old.min(new)),
+            (old, new) => old.or(new),
+        };
+        let saved_inherited = payload
+            .clocks
+            .inherited_expires_at
+            .map(|expiry| {
+                let anchor = Instant::now();
+                anchor
+                    .checked_add((expiry - chrono::Utc::now()).to_std().unwrap_or_default())
+                    .ok_or_else(|| AgentError::Config("inherited task deadline overflow".into()))
+            })
+            .transpose()?;
+        let inherited_projection = match (saved_inherited, sampled.map(|sample| sample.1)) {
+            (Some(old), Some(new)) => Some(old.min(new)),
+            (old, new) => old.or(new),
+        };
         let execution = Arc::new(Self {
             store,
             owner: owner.clone(),
@@ -90,7 +138,12 @@ impl RunExecution {
                         .checked_add(remaining)
                         .ok_or_else(|| AgentError::Config("expiry projection overflow".into()))
                 })
-                .transpose()?,
+                .transpose()?
+                .map_or(inherited_projection, |expiry| {
+                    Some(inherited_projection.map_or(expiry, |inherited| expiry.min(inherited)))
+                }),
+            inherited_projection,
+            inherited_utc,
             run_id: snapshot.key.run_id.clone(),
             owner_token: snapshot
                 .owner_token
@@ -162,6 +215,21 @@ impl RunExecution {
             .get("clocks")
             .and_then(|clocks| clocks.get("expires_at"))
             .and_then(|expiry| serde_json::from_value(expiry.clone()).ok())
+    }
+
+    /// Rechecks a selected failed validation against the same run, next cycle and current mutation generation before provider exposure.
+    /// External target revisions require a separate live binding and are never projected by this restricted feedback path.
+    pub(crate) fn validation_feedback_current(&self, identity: &EvidenceIdentity) -> bool {
+        self.scope.read().as_ref().is_some_and(|scope| {
+            identity.target.is_none()
+                && !self.owner.work.unsettled()
+                && !self.participants.unsettled()
+                && identity.key == scope.key
+                && identity.objective_revision == scope.objective_revision
+                && identity.cycle.checked_add(1) == Some(scope.cycle)
+                && identity.stage == scope.stage
+                && identity.mutation_generation == self.mutation_generation()
+        })
     }
 
     /// Captures immutable profile policy for interaction bridges without exposing mutable controller authority.
@@ -806,26 +874,46 @@ impl RunExecution {
                 if !self.allows_tool(tool) {
                     return Err(AgentError::Tool("autonomy lifecycle denies tool".into()));
                 }
-                if payload.counters.tool_attempts >= u64::from(payload.limits.max_tool_calls)
+                if payload
+                    .limits
+                    .max_tool_calls
+                    .is_some_and(|limit| payload.counters.tool_attempts >= u64::from(limit))
                     || (tool == "command"
-                        && payload.counters.command_attempts
-                            >= u64::from(payload.limits.max_command_calls))
+                        && payload.limits.max_command_calls.is_some_and(|limit| {
+                            payload.counters.command_attempts >= u64::from(limit)
+                        }))
                 {
                     super::invocation::capacity_denied("tool_capacity");
                     self.stop("tool_capacity");
                     return Err(AgentError::Other("autonomy tool capacity exhausted".into()));
                 }
-                payload.counters.tool_attempts += 1;
+                payload.counters.tool_attempts = payload
+                    .counters
+                    .tool_attempts
+                    .checked_add(1)
+                    .ok_or_else(|| AgentError::Config("tool counter overflow".into()))?;
                 if tool == "command" {
-                    payload.counters.command_attempts += 1;
+                    payload.counters.command_attempts = payload
+                        .counters
+                        .command_attempts
+                        .checked_add(1)
+                        .ok_or_else(|| AgentError::Config("command counter overflow".into()))?;
                 }
             } else {
-                if payload.counters.llm_attempts >= u64::from(payload.limits.max_llm_calls) {
+                if payload
+                    .limits
+                    .max_llm_calls
+                    .is_some_and(|limit| payload.counters.llm_attempts >= u64::from(limit))
+                {
                     super::invocation::capacity_denied("llm_capacity");
                     self.stop("llm_capacity");
                     return Err(AgentError::Other("autonomy LLM capacity exhausted".into()));
                 }
-                payload.counters.llm_attempts += 1;
+                payload.counters.llm_attempts = payload
+                    .counters
+                    .llm_attempts
+                    .checked_add(1)
+                    .ok_or_else(|| AgentError::Config("LLM counter overflow".into()))?;
             }
             payload.adapters.push(TaskAdapterCheckpoint {
                 id: format!("invocation:{id}"),
@@ -974,20 +1062,89 @@ impl RunExecution {
         Ok(())
     }
 
-    /// Live run and inherited composition deadlines intersect; a pause or nested callback cannot refill either allowance.
-    pub(crate) fn remaining_duration(&self) -> std::time::Duration {
-        let active = std::time::Duration::from_millis(
-            self.limits.max_active_time_seconds.saturating_mul(1000),
-        )
-        .saturating_sub(std::time::Duration::from_millis(
-            self.consumed_active_millis().unwrap_or(u64::MAX),
-        ));
-        let remaining = self.expiry_projection.map_or(active, |expiry| {
-            active.min(expiry.saturating_duration_since(Instant::now()))
+    /// Intersects only actual active, wall and inherited composition limits; None never suppresses accounting or a live restriction.
+    pub(crate) fn remaining_duration(&self) -> Option<std::time::Duration> {
+        let consumed = match self.consumed_active_millis() {
+            Ok(consumed) => consumed,
+            Err(_) => {
+                self.stop("time_violation");
+                return Some(std::time::Duration::ZERO);
+            }
+        };
+        let active = self.limits.max_active_time_seconds.map(|seconds| {
+            std::time::Duration::from_secs(seconds)
+                .saturating_sub(std::time::Duration::from_millis(consumed))
         });
-        super::composition::current_composition_deadline().map_or(remaining, |deadline| {
-            remaining.min(deadline.saturating_duration_since(Instant::now()))
-        })
+        [
+            active,
+            self.expiry_projection
+                .map(|expiry| expiry.saturating_duration_since(Instant::now())),
+            super::composition::current_composition_deadline()
+                .map(|deadline| deadline.saturating_duration_since(Instant::now())),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+    }
+
+    /// Projects the existing allowance from an earlier anchor so storage waits cannot renew the original bound.
+    pub(crate) fn final_deadline(&self) -> Result<Option<Instant>> {
+        let anchor = Instant::now();
+        self.remaining_duration()
+            .map(|remaining| {
+                anchor
+                    .checked_add(remaining)
+                    .ok_or_else(|| AgentError::Config("final deadline overflow".into()))
+            })
+            .transpose()
+    }
+
+    /// Gate waits retain owner, cancellation and inherited operation restrictions even when no aggregate timer exists.
+    pub(crate) async fn acquire_runtime_gate(
+        &self,
+        gate: Arc<tokio::sync::Mutex<()>>,
+    ) -> Result<tokio::sync::OwnedMutexGuard<()>> {
+        let inherited = ai_agents_llm::current_invocation_bounds();
+        let waiting = async {
+            let lock = gate.lock_owned();
+            tokio::pin!(lock);
+            loop {
+                if self.cancellation.load(Ordering::Acquire)
+                    || inherited.is_some_and(|bound| bound.remaining().is_zero())
+                    || ai_agents_core::autonomy::InvocationAdmission::execution_stopped(self)
+                {
+                    return Err(AgentError::Other(
+                        "task runtime gate admission cancelled or expired".into(),
+                    ));
+                }
+                tokio::select! {
+                    guard = &mut lock => {
+                        if self.cancellation.load(Ordering::Acquire)
+                            || inherited.is_some_and(|bound| bound.remaining().is_zero())
+                            || ai_agents_core::autonomy::InvocationAdmission::execution_stopped(self)
+                        {
+                            return Err(AgentError::Other("task runtime gate admission cancelled or expired".into()));
+                        }
+                        return Ok(guard);
+                    }
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
+                }
+            }
+        };
+        let duration = match (
+            self.remaining_duration(),
+            inherited.map(|bound| bound.remaining()),
+        ) {
+            (Some(run), Some(inherited)) => Some(run.min(inherited)),
+            (run, inherited) => run.or(inherited),
+        };
+        if let Some(duration) = duration {
+            tokio::time::timeout(duration, waiting)
+                .await
+                .map_err(|_| AgentError::Other("task runtime gate deadline exceeded".into()))?
+        } else {
+            waiting.await
+        }
     }
 
     /// Journal successors update the same acknowledged snapshot used to recognize cancellation-only revisions.
@@ -1017,9 +1174,13 @@ impl RunExecution {
             self.stop("composition_timeout");
             return Err(AgentError::Other("composition deadline exceeded".into()));
         }
-        if self.remaining_duration().is_zero()
-            || self.consumed_active_millis()?
-                >= payload.limits.max_active_time_seconds.saturating_mul(1000)
+        let consumed = self.consumed_active_millis()?;
+        if self
+            .remaining_duration()
+            .is_some_and(|remaining| remaining.is_zero())
+            || payload.limits.max_active_time_seconds.is_some_and(|limit| {
+                std::time::Duration::from_millis(consumed) >= std::time::Duration::from_secs(limit)
+            })
             || payload
                 .clocks
                 .expires_at
@@ -1062,20 +1223,21 @@ impl RunExecution {
                         | TaskEffectState::Uncertain
                 )
             });
+        let consumed = payload
+            .clocks
+            .active_millis
+            .checked_add(payload.clocks.interrupted_interval_millis)
+            .ok_or_else(|| AgentError::Config("terminal active clock overflow".into()))?;
         if uncertain {
             status = TaskRunStatus::RecoveryRequired;
         } else if snapshot.cancel_requested || self.cancellation.load(Ordering::Acquire) {
             status = TaskRunStatus::Cancelled;
-        } else if payload
+        } else if payload.limits.max_active_time_seconds.is_some_and(|limit| {
+            std::time::Duration::from_millis(consumed) > std::time::Duration::from_secs(limit)
+        }) || payload
             .clocks
-            .active_millis
-            .checked_add(payload.clocks.interrupted_interval_millis)
-            .ok_or_else(|| AgentError::Config("terminal active clock overflow".into()))?
-            > payload.limits.max_active_time_seconds.saturating_mul(1000)
-            || payload
-                .clocks
-                .expires_at
-                .is_some_and(|expiry| chrono::Utc::now() >= expiry)
+            .expires_at
+            .is_some_and(|expiry| chrono::Utc::now() >= expiry)
         {
             status = TaskRunStatus::LimitReached;
         }
@@ -1110,6 +1272,25 @@ impl RunExecution {
         mut payload: Box<TaskCheckpointPayload>,
         status: TaskRunStatus,
     ) -> Result<TaskRunSnapshot> {
+        // Persist newly inherited restrictions before any later pause or reconstruction can outlive their originating invocation.
+        if let Some(inherited) = self.inherited_utc {
+            if payload.version == 1 && payload.clocks.inherited_expires_at.is_none() {
+                // New restriction metadata upgrades the representation without changing any stored finite allowance.
+                payload.version = TASK_PAYLOAD_VERSION;
+            }
+            payload.clocks.inherited_expires_at = Some(
+                payload
+                    .clocks
+                    .inherited_expires_at
+                    .map_or(inherited, |old| old.min(inherited)),
+            );
+            payload.clocks.expires_at = Some(
+                payload
+                    .clocks
+                    .expires_at
+                    .map_or(inherited, |old| old.min(inherited)),
+            );
+        }
         let telemetry = self.owner.telemetry.prepare(&mut payload, &self.run_id)?;
         if status == TaskRunStatus::Running && payload.clocks.active_interval_started_at.is_some() {
             let sampled_at = chrono::Utc::now();
@@ -1151,11 +1332,7 @@ impl RunExecution {
                 evidence: self.final_evidence.read().clone(),
                 payload: serde_json::to_value(payload)?,
                 release: true,
-                deadline: Some(
-                    Instant::now()
-                        .checked_add(self.remaining_duration())
-                        .ok_or_else(|| AgentError::Config("final deadline overflow".into()))?,
-                ),
+                deadline: self.final_deadline()?,
             }
         };
         let saved = self
@@ -1228,14 +1405,17 @@ impl ai_agents_core::autonomy::InvocationAdmission for RunExecution {
             .is_some_and(|deadline| Instant::now() >= deadline)
         {
             self.stop("composition_timeout");
-        } else if self.remaining_duration().is_zero() {
+        } else if self
+            .remaining_duration()
+            .is_some_and(|remaining| remaining.is_zero())
+        {
             self.stop("time_violation");
         }
         self.stop_reason().is_some()
     }
     /// Provider waits receive the same shrinking run allowance as tool attempts.
     fn remaining_duration(&self) -> Option<std::time::Duration> {
-        Some(RunExecution::remaining_duration(self))
+        RunExecution::remaining_duration(self)
     }
 }
 

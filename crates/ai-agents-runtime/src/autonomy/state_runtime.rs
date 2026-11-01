@@ -17,7 +17,9 @@ impl RuntimeAgent {
         let denied_cleanup =
             execution.stop_reason().as_deref() == Some("retained_response_invalid");
         if (stopped && !denied_cleanup)
-            || execution.remaining_duration().is_zero()
+            || execution
+                .remaining_duration()
+                .is_some_and(|remaining| remaining.is_zero())
             || ai_agents_llm::current_invocation_bounds()
                 .is_some_and(|bounds| bounds.remaining().is_zero())
         {
@@ -290,7 +292,7 @@ impl RuntimeAgent {
                         .template_renderer
                         .render(&prompt, &self.build_context_with_overlays())
                         .unwrap_or(prompt);
-                    let mut messages = self.memory.get_messages(Some(5)).await?;
+                    let mut messages = self.recent_native_safe_messages(5).await?;
                     messages.push(ChatMessage::user(rendered));
                     self.validate_task_actions(state)?;
                     let response = self
@@ -473,20 +475,24 @@ impl RuntimeAgent {
             }
             TaskStateReturn::ModelFinish { state } => {
                 let state = *state;
-                let result = crate::autonomy::location::scope_state_return(
+                // Retained state actions must carry the original response count through a full redispatch as well as ordinary regeneration.
+                let applied = crate::autonomy::location::scope_state_return(
                     TaskStateReturn::ModelFinish {
                         state: Box::new(state.clone()),
                     },
-                    Box::pin(self.post_transition_processing(
-                        &state.processed_input,
-                        state.content.clone(),
-                        transitioned,
-                    )),
+                    Box::pin(async {
+                        let result = self
+                            .post_transition_processing(
+                                &state.processed_input,
+                                state.content.clone(),
+                                transitioned,
+                            )
+                            .await?;
+                        self.apply_post_loop_result(&state.processed_input, result)
+                            .await
+                    }),
                 )
                 .await?;
-                let applied = self
-                    .apply_post_loop_result(&state.processed_input, result)
-                    .await?;
                 let mut response = self.build_agent_response(AgentResponseParts {
                     content: applied.content,
                     all_tool_calls: applied.tool_calls.unwrap_or(state.all_tool_calls),

@@ -480,7 +480,7 @@ scenarios:
       - input: Run the bounded pipeline.
 ```
 
-`max_llm_calls` limits calls across every alias, child agent using the shared registry, turn, agent reset, and retry in that scenario. Token and cost limits reserve a conservative maximum before each provider call, then settle against provider usage or a fallback estimate. A call is rejected before it starts when its reservation would exceed a configured limit; if reported usage exceeds the reservation, the response fails and no later provider call may start.
+A scenario budget is independent of the development task controller's optional cumulative defaults: it still applies when the task itself has no configured count limit. `max_llm_calls` limits calls across every alias, child agent using the shared registry, turn, agent reset, and retry in that scenario. Token and cost limits reserve a conservative maximum before each provider call, then settle against provider usage or a fallback estimate. A call is rejected before it starts when its reservation would exceed a configured limit; if reported usage exceeds the reservation, the response fails and no later provider call may start.
 
 `max_cost_usd` requires suite-level `observability.cost` pricing for every provider/model alias that may execute. Missing pricing fails before the provider call. Budget values must be finite and greater than zero. Scenario retries share the same budget rather than receiving a fresh allowance, so a declared budget must cover every intended attempt.
 

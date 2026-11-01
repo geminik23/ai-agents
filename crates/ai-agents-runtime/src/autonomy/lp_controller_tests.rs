@@ -76,10 +76,10 @@ fn configured(replies: &[&str], yaml: &str) -> DomainFixture {
     let mut parsed: AutonomyConfig = serde_yaml::from_str(yaml).unwrap();
     parsed.defaults.enabled = Some(true);
     if parsed.defaults.max_turns.is_none() {
-        parsed.defaults.max_turns = Some(12);
+        parsed.defaults.max_turns = Some(ai_agents_core::autonomy::AutonomyLimit::Finite(12));
     }
     if parsed.defaults.max_llm_calls.is_none() {
-        parsed.defaults.max_llm_calls = Some(12);
+        parsed.defaults.max_llm_calls = Some(ai_agents_core::autonomy::AutonomyLimit::Finite(12));
     }
     if parsed.defaults.completion.is_none() {
         parsed.defaults.completion = Some(CompletionGate::ResponseContains("done".into()));
@@ -591,7 +591,8 @@ async fn lp_schedule_reentry_preserves_completed_checks_and_one_observation() {
             let f = super::controller_tests::fixture("tool");
             let store = support::store(f.agent.info().id, "controller.v1", *sqlite).await;
             let mut config = f.config;
-            config.defaults.max_tool_calls = Some(3);
+            config.defaults.max_tool_calls =
+                Some(ai_agents_core::autonomy::AutonomyLimit::Finite(3));
             let checks = format!(
                 "checks: [{{id: first, adapter: host.observation, schedule: {schedule}}}, {{id: second, adapter: host.observation, schedule: {schedule}}}]"
             );
@@ -677,7 +678,7 @@ async fn lp_schedule_reentry_preserves_completed_checks_and_one_observation() {
 async fn lp_completion_observation_can_satisfy_a_currently_failing_tool_count_gate() {
     let f = super::controller_tests::fixture("tool");
     let mut config = f.config;
-    config.defaults.max_tool_calls = Some(2);
+    config.defaults.max_tool_calls = Some(ai_agents_core::autonomy::AutonomyLimit::Finite(2));
     config.defaults.validation = Some(serde_yaml::from_str("checks: [{id: first, adapter: host.observation}, {id: second, adapter: host.observation, schedule: completion}]").unwrap());
     config.defaults.completion = Some(
         serde_yaml::from_str(

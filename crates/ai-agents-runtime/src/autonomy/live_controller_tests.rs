@@ -252,7 +252,7 @@ async fn live_controller_capacity_wait_requires_explicit_revision_and_preserves_
             )
             .unwrap();
             let mut limits = payload.limits;
-            limits.max_llm_calls = 2;
+            limits.max_llm_calls = Some(2);
             let revised = runner
                 .revise_limits_paused(
                     &paused.run.key.run_id,
@@ -400,7 +400,7 @@ async fn live_skill_capacity_preserves_the_original_prompt_prefix_and_logical_tu
         )
         .unwrap();
         let mut limits = payload.limits;
-        limits.max_llm_calls = 2;
+        limits.max_llm_calls = Some(2);
         let revised = f
             .runner
             .revise_limits_paused(
@@ -440,7 +440,7 @@ async fn live_skill_final_tool_admission_reparks_after_approval_without_transfer
         let mut f = Box::pin(skill_fixture(false)).await;
         f.store = support::store(f.agent.info().id, "locations.v1", *sqlite).await;
         let mut config = super::super::runner_tests::config(4);
-        config.defaults.max_tool_calls = Some(1);
+        config.defaults.max_tool_calls = Some(ai_agents_core::autonomy::AutonomyLimit::Finite(1));
         config.defaults.hitl =
             Some(serde_yaml::from_str("on_approval_required: pause_run").unwrap());
         config.defaults.on_limit = Some(serde_yaml::from_str("action: pause_run").unwrap());
@@ -473,7 +473,7 @@ async fn live_skill_final_tool_admission_reparks_after_approval_without_transfer
         )
         .unwrap();
         let mut limits = payload.limits;
-        limits.max_tool_calls = 2;
+        limits.max_tool_calls = Some(2);
         let revised = f
             .runner
             .revise_limits_paused(
@@ -537,7 +537,7 @@ async fn live_controller_required_judge_resumes_only_validation_after_explicit_l
         )
         .unwrap();
         let mut limits = payload.limits;
-        limits.max_llm_calls = 2;
+        limits.max_llm_calls = Some(2);
         let revised = runner
             .revise_limits_paused(
                 &paused.run.key.run_id,

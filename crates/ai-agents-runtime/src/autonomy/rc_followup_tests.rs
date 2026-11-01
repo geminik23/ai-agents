@@ -185,7 +185,8 @@ async fn rc_startup_skips_expired_pauses_without_hiding_integrity_or_clock_error
         ScopedTaskRunStore::in_memory("RestoreRoot".into(), None, "restore.v1".into()).unwrap(),
     );
     let mut expired = persistent_config(false);
-    expired.defaults.max_wall_time_seconds = Some(1);
+    expired.defaults.max_wall_time_seconds =
+        Some(ai_agents_core::autonomy::AutonomyLimit::Finite(1));
     let runner = AutonomyRunner::try_new(
         host.runtime(host.root.clone()),
         expired,

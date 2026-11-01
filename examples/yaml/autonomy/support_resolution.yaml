@@ -11,8 +11,8 @@ system_prompt: Resolve the ticket or create a real escalation record; do not cla
 llm: {provider: openai, model: gpt-5.4-mini}
 tools: [domain, ask_user]
 autonomy:
-  max_turns: 8  # Inherited state work-cycle allowance; resolved default: 30.
-  max_llm_calls: 20  # State and nested work share admitted calls; resolved default: 60.
+  max_turns: 8  # Inherited state work-cycle allowance; resolved default: unlimited.
+  max_llm_calls: 20  # State and nested work share admitted calls; resolved default: unlimited.
   hitl: {on_approval_required: pause_run, on_user_question: pause_run}
 # Only the enabled support state promotes ordinary input; top-level defaults alone start no task.
 states:

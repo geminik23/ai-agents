@@ -102,6 +102,10 @@ impl RuntimeAgent {
         if let Some(manager) = &self.relationship_manager {
             value["relationships"] = serde_json::to_value(manager.config())?;
         }
+        // The legacy configured policy keeps its old digest; source-aware semantics must not alias a different prepared runtime.
+        if self.task_iteration_policy != crate::spec::TaskIterationPolicy::configured() {
+            value["task_iteration_policy"] = serde_json::to_value(&self.task_iteration_policy)?;
+        }
         Ok(format!("{:x}", Sha256::digest(serde_json::to_vec(&value)?)))
     }
 

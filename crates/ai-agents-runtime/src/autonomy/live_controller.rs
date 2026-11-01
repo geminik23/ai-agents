@@ -346,7 +346,9 @@ impl AutonomyRunner {
                 ) || (r.state == TaskEffectState::Suspended && logical_wait.as_ref() == Some(&r.id))
             })
             && !execution.has_storage_failure()
-            && execution.remaining_duration() > std::time::Duration::ZERO;
+            && execution
+                .remaining_duration()
+                .is_none_or(|remaining| !remaining.is_zero());
         if !safe || !matches!(action, LimitAction::AskUser | LimitAction::PauseRun) {
             if safe && let Some(driver) = &state.driver {
                 execution

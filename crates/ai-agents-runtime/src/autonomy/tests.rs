@@ -18,7 +18,14 @@ pub(super) fn checkpoint(run_id: &str) -> TaskRunSnapshot {
         None,
         None,
         None,
-        &AutonomyHostCeilings::default(),
+        &AutonomyHostCeilings {
+            max_turns: Some(30),
+            max_active_time_seconds: Some(900),
+            max_llm_calls: Some(60),
+            max_tool_calls: Some(120),
+            max_command_calls: Some(10),
+            ..Default::default()
+        },
     )
     .unwrap();
     let payload =
@@ -249,7 +256,7 @@ async fn scoped_contract(storage: Arc<dyn AgentStorage>) {
             .is_err()
     );
     let mut changed = payload.clone();
-    changed.settings.max_turns = Some(999);
+    changed.settings.max_turns = Some(ai_agents_core::autonomy::AutonomyLimit::Finite(999));
     assert!(
         store
             .mutate(
@@ -521,6 +528,54 @@ async fn task_namespaced_storage_explicitly_unsupported() {
         Err(AgentError::UnsupportedStorageCapability(_))
     ));
     assert!(inner.load_task_run(&snapshot.key).await.unwrap().is_none());
+}
+
+// Between-turn snapshots cannot hide an incomplete unsigned native call behind an otherwise valid history.
+#[test]
+fn task_between_turns_rejects_incomplete_unsigned_native_batch() {
+    let call = ToolCall {
+        id: "pending".into(),
+        name: "echo".into(),
+        arguments: json!({}),
+    };
+    let mut snapshot = AgentSnapshot::new("agent".into());
+    snapshot.memory.messages = vec![
+        ChatMessage::user("objective"),
+        ChatMessage::assistant(
+            encode_native_tool_call_markers(std::slice::from_ref(&call), None).unwrap(),
+        ),
+    ];
+    assert!(TaskRuntimeCheckpoint::between_turns(snapshot.clone()).is_err());
+    snapshot.memory.messages.push(ChatMessage::function(
+        "echo",
+        encode_native_tool_result_marker(&call, json!({"ok":true})).unwrap(),
+    ));
+    assert!(TaskRuntimeCheckpoint::between_turns(snapshot).is_ok());
+}
+
+// Numeric legacy images remain finite; missing replacement fields cannot silently remove limits from control or recovery.
+#[test]
+fn task_checkpoint_legacy_limits_and_required_presence() {
+    let snapshot = checkpoint("legacy-limits");
+    let mut value = snapshot.payload.clone();
+    value["version"] = json!(1);
+    // This frozen numeric image is independent of the new resolver and serializer.
+    value["limits"] = serde_json::from_str(r#"{"max_turns":30,"max_active_time_seconds":900,"max_wall_time_seconds":null,"max_llm_calls":60,"max_tool_calls":120,"max_command_calls":10,"max_micro_usd":null,"max_declared_write_paths":null}"#).unwrap();
+    let legacy: TaskCheckpointPayload = serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(legacy.limits.max_turns, Some(30));
+    assert_eq!(legacy.limits.max_llm_calls, Some(60));
+    assert_eq!(legacy.limits.max_tool_calls, Some(120));
+    assert_eq!(legacy.limits.max_command_calls, Some(10));
+    assert_eq!(legacy.limits.max_active_time_seconds, Some(900));
+    legacy.bind(snapshot.clone()).unwrap();
+    value["limits"]["max_llm_calls"] = serde_json::Value::Null;
+    let invalid: TaskCheckpointPayload = serde_json::from_value(value.clone()).unwrap();
+    assert!(invalid.bind(snapshot).is_err());
+    value["limits"].as_object_mut().unwrap().remove("max_turns");
+    assert!(serde_json::from_value::<TaskCheckpointPayload>(value).is_err());
+    assert!(serde_json::from_value::<TaskRunLimits>(json!({"max_llm_calls": 70})).is_err());
+    let unlimited = json!({"max_turns": null, "max_active_time_seconds": null, "max_llm_calls": null, "max_tool_calls": null, "max_command_calls": null});
+    assert!(serde_json::from_value::<TaskRunLimits>(unlimited).is_ok());
 }
 
 // Malformed and excessive recovery records fail without truncating the required state.

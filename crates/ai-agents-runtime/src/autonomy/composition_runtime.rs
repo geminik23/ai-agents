@@ -193,12 +193,9 @@ impl RuntimeAgent {
                 "nested resume owner binding changed".into(),
             ));
         }
-        let guard = tokio::time::timeout(
-            execution.remaining_duration(),
-            self.root_turn_gate.clone().lock_owned(),
-        )
-        .await
-        .map_err(|_| AgentError::Other("nested resume gate deadline exceeded".into()))?;
+        let guard = execution
+            .acquire_runtime_gate(self.root_turn_gate.clone())
+            .await?;
         let mut lease = Box::pin(execution.enroll_child(
             owner.clone(),
             self.autonomy_owner.clone(),

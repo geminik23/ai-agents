@@ -177,6 +177,118 @@ async fn interaction_transition_approval_and_rejection_preserve_post_text_positi
     }
 }
 
+// A direct model-batch approval must check its live iteration policy before claiming or consuming the pending response.
+#[tokio::test]
+async fn interaction_rejects_invalid_direct_batch_loop_policy_before_response_claim() {
+    let marker = ai_agents_core::encode_native_tool_call_markers(
+        &[ai_agents_core::ToolCall {
+            id: "direct".into(),
+            name: "probe".into(),
+            arguments: json!({}),
+        }],
+        None,
+    )
+    .unwrap();
+    let yaml = "name: Direct\nsystem_prompt: test\ntools: [probe]\nhitl:\n  tools:\n    probe: {require_approval: true}\n";
+    let f = fixture(yaml, &[&marker, "done"], &[]);
+    let paused = f.runner.run("objective", None).await.unwrap();
+    assert_eq!(paused.run.status, TaskRunStatus::Paused);
+    let snapshot = f.store.load(&paused.run.key.run_id).await.unwrap().unwrap();
+    let adapter = snapshot.payload["adapters"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|adapter| adapter["id"] == "runtime.tool_batch")
+        .unwrap();
+    let batch: TaskBatchState = serde_json::from_value(adapter["state"].clone()).unwrap();
+    assert!(batch.interaction.is_none());
+    let response = super::suspension::BatchResponse::Approval(ApprovalResult::Approved);
+    assert!(
+        f.agent
+            .validate_task_batch_response(&batch, &response)
+            .is_ok()
+    );
+    for policy in [None, Some(crate::spec::TaskIterationPolicy::configured())] {
+        let mut malformed = batch.clone();
+        let state = malformed.loop_state.as_mut().unwrap();
+        assert_eq!(state.version, 2);
+        state.task_iteration_policy = policy;
+        assert!(
+            f.agent
+                .validate_task_batch_response(&malformed, &response)
+                .is_err()
+        );
+    }
+    let retained = f.store.load(&paused.run.key.run_id).await.unwrap().unwrap();
+    assert_eq!(retained.revision, snapshot.revision);
+    assert_eq!(retained.status, TaskRunStatus::Paused);
+    assert_eq!(f.effects.load(Ordering::SeqCst), 0);
+    let done = respond(&f, &paused.run, ApprovalResult::Approved).await;
+    assert_eq!(done.run.status, TaskRunStatus::Completed);
+    assert_eq!(f.effects.load(Ordering::SeqCst), 1);
+}
+
+// A restored transition review must reject a missing or mismatched model-loop policy before executing its retained calls.
+#[tokio::test]
+async fn interaction_rejects_invalid_retained_loop_policy_before_response_claim() {
+    let marker = ai_agents_core::encode_native_tool_call_markers(
+        &[ai_agents_core::ToolCall {
+            id: "original".into(),
+            name: "probe".into(),
+            arguments: json!({}),
+        }],
+        None,
+    )
+    .unwrap();
+    let f = fixture(STATE, &[&marker, "done"], &[]);
+    let paused = f.runner.run("objective", None).await.unwrap();
+    assert_eq!(paused.run.status, TaskRunStatus::Paused);
+    let snapshot = f.store.load(&paused.run.key.run_id).await.unwrap().unwrap();
+    let adapter = snapshot.payload["adapters"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|adapter| adapter["id"] == "runtime.tool_batch")
+        .unwrap();
+    let batch: TaskBatchState = serde_json::from_value(adapter["state"].clone()).unwrap();
+    let original = batch.interaction.unwrap();
+    let response =
+        super::suspension::BatchResponse::Approval(ApprovalResult::Rejected { reason: None });
+    assert!(
+        f.agent
+            .validate_task_interaction_response(&original, &response)
+            .is_ok()
+    );
+    for policy in [None, Some(crate::spec::TaskIterationPolicy::configured())] {
+        let mut malformed = original.as_ref().clone();
+        let super::interaction::TaskInteractionKind::StateApproval { return_to, .. } =
+            &mut malformed.kind
+        else {
+            panic!("expected a retained state review");
+        };
+        let super::location::TaskStateReturn::BeforeCalls { saved } = return_to.as_mut() else {
+            panic!("expected retained pre-tool calls");
+        };
+        assert_eq!(saved.state.version, 2);
+        saved.state.task_iteration_policy = policy;
+        // Binding-only validation is also used by cancellation-only reconstruction and must not execute the saved calls.
+        assert!(f.agent.validate_task_interaction(&malformed).is_ok());
+        assert!(
+            f.agent
+                .validate_task_interaction_response(&malformed, &response)
+                .is_err()
+        );
+    }
+    let retained = f.store.load(&paused.run.key.run_id).await.unwrap().unwrap();
+    assert_eq!(retained.revision, snapshot.revision);
+    assert_eq!(retained.status, TaskRunStatus::Paused);
+    assert_eq!(f.effects.load(Ordering::SeqCst), 0);
+    assert_eq!(f.main.calls.load(Ordering::SeqCst), 1);
+    let resumed = respond(&f, &paused.run, ApprovalResult::Rejected { reason: None }).await;
+    assert_eq!(resumed.run.status, TaskRunStatus::Paused);
+    assert_eq!(f.effects.load(Ordering::SeqCst), 1);
+}
+
 #[tokio::test]
 async fn interaction_rejected_pre_tool_transition_keeps_original_native_calls() {
     let marker = ai_agents_core::encode_native_tool_call_markers(

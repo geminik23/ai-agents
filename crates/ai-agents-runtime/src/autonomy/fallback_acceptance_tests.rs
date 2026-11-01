@@ -703,7 +703,7 @@ async fn fallback_acceptance_fixed_host_operation_recovers_without_permit_transf
         );
         let store = support::store(parent.info().id, "host-recovery.v1", false).await;
         let mut config = super::runner_tests::config(8);
-        config.defaults.max_turns = Some(1);
+        config.defaults.max_turns = Some(ai_agents_core::autonomy::AutonomyLimit::Finite(1));
         config.defaults.validation=Some(serde_yaml::from_str("checks: [{id: check, adapter: host.recovery, schedule: each_cycle, config: {host_binding: fixed-recovery}}]").unwrap());
         config.defaults.completion = Some(CompletionGate::ValidatorPassed("check".into()));
         config.defaults.hitl = Some(AutonomyHitlConfig {
@@ -1117,7 +1117,7 @@ async fn fallback_acceptance_unknown_tool_timeout_cannot_start_fresh_fallback() 
 async fn fallback_acceptance_retry_capacity_failure_keeps_settled_original_evidence() {
     let mut f = Box::pin(fixture(false, false, None, false)).await;
     let mut config = super::runner_tests::config(16);
-    config.defaults.max_tool_calls = Some(3);
+    config.defaults.max_tool_calls = Some(ai_agents_core::autonomy::AutonomyLimit::Finite(3));
     config.defaults.hitl = Some(AutonomyHitlConfig {
         on_approval_required: Some(InteractionAction::PauseRun),
         on_user_question: Some(InteractionAction::PauseRun),
@@ -1150,6 +1150,9 @@ async fn fallback_acceptance_retry_capacity_failure_keeps_settled_original_evide
     assert!(record.metadata.contains_key("recovery_error"));
     assert_eq!(f.calls.load(Ordering::SeqCst), 2);
     assert_eq!(done.run.counters.tool_attempts, 3);
+    let parent = f.parent.save_state().await.unwrap();
+    let native = ai_agents_core::inspect_native_history(&parent.memory.messages).unwrap();
+    assert!(!native.has_incomplete_unsigned());
     assert_eq!(
         f.trace
             .0

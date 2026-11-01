@@ -76,6 +76,7 @@ impl Drop for CapacityReservation {
 struct AdmittedChild {
     id: String,
     spec: AgentSpec,
+    task_iteration_policy: crate::spec::TaskIterationPolicy,
     base_dir: Option<PathBuf>,
 }
 
@@ -368,13 +369,21 @@ impl AgentSpawner {
 
     /// Spawn an agent from a YAML string.
     pub async fn spawn_from_yaml(&self, yaml: &str) -> Result<SpawnedAgent> {
-        let spec = AgentSpec::from_yaml_strict(yaml)?;
-        self.spawn_admitted(None, spec, None).await
+        let prepared = crate::spec::PreparedAgentSpec::from_yaml_strict(yaml)?;
+        self.spawn_admitted(None, prepared, None).await
     }
 
     /// Spawn an agent from a pre-built AgentSpec.
     pub async fn spawn_from_spec(&self, spec: AgentSpec) -> Result<SpawnedAgent> {
-        self.spawn_admitted(None, spec, None).await
+        self.spawn_admitted(
+            None,
+            crate::spec::PreparedAgentSpec::new(
+                spec,
+                crate::spec::TaskIterationPolicy::configured(),
+            ),
+            None,
+        )
+        .await
     }
 
     /// Validate an explicit child ID and spec without reserving capacity or building an agent.
@@ -385,7 +394,15 @@ impl AgentSpawner {
 
     /// Spawn an agent with a specific ID, used for session restore.
     pub async fn spawn_with_id(&self, id: String, spec: AgentSpec) -> Result<SpawnedAgent> {
-        self.spawn_admitted(Some(id), spec, None).await
+        self.spawn_admitted(
+            Some(id),
+            crate::spec::PreparedAgentSpec::new(
+                spec,
+                crate::spec::TaskIterationPolicy::configured(),
+            ),
+            None,
+        )
+        .await
     }
 
     pub(crate) async fn spawn_from_yaml_file_with_id(
@@ -394,18 +411,18 @@ impl AgentSpawner {
         path: &Path,
     ) -> Result<SpawnedAgent> {
         let yaml = std::fs::read_to_string(path).map_err(AgentError::IoError)?;
-        let spec = AgentSpec::from_yaml_strict(&yaml)?;
+        let prepared = crate::spec::PreparedAgentSpec::from_yaml_strict(&yaml)?;
         let base_dir = path.parent().map(Path::to_path_buf);
-        self.spawn_admitted(Some(id), spec, base_dir).await
+        self.spawn_admitted(Some(id), prepared, base_dir).await
     }
 
     async fn spawn_admitted(
         &self,
         explicit_id: Option<String>,
-        spec: AgentSpec,
+        prepared: crate::spec::PreparedAgentSpec,
         base_dir: Option<PathBuf>,
     ) -> Result<SpawnedAgent> {
-        let admitted = self.admit_spec(explicit_id, spec, base_dir)?;
+        let admitted = self.admit_spec(explicit_id, prepared, base_dir)?;
         let reservation = self.reserve_capacity()?;
         self.spawn_inner(admitted, reservation).await
     }
@@ -413,22 +430,28 @@ impl AgentSpawner {
     pub(crate) async fn spawn_with_reserved_capacity(
         &self,
         id: String,
-        spec: AgentSpec,
+        prepared: crate::spec::PreparedAgentSpec,
         reservation: CapacityReservation,
     ) -> Result<SpawnedAgent> {
-        let admitted = self.admit_spec(Some(id), spec, None)?;
+        let admitted = self.admit_spec(Some(id), prepared, None)?;
         self.spawn_inner(admitted, reservation).await
     }
 
     fn admit_spec(
         &self,
         explicit_id: Option<String>,
-        spec: AgentSpec,
+        prepared: crate::spec::PreparedAgentSpec,
         base_dir: Option<PathBuf>,
     ) -> Result<AdmittedChild> {
+        let (spec, task_iteration_policy) = prepared.into_parts();
         let id = explicit_id.unwrap_or_else(|| self.generate_id(&spec.name));
         self.validate_admission(&id, &spec)?;
-        Ok(AdmittedChild { id, spec, base_dir })
+        Ok(AdmittedChild {
+            id,
+            spec,
+            task_iteration_policy,
+            base_dir,
+        })
     }
 
     // Model-generated child declarations cannot install their own prices or server limits inside a hard-priced run.
@@ -467,12 +490,18 @@ impl AgentSpawner {
         admitted: AdmittedChild,
         reservation: CapacityReservation,
     ) -> Result<SpawnedAgent> {
-        let AdmittedChild { id, spec, base_dir } = admitted;
+        let AdmittedChild {
+            id,
+            spec,
+            task_iteration_policy,
+            base_dir,
+        } = admitted;
 
         let mut builder = match base_dir {
             Some(base_dir) => AgentBuilder::from_spec_with_base_dir(spec.clone(), base_dir),
             None => AgentBuilder::from_spec(spec.clone()),
-        };
+        }
+        .task_iteration_policy(task_iteration_policy);
 
         if let Some(ref shared_reg) = self.llm_registry {
             // Shared providers are authoritative. Child provider declarations are never constructed or allowed to read credentials in this mode.

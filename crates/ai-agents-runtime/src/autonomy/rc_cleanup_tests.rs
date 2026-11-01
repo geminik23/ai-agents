@@ -13,7 +13,8 @@ async fn rc_cancelled_interrupted_constructor_rebuilds_only_for_typed_cleanup_ev
             crate::autonomy::continuation_test_support::store(root.info().id, "restore.v1", sqlite)
                 .await;
         let mut config = config();
-        config.defaults.max_wall_time_seconds = Some(1);
+        config.defaults.max_wall_time_seconds =
+            Some(ai_agents_core::autonomy::AutonomyLimit::Finite(1));
         let runner = AutonomyRunner::try_new(
             root,
             config.clone(),

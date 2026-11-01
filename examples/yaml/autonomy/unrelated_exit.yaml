@@ -16,8 +16,8 @@ states:
       autonomy:
         enabled: true  # Opt into the declaring state only; default: false.
         mode: state_until_exit
-        max_turns: 3  # Work-cycle allowance; resolved default: 30.
-        max_llm_calls: 4  # Managed-call allowance; resolved default: 60.
+        max_turns: 3  # Work-cycle allowance; resolved default: unlimited.
+        max_llm_calls: 4  # Managed-call allowance; resolved default: unlimited.
         completion: {state: resolved}
       transitions:
         - to: abandoned

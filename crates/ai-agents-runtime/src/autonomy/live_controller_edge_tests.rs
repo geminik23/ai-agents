@@ -43,6 +43,116 @@ fn call(id: &str, tool: &str) -> String {
     .unwrap()
 }
 
+// A legacy capacity review omits the v2 policy field in both exact copies of its retained model cursor.
+#[tokio::test]
+async fn legacy_capacity_review_preserves_original_cursor_shape() {
+    for sqlite in support::backends() {
+        let first = call("legacy-first", "first");
+        let provider = super::super::super::runner_tests::RecordingProvider::new(&[&first, "done"]);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let agent = Arc::new(
+            AgentBuilder::new()
+                .system_prompt("test")
+                .max_iterations(2)
+                .llm(provider)
+                .tool(Arc::new(Probe {
+                    id: "first",
+                    calls: calls.clone(),
+                    fail: false,
+                }))
+                .build()
+                .unwrap(),
+        );
+        let store = support::store(agent.info().id, "legacy-cursor.v1", *sqlite).await;
+        let mut config = super::super::super::runner_tests::config(1);
+        config.defaults.on_limit = Some(serde_yaml::from_str("action: pause_run").unwrap());
+        let runner = live_runner(agent.clone(), store.clone(), config, "legacy-cursor.v1");
+        let paused = runner.run("objective", None).await.unwrap();
+        assert_eq!(paused.run.status, TaskRunStatus::Paused);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let mut snapshot = store.load(&paused.run.key.run_id).await.unwrap().unwrap();
+        let current: TaskCheckpointPayload =
+            serde_json::from_value(snapshot.payload.clone()).unwrap();
+        let controller = crate::autonomy::controller_checkpoint(&current)
+            .unwrap()
+            .unwrap();
+        let crate::autonomy::controller::ControllerProposal::Capacity { limit } =
+            &controller.review.as_ref().unwrap().proposal
+        else {
+            panic!("expected capacity review");
+        };
+        let model = limit.model.as_ref().unwrap();
+        assert!(agent.checked_task_loop_policy(model).is_ok());
+        let mut mismatch = model.as_ref().clone();
+        mismatch.task_iteration_policy = Some(crate::spec::TaskIterationPolicy::configured());
+        assert!(agent.checked_task_loop_policy(&mismatch).is_err());
+        let mut malformed = snapshot.clone();
+        let review = &mut malformed.payload["pending"]["reviewed_action"];
+        let model = review["proposal"]["limit"]["model"]
+            .as_object_mut()
+            .unwrap();
+        assert_eq!(model["version"], 2);
+        assert!(model.remove("task_iteration_policy").is_some());
+        let malformed_review = review.clone();
+        let adapter = malformed.payload["adapters"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|adapter| adapter["id"] == "runtime.validation")
+            .unwrap();
+        adapter["state"]["review"] = malformed_review;
+        let invalid: TaskCheckpointPayload =
+            serde_json::from_value(malformed.payload.clone()).unwrap();
+        assert!(invalid.validate(&malformed, "legacy-cursor.v1").is_err());
+
+        snapshot.payload["version"] = json!(1);
+        let review = &mut snapshot.payload["pending"]["reviewed_action"];
+        let model = review["proposal"]["limit"]["model"]
+            .as_object_mut()
+            .unwrap();
+        model.insert("version".into(), json!(1));
+        assert!(model.remove("task_iteration_policy").is_some());
+        let legacy_review = review.clone();
+        let adapter = snapshot.payload["adapters"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|adapter| adapter["id"] == "runtime.validation")
+            .unwrap();
+        adapter["state"]["review"] = legacy_review;
+        let payload: TaskCheckpointPayload =
+            serde_json::from_value(snapshot.payload.clone()).unwrap();
+        payload.validate(&snapshot, "legacy-cursor.v1").unwrap();
+        assert!(
+            super::super::controller_checkpoint(&payload)
+                .unwrap()
+                .is_some()
+        );
+
+        // A v1 cursor reserialized by a newer runtime can contain explicit null instead of the historical omission.
+        let mut nullable = snapshot.clone();
+        let review = &mut nullable.payload["pending"]["reviewed_action"];
+        review["proposal"]["limit"]["model"]["task_iteration_policy"] = Value::Null;
+        let nullable_review = review.clone();
+        let adapter = nullable.payload["adapters"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|adapter| adapter["id"] == "runtime.validation")
+            .unwrap();
+        adapter["state"]["review"] = nullable_review;
+        let decoded: TaskCheckpointPayload =
+            serde_json::from_value(nullable.payload.clone()).unwrap();
+        decoded.validate(&nullable, "legacy-cursor.v1").unwrap();
+        let mut altered = nullable.clone();
+        altered.payload["pending"]["reviewed_action"]["proposal"]["limit"]["model"]["processed_input"] =
+            json!("different objective");
+        let changed: TaskCheckpointPayload =
+            serde_json::from_value(altered.payload.clone()).unwrap();
+        assert!(changed.validate(&altered, "legacy-cursor.v1").is_err());
+    }
+}
+
 #[tokio::test]
 async fn live_controller_native_provider_capacity_retains_iterations_and_accumulated_calls() {
     for sqlite in support::backends() {
@@ -86,7 +196,7 @@ async fn live_controller_native_provider_capacity_retains_iterations_and_accumul
             )
             .unwrap();
             let mut limits = payload.limits;
-            limits.max_llm_calls = 4;
+            limits.max_llm_calls = Some(4);
             let revised = runner
                 .revise_limits_paused(
                     &paused.run.key.run_id,
@@ -160,7 +270,8 @@ async fn live_controller_native_tool_capacity_resumes_selected_call_without_mode
             );
             let store = support::store(agent.info().id, "native.v1", *sqlite).await;
             let mut config = super::super::super::runner_tests::config(4);
-            config.defaults.max_tool_calls = Some(1);
+            config.defaults.max_tool_calls =
+                Some(ai_agents_core::autonomy::AutonomyLimit::Finite(1));
             config.defaults.on_limit =
                 Some(serde_yaml::from_str(&format!("action: {action}")).unwrap());
             let runner = live_runner(agent.clone(), store.clone(), config, "native.v1");
@@ -188,7 +299,7 @@ async fn live_controller_native_tool_capacity_resumes_selected_call_without_mode
             )
             .unwrap();
             let mut limits = payload.limits;
-            limits.max_tool_calls = 2;
+            limits.max_tool_calls = Some(2);
             let revised = runner
                 .revise_limits_paused(
                     &paused.run.key.run_id,

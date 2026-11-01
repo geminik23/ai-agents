@@ -471,7 +471,7 @@ async fn host_evidence_signal_control_races_have_one_winner() {
                     match action {
                         "limits" => {
                             let mut limits = first.run.limits.clone();
-                            limits.max_turns += 1;
+                            *limits.max_turns.as_mut().expect("finite test limit") += 1;
                             f.runner
                                 .revise_limits_paused(id, first.run.revision, limits, "capacity")
                                 .await
@@ -767,7 +767,7 @@ async fn host_evidence_objective_revision_and_unrelated_targets_preserve_binding
             *sqlite,
         )
         .await;
-        f.config.defaults.max_llm_calls = Some(2);
+        f.config.defaults.max_llm_calls = Some(ai_agents_core::autonomy::AutonomyLimit::Finite(2));
         f.runner = AutonomyRunner::try_new(
             f.agent.clone(),
             f.config.clone(),

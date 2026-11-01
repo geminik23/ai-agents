@@ -155,9 +155,9 @@ impl ValidationJournal for TaskValidationJournal {
                                 .ok_or_else(|| {
                                     AgentError::Config("tool counter overflow".into())
                                 })?;
-                            if payload.counters.tool_attempts
-                                > u64::from(payload.limits.max_tool_calls)
-                            {
+                            if payload.limits.max_tool_calls.is_some_and(|limit| {
+                                payload.counters.tool_attempts > u64::from(limit)
+                            }) {
                                 return Err(AgentError::Config(
                                     "validation tool capacity exhausted".into(),
                                 ));
@@ -170,9 +170,9 @@ impl ValidationJournal for TaskValidationJournal {
                                     .ok_or_else(|| {
                                         AgentError::Config("command counter overflow".into())
                                     })?;
-                                if payload.counters.command_attempts
-                                    > u64::from(payload.limits.max_command_calls)
-                                {
+                                if payload.limits.max_command_calls.is_some_and(|limit| {
+                                    payload.counters.command_attempts > u64::from(limit)
+                                }) {
                                     return Err(AgentError::Config(
                                         "validation command capacity exhausted".into(),
                                     ));
@@ -186,9 +186,9 @@ impl ValidationJournal for TaskValidationJournal {
                                 .llm_attempts
                                 .checked_add(1)
                                 .ok_or_else(|| AgentError::Config("LLM counter overflow".into()))?;
-                            if payload.counters.llm_attempts
-                                > u64::from(payload.limits.max_llm_calls)
-                            {
+                            if payload.limits.max_llm_calls.is_some_and(|limit| {
+                                payload.counters.llm_attempts > u64::from(limit)
+                            }) {
                                 return Err(AgentError::Config(
                                     "validation judge capacity exhausted".into(),
                                 ));

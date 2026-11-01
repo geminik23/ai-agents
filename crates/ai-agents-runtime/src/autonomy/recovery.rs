@@ -294,7 +294,11 @@ fn prepare_recovery(
             .clocks
             .active_millis
             .checked_add(payload.clocks.interrupted_interval_millis)
-            .is_none_or(|used| used >= payload.limits.max_active_time_seconds.saturating_mul(1000))
+            .is_none_or(|used| {
+                payload.limits.max_active_time_seconds.is_some_and(|limit| {
+                    std::time::Duration::from_millis(used) >= std::time::Duration::from_secs(limit)
+                })
+            })
             || payload.clocks.expires_at.is_some_and(|cut| now >= cut))
     {
         return Err(TaskRunStorageError::AdmissionExpired.into());

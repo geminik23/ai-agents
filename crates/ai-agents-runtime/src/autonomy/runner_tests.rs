@@ -1,3 +1,4 @@
+use super::runner::remaining_wall;
 use super::*;
 use crate::Agent;
 use ai_agents_core::{
@@ -133,13 +134,18 @@ pub(super) fn fixture(
     (agent, runner, store)
 }
 
-// A response predicate is deliberate deterministic completion, not a semantic acceptance heuristic.
+// Legacy finite bounds keep existing capacity fixtures explicit; default-unlimited tests build their own profile.
 pub(super) fn config(max_llm_calls: u32) -> AutonomyConfig {
     AutonomyConfig {
         defaults: AutonomyProfile {
             enabled: Some(true),
-            max_turns: Some(4),
-            max_llm_calls: Some(max_llm_calls),
+            max_turns: Some(ai_agents_core::autonomy::AutonomyLimit::Finite(4)),
+            max_llm_calls: Some(ai_agents_core::autonomy::AutonomyLimit::Finite(
+                max_llm_calls,
+            )),
+            max_tool_calls: Some(ai_agents_core::autonomy::AutonomyLimit::Finite(120)),
+            max_command_calls: Some(ai_agents_core::autonomy::AutonomyLimit::Finite(10)),
+            max_active_time_seconds: Some(ai_agents_core::autonomy::AutonomyLimit::Finite(900)),
             completion: Some(CompletionGate::ResponseContains("done".into())),
             ..Default::default()
         },
@@ -204,6 +210,21 @@ async fn continuation_commits_one_objective_and_persists_output_provenance() {
     }));
 }
 
+// The effective wall expiry can be inherited even when the task declares no aggregate wall budget.
+#[test]
+fn remaining_wall_distinguishes_unlimited_inherited_and_expired_bounds() {
+    let now = chrono::Utc::now();
+    assert_eq!(remaining_wall(None, now), serde_json::json!("unlimited"));
+    assert_eq!(
+        remaining_wall(Some(now + chrono::Duration::seconds(12)), now),
+        serde_json::json!(12)
+    );
+    assert_eq!(
+        remaining_wall(Some(now - chrono::Duration::seconds(1)), now),
+        serde_json::json!(0)
+    );
+}
+
 // The controller view reports command allowance and both clocks, not only turn and call counts.
 #[tokio::test]
 async fn controller_state_reports_command_and_clock_allowance() {
@@ -226,7 +247,7 @@ async fn controller_state_reports_command_and_clock_allowance() {
     );
     assert_eq!(
         controller.get("remaining_wall_seconds"),
-        Some(&serde_json::Value::Null)
+        Some(&serde_json::json!("unlimited"))
     );
 }
 

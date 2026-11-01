@@ -958,11 +958,7 @@ impl RunExecution {
             release: true,
             expires_at: self.expiry(),
             evidence: None,
-            deadline: Some(
-                std::time::Instant::now()
-                    .checked_add(self.remaining_duration())
-                    .ok_or_else(|| AgentError::Config("group pause deadline overflow".into()))?,
-            ),
+            deadline: self.final_deadline()?,
         };
         let saved = self
             .store

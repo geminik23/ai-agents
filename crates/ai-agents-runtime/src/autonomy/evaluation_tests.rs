@@ -799,7 +799,7 @@ async fn host_controls_use_cas_preserve_usage_and_cannot_revive_terminal_runs() 
             .is_err()
     );
     let mut limits = payload.limits.clone();
-    limits.max_llm_calls = 2;
+    limits.max_llm_calls = Some(2);
     assert!(
         store
             .apply_host_action(
@@ -815,7 +815,7 @@ async fn host_controls_use_cas_preserve_usage_and_cannot_revive_terminal_runs() 
             .is_err()
     );
     let mut limits = payload.limits;
-    limits.max_llm_calls = 70;
+    limits.max_llm_calls = Some(70);
     let changed = store
         .apply_host_action(
             "run",

@@ -43,7 +43,7 @@ impl NativeRetentionInspection {
         Ok(Self { core, signed_turns })
     }
 
-    /// Returns the protected start of the latest user turn that contains signed history.
+    /// Returns the earliest active native boundary that compression must retain.
     pub(crate) fn protected_suffix_start(&self) -> Option<usize> {
         self.core.protected_suffix_start()
     }

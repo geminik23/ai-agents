@@ -116,7 +116,7 @@ async fn contract(storage: Arc<dyn ai_agents_core::AgentStorage>) {
     let mut snapshot = super::tests::checkpoint("run");
     let mut payload: TaskCheckpointPayload =
         serde_json::from_value(snapshot.payload.clone()).unwrap();
-    payload.limits.max_tool_calls = 1;
+    payload.limits.max_tool_calls = Some(1);
     snapshot.payload = serde_json::to_value(payload).unwrap();
     store.create(&snapshot).await.unwrap();
     let claimed = store

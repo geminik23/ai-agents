@@ -35,13 +35,53 @@ pub async fn run(args: TaskArgs) -> Result<()> {
 }
 
 fn scope(host: &TaskAgentArgs) -> Result<TaskHostScope> {
-    let spec = crate::run::load_spec(&host.agent)?;
-    TaskHostScope::from_spec(
-        &spec,
+    let prepared = crate::run::load_prepared_spec(&host.agent)?;
+    TaskHostScope::from_prepared_spec(
+        &prepared,
         host.agent.parent().unwrap_or(Path::new(".")),
         host.actor.clone(),
     )
     .map_err(Into::into)
+}
+
+// Store-only operations inspect both exact current and legacy namespaces without resuming or reinterpreting saved limits.
+async fn management_stores(
+    host: &TaskAgentArgs,
+) -> Result<Vec<Arc<ai_agents::autonomy::ScopedTaskRunStore>>> {
+    let prepared = crate::run::load_prepared_spec(&host.agent)?;
+    let base = host.agent.parent().unwrap_or(Path::new("."));
+    let current = TaskHostScope::from_prepared_spec(&prepared, base, host.actor.clone())?;
+    let legacy = TaskHostScope::from_spec(prepared.spec(), base, host.actor.clone())?;
+    let same = current.identity() == legacy.identity();
+    let mut stores = vec![current.open_store().await?];
+    if !same {
+        stores.push(legacy.open_store().await?);
+    }
+    Ok(stores)
+}
+
+// Never guess a namespace from an untrusted run ID; only one authorized exact-scope candidate may be used.
+async fn management_store(
+    host: &TaskAgentArgs,
+    id: &str,
+) -> Result<Arc<ai_agents::autonomy::ScopedTaskRunStore>> {
+    let mut selected = None;
+    for store in management_stores(host).await? {
+        if store
+            .list_compatible()
+            .await?
+            .iter()
+            .any(|row| row.key.run_id == id)
+        {
+            if selected.is_some() {
+                anyhow::bail!("task matches multiple authorized namespaces");
+            }
+            selected = Some(store);
+        }
+    }
+    selected.ok_or_else(|| {
+        anyhow::anyhow!("task was not found in the current or compatible legacy namespace")
+    })
 }
 
 async fn run_inner(args: TaskArgs) -> Result<u8> {
@@ -63,12 +103,12 @@ async fn run_inner(args: TaskArgs) -> Result<u8> {
                 plain: true,
                 theme: None,
             };
-            let spec = crate::run::load_spec(&options.agent_path)?;
-            preflight_run(&spec, args.profile.as_deref(), &args.objective)?;
+            let prepared = crate::run::load_prepared_spec(&options.agent_path)?;
+            preflight_run(prepared.spec(), args.profile.as_deref(), &args.objective)?;
             let namespace = scope(&args.host)?;
             let agent = crate::run::build_frontend_agent(
                 &options.agent_path,
-                spec,
+                prepared,
                 io.bridge(),
                 Some(namespace),
             )
@@ -130,8 +170,11 @@ async fn run_inner(args: TaskArgs) -> Result<u8> {
             Ok(result_code(final_result))
         }
         TaskCommand::List(host) => {
-            let store = scope(&host)?.open_store().await?;
-            let rows = store.list_compatible().await?;
+            let mut rows = Vec::new();
+            for store in management_stores(&host).await? {
+                rows.extend(store.list_compatible().await?);
+            }
+            rows.sort_by(|a, b| a.key.run_id.cmp(&b.key.run_id));
             if host.json {
                 println!("{}", serde_json::to_string(&rows)?);
             } else {
@@ -142,7 +185,7 @@ async fn run_inner(args: TaskArgs) -> Result<u8> {
             Ok(0)
         }
         TaskCommand::Show(args) => {
-            let store = scope(&args.host)?.open_store().await?;
+            let store = management_store(&args.host, &args.run_id).await?;
             let view = ai_agents::TaskRunDisplay::read(store.as_ref(), &args.run_id).await?;
             println!("{}", serde_json::to_string_pretty(&view)?);
             Ok(0)
@@ -151,7 +194,7 @@ async fn run_inner(args: TaskArgs) -> Result<u8> {
             let revision = args
                 .revision
                 .context("cancel requires --revision from an observed snapshot")?;
-            let store = scope(&args.target.host)?.open_store().await?;
+            let store = management_store(&args.target.host, &args.target.run_id).await?;
             let receipt =
                 CancellationOutcome::request(store.as_ref(), &args.target.run_id, revision).await?;
             if args.target.host.json {

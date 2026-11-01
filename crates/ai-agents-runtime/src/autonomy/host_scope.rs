@@ -1,7 +1,7 @@
 //! Declarative host namespaces are resolved without constructing providers or executable restoration graphs.
 
 use super::{AutomaticTaskOptions, ScopedTaskRunStore};
-use crate::spec::{AgentSpec, StorageConfig};
+use crate::spec::{AgentSpec, PreparedAgentSpec, StorageConfig, TaskIterationPolicy};
 use ai_agents_core::{AgentError, Result};
 use ai_agents_skills::{SkillDefinition, SkillLoader};
 use sha2::{Digest, Sha256};
@@ -19,8 +19,32 @@ pub struct TaskHostScope {
 }
 
 impl TaskHostScope {
-    /// Resolves external skills using the same loader/base directory as the builder, without providers, environment credentials or startup work.
+    /// Typed specifications have no source-presence witness, so their numeric task-loop limits remain configured.
     pub fn from_spec(spec: &AgentSpec, base_dir: &Path, actor_id: Option<String>) -> Result<Self> {
+        Self::from_parts(spec, &TaskIterationPolicy::configured(), base_dir, actor_id)
+    }
+
+    /// Resolves a source-aware declaration and loaded skills without constructing providers or granting task authority.
+    pub fn from_prepared_spec(
+        prepared: &PreparedAgentSpec,
+        base_dir: &Path,
+        actor_id: Option<String>,
+    ) -> Result<Self> {
+        Self::from_parts(
+            prepared.spec(),
+            prepared.task_iteration_policy(),
+            base_dir,
+            actor_id,
+        )
+    }
+
+    // Source policy is part of the namespace because equal materialized defaults may have different task-loop semantics.
+    fn from_parts(
+        spec: &AgentSpec,
+        policy: &TaskIterationPolicy,
+        base_dir: &Path,
+        actor_id: Option<String>,
+    ) -> Result<Self> {
         spec.validate()?;
         if actor_id.as_ref().is_some_and(|id| id.trim().is_empty()) {
             return Err(AgentError::Config("task actor must not be empty".into()));
@@ -32,7 +56,7 @@ impl TaskHostScope {
         Ok(Self {
             agent_id: spec.name.clone(),
             actor_id,
-            identity: declaration_identity(spec, &skills)?,
+            identity: declaration_identity(spec, &skills, policy)?,
             storage: spec.storage.clone(),
         })
     }
@@ -42,14 +66,20 @@ impl TaskHostScope {
         &self,
         spec: &AgentSpec,
         skills: &[SkillDefinition],
+        policy: &TaskIterationPolicy,
     ) -> Result<String> {
-        let identity = declaration_identity(spec, skills)?;
+        let identity = declaration_identity(spec, skills, policy)?;
         if identity != self.identity || spec.name != self.agent_id {
             return Err(AgentError::Config(
                 "task host declaration changed during preparation".into(),
             ));
         }
         Ok(identity)
+    }
+
+    /// Returns the declarative namespace identity for exact store-only scope selection, not execution authority.
+    pub fn identity(&self) -> &str {
+        &self.identity
     }
 
     /// Supplies only the explicit namespace; hosts with external definitions should prefer the builder's checked task_host_scope binding.
@@ -86,10 +116,21 @@ impl TaskHostScope {
 }
 
 // Value uses deterministic object ordering; raw YAML formatting and HashMap iteration do not change the declared namespace.
-fn declaration_identity(spec: &AgentSpec, skills: &[SkillDefinition]) -> Result<String> {
-    let value = serde_json::json!({"contract":1,"spec":spec,"loaded_skills":skills});
+fn declaration_identity(
+    spec: &AgentSpec,
+    skills: &[SkillDefinition],
+    policy: &TaskIterationPolicy,
+) -> Result<String> {
+    if *policy == TaskIterationPolicy::configured() {
+        let value = serde_json::json!({"contract":1,"spec":spec,"loaded_skills":skills});
+        return Ok(format!(
+            "yaml-host.v1:{:x}",
+            Sha256::digest(serde_json::to_vec(&value)?)
+        ));
+    }
+    let value = serde_json::json!({"contract":2,"spec":spec,"loaded_skills":skills,"task_iteration_policy":policy});
     Ok(format!(
-        "yaml-host.v1:{:x}",
+        "yaml-host.v2:{:x}",
         Sha256::digest(serde_json::to_vec(&value)?)
     ))
 }

@@ -17,17 +17,15 @@ fn prefix_at_char_boundary(text: &str, max_chars: usize) -> &str {
     }
 }
 
-// Selects recent history from safe whole-turn boundaries. A protected signed suffix is retained
-// even when it exceeds the caller's allocation; the runtime performs the final hard-limit check.
+// Selects recent history from safe whole-turn boundaries, retaining active signed and unsigned batches even above the allocation.
+// The runtime checks the final hard request limit after any configured overflow handling.
 fn recent_suffix_start(messages: &[ChatMessage], token_budget: u32) -> usize {
     let Ok(inspection) = NativeRetentionInspection::inspect(messages) else {
         // The Vec-returning public helpers cannot surface malformed history. Keeping all input is
         // fail-closed with respect to deletion and lets the runtime's checked boundary reject it.
         return 0;
     };
-    let mut start = inspection
-        .protected_suffix_start()
-        .unwrap_or(messages.len());
+    let mut start = inspection.safe_prefix_len_at_most(messages.len());
     let mut used_tokens = messages[start..]
         .iter()
         .map(estimate_message_tokens)
@@ -100,7 +98,7 @@ impl ConversationContext {
 
     /// Build LLM messages with per-component token budgets.
     ///
-    /// Provider-state-bearing native exchanges are selected as complete signed user-turn groups.
+    /// Native tool batches and provider-state-bearing signed turns are retained at structurally safe boundaries.
     /// The latest protected group is retained intact even when it exceeds the recent allocation;
     /// callers that enforce a hard request limit must reject that over-budget result explicitly.
     pub fn to_llm_messages_with_allocation(
@@ -143,9 +141,9 @@ impl ConversationContext {
         result
     }
 
-    /// Build a budgeted prompt without splitting provider-state-bearing signed user turns.
+    /// Build a budgeted prompt without splitting native tool batches or signed user turns.
     ///
-    /// A latest protected signed suffix remains intact when it alone exceeds `max_tokens`; the
+    /// A latest protected native suffix remains intact when it alone exceeds `max_tokens`; the
     /// runtime is responsible for rejecting the resulting hard-limit overflow before transport.
     pub fn to_llm_messages_with_budget(&self, max_tokens: u32) -> Vec<ChatMessage> {
         let mut result = Vec::new();
@@ -494,6 +492,39 @@ mod tests {
         assert_eq!(selected.len(), messages.len());
         assert_eq!(selected[0].content, "signed user request");
         assert!(selected[1].content.contains("fixture-signature"));
+    }
+
+    #[test]
+    fn allocation_and_budget_keep_active_unsigned_batch_when_it_exceeds_the_budget() {
+        let call = ToolCall {
+            id: "active".into(),
+            name: "lookup".into(),
+            arguments: serde_json::json!({}),
+        };
+        let messages = vec![
+            make_message(Role::User, "objective"),
+            ChatMessage::assistant(
+                encode_native_tool_call_markers(std::slice::from_ref(&call), None).unwrap(),
+            ),
+            ChatMessage::function(
+                "lookup",
+                encode_native_tool_result_marker(&call, serde_json::json!({"ok":true})).unwrap(),
+            ),
+        ];
+        let context = ConversationContext::with_messages(messages);
+        let allocation = TokenAllocation {
+            summary: 0,
+            recent_messages: 1,
+            facts: 0,
+            relationships: 0,
+        };
+        for selected in [
+            context.to_llm_messages_with_allocation(&allocation),
+            context.to_llm_messages_with_budget(1),
+        ] {
+            assert_eq!(selected.len(), 2);
+            ai_agents_core::inspect_native_history(&selected).unwrap();
+        }
     }
 
     #[test]

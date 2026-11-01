@@ -50,6 +50,14 @@ use crate::tui::widgets::{
     tools_panel::{LastToolCall, ToolsPanelState, render_tools_panel},
 };
 
+// Usage stays visible even when a particular cumulative allowance is unbounded.
+fn task_count(used: u64, limit: Option<u32>) -> String {
+    match limit {
+        Some(limit) => format!("{used}/{limit}"),
+        None => format!("{used}/unlimited"),
+    }
+}
+
 fn preview_text(text: &str, max_chars: usize) -> String {
     if max_chars == 0 {
         return String::new();
@@ -492,16 +500,29 @@ impl App {
                 display.locally_retained, display.restoration_review_required
             ));
             lines.push(format!(
-                "Active observed: {} ms / {} s | original expiry: {:?}",
+                "Active observed: {} ms / {} s | wall expiry: {}",
                 display.clocks.active_millis,
-                display.limits.max_active_time_seconds,
-                display.clocks.expires_at
+                display
+                    .limits
+                    .max_active_time_seconds
+                    .map_or_else(|| "unlimited".to_string(), |limit| limit.to_string()),
+                display
+                    .clocks
+                    .expires_at
+                    .map_or_else(|| "unlimited".to_string(), |expiry| expiry.to_rfc3339())
             ));
             lines.push(format!(
-                "Cumulative: {} turns; {} LLM attempts; {} tool attempts",
-                display.counters.turns,
-                display.counters.llm_attempts,
-                display.counters.tool_attempts
+                "Cumulative: {} turns; {} LLM; {} tools; {} commands",
+                task_count(display.counters.turns, display.limits.max_turns),
+                task_count(display.counters.llm_attempts, display.limits.max_llm_calls),
+                task_count(
+                    display.counters.tool_attempts,
+                    display.limits.max_tool_calls
+                ),
+                task_count(
+                    display.counters.command_attempts,
+                    display.limits.max_command_calls
+                )
             ));
             lines.push(format!(
                 "Last gate: {:?} (historical cycle {:?}, objective revision {:?})",
@@ -2202,6 +2223,100 @@ mod tests {
             serde_json::from_str::<serde_json::Value>(&line).unwrap()["other_text"],
             "중단하지 마세요"
         );
+    }
+
+    #[test]
+    fn task_panel_renders_unlimited_and_finite_usage_including_commands() {
+        use ai_agents::autonomy::{
+            TaskClocks, TaskCounters, TaskRunKey, TaskRunLimits, TaskRunStatus, TaskRunSummary,
+        };
+
+        let now = chrono::Utc::now();
+        let display = ai_agents::TaskRunDisplay {
+            summary: TaskRunSummary {
+                key: TaskRunKey {
+                    agent_id: "agent".into(),
+                    run_id: "run".into(),
+                },
+                actor_id: None,
+                revision: 2,
+                status: TaskRunStatus::Paused,
+                owned: false,
+                cancel_requested: false,
+                created_at: now,
+                updated_at: now,
+            },
+            locally_retained: true,
+            objective: serde_json::Value::Null,
+            profile: None,
+            stage: None,
+            pause_reason: None,
+            stop_reason: None,
+            pending_kind: None,
+            counters: TaskCounters {
+                turns: 2,
+                llm_attempts: 3,
+                tool_attempts: 4,
+                command_attempts: 1,
+                ..Default::default()
+            },
+            limits: TaskRunLimits {
+                max_turns: None,
+                max_active_time_seconds: None,
+                max_wall_time_seconds: None,
+                max_llm_calls: Some(8),
+                max_tool_calls: None,
+                max_command_calls: Some(4),
+                max_micro_usd: None,
+                max_declared_write_paths: None,
+            },
+            clocks: TaskClocks::default(),
+            todos: serde_json::Value::Null,
+            progress: serde_json::Value::Null,
+            last_gate: None,
+            last_gate_cycle: None,
+            last_gate_objective_revision: None,
+            artifacts: None,
+            restoration_review_required: None,
+        };
+        let mut app = test_app();
+        app.host_output(crate::session::Output::View {
+            display: Box::new(display),
+            details: None,
+        });
+        app.task_panel = true;
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 30)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("2/unlimited turns"));
+        assert!(rendered.contains("3/8 LLM"));
+        assert!(rendered.contains("4/unlimited tools"));
+        assert!(rendered.contains("1/4 commands"));
+        assert!(rendered.contains("unlimited s"));
+        assert!(rendered.contains("wall expiry: unlimited"));
+
+        let view = &mut app.task_views.get_mut("run").unwrap().0;
+        let inherited = now + chrono::Duration::seconds(45);
+        view.clocks.expires_at = Some(inherited);
+        view.clocks.inherited_expires_at = Some(inherited);
+        assert_eq!(view.limits.max_wall_time_seconds, None);
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains(&format!("wall expiry: {}", inherited.to_rfc3339())));
+        assert!(!rendered.contains("wall expiry: unlimited"));
     }
 
     #[test]

@@ -219,7 +219,16 @@ impl AutonomyRunner {
         let mut scope: EvaluationScope = serde_json::from_value(controller.state["scope"].clone())?;
         let mut progress: ProgressState =
             serde_json::from_value(controller.state["progress"].clone())?;
-        let (owner, participants, targets, batch, group, retained_controller, whole_expiry) = {
+        let (
+            owner,
+            participants,
+            targets,
+            batch,
+            group,
+            retained_controller,
+            whole_expiry,
+            inherited_expiry,
+        ) = {
             let retained = self.paused.lock();
             let retained = retained
                 .get(run_id)
@@ -247,7 +256,13 @@ impl AutonomyRunner {
                 retained.group.clone(),
                 retained.controller.clone(),
                 retained.whole_expiry,
+                retained.inherited_expiry,
             )
+        };
+        let incoming = super::super::execution::sample_inherited_deadline()?.map(|sample| sample.1);
+        let whole_expiry = match (whole_expiry, incoming) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
         };
         if serde_json::to_value(controller_checkpoint(&payload)?)?
             != serde_json::to_value(&retained_controller)?
@@ -304,7 +319,14 @@ impl AutonomyRunner {
         let live = Arc::get_mut(&mut execution).ok_or(TaskRunStorageError::Conflict)?;
         live.participants = participants.clone();
         live.targets = targets.clone();
-        live.expiry_projection = whole_expiry;
+        live.expiry_projection = match (live.expiry_projection, whole_expiry) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        live.inherited_projection = match (live.inherited_projection, inherited_expiry) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
         *self.active.lock() = Some(execution.clone());
         if let Some(todos) = &payload.todos {
             execution.install_todos(self.agent.todo_store(), todos.binding.clone());
@@ -589,6 +611,8 @@ impl AutonomyRunner {
         retained.batch = None;
         retained.group = None;
         retained.controller = execution.controller.lock().clone();
+        retained.whole_expiry = execution.expiry_projection;
+        retained.inherited_expiry = execution.inherited_projection;
         retained.approval_deadlines.clear();
         cleanup.finish();
         self.publish_automatic(&result);
@@ -763,6 +787,10 @@ impl AutonomyRunner {
         if let Some(skill) = limit.and_then(|limit| limit.skill.as_ref()) {
             self.agent.validate_capacity_skill(skill)?;
         }
+        // A retained model cursor must match the live runtime before this response consumes the pending capacity review.
+        if let Some(model) = limit.and_then(|limit| limit.model.as_ref()) {
+            self.agent.checked_task_loop_policy(model)?;
+        }
         if let Some(driver) = &state.driver {
             if driver.expired() {
                 return Err(TaskRunStorageError::AdmissionExpired.into());
@@ -797,10 +825,7 @@ impl AutonomyRunner {
         let live = Arc::get_mut(&mut execution).ok_or(TaskRunStorageError::Conflict)?;
         live.participants = paused.participants.clone();
         live.targets = paused.targets.clone();
-        live.expiry_projection = match (live.expiry_projection, paused.whole_expiry) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        };
+        paused.bind_deadlines(live);
         *execution.approval_deadlines.lock() = paused.approval_deadlines.clone();
         execution.set_scope(&state.scope);
         if let Some(todo) = &paused.todo {

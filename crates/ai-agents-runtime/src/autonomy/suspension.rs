@@ -62,12 +62,29 @@ pub(crate) struct TaskLoopState {
     pub reasoning_mode: ai_agents_reasoning::ReasoningMode,
     pub auto_detected: bool,
     pub iterations: u32,
+    // Legacy cursors omitted this field; preserving its shape keeps exact retained-review identity intact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_iteration_policy: Option<crate::spec::TaskIterationPolicy>,
     pub all_tool_calls: Vec<ToolCall>,
     pub thinking_content: Option<String>,
     #[serde(default)]
     pub native_exchanges: Vec<TaskNativeExchange>,
     #[serde(default)]
     pub deferred_final: Option<Box<super::location::TaskModelFinal>>,
+}
+
+impl TaskLoopState {
+    // A v1 cursor has no source witness; a v2 cursor must retain the policy it originally recorded.
+    pub(crate) fn validate_policy_shape(&self) -> Result<()> {
+        if matches!(
+            (self.version, &self.task_iteration_policy),
+            (1, None) | (2, Some(_))
+        ) {
+            Ok(())
+        } else {
+            Err(TaskRunStorageError::InvalidCheckpoint.into())
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -409,7 +426,7 @@ impl TaskBatchState {
             || self
                 .loop_state
                 .as_ref()
-                .is_some_and(|state| state.version != 1)
+                .is_some_and(|state| state.validate_policy_shape().is_err())
         {
             return Err(TaskRunStorageError::InvalidCheckpoint.into());
         }
@@ -1098,11 +1115,7 @@ impl RunExecution {
             release: true,
             expires_at: self.expiry(),
             evidence: None,
-            deadline: Some(
-                std::time::Instant::now()
-                    .checked_add(self.remaining_duration())
-                    .ok_or_else(|| AgentError::Config("pause deadline overflow".into()))?,
-            ),
+            deadline: self.final_deadline()?,
         };
         let saved = self
             .store

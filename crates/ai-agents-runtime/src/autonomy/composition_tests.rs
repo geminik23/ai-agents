@@ -572,7 +572,7 @@ async fn lp_group_return_capacity_resumes_parent_without_replaying_child_or_deli
         )
         .unwrap();
         let mut limits = payload.limits;
-        limits.max_llm_calls = 4;
+        limits.max_llm_calls = Some(4);
         let revised = runner
             .revise_limits_paused(
                 &paused.run.key.run_id,

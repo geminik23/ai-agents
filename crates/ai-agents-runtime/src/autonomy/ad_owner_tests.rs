@@ -75,7 +75,7 @@ async fn ad_final_paused_actor_deletion_and_session_identity_preserve_both_stora
         let mut config = AutonomyConfig {
             defaults: AutonomyProfile {
                 enabled: Some(true),
-                max_llm_calls: Some(2),
+                max_llm_calls: Some(ai_agents_core::autonomy::AutonomyLimit::Finite(2)),
                 completion: Some(CompletionGate::ResponseContains("done".into())),
                 ..Default::default()
             },

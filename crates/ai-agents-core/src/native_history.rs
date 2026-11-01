@@ -777,11 +777,15 @@ impl std::fmt::Debug for NativeExchange {
     }
 }
 
-/// Provider-neutral signed-history boundaries used by memory and runtime admission.
+/// Provider-neutral signed and unsigned structural boundaries used by memory and runtime admission.
 #[derive(Clone, Debug, PartialEq)]
 pub struct NativeHistoryInspection {
     message_count: usize,
     exchanges: Vec<NativeExchange>,
+    signed_user_ranges: Vec<std::ops::Range<usize>>,
+    unsigned_ranges: Vec<std::ops::Range<usize>>,
+    incomplete_unsigned: bool,
+    protected_unsigned_start: Option<usize>,
     protected_suffix_start: Option<usize>,
 }
 
@@ -791,9 +795,17 @@ impl NativeHistoryInspection {
         &self.exchanges
     }
 
-    /// Returns the first message of the latest user turn containing signed history.
+    /// Reports whether any unsigned call batch still lacks a correlated result.
+    pub fn has_incomplete_unsigned(&self) -> bool {
+        self.incomplete_unsigned
+    }
+
+    /// Returns the earliest protected signed turn or active/incomplete unsigned batch.
     pub fn protected_suffix_start(&self) -> Option<usize> {
-        self.protected_suffix_start
+        match (self.protected_suffix_start, self.protected_unsigned_start) {
+            (Some(signed), Some(unsigned)) => Some(signed.min(unsigned)),
+            (signed, unsigned) => signed.or(unsigned),
+        }
     }
 
     /// Reports whether removing exactly this prefix preserves every exchange and protected suffix.
@@ -802,12 +814,23 @@ impl NativeHistoryInspection {
             || self
                 .protected_suffix_start
                 .is_some_and(|protected| count > protected)
+            || self
+                .protected_unsigned_start
+                .is_some_and(|protected| count > protected)
         {
             return false;
         }
         self.exchanges
             .iter()
             .all(|exchange| count <= exchange.message_start() || count >= exchange.message_end())
+            && self
+                .signed_user_ranges
+                .iter()
+                .all(|range| count <= range.start || count >= range.end)
+            && self
+                .unsigned_ranges
+                .iter()
+                .all(|range| count <= range.start || count >= range.end)
     }
 
     /// Finds the greatest safe removable prefix no larger than `requested`.
@@ -835,6 +858,28 @@ fn finish_exchange(exchanges: &mut Vec<NativeExchange>, active: &mut Option<Nati
 struct UnsignedExchange {
     calls: Vec<(String, String)>,
     result_ids: HashSet<String>,
+    message_start: usize,
+    message_end: usize,
+}
+
+// Finished unsigned batches may be evicted only as a unit; incomplete batches retain their original history until resolved.
+fn finish_unsigned(
+    active: &mut Option<UnsignedExchange>,
+    ranges: &mut Vec<std::ops::Range<usize>>,
+    protected: &mut Option<usize>,
+    incomplete: &mut bool,
+    current: bool,
+) {
+    if let Some(exchange) = active.take() {
+        let missing = exchange.result_ids.len() != exchange.calls.len();
+        *incomplete |= missing;
+        if current || missing {
+            *protected = Some(protected.map_or(exchange.message_start, |old| {
+                old.min(exchange.message_start)
+            }));
+        }
+        ranges.push(exchange.message_start..exchange.message_end);
+    }
 }
 
 /// Inspects signed assistant exchanges without treating user-controlled marker text as authority.
@@ -844,6 +889,9 @@ pub fn inspect_native_history(
     let mut exchanges = Vec::new();
     let mut active: Option<NativeExchange> = None;
     let mut active_unsigned: Option<UnsignedExchange> = None;
+    let mut unsigned_ranges = Vec::new();
+    let mut incomplete_unsigned = false;
+    let mut protected_unsigned_start = None;
     let mut seen_exchange_ids = HashSet::new();
     let mut latest_user_index = None;
     let mut exchange_user_indexes = HashMap::<String, usize>::new();
@@ -852,13 +900,25 @@ pub fn inspect_native_history(
         match message.role {
             Role::User => {
                 finish_exchange(&mut exchanges, &mut active);
-                active_unsigned = None;
+                finish_unsigned(
+                    &mut active_unsigned,
+                    &mut unsigned_ranges,
+                    &mut protected_unsigned_start,
+                    &mut incomplete_unsigned,
+                    false,
+                );
                 latest_user_index = Some(index);
             }
             Role::Assistant => {
+                finish_unsigned(
+                    &mut active_unsigned,
+                    &mut unsigned_ranges,
+                    &mut protected_unsigned_start,
+                    &mut incomplete_unsigned,
+                    false,
+                );
                 let Some(batch) = decode_native_tool_call_markers(&message.content)? else {
                     finish_exchange(&mut exchanges, &mut active);
-                    active_unsigned = None;
                     continue;
                 };
                 let Some(state) = batch.provider_state().cloned() else {
@@ -870,11 +930,12 @@ pub fn inspect_native_history(
                             .map(|call| (call.id.clone(), call.name.clone()))
                             .collect(),
                         result_ids: HashSet::new(),
+                        message_start: index,
+                        message_end: index + 1,
                     });
                     continue;
                 };
                 finish_exchange(&mut exchanges, &mut active);
-                active_unsigned = None;
                 let user_index = latest_user_index.ok_or_else(|| {
                     protocol_error(format!(
                         "signed exchange '{}' has no preceding user boundary",
@@ -925,6 +986,7 @@ pub fn inspect_native_history(
                             )));
                         }
                     }
+                    unsigned.message_end = index + 1;
                     continue;
                 }
                 let exchange = active.as_mut().expect("checked above");
@@ -973,6 +1035,14 @@ pub fn inspect_native_history(
         }
     }
     finish_exchange(&mut exchanges, &mut active);
+    // Even a completed final batch must remain available until the following assistant response consumes its results.
+    finish_unsigned(
+        &mut active_unsigned,
+        &mut unsigned_ranges,
+        &mut protected_unsigned_start,
+        &mut incomplete_unsigned,
+        true,
+    );
 
     let protected_suffix_start = latest_user_index.and_then(|latest_user| {
         exchanges
@@ -986,9 +1056,21 @@ pub fn inspect_native_history(
             .min()
     });
 
+    let signed_user_ranges = exchanges
+        .iter()
+        .filter_map(|exchange| {
+            exchange_user_indexes
+                .get(exchange.state().exchange_id())
+                .map(|start| *start..exchange.message_end())
+        })
+        .collect();
     Ok(NativeHistoryInspection {
         message_count: messages.len(),
         exchanges,
+        signed_user_ranges,
+        unsigned_ranges,
+        incomplete_unsigned,
+        protected_unsigned_start,
         protected_suffix_start,
     })
 }
@@ -1036,6 +1118,58 @@ mod tests {
                 .collect(),
         )
         .unwrap()
+    }
+
+    // Every advertised cut must leave independently valid native history, including signed user boundaries and unsigned batches.
+    #[test]
+    fn safe_cuts_keep_signed_user_and_unsigned_call_result_boundaries() {
+        let signed_call = call("signed", "one");
+        let unsigned_call = call("unsigned", "two");
+        let active_call = call("active", "three");
+        let messages = vec![
+            ChatMessage::user("signed turn"),
+            ChatMessage::assistant(
+                encode_native_tool_call_markers(
+                    std::slice::from_ref(&signed_call),
+                    Some(&state(
+                        "signed-exchange",
+                        std::slice::from_ref(&signed_call),
+                    )),
+                )
+                .unwrap(),
+            ),
+            ChatMessage::function(
+                "lookup",
+                encode_native_tool_result_marker(&signed_call, serde_json::json!({"ok":true}))
+                    .unwrap(),
+            ),
+            ChatMessage::assistant("done"),
+            ChatMessage::user("unsigned turn"),
+            ChatMessage::assistant(
+                encode_native_tool_call_markers(std::slice::from_ref(&unsigned_call), None)
+                    .unwrap(),
+            ),
+            ChatMessage::function(
+                "lookup",
+                encode_native_tool_result_marker(&unsigned_call, serde_json::json!({"ok":true}))
+                    .unwrap(),
+            ),
+            ChatMessage::assistant("done"),
+            ChatMessage::user("active turn"),
+            ChatMessage::assistant(
+                encode_native_tool_call_markers(std::slice::from_ref(&active_call), None).unwrap(),
+            ),
+        ];
+        let inspection = inspect_native_history(&messages).unwrap();
+        assert!(!inspection.is_safe_prefix_len(1));
+        assert!(!inspection.is_safe_prefix_len(6));
+        assert!(!inspection.is_safe_prefix_len(messages.len()));
+        for cut in 0..=messages.len() {
+            if inspection.is_safe_prefix_len(cut) {
+                inspect_native_history(&messages[cut..])
+                    .unwrap_or_else(|error| panic!("unsafe cut {cut}: {error}"));
+            }
+        }
     }
 
     #[test]

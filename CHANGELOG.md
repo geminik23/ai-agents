@@ -3,7 +3,7 @@
 ## Unreleased
 
 ### Added
-- Code agent example: run the scripted sample or connect a selected workspace file and provider to an approved host-owned checker
+- Code agent example: run the scripted sample or connect selected workspace files and a provider to an approved host-owned checker
 - Task evaluation: development typed operations and foreground child decisions share configured hosts, exact continuation, isolated domain bindings and bounded redacted results without replacing the parent's response
 - Task observability: development task lifecycle facts carry run, profile and stage attribution through existing aggregation without replacing authoritative invocation accounting
 - Task TUI: development terminal sessions share task hosting and exact human decisions with the plain frontend, show bounded task evidence and retain original work through acknowledged shutdown
@@ -39,8 +39,10 @@
 - Task validation: development-only tri-state checks, tool/fallback/child observation continuation and external signals preserve post-turn controller progress; fixed host permits and single logical journal charges survive re-pause, without adding a second executor or inferring completion from unavailable evidence
 
 ### Changed
-- Rust task time compatibility: development validation drives and final publications accept absent aggregate deadlines without bypassing live evidence, cancellation, conditional ownership or original operation bounds; existing finite defaults remain unchanged
-- Code agent workflow: request guidance after incomplete checks and allow explicit model output and checker time limits for the selected workspace
+- Task execution defaults: new autonomous tasks omit cumulative count and time limits unless explicitly configured or host-bounded; ordinary chat and saved finite limits retain their contracts
+- Code agent workflow: support explicitly selected multi-file edits, optional workspace discovery and bounded untrusted feedback from an approved failed checker
+- Rust task time compatibility: development validation drives and final publications accept absent aggregate deadlines without bypassing live evidence, cancellation, conditional ownership or original explicit bounds
+- Code agent settings: choose model output and checker time limits while denied or unavailable checks still require guidance
 - Task validation: allow an exact command check to specify its attempt timeout within the host and tool policy limits
 - Evaluation compatibility: development report schema 3 separates participant control results from parent turns, retains acknowledged evidence after interrupted foreground work and rejects task controls in chat-only JSONL
 - Rust evaluation compatibility: scenario and turn literals add empty interaction collections; existing typed task fields, task-step variants and lifecycle categories retain their owning module paths
@@ -66,6 +68,9 @@
 - Rust configuration compatibility: typed autonomy fields, validation driver bounds and objective-bound todo identities require affected struct literals to be updated; these development additions are not the published stable API
 
 ### Fixed
+- Task continuation: preserve legacy capacity-review identity and reject changed model-loop bindings before consuming pending work
+- Task allowance display: distinguish unbounded wall time and show cumulative command and model usage alongside configured limits
+- Native tool history: keep unsigned call and result batches intact during bounded memory retention and reject context overflow that cannot preserve them
 - File mutation: preserve ordinary Unix modes with private temporary files, reject special-bit patch targets and report incomplete rollback or cleanup honestly
 - Command output: preserve bounded error tails and structured exit results when command logs exceed output limits
 - File editing: show accurate authorized previews and mismatch hints, and refuse writes when the effect cannot be reported

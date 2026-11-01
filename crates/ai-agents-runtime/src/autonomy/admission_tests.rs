@@ -238,6 +238,26 @@ async fn ledger(write_limit: Option<u32>, cost: bool) -> Arc<RunExecution> {
 
 // Memory and SQLite use identical real conditional admission and settlement logic.
 async fn ledger_backend(write_limit: Option<u32>, cost: bool, sqlite: bool) -> Arc<RunExecution> {
+    ledger_with_clock(
+        write_limit,
+        cost,
+        sqlite,
+        Some(900),
+        None,
+        std::time::Duration::ZERO,
+    )
+    .await
+}
+
+// A backdated monotonic anchor simulates accumulated active work without sleeping or resetting the journal.
+async fn ledger_with_clock(
+    write_limit: Option<u32>,
+    cost: bool,
+    sqlite: bool,
+    active: Option<u64>,
+    host_active: Option<u64>,
+    elapsed: std::time::Duration,
+) -> Arc<RunExecution> {
     let mut mock = ai_agents_llm::mock::MockLLMProvider::new("test");
     mock.set_response("done");
     let agent = Arc::new(
@@ -251,9 +271,11 @@ async fn ledger_backend(write_limit: Option<u32>, cost: bool, sqlite: bool) -> A
     let store = super::continuation_test_support::store(agent.info().id, "ledger-v1", sqlite).await;
     let owner = agent.reserve_autonomy_run("ledger".into()).await.unwrap();
     let mut config = super::runner_tests::config(8);
+    config.defaults.max_active_time_seconds = active.map(AutonomyLimit::Finite);
     config.defaults.max_declared_write_paths = write_limit;
     config.defaults.max_cost_usd = cost.then(|| UsdAmount::parse("1.00").unwrap());
     let host = AutonomyHostCeilings {
+        max_active_time_seconds: host_active,
         max_declared_write_paths: write_limit,
         max_cost_usd: cost.then(|| UsdAmount::parse("1.00").unwrap()),
         ..Default::default()
@@ -299,9 +321,60 @@ async fn ledger_backend(write_limit: Option<u32>, cost: bool, sqlite: bool) -> A
         &snapshot,
         lifecycle,
         owner,
-        std::time::Instant::now(),
+        std::time::Instant::now().checked_sub(elapsed).unwrap(),
     )
     .unwrap()
+}
+
+// The old active-time boundary is crossed without sleeping, while finite task and host limits still reject before admission.
+#[tokio::test]
+async fn active_time_unbounded_and_finite_limits_preserve_real_admission() {
+    for sqlite in super::continuation_test_support::backends() {
+        for (active, host, seconds, allowed) in [
+            (None, None, 901, true),
+            (Some(900), None, 899, true),
+            (Some(900), None, 901, false),
+            (None, Some(900), 901, false),
+        ] {
+            let execution = ledger_with_clock(
+                None,
+                false,
+                *sqlite,
+                active,
+                host,
+                std::time::Duration::from_secs(seconds),
+            )
+            .await;
+            let mut provider = ai_agents_llm::mock::MockLLMProvider::new("clock-test");
+            provider.set_response("done");
+            let provider = Arc::new(provider);
+            let managed = ai_agents_llm::managed_provider(provider.clone());
+            let admitted = scope_execution(execution.clone(), async {
+                managed
+                    .complete(&[ChatMessage::user("objective")], None)
+                    .await
+            })
+            .await;
+            assert_eq!(
+                admitted.is_ok(),
+                allowed,
+                "active={active:?} host={host:?} elapsed={seconds}"
+            );
+            assert_eq!(provider.call_count(), usize::from(allowed));
+            let snapshot = execution.store.load("ledger").await.unwrap().unwrap();
+            let payload: TaskCheckpointPayload = serde_json::from_value(snapshot.payload).unwrap();
+            assert_eq!(payload.counters.llm_attempts, u64::from(allowed));
+            if allowed {
+                assert!(execution.consumed_active_millis().unwrap() >= seconds * 1000);
+                assert!(
+                    payload
+                        .reservations
+                        .iter()
+                        .all(|reservation| reservation.state == TaskEffectState::Completed)
+                );
+            }
+        }
+    }
 }
 
 #[tokio::test]

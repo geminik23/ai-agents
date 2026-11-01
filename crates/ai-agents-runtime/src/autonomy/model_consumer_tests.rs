@@ -246,7 +246,7 @@ async fn fixture_options(
 // Every fixture keeps normal shared accounting and explicit interaction pauses under the real runner.
 fn runner(parent: &Arc<RuntimeAgent>, store: Arc<dyn TaskRunStore>) -> AutonomyRunner {
     let mut config = super::runner_tests::config(24);
-    config.defaults.max_tool_calls = Some(20);
+    config.defaults.max_tool_calls = Some(ai_agents_core::autonomy::AutonomyLimit::Finite(20));
     config.defaults.hitl = Some(AutonomyHitlConfig {
         on_approval_required: Some(InteractionAction::PauseRun),
         on_user_question: Some(InteractionAction::PauseRun),

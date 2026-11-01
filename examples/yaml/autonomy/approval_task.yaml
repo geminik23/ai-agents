@@ -26,7 +26,7 @@ hitl:
       approval_message: 'Approve {{ method }} request to {{ url }}?'
 autonomy:
   enabled: true
-  max_turns: 4  # Work-cycle allowance; resolved default: 30.
-  max_llm_calls: 8  # Admitted model-call allowance; resolved default: 60.
+  max_turns: 4  # Work-cycle allowance; resolved default: unlimited.
+  max_llm_calls: 8  # Admitted model-call allowance; resolved default: unlimited.
   hitl: {on_approval_required: pause_run}
   completion: {tool_called: {id: http, count: 1, executed: true, success: true}}

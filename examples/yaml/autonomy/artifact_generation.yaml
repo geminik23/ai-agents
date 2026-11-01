@@ -21,8 +21,8 @@ tool_security:
     file_read: {read_paths: [], allow_without_confirmation: true}
 autonomy:
   enabled: true
-  max_turns: 6  # Work-cycle allowance; resolved default: 30.
-  max_llm_calls: 16  # Shared admitted calls; resolved default: 60.
+  max_turns: 6  # Work-cycle allowance; resolved default: unlimited.
+  max_llm_calls: 16  # Shared admitted calls; resolved default: unlimited.
   max_declared_write_paths: 1  # Optional distinct-target cap; no cap by default, and a real host ceiling is required.
   validation:
     checks:

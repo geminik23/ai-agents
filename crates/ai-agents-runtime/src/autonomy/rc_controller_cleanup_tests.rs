@@ -67,7 +67,8 @@ async fn rc_cancelled_controller_driver_cleanup_preserves_stored_bound_and_survi
             )
             .await;
             let mut config = f.config.clone();
-            config.defaults.max_wall_time_seconds = Some(1);
+            config.defaults.max_wall_time_seconds =
+                Some(ai_agents_core::autonomy::AutonomyLimit::Finite(1));
             let runner = AutonomyRunner::try_new(
                 f.agent.clone(),
                 config.clone(),

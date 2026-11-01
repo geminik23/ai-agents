@@ -130,8 +130,8 @@ fn runner(agent: Arc<RuntimeAgent>, cap: u32) -> (AutonomyRunner, Arc<ScopedTask
     let config = AutonomyConfig {
         defaults: AutonomyProfile {
             enabled: Some(true),
-            max_turns: Some(4),
-            max_llm_calls: Some(cap),
+            max_turns: Some(ai_agents_core::autonomy::AutonomyLimit::Finite(4)),
+            max_llm_calls: Some(ai_agents_core::autonomy::AutonomyLimit::Finite(cap)),
             completion: Some(CompletionGate::ResponseContains("done".into())),
             ..Default::default()
         },

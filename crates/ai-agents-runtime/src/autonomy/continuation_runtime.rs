@@ -11,12 +11,32 @@ impl RuntimeAgent {
         group: &crate::autonomy::TaskGroupState,
         targets: &crate::autonomy::CompositionTargets,
     ) -> Result<Arc<RuntimeAgent>> {
+        self.task_group_child_with_policy(group, targets, true)
+    }
+
+    // Cancellation-only reconstruction needs live topology and tool bindings but never executes the saved model cursor.
+    pub(crate) fn task_group_child_for_cleanup(
+        &self,
+        group: &crate::autonomy::TaskGroupState,
+        targets: &crate::autonomy::CompositionTargets,
+    ) -> Result<Arc<RuntimeAgent>> {
+        self.task_group_child_with_policy(group, targets, false)
+    }
+
+    // The same topology resolution serves execution and cleanup; only execution requires a matching model-loop policy.
+    fn task_group_child_with_policy(
+        &self,
+        group: &crate::autonomy::TaskGroupState,
+        targets: &crate::autonomy::CompositionTargets,
+        execution: bool,
+    ) -> Result<Arc<RuntimeAgent>> {
         let child = self.task_composition_target(
             &group.frame,
             &group.frames,
             targets,
             &group.child_operation,
             &mut Vec::new(),
+            execution,
         )?;
         if child.info.id != group.child_runtime_id {
             return Err(AgentError::Config(
@@ -34,6 +54,7 @@ impl RuntimeAgent {
         targets: &crate::autonomy::CompositionTargets,
         operation: &str,
         ancestry: &mut Vec<String>,
+        execution: bool,
     ) -> Result<Arc<RuntimeAgent>> {
         if ancestry.len() >= 32 || ancestry.contains(&self.info.id) {
             return Err(crate::autonomy::TaskRunStorageError::InvalidCheckpoint.into());
@@ -47,7 +68,7 @@ impl RuntimeAgent {
                 let invocation = frames
                     .get(&id)
                     .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
-                self.check_message_frame(invocation, targets)?;
+                self.check_message_frame(invocation, targets, execution)?;
                 if invocation.contains_operation(operation, frames, &mut Vec::new()) {
                     selected = Some(self.task_composition_target(
                         invocation,
@@ -55,6 +76,7 @@ impl RuntimeAgent {
                         targets,
                         operation,
                         &mut Vec::new(),
+                        execution,
                     )?);
                 }
             }
@@ -63,7 +85,7 @@ impl RuntimeAgent {
                 .ok_or_else(|| crate::autonomy::TaskRunStorageError::InvalidCheckpoint.into());
         }
         if frame.dispatch == CompositionDispatch::ToolMessage {
-            self.check_message_frame(frame, targets)?;
+            self.check_message_frame(frame, targets, execution)?;
             for slot in frame.children.iter().chain(&frame.calls) {
                 let target = targets.resolve(&slot.operation)?;
                 if slot.operation == operation {
@@ -74,8 +96,9 @@ impl RuntimeAgent {
                     nested.parent_operation.as_deref() == Some(slot.operation.as_str())
                         && nested.contains_operation(operation, frames, &mut Vec::new())
                 }) {
-                    let selected = target
-                        .task_composition_target(nested, frames, targets, operation, ancestry)?;
+                    let selected = target.task_composition_target(
+                        nested, frames, targets, operation, ancestry, execution,
+                    )?;
                     ancestry.pop();
                     return Ok(selected);
                 }
@@ -142,9 +165,9 @@ impl RuntimeAgent {
                 && nested.parent_operation.as_deref() == Some(slot.operation.as_str())
                 && nested.contains_operation(operation, frames, &mut Vec::new())
             {
-                selected = Some(
-                    target.task_composition_target(nested, frames, targets, operation, ancestry)?,
-                );
+                selected = Some(target.task_composition_target(
+                    nested, frames, targets, operation, ancestry, execution,
+                )?);
             }
         }
         ancestry.pop();
@@ -443,12 +466,9 @@ impl RuntimeAgent {
         {
             return Err(AgentError::Other("parked child owner changed".into()));
         }
-        let guard = tokio::time::timeout(
-            execution.remaining_duration(),
-            self.root_turn_gate.clone().lock_owned(),
-        )
-        .await
-        .map_err(|_| AgentError::Other("child resume gate deadline exceeded".into()))?;
+        let guard = execution
+            .acquire_runtime_gate(self.root_turn_gate.clone())
+            .await?;
         let mut lease = execution
             .enroll_child(owner.clone(), self.autonomy_owner.clone(), Some(&operation))
             .await?;
@@ -735,6 +755,19 @@ impl RuntimeAgent {
         result: crate::autonomy::suspension::BatchResponse,
     ) -> Result<AgentResponse> {
         batch.validate()?;
+        if let Some(state) = &batch.loop_state {
+            self.checked_task_loop_policy(state)?;
+        }
+        if let Some(location) = &batch.location {
+            let actions = match location {
+                crate::autonomy::location::TaskLocation::Actions(actions) => Some(actions.as_ref()),
+                crate::autonomy::location::TaskLocation::Skill(skill) => skill.actions.as_deref(),
+                crate::autonomy::location::TaskLocation::Observation(_) => None,
+            };
+            if let Some(actions) = actions {
+                self.validate_task_return_policy(&actions.return_to)?;
+            }
+        }
         if batch.interaction.is_some() {
             return self
                 .resume_task_interaction_batch(input, batch, result)
@@ -1022,21 +1055,95 @@ impl RuntimeAgent {
         })
     }
 
+    // A retained cursor must match the live prepared policy before any pending tool or state action can execute.
+    pub(crate) fn checked_task_loop_policy(
+        &self,
+        state: &TaskLoopState,
+    ) -> Result<crate::spec::TaskIterationPolicy> {
+        match (state.version, state.task_iteration_policy.as_ref()) {
+            (1, None)
+                if self.task_iteration_policy == crate::spec::TaskIterationPolicy::configured() =>
+            {
+                Ok(crate::spec::TaskIterationPolicy::configured())
+            }
+            (2, Some(policy)) if policy == &self.task_iteration_policy => Ok(policy.clone()),
+            _ => Err(AgentError::Config(
+                "task model loop policy or version changed".into(),
+            )),
+        }
+    }
+
+    // Nested state/skill locations retain the same loop binding as direct model batches.
+    pub(super) fn validate_task_return_policy(
+        &self,
+        position: &crate::autonomy::location::TaskStateReturn,
+    ) -> Result<()> {
+        use crate::autonomy::location::TaskStateReturn;
+        match position {
+            TaskStateReturn::BeforeCalls { saved } => {
+                self.checked_task_loop_policy(&saved.state)?;
+            }
+            TaskStateReturn::ModelContinue { state } => {
+                self.checked_task_loop_policy(state)?;
+            }
+            TaskStateReturn::ModelFinish { state } => {
+                let expected = state
+                    .task_iteration_policy
+                    .as_ref()
+                    .cloned()
+                    .unwrap_or_else(crate::spec::TaskIterationPolicy::configured);
+                if expected != self.task_iteration_policy {
+                    return Err(AgentError::Config(
+                        "task finalization policy changed".into(),
+                    ));
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     /// Runs initial or resumed committed model work from exact iteration, reasoning and native history state.
     /// The caller owns user commit; reflection retains this loop's provider and suspension never resets accumulated calls.
+    /// Ordinary chat retains numeric defaults, while task loops enforce only source-proven or explicitly configured limits.
+    /// Legacy cursors without provenance remain finite, and a new cursor cannot resume under a different prepared policy.
     pub(super) async fn run_committed_task_loop(
         &self,
         mut state: TaskLoopState,
     ) -> Result<AgentResponse> {
+        let task_policy = if crate::autonomy::current_execution().is_some() {
+            Some(self.checked_task_loop_policy(&state)?)
+        } else {
+            None
+        };
         let llm = self.get_state_llm()?;
         loop {
-            let max = if state.reasoning_mode != ReasoningMode::None {
-                self.max_iterations
-                    .min(self.get_effective_reasoning_config().max_iterations)
+            let max = if let Some(policy) = &task_policy {
+                let root = policy.root_configured().then_some(self.max_iterations);
+                let state_reasoning = self.state_machine.as_ref().and_then(|machine| {
+                    machine
+                        .current_definition()
+                        .and_then(|definition| definition.reasoning.map(|_| machine.current()))
+                });
+                let reasoning = (state.reasoning_mode != ReasoningMode::None
+                    && policy
+                        .limit_for_state(state_reasoning.as_deref(), state_reasoning.is_some()))
+                .then(|| self.get_effective_reasoning_config().max_iterations);
+                match (root, reasoning) {
+                    (Some(root), Some(reasoning)) => Some(root.min(reasoning)),
+                    (root, reasoning) => root.or(reasoning),
+                }
             } else {
-                self.max_iterations
+                Some(if state.reasoning_mode != ReasoningMode::None {
+                    self.max_iterations
+                        .min(self.get_effective_reasoning_config().max_iterations)
+                } else {
+                    self.max_iterations
+                })
             };
-            if state.iterations >= max {
+            if let Some(max) = max
+                && state.iterations >= max
+            {
                 let error = AgentError::Other(format!("Max iterations ({max}) exceeded"));
                 self.hooks.on_error(&error).await;
                 error!(iterations = state.iterations, "Max iterations exceeded");
@@ -1050,22 +1157,43 @@ impl RuntimeAgent {
                 state.native_exchanges = self.task_native_expectations();
                 *execution.capacity_model.lock() = Some(Box::new(state.clone()));
             }
-            state.iterations += 1;
+            state.iterations = state.iterations.checked_add(1).ok_or_else(|| {
+                AgentError::Config("model loop iteration counter overflow".into())
+            })?;
             *self.iteration_count.write() = state.iterations;
             let protocol = self.main_tool_protocol(llm.as_ref(), false).await?;
             let mut messages = self
-                .build_messages_internal(true, None, protocol.choice.is_none())
+                .build_messages_internal(
+                    true,
+                    None,
+                    protocol.choice.is_none(),
+                    state.iterations == 1,
+                )
                 .await?;
             self.inject_reasoning_prompt(
                 &mut messages,
                 &state.reasoning_mode,
                 state.iterations == 1,
             );
-            self.hooks.on_llm_start(&messages).await;
+            let feedback_guard = if state.iterations == 1 {
+                self.task_validation_feedback_guard()?
+            } else {
+                None
+            };
             let start = Instant::now();
-            let response = self
-                .complete_main_llm_with_recovery(llm.clone(), &messages, &protocol)
-                .await?;
+            let response = if let Some(guard) = feedback_guard {
+                // Preserve the live freshness witness through hooks and the managed first poll; never retry or fall back with this disclosure.
+                ai_agents_llm::scope_invocation_evidence(vec![guard], async {
+                    self.hooks.on_llm_start(&messages).await;
+                    self.complete_main_llm_once(llm.clone(), &messages, &protocol)
+                        .await
+                })
+                .await?
+            } else {
+                self.hooks.on_llm_start(&messages).await;
+                self.complete_main_llm_with_recovery(llm.clone(), &messages, &protocol)
+                    .await?
+            };
             self.hooks
                 .on_llm_complete(&response, start.elapsed().as_millis() as u64)
                 .await;

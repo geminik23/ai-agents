@@ -127,7 +127,7 @@ fn prepare_host_control_at_boundary(
             validate_limits(&limits, &payload, host)?;
             let old = payload.limits.clone();
             if limits.max_wall_time_seconds != old.max_wall_time_seconds {
-                payload.clocks.expires_at = limits
+                let requested_expiry = limits
                     .max_wall_time_seconds
                     .map(|seconds| {
                         let duration = chrono::Duration::try_seconds(
@@ -141,6 +141,12 @@ fn prepare_host_control_at_boundary(
                             .ok_or_else(|| AgentError::Config("wall expiry overflow".into()))
                     })
                     .transpose()?;
+                // A revised host wall limit cannot replace or extend the original parent invocation restriction.
+                payload.clocks.expires_at =
+                    match (requested_expiry, payload.clocks.inherited_expires_at) {
+                        (Some(requested), Some(inherited)) => Some(requested.min(inherited)),
+                        (requested, inherited) => requested.or(inherited),
+                    };
             }
             if payload
                 .clocks
@@ -151,6 +157,8 @@ fn prepare_host_control_at_boundary(
                     "revised lifetime already expired from original admission".into(),
                 ));
             }
+            // An authenticated revision is the only point that may explicitly change legacy finite limits to the new representation.
+            payload.version = TASK_PAYLOAD_VERSION;
             payload.limits = limits.clone();
             (
                 reason,
@@ -198,22 +206,22 @@ fn validate_limits(
     };
     for (requested, consumed, ceiling) in [
         (
-            u64::from(limits.max_turns),
+            limits.max_turns.map(u64::from),
             payload.counters.turns,
             host.max_turns.map(u64::from),
         ),
         (
-            u64::from(limits.max_llm_calls),
+            limits.max_llm_calls.map(u64::from),
             payload.counters.llm_attempts,
             host.max_llm_calls.map(u64::from),
         ),
         (
-            u64::from(limits.max_tool_calls),
+            limits.max_tool_calls.map(u64::from),
             payload.counters.tool_attempts,
             host.max_tool_calls.map(u64::from),
         ),
         (
-            u64::from(limits.max_command_calls),
+            limits.max_command_calls.map(u64::from),
             payload.counters.command_attempts,
             host.max_command_calls.map(u64::from),
         ),
@@ -227,7 +235,9 @@ fn validate_limits(
             host.max_active_time_seconds,
         ),
     ] {
-        if requested == 0 || requested < consumed || ceiling.is_some_and(|c| requested > c) {
+        if requested.is_some_and(|value| value == 0 || value < consumed)
+            || ceiling.is_some_and(|ceiling| requested.is_none_or(|value| value > ceiling))
+        {
             return Err(invalid());
         }
     }

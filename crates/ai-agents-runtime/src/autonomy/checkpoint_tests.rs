@@ -260,7 +260,7 @@ fn task_new_request_revision_and_over_limit_completion_are_rejected() {
     next.pending.as_mut().unwrap().issued_revision = 1;
     next.validate_successor(&old, 1, false).unwrap();
     next.pending = None;
-    next.counters.llm_attempts = u64::from(next.limits.max_llm_calls) + 1;
+    next.counters.llm_attempts = u64::from(next.limits.max_llm_calls.unwrap()) + 1;
     let mut terminal = s;
     terminal.status = TaskRunStatus::Completed;
     assert!(next.bind(terminal).is_err());

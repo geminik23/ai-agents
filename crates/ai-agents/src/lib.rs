@@ -322,9 +322,10 @@ pub mod spec {
     pub use ai_agents_runtime::spec::{
         AgentSpec, AutoSpawnEntry, CliHitlMetadata, CliHitlStyle, CliMetadata, CliPromptStyle,
         FileStorageConfig, LLMConfig, LLMConfigOrSelector, LLMSelector, ManagementToolsConfig,
-        MemoryConfig, OrchestrationToolsConfig, RedisStorageConfig, RuntimeConfig, SpawnerConfig,
-        SpawnerToolGrantConfig, SqliteStorageConfig, StorageConfig, StructuredToolEntry,
-        TemplateSource, ToolAliasesConfig, ToolConfig, ToolEntry,
+        MemoryConfig, OrchestrationToolsConfig, PreparedAgentSpec, RedisStorageConfig,
+        RuntimeConfig, SpawnerConfig, SpawnerToolGrantConfig, SqliteStorageConfig, StorageConfig,
+        StructuredToolEntry, TaskIterationPolicy, TemplateSource, ToolAliasesConfig, ToolConfig,
+        ToolEntry,
     };
 }
 
@@ -347,7 +348,7 @@ pub mod template {
     pub use ai_agents_template::{TemplateInheritance, TemplateRenderer};
 
     use crate::error::Result;
-    use crate::spec::AgentSpec;
+    use crate::spec::{AgentSpec, PreparedAgentSpec};
 
     pub struct TemplateLoader {
         inner: InnerTemplateLoader,
@@ -400,6 +401,11 @@ pub mod template {
         }
 
         pub fn load_and_parse(&self, template_name: &str) -> Result<AgentSpec> {
+            Ok(self.load_and_prepare(template_name)?.into_parts().0)
+        }
+
+        /// Renders inheritance while retaining source presence for task-only model-loop limits.
+        pub fn load_and_prepare(&self, template_name: &str) -> Result<PreparedAgentSpec> {
             let renderer = TemplateRenderer::new();
             let variables = self.variables();
 
@@ -410,10 +416,10 @@ pub mod template {
 
             let rendered_root = load_and_render(template_name)?;
             let processed = TemplateInheritance::process(&rendered_root, load_and_render)?;
-            let spec = AgentSpec::from_yaml_strict(&processed)?;
-            spec.validate()?;
+            let prepared = PreparedAgentSpec::from_yaml_strict(&processed)?;
+            prepared.spec().validate()?;
 
-            Ok(spec)
+            Ok(prepared)
         }
     }
 
@@ -612,9 +618,9 @@ pub use memory::{
 };
 pub use skill::{SkillDefinition, SkillExecutor, SkillLoader, SkillRef, SkillRouter, SkillStep};
 pub use spec::{
-    AgentSpec, FileStorageConfig, LLMConfig, LLMSelector, MemoryConfig, RedisStorageConfig,
-    RuntimeConfig as SpecRuntimeConfig, SqliteStorageConfig, StorageConfig, ToolAliasesConfig,
-    ToolConfig,
+    AgentSpec, FileStorageConfig, LLMConfig, LLMSelector, MemoryConfig, PreparedAgentSpec,
+    RedisStorageConfig, RuntimeConfig as SpecRuntimeConfig, SqliteStorageConfig, StorageConfig,
+    TaskIterationPolicy, ToolAliasesConfig, ToolConfig,
 };
 pub use template::TemplateLoader;
 pub use tools::HttpTool;

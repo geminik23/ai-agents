@@ -256,7 +256,8 @@ async fn retained_admission_original_check_bounds_reach_real_tool_and_provider()
                     final_copies: AtomicUsize::new(0),
                 });
                 let mut config = super::runner_tests::config(4);
-                config.defaults.max_turns = Some(1);
+                config.defaults.max_turns =
+                    Some(ai_agents_core::autonomy::AutonomyLimit::Finite(1));
                 config.defaults.validation = Some(serde_yaml::from_str(if judge {
                     "checks: [{id: check, adapter: builtin.judge, timeout_seconds: 1, config: {criteria: [Correctness]}}]"
                 } else { "checks: [{id: check, adapter: host.observe, timeout_seconds: 1}]" }).unwrap());
@@ -472,7 +473,8 @@ async fn retained_admission_upstream_drift_blocks_actual_tool_and_provider() {
                     final_copies: AtomicUsize::new(0),
                 });
                 let mut config = super::runner_tests::config(4);
-                config.defaults.max_turns = Some(1);
+                config.defaults.max_turns =
+                    Some(ai_agents_core::autonomy::AutonomyLimit::Finite(1));
                 config.defaults.validation=Some(serde_yaml::from_str("checks: [{id: ticket, adapter: host.ticket, required: false}, {id: effect, adapter: host.effect}]").unwrap());
                 config.defaults.completion = Some(CompletionGate::ValidatorPassed("effect".into()));
                 let runner = AutonomyRunner::try_new(

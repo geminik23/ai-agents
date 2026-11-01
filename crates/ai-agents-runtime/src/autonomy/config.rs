@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 
 use ai_agents_core::autonomy::{
-    AutonomyConfig, AutonomyMode, AutonomyOverride, AutonomyProfile, CompletionGate,
+    AutonomyConfig, AutonomyLimit, AutonomyMode, AutonomyOverride, AutonomyProfile, CompletionGate,
     DiagnosticsConfig, ExecutionStrategy, JudgeConfig, ProgressConfig, StagnationAction,
     StagnationConfig, SupervisionConfig, UsdAmount, ValidationConfig,
 };
@@ -39,12 +39,12 @@ pub struct EffectiveAutonomyProfile {
     pub enabled: bool,
     pub mode: AutonomyMode,
     pub strategy: ExecutionStrategy,
-    pub max_turns: u32,
-    pub max_active_time_seconds: u64,
+    pub max_turns: Option<u32>,
+    pub max_active_time_seconds: Option<u64>,
     pub max_wall_time_seconds: Option<u64>,
-    pub max_llm_calls: u32,
-    pub max_tool_calls: u32,
-    pub max_command_calls: u32,
+    pub max_llm_calls: Option<u32>,
+    pub max_tool_calls: Option<u32>,
+    pub max_command_calls: Option<u32>,
     pub max_cost_usd: Option<UsdAmount>,
     pub max_declared_write_paths: Option<u32>,
     pub settings: AutonomyProfile,
@@ -197,6 +197,9 @@ fn merge_profile(base: &mut AutonomyProfile, overlay: &AutonomyProfile) -> Resul
         if incoming.prompt.is_some() {
             target.prompt = incoming.prompt.clone();
         }
+        if incoming.validation_feedback.is_some() {
+            target.validation_feedback = incoming.validation_feedback.clone();
+        }
     }
     if let Some(incoming) = &overlay.on_limit {
         let target = base.on_limit.get_or_insert_with(Default::default);
@@ -234,10 +237,22 @@ fn merge_profile(base: &mut AutonomyProfile, overlay: &AutonomyProfile) -> Resul
 // Keeps the parser independent of a user objective supplied later by a task invocation.
 fn validate_raw(profile: &AutonomyProfile) -> Result<()> {
     for (name, value) in [
-        ("max_turns", profile.max_turns),
-        ("max_llm_calls", profile.max_llm_calls),
-        ("max_tool_calls", profile.max_tool_calls),
-        ("max_command_calls", profile.max_command_calls),
+        (
+            "max_turns",
+            profile.max_turns.and_then(AutonomyLimit::finite),
+        ),
+        (
+            "max_llm_calls",
+            profile.max_llm_calls.and_then(AutonomyLimit::finite),
+        ),
+        (
+            "max_tool_calls",
+            profile.max_tool_calls.and_then(AutonomyLimit::finite),
+        ),
+        (
+            "max_command_calls",
+            profile.max_command_calls.and_then(AutonomyLimit::finite),
+        ),
         ("max_declared_write_paths", profile.max_declared_write_paths),
     ] {
         if value == Some(0) {
@@ -247,8 +262,18 @@ fn validate_raw(profile: &AutonomyProfile) -> Result<()> {
         }
     }
     for (name, value) in [
-        ("max_active_time_seconds", profile.max_active_time_seconds),
-        ("max_wall_time_seconds", profile.max_wall_time_seconds),
+        (
+            "max_active_time_seconds",
+            profile
+                .max_active_time_seconds
+                .and_then(AutonomyLimit::finite),
+        ),
+        (
+            "max_wall_time_seconds",
+            profile
+                .max_wall_time_seconds
+                .and_then(AutonomyLimit::finite),
+        ),
     ] {
         if value == Some(0) {
             return Err(AgentError::InvalidSpec(format!(
@@ -311,6 +336,19 @@ fn validate_raw(profile: &AutonomyProfile) -> Result<()> {
     {
         return Err(AgentError::InvalidSpec(
             "max_continuations must be positive".into(),
+        ));
+    }
+    if let Some(feedback) = profile
+        .premature_finish
+        .as_ref()
+        .and_then(|policy| policy.validation_feedback.as_ref())
+        && feedback.enabled
+        && (feedback.check_id.trim().is_empty()
+            || !(1..=4096).contains(&feedback.max_output_chars)
+            || !(1..=16).contains(&feedback.max_retries))
+    {
+        return Err(AgentError::InvalidSpec(
+            "invalid bounded validation feedback".into(),
         ));
     }
     if let Some(validation) = &profile.validation {
@@ -500,6 +538,57 @@ fn validate_resolved(profile: &AutonomyProfile, scope: AutonomyScope) -> Result<
                     ));
                 }
             }
+        }
+    }
+    if let Some(policy) = &profile.premature_finish
+        && let Some(feedback) = &policy.validation_feedback
+        && feedback.enabled
+    {
+        // Limit automatic feedback to one fixed required command gate; other outcomes must not trigger an implicit retry.
+        let validation = profile.validation.as_ref();
+        let selected = validation
+            .and_then(|validation| validation.checks.as_ref())
+            .filter(|checks| checks.len() == 1)
+            .and_then(|checks| checks.first());
+        let required = selected.zip(validation).is_some_and(|(check, validation)| {
+            check
+                .required
+                .unwrap_or(validation.required.unwrap_or(true))
+        });
+        let fixed = selected
+            .and_then(|check| check.config.as_ref())
+            .and_then(|config| config.get("host_binding"))
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|binding| !binding.trim().is_empty());
+        let no_other_checks = validation.is_some_and(|validation| {
+            validation.commands.as_ref().is_none_or(Vec::is_empty)
+                && validation
+                    .diagnostics
+                    .as_ref()
+                    .is_none_or(|diagnostics| diagnostics.enabled != Some(true))
+                && validation
+                    .judge
+                    .as_ref()
+                    .is_none_or(|judge| judge.enabled != Some(true))
+        });
+        let exact_gate = matches!(profile.completion.as_ref(), Some(CompletionGate::ValidatorPassed(id)) if id == &feedback.check_id);
+        if policy.action != Some(ai_agents_core::autonomy::PrematureFinishAction::AskUser)
+            || selected.is_none_or(|check| {
+                check.id != feedback.check_id || check.adapter != "builtin.command"
+            })
+            || !required
+            || !fixed
+            || !no_other_checks
+            || !exact_gate
+            || !stages.is_empty()
+            || profile
+                .progress
+                .as_ref()
+                .is_some_and(|progress| progress.stagnation.is_some())
+        {
+            return Err(AgentError::InvalidSpec(
+                "validation feedback requires ask_user and one fixed required command completion gate without lifecycle or stagnation".into(),
+            ));
         }
     }
     // A stage cannot prove ValidationPassed using checks owned by later stages.
@@ -846,10 +935,13 @@ pub fn resolve_profile(
         } else {
             ExecutionStrategy::ModelLed
         });
+    // Omitted values inherit before this point; both an unresolved value and explicit unlimited retain any real host ceiling.
     macro_rules! cap {
-        ($name:ident, $default:expr) => {{
-            let requested = raw.$name.unwrap_or($default);
-            requested.min(host.$name.unwrap_or(requested))
+        ($name:ident) => {{
+            match (raw.$name.and_then(AutonomyLimit::finite), host.$name) {
+                (Some(requested), Some(ceiling)) => Some(requested.min(ceiling)),
+                (requested, ceiling) => requested.or(ceiling),
+            }
         }};
     }
     // A ceiling alone is not proof of a priced provider or trusted write footprint.
@@ -884,15 +976,12 @@ pub fn resolve_profile(
             AutonomyMode::Disabled
         },
         strategy,
-        max_turns: cap!(max_turns, 30),
-        max_active_time_seconds: cap!(max_active_time_seconds, 900),
-        max_wall_time_seconds: raw
-            .max_wall_time_seconds
-            .map(|requested| requested.min(host.max_wall_time_seconds.unwrap_or(requested)))
-            .or(host.max_wall_time_seconds),
-        max_llm_calls: cap!(max_llm_calls, 60),
-        max_tool_calls: cap!(max_tool_calls, 120),
-        max_command_calls: cap!(max_command_calls, 10),
+        max_turns: cap!(max_turns),
+        max_active_time_seconds: cap!(max_active_time_seconds),
+        max_wall_time_seconds: cap!(max_wall_time_seconds),
+        max_llm_calls: cap!(max_llm_calls),
+        max_tool_calls: cap!(max_tool_calls),
+        max_command_calls: cap!(max_command_calls),
         max_cost_usd: raw.max_cost_usd.clone(),
         max_declared_write_paths: raw.max_declared_write_paths,
         settings: raw,
@@ -928,7 +1017,122 @@ mod tests {
         .unwrap();
         assert!(!effective.enabled);
         assert_eq!(effective.mode, AutonomyMode::Disabled);
-        assert_eq!(effective.max_turns, 30);
+        assert_eq!(effective.max_turns, None);
+    }
+
+    // Omission inherits, explicit unlimited removes a lower-precedence request, and host ceilings always narrow the result.
+    #[test]
+    fn cumulative_limits_resolve_unlimited_overlays_and_host_ceilings() {
+        let config: AutonomyConfig = serde_yaml::from_str(
+            r#"
+enabled: true
+objective: work
+completion: {response_contains: done}
+max_turns: 20
+max_llm_calls: 60
+profiles:
+  long: {max_turns: unlimited, max_llm_calls: null, max_active_time_seconds: unlimited}
+"#,
+        )
+        .unwrap();
+        let scoped: AutonomyOverride =
+            serde_yaml::from_str("profile: long\nmax_llm_calls: unlimited\nmax_tool_calls: 9\n")
+                .unwrap();
+        let per_run: AutonomyProfile =
+            serde_yaml::from_str("max_tool_calls: null\nmax_command_calls: unlimited\n").unwrap();
+        let resolve = |host: &AutonomyHostCeilings| {
+            resolve_profile(
+                &config,
+                AutonomyScope::Task,
+                None,
+                Some(&scoped),
+                Some(&per_run),
+                None,
+                host,
+            )
+            .unwrap()
+        };
+        let unlimited = resolve(&AutonomyHostCeilings::default());
+        assert_eq!(unlimited.max_turns, None);
+        assert_eq!(unlimited.max_llm_calls, None);
+        assert_eq!(unlimited.max_active_time_seconds, None);
+        assert_eq!(unlimited.max_tool_calls, Some(9));
+        assert_eq!(unlimited.max_command_calls, None);
+        let clamped = resolve(&AutonomyHostCeilings {
+            max_turns: Some(8),
+            max_llm_calls: Some(100),
+            max_tool_calls: Some(12),
+            max_command_calls: Some(4),
+            max_active_time_seconds: Some(600),
+            ..Default::default()
+        });
+        assert_eq!(clamped.max_turns, Some(8));
+        assert_eq!(clamped.max_llm_calls, Some(100));
+        assert_eq!(clamped.max_tool_calls, Some(9));
+        assert_eq!(clamped.max_command_calls, Some(4));
+        assert_eq!(clamped.max_active_time_seconds, Some(600));
+        for field in [
+            "max_turns",
+            "max_llm_calls",
+            "max_tool_calls",
+            "max_command_calls",
+            "max_active_time_seconds",
+            "max_wall_time_seconds",
+        ] {
+            for invalid in ["0", "-1", "wrong"] {
+                let raw = format!("{field}: {invalid}");
+                if let Ok(profile) = serde_yaml::from_str::<AutonomyProfile>(&raw) {
+                    assert!(validate_raw(&profile).is_err(), "{raw}");
+                }
+            }
+        }
+    }
+
+    // Automatic feedback is opt-in and applies only to one fixed, required command gate with bounded retries.
+    #[test]
+    fn validation_feedback_requires_an_exact_safe_configuration() {
+        let base = "enabled: true\ncompletion: {validator_passed: acceptance}\nvalidation:\n  checks: [{id: acceptance, adapter: builtin.command, config: {command: verify, host_binding: fixed}}]\npremature_finish: {action: ask_user, validation_feedback: {check_id: acceptance}}\n";
+        let resolve = |yaml: &str, selected| -> Result<EffectiveAutonomyProfile> {
+            let config: AutonomyConfig = serde_yaml::from_str(yaml)?;
+            resolve_profile(
+                &config,
+                AutonomyScope::Task,
+                selected,
+                None,
+                None,
+                Some("objective"),
+                &Default::default(),
+            )
+        };
+        assert!(resolve(base, None).is_ok());
+        for invalid in [
+            base.replace("host_binding: fixed", ""),
+            base.replace("validation:\n", "validation:\n  required: false\n"),
+            base.replace("action: ask_user", "action: continue"),
+            base.replace("validator_passed: acceptance", "response_contains: done"),
+            format!(
+                "{base}progress: {{stagnation: {{action: continue, max_cycles_without_progress: 1}}}}\n"
+            ),
+            base.replace(
+                "check_id: acceptance",
+                "check_id: acceptance, max_output_chars: 4097",
+            ),
+        ] {
+            assert!(resolve(&invalid, None).is_err(), "{invalid}");
+        }
+        let disabled = format!(
+            "{base}profiles:\n  quiet:\n    premature_finish:\n      validation_feedback: {{enabled: false}}\n"
+        );
+        let profile = resolve(&disabled, Some("quiet")).unwrap();
+        assert!(
+            !profile
+                .settings
+                .premature_finish
+                .unwrap()
+                .validation_feedback
+                .unwrap()
+                .enabled
+        );
     }
 
     // Presence must survive all layers, while an adapter replacement must discard old config.
@@ -994,7 +1198,7 @@ progress:
         )
         .unwrap();
         assert!(!effective.enabled);
-        assert_eq!(effective.max_turns, 15);
+        assert_eq!(effective.max_turns, Some(15));
         let bad: AutonomyOverride =
             serde_yaml::from_str("progress: {config: {new: true}}").unwrap();
         assert!(
@@ -1044,8 +1248,8 @@ progress:
         )
         .unwrap();
         assert!(resolved.enabled);
-        assert_eq!(resolved.max_turns, 4);
-        assert_eq!(resolved.max_active_time_seconds, 60);
+        assert_eq!(resolved.max_turns, Some(4));
+        assert_eq!(resolved.max_active_time_seconds, Some(60));
         let invalid_host = AutonomyHostCeilings {
             max_tool_calls: Some(0),
             ..Default::default()

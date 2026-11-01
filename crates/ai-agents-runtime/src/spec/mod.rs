@@ -5,6 +5,7 @@ mod memory;
 mod provider;
 pub mod spawner;
 pub(crate) mod storage;
+mod task_iteration;
 mod tool;
 
 pub use ai_agents_llm::{LLMRole, RouterRolesConfig, RouterSelector};
@@ -16,6 +17,7 @@ pub use spawner::{
     SpawnerToolGrantConfig, TemplateSource,
 };
 pub use storage::{FileStorageConfig, RedisStorageConfig, SqliteStorageConfig, StorageConfig};
+pub use task_iteration::{PreparedAgentSpec, TaskIterationPolicy};
 pub use tool::{StructuredToolEntry, ToolConfig, ToolEntry};
 
 use serde::{Deserialize, Deserializer, Serialize};

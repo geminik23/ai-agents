@@ -418,7 +418,8 @@ async fn rg_builtin_artifact_uses_authorized_file_info() {
                 serde_json::to_string(&path.to_string_lossy()).unwrap(),
                 serde_json::to_string(&path.to_string_lossy()).unwrap()
             ));
-            config.defaults.max_llm_calls = Some(1);
+            config.defaults.max_llm_calls =
+                Some(ai_agents_core::autonomy::AutonomyLimit::Finite(1));
             let (runner, _) = runner(agent, config, *sqlite).await;
             let done = runner.run("verify artifact", None).await.unwrap();
             assert_eq!(
@@ -536,7 +537,7 @@ async fn rg_support_real_ticket_survives_question_restart_and_fresh_review() {
         let mut config = config(
             "max_wall_time_seconds: 600\nvalidation:\n  checks: [{id: records, adapter: host.records, config: {domain: support}}]\ncompletion: {all: [{validator_passed: records}, {observability: {path: summary.total_llm_calls, eq: 3}}]}\nhitl: {on_user_question: pause_run}\n",
         );
-        config.defaults.max_llm_calls = Some(3);
+        config.defaults.max_llm_calls = Some(ai_agents_core::autonomy::AutonomyLimit::Finite(3));
         let (runner, store) = runner(agent.clone(), config.clone(), *sqlite).await;
         let debug_cursor = agent.observability().unwrap().event_cursor();
         let paused = runner.run("resolve the actual ticket", None).await.unwrap();
@@ -671,7 +672,7 @@ async fn rg_composed_research_deduplicates_actual_child_sources_after_pause() {
         let mut config = config(
             "validation:\n  checks: [{id: records, adapter: host.records, config: {domain: research, min_unique: 3, citations: true}}]\ncompletion: {validator_passed: records}\nhitl: {on_user_question: pause_run}\n",
         );
-        config.defaults.max_llm_calls = Some(8);
+        config.defaults.max_llm_calls = Some(ai_agents_core::autonomy::AutonomyLimit::Finite(8));
         let (runner, _) = runner(agent, config, *sqlite).await;
         let paused = runner
             .run("verify and synthesize three unique sources", None)
@@ -837,7 +838,7 @@ async fn rg_last_slot_progress_survives_reconstruction_and_final_review_without_
         let mut config = config(
             "lifecycle: [{id: final_review}]\nsupervision: {stage_changes: require_approval}\nvalidation:\n  checks: [{id: records, adapter: host.records, config: {domain: research}}]\nprogress:\n  adapter: builtin.evidence\n  config:\n    signals: [{id: sources, validator: records, path: metrics.unique, comparison: increase}]\n  stagnation: {max_cycles_without_progress: 1, action: fail}\ncompletion: {progress_path: {path: metrics.signals.sources, gte: 2}}\n",
         );
-        config.defaults.max_llm_calls = Some(1);
+        config.defaults.max_llm_calls = Some(ai_agents_core::autonomy::AutonomyLimit::Finite(1));
         let (runner, store) = runner(agent.clone(), config.clone(), *sqlite).await;
         let initial = runner
             .run("finalize from the last admitted call", None)
@@ -978,7 +979,8 @@ async fn rg_code_source_mutation_revalidates_real_tests_and_rejects_unknown_comm
             let mut config = config(
                 "lifecycle: [{id: baseline}, {id: repair}]\nvalidation:\n  checks: [{id: tests, adapter: builtin.command, config: {command: fixture-test}}]\ncompletion: {command_exit: {command: fixture-test, code: 0}}\n",
             );
-            config.defaults.max_llm_calls = Some(5);
+            config.defaults.max_llm_calls =
+                Some(ai_agents_core::autonomy::AutonomyLimit::Finite(5));
             let mut ceiling = AutonomyHostCeilings::default();
             if capped {
                 config.defaults.max_declared_write_paths = Some(1);
@@ -1116,7 +1118,8 @@ async fn rg_tool_free_judge_revisions_share_exact_allowance() {
             let mut config = config(
                 "validation:\n  checks: [{id: quality, adapter: builtin.judge, config: {criteria: [grounded analysis], pass_threshold: 0.8}}]\ncompletion: {validator_passed: quality}\n",
             );
-            config.defaults.max_llm_calls = Some(cap);
+            config.defaults.max_llm_calls =
+                Some(ai_agents_core::autonomy::AutonomyLimit::Finite(cap));
             let (runner, _) = runner(agent.clone(), config, *sqlite).await;
             let done = runner.run("revise the analysis", None).await.unwrap();
             assert_eq!(provider.calls.load(Ordering::SeqCst), cap as usize);

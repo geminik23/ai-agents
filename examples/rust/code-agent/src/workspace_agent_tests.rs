@@ -11,8 +11,13 @@ use ai_agents::tool_security::{SecurityCheckResult, ToolSecurityEngine};
 use ai_agents::tools::ToolCallSource;
 use std::collections::VecDeque;
 use std::os::unix::fs::PermissionsExt;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicU64, Ordering},
+};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+static NEXT_SANDBOX: AtomicU64 = AtomicU64::new(0);
 
 struct Sandbox {
     parent: PathBuf,
@@ -30,8 +35,9 @@ impl Sandbox {
             .unwrap()
             .as_nanos();
         let parent = PathBuf::from("/tmp").join(format!(
-            "code-agent-workspace-test-{}-{nonce}",
-            std::process::id()
+            "code-agent-workspace-test-{}-{nonce}-{}",
+            std::process::id(),
+            NEXT_SANDBOX.fetch_add(1, Ordering::Relaxed)
         ));
         fs::create_dir(&parent).unwrap();
         let root = parent.join("workspace");
@@ -124,6 +130,121 @@ impl LLMProvider for Provider {
     }
     fn supports(&self, _: LLMFeature) -> bool {
         false
+    }
+}
+
+struct FeedbackFailProvider {
+    requests: Mutex<Vec<Vec<ChatMessage>>>,
+}
+
+#[async_trait]
+impl LLMProvider for FeedbackFailProvider {
+    async fn complete(
+        &self,
+        messages: &[ChatMessage],
+        _: Option<&LLMConfig>,
+    ) -> std::result::Result<LLMResponse, LLMError> {
+        self.requests.lock().unwrap().push(messages.to_vec());
+        if messages.iter().any(|message| {
+            message
+                .content
+                .contains("Untrusted output from a failed authorized validation check")
+        }) {
+            Err(LLMError::RateLimit { retry_after: None })
+        } else {
+            Ok(LLMResponse::new("Ready for checking.", FinishReason::Stop))
+        }
+    }
+    async fn complete_stream(
+        &self,
+        _: &[ChatMessage],
+        _: Option<&LLMConfig>,
+    ) -> std::result::Result<
+        Box<dyn futures::Stream<Item = std::result::Result<LLMChunk, LLMError>> + Unpin + Send>,
+        LLMError,
+    > {
+        Err(LLMError::Config("unexpected stream".into()))
+    }
+    fn provider_name(&self) -> &str {
+        "feedback-failure-test"
+    }
+    fn supports(&self, _: LLMFeature) -> bool {
+        false
+    }
+}
+
+struct HookMutation(Arc<std::sync::atomic::AtomicUsize>);
+#[async_trait]
+impl ai_agents::tools::Tool for HookMutation {
+    fn id(&self) -> &str {
+        "hook_mutation"
+    }
+    fn name(&self) -> &str {
+        "hook_mutation"
+    }
+    fn description(&self) -> &str {
+        "Count an admitted fixture mutation"
+    }
+    fn input_schema(&self) -> serde_json::Value {
+        json!({"type":"object"})
+    }
+    fn safety_metadata(&self) -> ai_agents::tools::ToolSafetyMetadata {
+        ai_agents::tools::ToolSafetyMetadata {
+            default_requires_approval: false,
+            ..Default::default()
+        }
+    }
+    async fn execute(
+        &self,
+        _: serde_json::Value,
+        _: ToolExecutionContext,
+    ) -> ai_agents::tools::ToolResult {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        ai_agents::tools::ToolResult::ok("changed")
+    }
+}
+
+struct FeedbackMutationHook {
+    runtime: Mutex<std::sync::Weak<ai_agents::RuntimeAgent>>,
+}
+#[async_trait]
+impl ai_agents::AgentHooks for FeedbackMutationHook {
+    fn task_providers(&self) -> Option<Vec<Arc<dyn LLMProvider>>> {
+        Some(vec![])
+    }
+    async fn on_llm_start(&self, messages: &[ChatMessage]) {
+        if !messages.iter().any(|message| {
+            message
+                .content
+                .contains("Untrusted output from a failed authorized validation check")
+        }) {
+            return;
+        }
+        let runtime = self.runtime.lock().unwrap().upgrade();
+        if let Some(runtime) = runtime {
+            use ai_agents::tools::ToolInvoker;
+            let _ = runtime
+                .invoke_tool(ai_agents::tools::ToolExecutionRequest::new(
+                    "hook-change",
+                    "hook_mutation",
+                    json!({}),
+                    ToolCallSource::Model,
+                ))
+                .await;
+        }
+    }
+}
+
+struct RejectEditApproveChecker;
+#[async_trait]
+impl ai_agents::ApprovalHandler for RejectEditApproveChecker {
+    async fn request_approval(&self, request: ai_agents::ApprovalRequest) -> ApprovalResult {
+        match request.trigger {
+            ai_agents::ApprovalTrigger::Tool { name, .. } if name == "file_edit" => {
+                ApprovalResult::Rejected { reason: None }
+            }
+            _ => ApprovalResult::Approved,
+        }
     }
 }
 
@@ -461,37 +582,33 @@ async fn failed_validation_allows_another_edit_and_fresh_checker_success() {
     assert_eq!(first_edit.run.status, TaskRunStatus::Paused);
     let first_check = respond(&runner, first_edit, ApprovalResult::Approved).await;
     assert_eq!(first_check.run.status, TaskRunStatus::Paused);
-    let guidance = respond(&runner, first_check, ApprovalResult::Approved).await;
-    assert_eq!(guidance.run.status, TaskRunStatus::Paused);
-    let question = runner
-        .task_interaction(&guidance.run.key.run_id, guidance.run.revision)
+    let repair_edit = respond(&runner, first_check, ApprovalResult::Approved).await;
+    assert_eq!(repair_edit.run.status, TaskRunStatus::Paused);
+    let interaction = runner
+        .task_interaction(&repair_edit.run.key.run_id, repair_edit.run.revision)
         .await
         .unwrap()
         .unwrap();
-    assert!(matches!(question.prompt, TaskHostPrompt::Question(_)));
-    let repair_edit = runner
-        .resume(
-            &guidance.run.key.run_id,
-            guidance.run.revision,
-            TaskResumeInput::UserAnswer {
-                request_id: question.request_id,
-                answer: json!("The checker reported 3 instead of 2; repair the calculation."),
-            },
-        )
-        .await
-        .unwrap();
-    assert_eq!(repair_edit.run.status, TaskRunStatus::Paused);
+    assert!(matches!(
+        interaction.prompt,
+        TaskHostPrompt::Approval { .. }
+    ));
+    let requests = provider.requests.lock().unwrap();
+    assert!(requests.iter().flatten().any(|message| {
+        message.role == ai_agents::Role::User
+            && message
+                .content
+                .contains("Untrusted output from a failed authorized validation check")
+            && message.content.contains("left: 3")
+    }));
     assert!(
-        provider
-            .requests
-            .lock()
-            .unwrap()
+        !requests
             .iter()
             .flatten()
-            .any(|message| message
-                .content
-                .contains("The checker reported 3 instead of 2"))
+            .any(|message| message.role == ai_agents::Role::System
+                && message.content.contains("left: 3"))
     );
+    drop(requests);
     assert_eq!(
         fs::read_to_string(&sandbox.source).unwrap(),
         "pub fn value() -> i32 { 1 + 2 }\n"
@@ -532,6 +649,457 @@ async fn failed_validation_allows_another_edit_and_fresh_checker_success() {
         fs::read_to_string(&sandbox.outside).unwrap(),
         "user data stays unchanged\n"
     );
+    drop(runner);
+    sandbox.cleanup();
+}
+
+// Discovery is an explicit broader read-only grant and does not widen direct file edits.
+#[tokio::test]
+async fn opted_in_workspace_discovery_executes_with_root_scope_but_keeps_edit_scope() {
+    let sandbox = Sandbox::new();
+    let mut setup = sandbox.setup();
+    setup.enable_discovery().unwrap();
+    let policy = &setup.spec.tool_security.tools["file_edit"];
+    assert_eq!(policy.write_paths, vec![sandbox.source.to_str().unwrap()]);
+    let provider = Arc::new(Provider::new(VecDeque::from([
+        json!({"tool":"grep","arguments":{"path":sandbox.root,"pattern":"user data stays unchanged"}}).to_string(),
+        "Ready for checking.".into(),
+    ])));
+    let runner = runner_with_provider(&setup, provider.clone());
+    let result = runner.run("Inspect the workspace.", None).await.unwrap();
+    assert_eq!(result.run.status, TaskRunStatus::Paused);
+    assert!(
+        result
+            .run
+            .evidence
+            .tool_calls
+            .iter()
+            .any(|entry| entry.record.canonical_id == "grep" && entry.record.executed)
+    );
+    assert!(
+        provider
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .flatten()
+            .any(|message| message.content.contains("user data stays unchanged"))
+    );
+    assert_eq!(
+        fs::read_to_string(&sandbox.outside).unwrap(),
+        "user data stays unchanged\n"
+    );
+    cancel_if_paused(&runner, &result).await;
+    drop(runner);
+    sandbox.cleanup();
+}
+
+// Two explicitly selected files share one real checker while the pre-existing index, unstaged file and untracked file remain untouched.
+#[tokio::test]
+async fn selected_multifile_repairs_keep_dirty_workspace_and_require_fresh_check() {
+    let sandbox = Sandbox::new();
+    let second = sandbox.root.join("second.rs");
+    let untracked = sandbox.root.join("untracked.txt");
+    fs::write(
+        &sandbox.source,
+        "pub fn value() -> i32 { 1 } // user note\n",
+    )
+    .unwrap();
+    fs::write(&second, "pub fn value() -> i32 { 1 }\n").unwrap();
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&sandbox.root)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git fixture failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    };
+    git(&["init", "--quiet"]);
+    git(&["add", "--", "source.rs", "second.rs", "protected.rs"]);
+    let staged = ["source.rs", "second.rs", "protected.rs"]
+        .map(|file| git(&["--no-pager", "show", &format!(":{file}")]));
+    fs::write(&sandbox.outside, "unstaged user change\n").unwrap();
+    fs::write(&untracked, "untracked user data\n").unwrap();
+    let before = git(&["--no-optional-locks", "status", "--porcelain=v1"]);
+    assert!(String::from_utf8_lossy(&before).contains("protected.rs"));
+    assert!(String::from_utf8_lossy(&before).contains("untracked.txt"));
+
+    let checker_root = sandbox.parent.join("checker");
+    let harness = checker_root.join("multi_acceptance.rs");
+    fs::write(&harness, format!("#[path = {:?}] mod first;\n#[path = {:?}] mod second;\n#[test] fn expected_values() {{ assert_eq!(first::value(), 2); assert_eq!(second::value(), 3); }}\n", sandbox.source, second)).unwrap();
+    let rustc = fs::canonicalize(env!("CARGO"))
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("rustc");
+    let binary = checker_root.join("multi-acceptance");
+    fs::write(&sandbox.checker, format!("#!/bin/sh\nset -eu\nPATH=/usr/bin:/bin\nexport PATH\n'{}' --edition 2024 --test '{}' -o '{}'\nexec '{}' --test-threads=1\n", rustc.display(), harness.display(), binary.display(), binary.display())).unwrap();
+    let setup = prepare_files(
+        &sandbox.root,
+        &[PathBuf::from("source.rs"), PathBuf::from("second.rs")],
+        &sandbox.checker,
+        "openai",
+        "offline-test",
+        None,
+    )
+    .unwrap();
+    let provider = Arc::new(Provider::new(VecDeque::from([
+        json!({"tool":"file_read","arguments":{"path":sandbox.source}}).to_string(),
+        json!({"tool":"file_edit","arguments":{"path":sandbox.source,"old_text":"{ 1 }","new_text":"{ 1 + 1 }","dry_run":false}}).to_string(),
+        json!({"tool":"file_read","arguments":{"path":second}}).to_string(),
+        json!({"tool":"file_edit","arguments":{"path":second,"old_text":"{ 1 }","new_text":"{ 1 + 3 }","dry_run":false}}).to_string(),
+        "First edit ready.".into(),
+        json!({"tool":"file_read","arguments":{"path":second}}).to_string(),
+        json!({"tool":"file_edit","arguments":{"path":second,"old_text":"{ 1 + 3 }","new_text":"{ 1 + 2 }","dry_run":false}}).to_string(),
+        "Repair ready.".into(),
+    ])));
+    let runner = runner_with_provider(&setup, provider.clone());
+    let first = runner
+        .run("Fix both selected functions.", None)
+        .await
+        .unwrap();
+    assert_eq!(first.run.status, TaskRunStatus::Paused);
+    let second_edit = respond(&runner, first, ApprovalResult::Approved).await;
+    assert_eq!(second_edit.run.status, TaskRunStatus::Paused);
+    let first_check = respond(&runner, second_edit, ApprovalResult::Approved).await;
+    assert_eq!(first_check.run.status, TaskRunStatus::Paused);
+    let repair = respond(&runner, first_check, ApprovalResult::Approved).await;
+    assert_eq!(repair.run.status, TaskRunStatus::Paused);
+    let final_check = respond(&runner, repair, ApprovalResult::Approved).await;
+    assert_eq!(final_check.run.status, TaskRunStatus::Paused);
+    let done = respond(&runner, final_check, ApprovalResult::Approved).await;
+    assert_eq!(
+        done.run.status,
+        TaskRunStatus::Completed,
+        "{:?}",
+        done.run.stop_reason
+    );
+    assert_eq!(
+        fs::read_to_string(&sandbox.source).unwrap(),
+        "pub fn value() -> i32 { 1 + 1 } // user note\n"
+    );
+    assert_eq!(
+        fs::read_to_string(&second).unwrap(),
+        "pub fn value() -> i32 { 1 + 2 }\n"
+    );
+    assert_eq!(
+        fs::read_to_string(&sandbox.outside).unwrap(),
+        "unstaged user change\n"
+    );
+    assert_eq!(
+        fs::read_to_string(&untracked).unwrap(),
+        "untracked user data\n"
+    );
+    for (index, file) in ["source.rs", "second.rs", "protected.rs"]
+        .into_iter()
+        .enumerate()
+    {
+        assert_eq!(
+            git(&["--no-pager", "show", &format!(":{file}")]),
+            staged[index]
+        );
+    }
+    assert_eq!(
+        done.run
+            .evidence
+            .tool_calls
+            .iter()
+            .filter(|entry| entry.record.canonical_id == "command" && entry.record.executed)
+            .count(),
+        2
+    );
+    assert_eq!(
+        done.run
+            .evidence
+            .tool_calls
+            .iter()
+            .filter(|entry| entry.record.canonical_id == "file_edit"
+                && entry.record.executed
+                && entry.record.success)
+            .count(),
+        3
+    );
+    assert!(
+        provider
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .flatten()
+            .any(|message| message.role == ai_agents::Role::User
+                && message
+                    .content
+                    .contains("Untrusted output from a failed authorized validation check"))
+    );
+    drop(runner);
+    sandbox.cleanup();
+}
+
+// The host limits both the untrusted provider projection and retries; repeated real failures fall back to a human question.
+#[tokio::test]
+async fn failed_checker_feedback_is_bounded_and_does_not_retry_indefinitely() {
+    let sandbox = Sandbox::new();
+    let mut setup = sandbox.setup();
+    let feedback = setup
+        .spec
+        .autonomy
+        .defaults
+        .premature_finish
+        .as_mut()
+        .unwrap()
+        .validation_feedback
+        .as_mut()
+        .unwrap();
+    feedback.max_output_chars = 12;
+    feedback.max_retries = 1;
+    let provider = Arc::new(Provider::new(VecDeque::from([
+        "Ready for the first check.".into(),
+        "Still not fixed.".into(),
+    ])));
+    let runner = runner_with_provider(&setup, provider.clone());
+    let first_check = runner
+        .run("Fix the selected function.", None)
+        .await
+        .unwrap();
+    assert_eq!(first_check.run.status, TaskRunStatus::Paused);
+    let second_check = respond(&runner, first_check, ApprovalResult::Approved).await;
+    assert_eq!(second_check.run.status, TaskRunStatus::Paused);
+    let guidance = respond(&runner, second_check, ApprovalResult::Approved).await;
+    assert_eq!(guidance.run.status, TaskRunStatus::Paused);
+    let pending = runner
+        .task_interaction(&guidance.run.key.run_id, guidance.run.revision)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(pending.prompt, TaskHostPrompt::Question(_)));
+    let requests = provider.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    let projected = requests
+        .iter()
+        .flatten()
+        .find(|message| {
+            message.role == ai_agents::Role::User
+                && message
+                    .content
+                    .starts_with("Untrusted output from a failed authorized validation check")
+        })
+        .expect("actual failed check output must reach the next model request");
+    let (_, body) = projected.content.split_once('\n').unwrap();
+    let body: serde_json::Value = serde_json::from_str(body).unwrap();
+    assert!(body["text"].as_str().unwrap().chars().count() <= 12);
+    assert_eq!(body["truncated"], true);
+    drop(requests);
+    let checks = guidance
+        .run
+        .evidence
+        .tool_calls
+        .iter()
+        .filter(|record| record.record.canonical_id == "command" && record.record.executed)
+        .count();
+    assert_eq!(checks, 2);
+    cancel_if_paused(&runner, &guidance).await;
+    drop(runner);
+    sandbox.cleanup();
+}
+
+// State-driven approval paths do not auto-continue from checker feedback; the host must obtain fresh guidance.
+#[tokio::test]
+async fn checker_feedback_with_state_machine_requires_guidance() {
+    let sandbox = Sandbox::new();
+    let mut setup = sandbox.setup();
+    setup.spec.states =
+        Some(serde_json::from_value(json!({"initial":"idle","states":{"idle":{}}})).unwrap());
+    let provider = Arc::new(Provider::new(VecDeque::from([
+        "Ready for checking.".into(),
+        "must not run".into(),
+    ])));
+    let runner = runner_with_provider(&setup, provider.clone());
+    let check = runner
+        .run("Inspect the selected function.", None)
+        .await
+        .unwrap();
+    assert_eq!(check.run.status, TaskRunStatus::Paused);
+    let guidance = respond(&runner, check, ApprovalResult::Approved).await;
+    assert_eq!(guidance.run.status, TaskRunStatus::Paused);
+    let pending = runner
+        .task_interaction(&guidance.run.key.run_id, guidance.run.revision)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(pending.prompt, TaskHostPrompt::Question(_)));
+    assert_eq!(provider.requests.lock().unwrap().len(), 1);
+    cancel_if_paused(&runner, &guidance).await;
+    drop(runner);
+    sandbox.cleanup();
+}
+
+// A feedback-bearing provider request is one-shot even if ordinary LLM retry and fallback are configured.
+#[tokio::test]
+async fn checker_feedback_never_retries_or_leaks_to_fallback_provider() {
+    let sandbox = Sandbox::new();
+    let mut setup = sandbox.setup();
+    setup.spec.error_recovery.default.max_retries = 2;
+    setup.spec.error_recovery.llm.on_failure =
+        serde_json::from_value(json!({"action":"fallback_llm","fallback_llm":"fallback"})).unwrap();
+    let primary = Arc::new(FeedbackFailProvider {
+        requests: Mutex::new(Vec::new()),
+    });
+    let fallback = Arc::new(Provider::new(VecDeque::from(
+        ["unexpected fallback".into()],
+    )));
+    let mut registry = ai_agents::LLMRegistry::new();
+    registry.register("default", primary.clone());
+    registry.register("fallback", fallback.clone());
+    let agent = Arc::new(
+        setup
+            .builder()
+            .llm_registry(registry)
+            .auto_configure_features()
+            .unwrap()
+            .autonomy_extensions(setup.extensions().unwrap())
+            .build()
+            .unwrap(),
+    );
+    agent.set_command_runner(setup.checker_runner());
+    let store = Arc::new(
+        ScopedTaskRunStore::in_memory(agent.info().id, None, "feedback-once.v1".into()).unwrap(),
+    );
+    let runner = AutonomyRunner::try_new(
+        agent,
+        setup.spec.autonomy.clone(),
+        Default::default(),
+        store,
+        "feedback-once.v1".into(),
+    )
+    .unwrap();
+    let check = runner
+        .run("Fix the selected function.", None)
+        .await
+        .unwrap();
+    assert_eq!(check.run.status, TaskRunStatus::Paused);
+    let done = respond(&runner, check, ApprovalResult::Approved).await;
+    assert_ne!(done.run.status, TaskRunStatus::Completed);
+    assert_eq!(primary.requests.lock().unwrap().len(), 2);
+    assert!(fallback.requests.lock().unwrap().is_empty());
+    cancel_if_paused(&runner, &done).await;
+    drop(runner);
+    sandbox.cleanup();
+}
+
+// A real managed mutation during the pre-provider hook invalidates feedback before the model receives it.
+#[tokio::test]
+async fn checker_feedback_stops_before_dispatch_when_hook_mutates() {
+    let sandbox = Sandbox::new();
+    let mut setup = sandbox.setup();
+    setup.spec.tools =
+        Some(serde_json::from_value(json!(["file_read", "file_edit", "hook_mutation"])).unwrap());
+    setup.spec.tool_security.tools.insert(
+        "hook_mutation".into(),
+        serde_json::from_value(json!({"allow_without_confirmation":true})).unwrap(),
+    );
+    let provider = Arc::new(Provider::new(VecDeque::from([
+        "Ready for checking.".into(),
+        "must not run".into(),
+    ])));
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let hook = Arc::new(FeedbackMutationHook {
+        runtime: Mutex::new(std::sync::Weak::new()),
+    });
+    let agent = Arc::new(
+        setup
+            .builder()
+            .llm(provider.clone())
+            .auto_configure_features()
+            .unwrap()
+            .tool(Arc::new(HookMutation(calls.clone())))
+            .hooks(hook.clone())
+            .autonomy_extensions(setup.extensions().unwrap())
+            .build()
+            .unwrap(),
+    );
+    *hook.runtime.lock().unwrap() = Arc::downgrade(&agent);
+    agent.set_command_runner(setup.checker_runner());
+    let store = Arc::new(
+        ScopedTaskRunStore::in_memory(agent.info().id, None, "feedback-stale.v1".into()).unwrap(),
+    );
+    let runner = AutonomyRunner::try_new(
+        agent,
+        setup.spec.autonomy.clone(),
+        Default::default(),
+        store,
+        "feedback-stale.v1".into(),
+    )
+    .unwrap();
+    let check = runner
+        .run("Fix the selected function.", None)
+        .await
+        .unwrap();
+    assert_eq!(check.run.status, TaskRunStatus::Paused);
+    let stopped = respond(&runner, check, ApprovalResult::Approved).await;
+    assert_ne!(stopped.run.status, TaskRunStatus::Completed);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(provider.requests.lock().unwrap().len(), 1);
+    cancel_if_paused(&runner, &stopped).await;
+    drop(runner);
+    sandbox.cleanup();
+}
+
+// An inline human rejection is not converted into permission to try the same edit again after a failed check.
+#[tokio::test]
+async fn inline_edit_rejection_does_not_trigger_automatic_checker_feedback() {
+    let sandbox = Sandbox::new();
+    let mut setup = sandbox.setup();
+    setup
+        .spec
+        .autonomy
+        .defaults
+        .hitl
+        .as_mut()
+        .unwrap()
+        .on_approval_required = None;
+    let provider = scripted_provider(&setup, &sandbox.source);
+    let agent = Arc::new(
+        setup
+            .builder()
+            .llm(provider.clone())
+            .auto_configure_features()
+            .unwrap()
+            .approval_handler(Arc::new(RejectEditApproveChecker))
+            .autonomy_extensions(setup.extensions().unwrap())
+            .build()
+            .unwrap(),
+    );
+    agent.set_command_runner(setup.checker_runner());
+    let store = Arc::new(
+        ScopedTaskRunStore::in_memory(agent.info().id, None, "inline-reject.v1".into()).unwrap(),
+    );
+    let runner = AutonomyRunner::try_new(
+        agent,
+        setup.spec.autonomy.clone(),
+        Default::default(),
+        store,
+        "inline-reject.v1".into(),
+    )
+    .unwrap();
+    let result = runner
+        .run("Fix the selected function.", None)
+        .await
+        .unwrap();
+    assert_ne!(result.run.status, TaskRunStatus::Completed);
+    assert_eq!(provider.requests.lock().unwrap().len(), 2);
+    assert_eq!(
+        fs::read_to_string(&sandbox.source).unwrap(),
+        "pub fn value() -> i32 { 1 }\n"
+    );
+    cancel_if_paused(&runner, &result).await;
     drop(runner);
     sandbox.cleanup();
 }

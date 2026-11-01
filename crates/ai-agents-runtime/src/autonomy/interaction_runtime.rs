@@ -254,6 +254,10 @@ impl RuntimeAgent {
         response: &BatchResponse,
     ) -> Result<()> {
         self.validate_task_interaction(state)?;
+        // Execution review checks the retained model binding; cleanup-only reconstruction does not execute this response.
+        if let TaskInteractionKind::StateApproval { return_to, .. } = &state.kind {
+            self.validate_task_return_policy(return_to)?;
+        }
         if self.runtime_control.emergency_deny.load(Ordering::SeqCst)
             || self.runtime_control.version.load(Ordering::SeqCst) != state.runtime_control_version
         {
@@ -324,12 +328,36 @@ impl RuntimeAgent {
         Ok(response)
     }
 
+    // Check every model return owned by this runtime before admitting work; cleanup-only paths do not use this execution preflight.
+    pub(super) fn validate_task_batch_loop_policy(&self, batch: &TaskBatchState) -> Result<()> {
+        if let Some(state) = &batch.loop_state {
+            self.checked_task_loop_policy(state)?;
+        }
+        if let Some(location) = &batch.location {
+            let actions = match location {
+                crate::autonomy::location::TaskLocation::Actions(actions) => Some(actions.as_ref()),
+                crate::autonomy::location::TaskLocation::Skill(skill) => skill.actions.as_deref(),
+                crate::autonomy::location::TaskLocation::Observation(_) => None,
+            };
+            if let Some(actions) = actions {
+                self.validate_task_return_policy(&actions.return_to)?;
+            }
+        }
+        if let Some(interaction) = &batch.interaction
+            && let TaskInteractionKind::StateApproval { return_to, .. } = &interaction.kind
+        {
+            self.validate_task_return_policy(return_to)?;
+        }
+        Ok(())
+    }
+
     /// Common response validation dispatches by actual location, never by a fabricated tool name.
     pub(crate) fn validate_task_batch_response(
         &self,
         batch: &TaskBatchState,
         response: &BatchResponse,
     ) -> Result<()> {
+        self.validate_task_batch_loop_policy(batch)?;
         if matches!(response, BatchResponse::Capacity)
             && batch
                 .approvals
@@ -672,6 +700,7 @@ impl RuntimeAgent {
             reasoning_mode: ReasoningMode::None,
             auto_detected: false,
             iterations: 0,
+            task_iteration_policy: Some(self.task_iteration_policy.clone()),
             thinking: None,
             reflection_metadata: None,
             finalize_on_resume: false,

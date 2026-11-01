@@ -294,10 +294,12 @@ impl RuntimeAgent {
     }
 
     /// Exact tool and target identities are checked before a coordinating response can claim execution.
+    /// Execution also checks this runtime's model policy; cleanup validates bindings without executing the saved loop.
     pub(super) fn check_message_frame(
         &self,
         frame: &DelegateFrame,
         targets: &crate::autonomy::CompositionTargets,
+        execution: bool,
     ) -> Result<MessageState> {
         let state: MessageState = serde_json::from_value(frame.cursor.clone())?;
         let resolved = self
@@ -322,6 +324,10 @@ impl RuntimeAgent {
             .as_ref()
             .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
         batch.validate()?;
+        // A parent message owns its own model cursor; child approval cannot authorize a different parent policy.
+        if execution {
+            self.validate_task_batch_loop_policy(batch)?;
+        }
         if let Some(location) = &batch.location {
             self.validate_task_location(location)?;
         }
@@ -466,19 +472,24 @@ impl RuntimeAgent {
     /// Completes the original parent result after its child settles; delivery hooks and the consumed attempt are never replayed.
     /// The settled result returns to captured retry/fallback recovery before the original caller advances.
     /// Both successful delivery and recovery preserve factual settlement while rechecking the original message clock after its ACK.
+    /// A failed retry closes only its acknowledged parent batch result and never fabricates non-invocation of the original effect.
     pub(super) async fn resume_message_frame(&self, frame: DelegateFrame) -> Result<AgentResponse> {
         let execution = crate::autonomy::current_execution()
             .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
-        let mut state = self.check_message_frame(&frame, &execution.targets)?;
+        let mut state = self.check_message_frame(&frame, &execution.targets, true)?;
         let original_deadline = execution
             .approval_deadlines
             .lock()
             .get(&format!("composition:{}", frame.id))
             .copied()
             .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
-        let allowance = original_deadline
-            .saturating_duration_since(std::time::Instant::now())
-            .min(execution.remaining_duration());
+        let original_allowance =
+            original_deadline.saturating_duration_since(std::time::Instant::now());
+        let allowance = execution
+            .remaining_duration()
+            .map_or(original_allowance, |remaining| {
+                original_allowance.min(remaining)
+            });
         let guards = tokio::time::timeout(
             allowance,
             Box::pin(self.reauthorize_message(&frame, &state)),
@@ -600,10 +611,14 @@ impl RuntimeAgent {
                 .await
             }),
         );
+        let original_allowance =
+            original_deadline.saturating_duration_since(std::time::Instant::now());
         let timer = tokio::time::sleep(
-            original_deadline
-                .saturating_duration_since(std::time::Instant::now())
-                .min(execution.remaining_duration()),
+            execution
+                .remaining_duration()
+                .map_or(original_allowance, |remaining| {
+                    original_allowance.min(remaining)
+                }),
         );
         tokio::pin!(timer);
         let mut work = Box::pin(work);
@@ -755,7 +770,27 @@ impl RuntimeAgent {
                     execution.retain_batch(&self.info.id, batch);
                     return Err(error);
                 }
-                result => result?,
+                Err(error) => {
+                    // A settled original followed by a failed retry still needs an exact terminal result in the parent native batch.
+                    // This records the recovery failure without replaying the original effect or claiming it never ran.
+                    let batch = state
+                        .batch
+                        .as_mut()
+                        .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
+                    let index = batch
+                        .calls
+                        .iter()
+                        .position(|call| call.id == state.record.call_id)
+                        .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
+                    if batch.results[index].is_some() {
+                        return Err(crate::autonomy::TaskRunStorageError::InvalidCheckpoint.into());
+                    }
+                    batch.results[index] = Some(Err(error.to_string()));
+                    self.append_task_batch_prefix(batch, &mut Vec::new())
+                        .await?;
+                    return Err(error);
+                }
+                Ok(record) => record,
             };
         } else {
             let (output, truncated) =

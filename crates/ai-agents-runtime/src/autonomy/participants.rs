@@ -314,6 +314,7 @@ impl RunExecution {
 
     /// Child setup cannot race terminal transition or barrier closure, including after waiting for a shared runtime gate.
     /// A denied not-started child has no lease or dispatched effect; already admitted children retain their settlement path.
+    /// A finite inherited invocation bound and live proof must still hold after storage waits and before owner enrollment.
     pub(crate) async fn enroll_child(
         self: &Arc<Self>,
         owner: Arc<RunOwner>,
@@ -324,6 +325,15 @@ impl RunExecution {
         let snapshot = self.load_owned_locked(&_serial).await?;
         let payload: TaskCheckpointPayload = serde_json::from_value(snapshot.payload)?;
         self.check(&payload)?;
+        if self.cancellation.load(std::sync::atomic::Ordering::Acquire)
+            || ai_agents_llm::current_invocation_bounds()
+                .is_some_and(|bound| bound.remaining().is_zero())
+        {
+            return Err(AgentError::Other(
+                "child admission cancelled or inherited deadline expired".into(),
+            ));
+        }
+        ai_agents_llm::validate_invocation_evidence()?;
         if let Some(parent) = super::composition::composition_admission_denial() {
             return Err(AgentError::TaskSuspended(parent));
         }

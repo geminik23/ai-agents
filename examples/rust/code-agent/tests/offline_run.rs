@@ -85,6 +85,7 @@ fn workspace_check_is_provider_free_and_live_mode_requires_explicit_consent() {
     std::fs::create_dir(&workspace).unwrap();
     let source = workspace.join("source.rs");
     std::fs::write(&source, "pub fn value() -> i32 { 1 }\n").unwrap();
+    std::fs::write(workspace.join("second.rs"), "pub fn value() -> i32 { 2 }\n").unwrap();
     let checker = parent.join("checker.sh");
     let marker = parent.join("checker-ran");
     std::fs::write(
@@ -101,6 +102,9 @@ fn workspace_check_is_provider_free_and_live_mode_requires_explicit_consent() {
         .arg(&checker)
         .arg("openai")
         .arg("offline-test")
+        .arg("--file")
+        .arg("second.rs")
+        .arg("--allow-discovery")
         .arg("--max-output-tokens")
         .arg("4096")
         .arg("--checker-timeout-ms")
@@ -116,8 +120,27 @@ fn workspace_check_is_provider_free_and_live_mode_requires_explicit_consent() {
         String::from_utf8_lossy(&checked.stdout)
             .contains("without constructing a provider or running the checker")
     );
+    assert!(String::from_utf8_lossy(&checked.stdout).contains("Selected source files: 2"));
+    assert!(String::from_utf8_lossy(&checked.stdout).contains("Workspace discovery enabled: true"));
     assert!(String::from_utf8_lossy(&checked.stdout).contains("Maximum model output tokens: 4096"));
     assert!(String::from_utf8_lossy(&checked.stdout).contains("Checker timeout: 45000 ms"));
+    assert!(!marker.exists());
+    let duplicate = Command::new(executable)
+        .env_clear()
+        .arg("check-workspace")
+        .arg(&workspace)
+        .arg("source.rs")
+        .arg(&checker)
+        .arg("openai")
+        .arg("offline-test")
+        .arg("--file")
+        .arg("source.rs")
+        .output()
+        .unwrap();
+    assert!(!duplicate.status.success());
+    assert!(
+        String::from_utf8_lossy(&duplicate.stderr).contains("must not be selected more than once")
+    );
     assert!(!marker.exists());
     for flag in ["--max-output-tokens", "--checker-timeout-ms"] {
         let invalid = Command::new(executable)

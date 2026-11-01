@@ -44,7 +44,7 @@ pub(super) fn current_host_compatible(
     let ceilings = &request.ceilings;
     for (old, current) in [
         (
-            u64::from(limits.max_turns),
+            limits.max_turns.map(u64::from),
             ceilings.max_turns.map(u64::from),
         ),
         (
@@ -52,19 +52,19 @@ pub(super) fn current_host_compatible(
             ceilings.max_active_time_seconds,
         ),
         (
-            u64::from(limits.max_llm_calls),
+            limits.max_llm_calls.map(u64::from),
             ceilings.max_llm_calls.map(u64::from),
         ),
         (
-            u64::from(limits.max_tool_calls),
+            limits.max_tool_calls.map(u64::from),
             ceilings.max_tool_calls.map(u64::from),
         ),
         (
-            u64::from(limits.max_command_calls),
+            limits.max_command_calls.map(u64::from),
             ceilings.max_command_calls.map(u64::from),
         ),
     ] {
-        if current.is_some_and(|current| old > current) {
+        if current.is_some_and(|current| old.is_none_or(|old| old > current)) {
             return Ok(false);
         }
     }
@@ -110,7 +110,10 @@ fn snapshot_identity(snapshot: &ai_agents_core::AgentSnapshot) -> Result<Value> 
     if let Some(entries) = value["spawned_agents"].as_array_mut() {
         for entry in entries.iter_mut() {
             if let Some(text) = entry["spec_yaml"].as_str() {
-                entry["spec_yaml"] = serde_json::to_value(AgentSpec::from_yaml_strict(text)?)?;
+                let prepared = crate::spec::PreparedAgentSpec::from_persistence_yaml(text)?;
+                let (spec, policy) = prepared.into_parts();
+                entry["spec_yaml"] =
+                    serde_json::json!({"spec": spec, "task_iteration_policy": policy});
             }
         }
         entries.sort_by(|left, right| left["id"].as_str().cmp(&right["id"].as_str()));
@@ -168,7 +171,12 @@ pub(super) fn validate_manifest(
     payload: &TaskCheckpointPayload,
     host: &dyn TaskRestoreHost,
 ) -> Result<()> {
-    if manifest.version != 1
+    if !matches!(manifest.version, 1 | 2)
+        || manifest.nodes.values().any(|node| match manifest.version {
+            1 => node.task_iteration_policy.is_some(),
+            2 => node.task_iteration_policy.is_none(),
+            _ => true,
+        })
         || manifest.host != host.identity()
         || manifest.host.0.trim().is_empty()
         || manifest.host.1 == 0
@@ -849,7 +857,13 @@ fn restored_pause(
     };
     if let Some(group) = &group {
         group.validate_checkpoint(payload)?;
-        runner.agent.task_group_child(group, &owner.targets)?;
+        if cleanup_only {
+            runner
+                .agent
+                .task_group_child_for_cleanup(group, &owner.targets)?;
+        } else {
+            runner.agent.task_group_child(group, &owner.targets)?;
+        }
     }
     if let Some(batch) = &batch {
         batch.validate_checkpoint(payload)?;
@@ -947,6 +961,7 @@ fn restored_pause(
         group,
         controller,
         whole_expiry: deadline_projection(payload.clocks.expires_at, now)?,
+        inherited_expiry: deadline_projection(payload.clocks.inherited_expires_at, now)?,
         approval_deadlines: deadlines,
         restoration: Some(review),
     })

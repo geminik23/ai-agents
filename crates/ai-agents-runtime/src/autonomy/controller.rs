@@ -48,6 +48,22 @@ pub(crate) struct ControllerReview {
     pub control_binding: (u64, u64),
 }
 
+// A legacy model cursor may have omitted its policy or encoded it as null; all other reviewed data remains an exact identity.
+fn matches_reviewed_action(action: &serde_json::Value, review: &ControllerReview) -> Result<bool> {
+    let mut action = action.clone();
+    if let Some(model) = action
+        .get_mut("proposal")
+        .and_then(|proposal| proposal.get_mut("limit"))
+        .and_then(|limit| limit.get_mut("model"))
+        .and_then(serde_json::Value::as_object_mut)
+        && model.get("version").and_then(serde_json::Value::as_u64) == Some(1)
+        && model.get("task_iteration_policy") == Some(&serde_json::Value::Null)
+    {
+        model.remove("task_iteration_policy");
+    }
+    Ok(action == serde_json::to_value(review)?)
+}
+
 /// Stage and plan proposals are advisory until approved; Continue carries no execution permission from model data.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -111,15 +127,26 @@ impl ControllerLimit {
     pub(crate) fn available(&self, payload: &TaskCheckpointPayload) -> bool {
         let limits = &payload.limits;
         match self.reason.as_str() {
-            "turn_capacity" => u64::from(limits.max_turns) > payload.counters.turns,
+            "turn_capacity" => limits
+                .max_turns
+                .is_none_or(|limit| u64::from(limit) > payload.counters.turns),
             "invocation_capacity" | "llm_capacity" => {
-                u64::from(limits.max_llm_calls) > payload.counters.llm_attempts
-                    && (self.resume_turn || u64::from(limits.max_turns) > payload.counters.turns)
+                limits
+                    .max_llm_calls
+                    .is_none_or(|limit| u64::from(limit) > payload.counters.llm_attempts)
+                    && (self.resume_turn
+                        || limits
+                            .max_turns
+                            .is_none_or(|limit| u64::from(limit) > payload.counters.turns))
             }
             "tool_capacity" => {
-                u64::from(limits.max_tool_calls) > payload.counters.tool_attempts
+                limits
+                    .max_tool_calls
+                    .is_none_or(|limit| u64::from(limit) > payload.counters.tool_attempts)
                     && (self.tool.as_deref() != Some("command")
-                        || u64::from(limits.max_command_calls) > payload.counters.command_attempts)
+                        || limits.max_command_calls.is_none_or(|limit| {
+                            u64::from(limit) > payload.counters.command_attempts
+                        }))
             }
             "priced_capacity" => limits.max_micro_usd > self.original.max_micro_usd,
             "write_capacity" => {
@@ -205,6 +232,16 @@ impl ControllerContinuation {
         }
         if let Some(review) = &self.review {
             self.lifecycle.validate(&payload.settings)?;
+            let limit = match &review.proposal {
+                ControllerProposal::Capacity { limit }
+                | ControllerProposal::Question {
+                    limit: Some(limit), ..
+                } => Some(limit),
+                _ => None,
+            };
+            if let Some(model) = limit.and_then(|limit| limit.model.as_ref()) {
+                model.validate_policy_shape()?;
+            }
             if (self.driver.is_some()
                 && !matches!(
                     review.proposal,
@@ -213,7 +250,7 @@ impl ControllerContinuation {
                 ))
                 || review.id != pending.id
                 || review.id.is_empty()
-                || pending.reviewed_action != serde_json::to_value(review)?
+                || !matches_reviewed_action(&pending.reviewed_action, review)?
                 || self.scope.objective_revision != payload.objective_revision
                 || !matches!(payload.runtime.continuation, TaskContinuation::BetweenTurns)
                 || !matches!(

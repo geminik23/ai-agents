@@ -96,6 +96,80 @@ async fn explicit_task_pause_resume_preserves_identity_accounting_events_and_red
     assert!(report.contains("completed"));
 }
 
+// The eval consumer preserves source-aware task defaults in both exact evidence and its safe report.
+#[tokio::test]
+async fn task_eval_reports_unlimited_and_explicit_finite_limits_across_resume() {
+    let unbounded = AGENT.replace("  max_turns: 4\n  max_llm_calls: 8\n", "");
+    for (agent, expected_turns, expected_llm) in
+        [(unbounded.as_str(), None, None), (AGENT, Some(4), Some(8))]
+    {
+        let result = evaluate(
+            agent,
+            r#"steps:
+      - !task
+        operation: {action: run, objective: report}
+        assert: {task: {status: paused, counters: {path: llm_attempts, eq: 1}}}
+      - !task
+        operation: {action: resume, response: {kind: answer, value: proceed}}
+        assert: {task: {status: completed, same_run: true, counters: {path: llm_attempts, eq: 2}}}
+"#,
+        )
+        .await;
+        assert_eq!(result.passed, 1, "{:#?}", result.scenarios);
+        let turns = &result.scenarios[0].attempts[0].turns;
+        for turn in turns {
+            let exact = &turn.evidence.task.as_ref().unwrap().inspection.run;
+            let safe = &turn.task.as_ref().unwrap().display;
+            assert_eq!(exact.limits.max_turns, expected_turns);
+            assert_eq!(exact.limits.max_llm_calls, expected_llm);
+            assert_eq!(safe.limits.max_turns, expected_turns);
+            assert_eq!(safe.limits.max_llm_calls, expected_llm);
+        }
+        assert_eq!(
+            turns[1]
+                .task
+                .as_ref()
+                .unwrap()
+                .display
+                .counters
+                .llm_attempts,
+            2
+        );
+        let serialized = serde_json::to_value(turns[1].task.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            serialized["display"]["limits"]["max_turns"],
+            serde_json::json!(expected_turns)
+        );
+        assert_eq!(
+            serialized["display"]["limits"]["max_llm_calls"],
+            serde_json::json!(expected_llm)
+        );
+    }
+}
+
+// Cancellation is acknowledged separately from the original unbounded task's cumulative usage.
+#[tokio::test]
+async fn unbounded_task_eval_cancellation_retains_the_original_usage() {
+    let agent = AGENT.replace("  max_turns: 4\n  max_llm_calls: 8\n", "");
+    let result = evaluate(
+        &agent,
+        r#"steps:
+      - !task
+        operation: {action: run, objective: report}
+        assert: {task: {status: paused, counters: {path: llm_attempts, eq: 1}}}
+      - !task
+        operation: {action: cancel}
+        assert: {task: {status: cancelled, same_run: true, counters: {path: llm_attempts, eq: 1}}}
+"#,
+    )
+    .await;
+    assert_eq!(result.passed, 1, "{:#?}", result.scenarios);
+    let turns = &result.scenarios[0].attempts[0].turns;
+    let display = &turns[1].task.as_ref().unwrap().display;
+    assert_eq!(display.limits.max_llm_calls, None);
+    assert_eq!(display.counters.llm_attempts, 1);
+}
+
 #[tokio::test]
 async fn paused_task_is_acknowledged_cancelled_at_attempt_end_without_answer_or_extra_calls() {
     let result = evaluate(

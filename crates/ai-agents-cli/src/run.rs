@@ -85,7 +85,8 @@ pub async fn run(cli: Cli) -> Result<()> {
 }
 
 pub async fn run_agent(options: RunOptions) -> Result<()> {
-    let spec = load_spec(&options.agent_path)?;
+    let prepared = load_prepared_spec(&options.agent_path)?;
+    let spec = prepared.spec().clone();
     let metadata = ResolvedCliMetadata::from_metadata_value(spec.metadata.as_ref())
         .merge_overrides(options.to_overrides());
 
@@ -100,14 +101,14 @@ pub async fn run_agent(options: RunOptions) -> Result<()> {
 
     if !is_tui {
         let io = crate::session::FrontendSession::terminal(false, true);
-        let namespace = ai_agents::TaskHostScope::from_spec(
-            &spec,
+        let namespace = ai_agents::TaskHostScope::from_prepared_spec(
+            &prepared,
             options.agent_path.parent().unwrap_or(Path::new(".")),
             options.actor.clone(),
         )?;
         let agent = build_frontend_agent(
             &options.agent_path,
-            spec.clone(),
+            prepared.clone(),
             io.bridge(),
             Some(namespace),
         )
@@ -121,18 +122,13 @@ pub async fn run_agent(options: RunOptions) -> Result<()> {
     }
 
     let (io, input, output) = crate::session::FrontendSession::embedded();
-    let namespace = ai_agents::TaskHostScope::from_spec(
-        &spec,
+    let namespace = ai_agents::TaskHostScope::from_prepared_spec(
+        &prepared,
         options.agent_path.parent().unwrap_or(Path::new(".")),
         options.actor.clone(),
     )?;
-    let agent = build_frontend_agent(
-        &options.agent_path,
-        spec.clone(),
-        io.bridge(),
-        Some(namespace),
-    )
-    .await?;
+    let agent =
+        build_frontend_agent(&options.agent_path, prepared, io.bridge(), Some(namespace)).await?;
     prepare_frontend(&agent, &options).await?;
     let config = resolve_cli_config(&spec, &metadata);
     crate::tui::run_prepared(agent, config, metadata.theme.clone(), io, input, output)
@@ -199,29 +195,40 @@ pub async fn validate_agent(path: &Path) -> Result<()> {
 }
 
 pub fn load_spec(path: &Path) -> Result<AgentSpec> {
+    Ok(load_prepared_spec(path)?.into_parts().0)
+}
+
+// Keep source presence beside the typed spec across CLI namespace construction and runtime preparation.
+pub(crate) fn load_prepared_spec(path: &Path) -> Result<ai_agents::spec::PreparedAgentSpec> {
     let content = fs::read_to_string(path)
         .with_context(|| format!("failed to read agent file: {}", path.display()))?;
 
-    let spec = AgentSpec::from_yaml_strict(&content).map_err(|error| {
-        anyhow::anyhow!(
-            "failed to parse YAML agent file: {}: {error}",
-            path.display()
-        )
-    })?;
+    let prepared =
+        ai_agents::spec::PreparedAgentSpec::from_yaml_strict(&content).map_err(|error| {
+            anyhow::anyhow!(
+                "failed to parse YAML agent file: {}: {error}",
+                path.display()
+            )
+        })?;
 
-    spec.validate()
+    prepared
+        .spec()
+        .validate()
         .with_context(|| format!("agent spec validation failed: {}", path.display()))?;
 
-    Ok(spec)
+    Ok(prepared)
 }
 
 pub async fn build_agent(path: &Path) -> Result<RuntimeAgent> {
-    let spec = load_spec(path)?;
-    build_agent_from_spec(path, spec).await
+    let prepared = load_prepared_spec(path)?;
+    build_agent_from_spec(path, prepared).await
 }
 
-async fn build_agent_from_spec(path: &Path, spec: AgentSpec) -> Result<RuntimeAgent> {
-    configured_builder(path, spec, None, None)
+async fn build_agent_from_spec(
+    path: &Path,
+    prepared: ai_agents::spec::PreparedAgentSpec,
+) -> Result<RuntimeAgent> {
+    configured_builder(path, prepared, None, None)
         .await?
         .build()
         .context("failed to build runtime agent")
@@ -230,12 +237,13 @@ async fn build_agent_from_spec(path: &Path, spec: AgentSpec) -> Result<RuntimeAg
 // Both ordinary and task hosting finalize this same configured builder; neither path reinterprets YAML or repeats preparation.
 async fn configured_builder(
     path: &Path,
-    spec: AgentSpec,
+    prepared: ai_agents::spec::PreparedAgentSpec,
     bridge: Option<Arc<crate::session::InputBridge>>,
     scope: Option<ai_agents::TaskHostScope>,
 ) -> Result<AgentBuilder> {
     let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let builder = AgentBuilder::from_spec_with_base_dir(spec.clone(), base_dir);
+    let spec = prepared.spec().clone();
+    let builder = AgentBuilder::from_prepared_spec_with_base_dir(prepared, base_dir);
     let builder = if let Some(scope) = scope {
         builder.task_host_scope(scope)?
     } else {
@@ -306,11 +314,11 @@ pub(crate) async fn prepare_frontend(agent: &RuntimeAgent, options: &RunOptions)
 /// Reuses the production builder chain; the bridge changes ordinary input delivery, never task approval authority.
 pub(crate) async fn build_frontend_agent(
     path: &Path,
-    spec: AgentSpec,
+    prepared: ai_agents::spec::PreparedAgentSpec,
     bridge: Arc<crate::session::InputBridge>,
     scope: Option<ai_agents::TaskHostScope>,
 ) -> Result<RuntimeAgent> {
-    let builder = configured_builder(path, spec, Some(bridge.clone()), scope).await?;
+    let builder = configured_builder(path, prepared, Some(bridge.clone()), scope).await?;
     let agent = builder.build_task_host().await?;
     agent.set_question_handler(Some(bridge));
     Ok(agent)

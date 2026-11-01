@@ -406,6 +406,10 @@ impl RestoreHost {
             })
             .unwrap_or_default();
         let mut builder = AgentBuilder::from_spec(spec).llm_registry(self.provider_registry());
+        if let Some(policy) = state.and_then(|state| state.get("task_iteration_policy")) {
+            builder =
+                builder.task_iteration_policy(serde_json::from_value(policy.clone()).unwrap());
+        }
         if let Some(gate) = &self.memory_gate {
             builder = builder.memory(gate.memory(id.clone()));
         }
@@ -657,12 +661,19 @@ impl TaskRestoreHost for RestoreHost {
                 .find(|(_, (runtime, _))| runtime == id)
                 .and_then(|(frame, _)| manifest.compositions.get(frame))
                 .map(|binding| graph.registries[&binding.registry].clone());
+            let mut state = node.binding.state.clone();
+            if !state.is_object() {
+                state = json!({});
+            }
+            if let Some(policy) = &node.task_iteration_policy {
+                state["task_iteration_policy"] = serde_json::to_value(policy)?;
+            }
             let runtime = self.runtime_with_handles(
                 spec.clone(),
                 registry,
                 spawner,
                 tool_registry,
-                Some(&node.binding.state),
+                Some(&state),
             );
             graph.runtimes.insert(id.clone(), runtime);
             if *id != manifest.root {
@@ -1394,43 +1405,60 @@ async fn restore_corrupt_manifest_references_reject_before_claim() {
     }
 }
 
-// A predictable image-size failure cannot abandon the existing safe continuation or consume a new revision.
+// A predictable image-size failure cannot abandon either a finite or unbounded safe continuation or consume a revision.
 #[tokio::test]
 async fn restore_oversized_preparation_preserves_usable_live_pause() {
-    let host = host();
-    let root = host.runtime(host.root.clone());
-    root.set_context("large_fixture", json!("x".repeat(2_095_000)))
+    for unbounded in [false, true] {
+        let host = host();
+        let root = host.runtime(host.root.clone());
+        root.set_context("large_fixture", json!("x".repeat(2_095_000)))
+            .unwrap();
+        let store =
+            super::continuation_test_support::store(root.info().id, "restore.v1", false).await;
+        let mut profile = config();
+        if unbounded {
+            profile.defaults.max_turns = None;
+            profile.defaults.max_active_time_seconds = None;
+            profile.defaults.max_llm_calls = None;
+            profile.defaults.max_tool_calls = None;
+            profile.defaults.max_command_calls = None;
+        }
+        let runner = AutonomyRunner::try_new(
+            root,
+            profile,
+            Default::default(),
+            store.clone(),
+            "restore.v1".into(),
+        )
         .unwrap();
-    let store = super::continuation_test_support::store(root.info().id, "restore.v1", false).await;
-    let runner = AutonomyRunner::try_new(
-        root,
-        config(),
-        Default::default(),
-        store.clone(),
-        "restore.v1".into(),
-    )
-    .unwrap();
-    let paused = runner.run("verify bounded image", None).await.unwrap();
-    assert_eq!(paused.run.status, TaskRunStatus::Paused);
-    let before = store.load(&paused.run.key.run_id).await.unwrap().unwrap();
-    assert!(
-        runner
-            .checkpoint_for_restore(&paused.run.key.run_id, paused.run.revision, host.as_ref())
-            .await
-            .is_err()
-    );
-    let after = store.load(&paused.run.key.run_id).await.unwrap().unwrap();
-    assert_eq!(after.revision, before.revision);
-    assert_eq!(after.status, TaskRunStatus::Paused);
-    assert_eq!(
-        runner
-            .cancel_paused(&paused.run.key.run_id, paused.run.revision)
-            .await
-            .unwrap()
-            .run
-            .status,
-        TaskRunStatus::Cancelled
-    );
+        let paused = runner.run("verify bounded image", None).await.unwrap();
+        assert_eq!(paused.run.status, TaskRunStatus::Paused);
+        if unbounded {
+            assert_eq!(paused.run.limits.max_llm_calls, None);
+        }
+        let before = store.load(&paused.run.key.run_id).await.unwrap().unwrap();
+        assert!(
+            runner
+                .checkpoint_for_restore(&paused.run.key.run_id, paused.run.revision, host.as_ref())
+                .await
+                .is_err()
+        );
+        let after = store.load(&paused.run.key.run_id).await.unwrap().unwrap();
+        assert_eq!(after.revision, before.revision);
+        assert_eq!(after.status, TaskRunStatus::Paused);
+        assert_eq!(after.payload["counters"], before.payload["counters"]);
+        assert_eq!(after.payload["pending"], before.payload["pending"]);
+        assert_eq!(host.effects.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            runner
+                .cancel_paused(&paused.run.key.run_id, paused.run.revision)
+                .await
+                .unwrap()
+                .run
+                .status,
+            TaskRunStatus::Cancelled
+        );
+    }
 }
 
 // Separate processes share only an isolated SQLite file and an external effect witness, never runtime/host/provider objects.
@@ -1571,6 +1599,208 @@ fn restore_participant_actorless_marker_round_trips() {
     assert!(encoded.is_object());
     let decoded: Option<TaskRestoreParticipant> = serde_json::from_value(encoded).unwrap();
     assert!(decoded.is_some_and(|member| member.actor_id.is_none()));
+}
+
+// A synthetic legacy prepared image must retain its finite limits and pass the actual host, digest and fresh-review boundaries.
+#[tokio::test]
+async fn legacy_prepared_pause_reconstructs_with_conservative_policy_and_no_replay() {
+    // This synthetic fixture restores prior field shapes but is not an image produced by a historical binary.
+    fn legacy_policy_shape(value: &mut Value) {
+        match value {
+            Value::Object(fields) => {
+                if fields.contains_key("task_iteration_policy")
+                    && (fields.contains_key("processed_input")
+                        || fields.contains_key("configuration_digest"))
+                {
+                    fields.remove("task_iteration_policy");
+                    if fields.contains_key("processed_input")
+                        && fields.get("version") == Some(&json!(2))
+                    {
+                        fields.insert("version".into(), json!(1));
+                    }
+                }
+                for child in fields.values_mut() {
+                    legacy_policy_shape(child);
+                }
+            }
+            Value::Array(items) => items.iter_mut().for_each(legacy_policy_shape),
+            _ => {}
+        }
+    }
+
+    for &sqlite in super::continuation_test_support::backends() {
+        let (host, store, prepared) = prepared_fixture(sqlite).await;
+        let id = prepared.run.key.run_id.clone();
+        let token = "synthetic-legacy-owner".to_string();
+        let claimed = store
+            .claim_paused(&id, prepared.run.revision, token.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut raw = claimed.payload.clone();
+        raw["version"] = json!(1);
+        legacy_policy_shape(&mut raw);
+        raw["controller_state"]["remaining_wall_seconds"] = Value::Null;
+        let manifest = raw["adapters"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|adapter| adapter["id"] == "runtime.restore")
+            .unwrap();
+        manifest["state"]["version"] = json!(1);
+        // Hash the synthetic old wire image before current typed serialization, so an added default field breaks the test.
+        let mut digest_input = raw.clone();
+        digest_input["adapters"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|adapter| {
+                adapter["id"] != "runtime.restore" && adapter["id"] != "runtime.restore_review"
+            });
+        use sha2::{Digest, Sha256};
+        let digest = format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&digest_input).unwrap())
+        );
+        let mut payload: TaskCheckpointPayload = serde_json::from_value(raw).unwrap();
+        let manifest = payload
+            .adapters
+            .iter_mut()
+            .find(|adapter| adapter.id == "runtime.restore")
+            .unwrap();
+        manifest.state["revision"] = json!(claimed.revision + 1);
+        manifest.state["payload_digest"] = json!(digest);
+        let saved = store
+            .mutate(
+                &id,
+                &TaskRunMutation::Checkpoint {
+                    expected_revision: claimed.revision,
+                    owner_token: token,
+                    status: TaskRunStatus::Paused,
+                    payload: serde_json::to_value(payload).unwrap(),
+                    release: true,
+                },
+            )
+            .await
+            .unwrap();
+        let saved_payload: TaskCheckpointPayload =
+            serde_json::from_value(saved.payload.clone()).unwrap();
+        assert_eq!(saved_payload.version, 1);
+        assert_eq!(saved_payload.limits.max_llm_calls, Some(12));
+        let effects_before = host.effects.load(Ordering::SeqCst);
+        let calls_before = host.calls.load(Ordering::SeqCst);
+        let request = TaskRestoreRequest {
+            run_id: id,
+            expected_revision: saved.revision,
+            config_identity: "restore.v1".into(),
+            config: config(),
+            ceilings: Default::default(),
+        };
+        let (restored, paused) =
+            AutonomyRunner::restore_paused(request, store.clone(), host.clone())
+                .await
+                .unwrap();
+        assert_eq!(paused.run.status, TaskRunStatus::Paused);
+        assert_eq!(paused.run.limits.max_llm_calls, Some(12));
+        assert_eq!(
+            paused.run.counters.llm_attempts,
+            prepared.run.counters.llm_attempts
+        );
+        assert_eq!(host.calls.load(Ordering::SeqCst), calls_before);
+        assert_eq!(host.effects.load(Ordering::SeqCst), effects_before);
+        let reviewed = approve(&restored, &paused.run).await;
+        let done = answer(&restored, &reviewed.run).await.unwrap();
+        assert_eq!(done.run.status, TaskRunStatus::Completed);
+        assert_eq!(host.effects.load(Ordering::SeqCst), effects_before);
+        assert!(done.run.counters.llm_attempts >= paused.run.counters.llm_attempts);
+    }
+}
+
+// An unbounded prepared pause cannot be silently clamped by a narrower host; a compatible reconstruction preserves counters and effects.
+#[tokio::test]
+async fn restore_unbounded_pause_rejects_narrow_host_and_preserves_usage() {
+    for &sqlite in super::continuation_test_support::backends() {
+        let host = host();
+        let prepared_spec = crate::spec::PreparedAgentSpec::from_yaml_strict(
+            "name: RestoreRoot\nsystem_prompt: evidence\ntools: [ask_user, restore_probe]\n",
+        )
+        .unwrap();
+        let source_policy = json!({"task_iteration_policy": prepared_spec.task_iteration_policy()});
+        let root =
+            host.runtime_with_handles(host.root.clone(), None, None, None, Some(&source_policy));
+        let store =
+            super::continuation_test_support::store(root.info().id, "restore.v1", sqlite).await;
+        let mut unbounded = config();
+        unbounded.defaults.max_turns = None;
+        unbounded.defaults.max_active_time_seconds = None;
+        unbounded.defaults.max_llm_calls = None;
+        unbounded.defaults.max_tool_calls = None;
+        unbounded.defaults.max_command_calls = None;
+        let runner = AutonomyRunner::try_new(
+            root,
+            unbounded.clone(),
+            Default::default(),
+            store.clone(),
+            "restore.v1".into(),
+        )
+        .unwrap();
+        let first = runner.run("verify evidence", None).await.unwrap();
+        assert_eq!(first.run.status, TaskRunStatus::Paused);
+        assert_eq!(first.run.limits.max_llm_calls, None);
+        assert_eq!(host.effects.load(Ordering::SeqCst), 1);
+        let prepared = runner
+            .checkpoint_for_restore(&first.run.key.run_id, first.run.revision, host.as_ref())
+            .await
+            .unwrap();
+        drop(runner);
+        let before = store.load(&prepared.run.key.run_id).await.unwrap().unwrap();
+        let rejected = TaskRestoreRequest {
+            run_id: prepared.run.key.run_id.clone(),
+            expected_revision: prepared.run.revision,
+            config_identity: "restore.v1".into(),
+            config: unbounded.clone(),
+            ceilings: AutonomyHostCeilings {
+                max_llm_calls: Some(100),
+                ..Default::default()
+            },
+        };
+        assert!(
+            AutonomyRunner::restore_paused(rejected, store.clone(), host.clone())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            serde_json::to_value(store.load(&prepared.run.key.run_id).await.unwrap().unwrap())
+                .unwrap(),
+            serde_json::to_value(&before).unwrap()
+        );
+        assert_eq!(host.effects.load(Ordering::SeqCst), 1);
+        let request = TaskRestoreRequest {
+            run_id: prepared.run.key.run_id.clone(),
+            expected_revision: prepared.run.revision,
+            config_identity: "restore.v1".into(),
+            config: unbounded,
+            ceilings: Default::default(),
+        };
+        let (restored, paused) =
+            AutonomyRunner::restore_paused(request, store.clone(), host.clone())
+                .await
+                .unwrap();
+        assert_eq!(paused.run.limits.max_llm_calls, None);
+        assert_eq!(
+            paused.run.counters.llm_attempts,
+            first.run.counters.llm_attempts
+        );
+        let reviewed = approve(&restored, &paused.run).await;
+        let done = answer(&restored, &reviewed.run).await.unwrap();
+        assert_eq!(
+            done.run.status,
+            TaskRunStatus::Completed,
+            "{:?}",
+            done.run.stop_reason
+        );
+        assert_eq!(host.effects.load(Ordering::SeqCst), 1);
+        assert!(done.run.counters.llm_attempts >= first.run.counters.llm_attempts);
+    }
 }
 
 // Durable state plus current host configuration, not a retained Arc, revives exact pending work without repeating the completed effect.

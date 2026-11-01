@@ -137,6 +137,119 @@ fn tui_pty_task_owned_child_questions_preserve_completed_prefixes() {
     assert_eq!(root.calls.load(Ordering::SeqCst), 0);
 }
 
+// Provider-free store commands retain exact access to legacy finite runs without reinterpreting their limits.
+#[test]
+fn task_store_commands_manage_legacy_finite_namespace() {
+    use ai_agents::autonomy::{
+        AutonomyConfig, AutonomyHostCeilings, AutonomyScope, TASK_RUN_SCHEMA_VERSION,
+        TaskCheckpointPayload, TaskRunKey, TaskRunSnapshot, TaskRunStatus, TaskRuntimeCheckpoint,
+        resolve_profile,
+    };
+    use ai_agents::{AgentSnapshot, AgentStorage, PreparedAgentSpec, SqliteStorage, TaskHostScope};
+    let dir = std::env::temp_dir().join(format!(
+        "task-cli-legacy-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir(&dir).unwrap();
+    let db = dir.join("tasks.db");
+    let agent = dir.join("agent.yaml");
+    let source = format!(
+        "name: LegacyTask\nsystem_prompt: test\nstorage: {{type: sqlite, path: '{}'}}\n",
+        db.display()
+    );
+    std::fs::write(&agent, &source).unwrap();
+    let prepared = PreparedAgentSpec::from_yaml_strict(&source).unwrap();
+    let legacy = TaskHostScope::from_spec(prepared.spec(), &dir, None).unwrap();
+    let current = TaskHostScope::from_prepared_spec(&prepared, &dir, None).unwrap();
+    assert_ne!(legacy.identity(), current.identity());
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let storage = SqliteStorage::new(db.to_str().unwrap()).await.unwrap();
+        let host = AutonomyHostCeilings {
+            max_turns: Some(30),
+            max_active_time_seconds: Some(900),
+            max_llm_calls: Some(60),
+            max_tool_calls: Some(120),
+            max_command_calls: Some(10),
+            ..Default::default()
+        };
+        let profile = resolve_profile(
+            &AutonomyConfig::default(),
+            AutonomyScope::Task,
+            None,
+            None,
+            None,
+            None,
+            &host,
+        )
+        .unwrap();
+        let mut payload = TaskCheckpointPayload::new(
+            "legacy objective".into(),
+            legacy.identity().into(),
+            &profile,
+            TaskRuntimeCheckpoint::between_turns(AgentSnapshot::new("LegacyTask".into())).unwrap(),
+        );
+        payload.version = 1;
+        let now = chrono::Utc::now();
+        let snapshot = payload
+            .bind(TaskRunSnapshot {
+                schema_version: TASK_RUN_SCHEMA_VERSION,
+                key: TaskRunKey {
+                    agent_id: "LegacyTask".into(),
+                    run_id: "legacy-run".into(),
+                },
+                actor_id: None,
+                revision: 0,
+                status: TaskRunStatus::Paused,
+                owner_token: None,
+                cancel_requested: false,
+                created_at: now,
+                updated_at: now,
+                payload: json!({}),
+            })
+            .unwrap();
+        storage.create_task_run(&snapshot).await.unwrap();
+        storage.close().await;
+    });
+    let run = |args: &[&str]| {
+        let output = Command::new(env!("CARGO_BIN_EXE_ai-agents-cli"))
+            .env_clear()
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "CLI failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()
+    };
+    let path = agent.to_str().unwrap();
+    let rows = run(&["task", "list", path, "--json"]);
+    assert_eq!(rows.as_array().unwrap().len(), 1);
+    assert_eq!(rows[0]["key"]["run_id"], "legacy-run");
+    let view = run(&["task", "show", path, "legacy-run", "--json"]);
+    assert_eq!(view["limits"]["max_llm_calls"], 60);
+    let receipt = run(&[
+        "task",
+        "cancel",
+        path,
+        "legacy-run",
+        "--revision",
+        "0",
+        "--json",
+    ]);
+    assert_eq!(receipt["disposition"], "requested");
+    let cancelled = run(&["task", "show", path, "legacy-run", "--json"]);
+    assert_eq!(cancelled["summary"]["cancel_requested"], true);
+    assert_eq!(cancelled["limits"]["max_llm_calls"], 60);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 static NEXT: AtomicUsize = AtomicUsize::new(0);
 struct Fixture {
     dir: PathBuf,

@@ -1,4 +1,4 @@
-// Bind one selected workspace file to an actual provider and a host-owned checker.
+// Bind explicitly selected workspace files to an actual provider and a host-owned checker.
 // Flow: validate explicit paths -> prepare a provider-free builder -> start a task with typed approvals.
 // The checker is trusted host code; the caller must provide any required isolation and independent tests.
 
@@ -6,7 +6,7 @@ use crate::code_agent_workspace::command_word;
 use ai_agents::AgentBuilder;
 use ai_agents::autonomy::{AutonomyExtensions, HostValidationBinding};
 use ai_agents::context::ContextSource;
-use ai_agents::spec::{AgentSpec, LLMConfigOrSelector};
+use ai_agents::spec::{AgentSpec, LLMConfigOrSelector, PreparedAgentSpec, TaskIterationPolicy};
 use ai_agents::tool_security::CommandRuleConfig;
 use ai_agents::tools::{
     CommandRequest, CommandResponse, CommandRunner, ProcessCommandRunner, ToolExecutionContext,
@@ -31,8 +31,11 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 pub struct WorkspaceSetup {
     spec: AgentSpec,
+    task_iteration_policy: TaskIterationPolicy,
     root: PathBuf,
     source: PathBuf,
+    sources: Vec<PathBuf>,
+    discovery_enabled: bool,
     checker: PathBuf,
     checker_bytes: Vec<u8>,
     argv: Vec<String>,
@@ -99,10 +102,29 @@ fn instructions(root: &Path, relative: Option<&Path>) -> Result<String> {
     Ok(String::from_utf8(bytes)?)
 }
 
-// Bind one selected file and one host-only checker without constructing a provider or starting work.
+// Preserve the original single-file entry while using the same exact multi-file authority checks.
 pub fn prepare(
     root: &Path,
     source: &Path,
+    checker: &Path,
+    provider: &str,
+    model: &str,
+    instruction_file: Option<&Path>,
+) -> Result<WorkspaceSetup> {
+    prepare_files(
+        root,
+        &[source.to_path_buf()],
+        checker,
+        provider,
+        model,
+        instruction_file,
+    )
+}
+
+// Every selected source is explicitly host-authorized; discovery, symlink traversal and implicit root write access remain excluded.
+pub fn prepare_files(
+    root: &Path,
+    sources: &[PathBuf],
     checker: &Path,
     provider: &str,
     model: &str,
@@ -115,15 +137,26 @@ pub fn prepare(
     if !root.is_dir() {
         return Err("workspace must be a directory".into());
     }
-    let source = selected_file(&root, source)?;
-    // Atomic replacement preserves ordinary Unix bits, not special privilege bits or extended metadata.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if fs::metadata(&source)?.permissions().mode() & 0o7000 != 0 {
-            return Err("source files with special permission bits are unsupported".into());
-        }
+    if sources.is_empty() {
+        return Err("at least one source file must be selected".into());
     }
+    let mut selected = Vec::with_capacity(sources.len());
+    for source in sources {
+        let source = selected_file(&root, source)?;
+        if selected.contains(&source) {
+            return Err("source files must not be selected more than once".into());
+        }
+        // Atomic replacement preserves ordinary Unix bits, not special privilege bits or extended metadata.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if fs::metadata(&source)?.permissions().mode() & 0o7000 != 0 {
+                return Err("source files with special permission bits are unsupported".into());
+            }
+        }
+        selected.push(source);
+    }
+    let source = selected[0].clone();
     let checker = fs::canonicalize(checker)?;
     if checker.starts_with(&root) {
         return Err("the trusted checker must be outside the workspace".into());
@@ -144,15 +177,16 @@ pub fn prepare(
         );
     }
     let snapshot = instructions(&root, instruction_file)?;
-    let argv = vec![
-        command_word(&checker)?,
-        command_word(&root)?,
-        command_word(&source)?,
-    ];
-    let command = argv.join(" ");
     let root_string = command_word(&root)?;
-    let source_string = command_word(&source)?;
-    let mut spec = AgentSpec::from_yaml_strict(YAML)?;
+    let source_strings = selected
+        .iter()
+        .map(|source| command_word(source))
+        .collect::<Result<Vec<_>>>()?;
+    let source_string = source_strings[0].clone();
+    let mut argv = vec![command_word(&checker)?, root_string.clone()];
+    argv.extend(source_strings.iter().cloned());
+    let command = argv.join(" ");
+    let (mut spec, task_iteration_policy) = PreparedAgentSpec::from_yaml_strict(YAML)?.into_parts();
     match &mut spec.llm {
         LLMConfigOrSelector::Config(config) => {
             config.provider = provider.to_string();
@@ -164,14 +198,14 @@ pub fn prepare(
         .tools
         .get_mut("file_read")
         .ok_or("missing file_read policy")?
-        .read_paths = vec![source_string.clone()];
+        .read_paths = source_strings.clone();
     let edit = spec
         .tool_security
         .tools
         .get_mut("file_edit")
         .ok_or("missing file_edit policy")?;
-    edit.read_paths = vec![source_string.clone()];
-    edit.write_paths = vec![source_string.clone()];
+    edit.read_paths = source_strings.clone();
+    edit.write_paths = source_strings.clone();
     let policy = spec
         .tool_security
         .tools
@@ -194,6 +228,8 @@ pub fn prepare(
     for (key, value) in [
         ("workspace_root", root_string),
         ("source_file", source_string),
+        ("source_files", serde_json::to_string(&source_strings)?),
+        ("discovery_scope", "disabled".into()),
         ("instruction_snapshot", snapshot),
     ] {
         match spec.context.get_mut(key) {
@@ -206,8 +242,11 @@ pub fn prepare(
     spec.validate()?;
     Ok(WorkspaceSetup {
         spec,
+        task_iteration_policy,
         root,
         source,
+        sources: selected,
+        discovery_enabled: false,
         checker,
         checker_bytes,
         argv,
@@ -217,6 +256,37 @@ pub fn prepare(
 }
 
 impl WorkspaceSetup {
+    // Explicit opt-in permits path discovery and content search under the root, but never widens file_read or write grants.
+    pub fn enable_discovery(&mut self) -> Result<()> {
+        let root = command_word(&self.root)?;
+        let mut spec = self.spec.clone();
+        let tools = spec.tools.as_mut().ok_or("missing tool grants")?;
+        for name in ["file_list", "glob", "grep"] {
+            if tools.iter().any(|tool| tool.name() == name) {
+                continue;
+            }
+            tools.push(serde_json::from_value(json!(name))?);
+            spec.tool_security.tools.insert(
+                name.into(),
+                serde_json::from_value(
+                    json!({"read_paths":[root],"allow_without_confirmation":true}),
+                )?,
+            );
+        }
+        match spec.context.get_mut("discovery_scope") {
+            Some(ContextSource::Runtime { default, .. }) => {
+                *default = Some(json!(
+                    "enabled for path listing and content search under the workspace root"
+                ))
+            }
+            _ => return Err("missing discovery scope context".into()),
+        }
+        spec.validate()?;
+        self.spec = spec;
+        self.discovery_enabled = true;
+        Ok(())
+    }
+
     // The host must choose a positive output limit supported by its selected provider and model.
     pub fn set_max_output_tokens(&mut self, tokens: u32) -> Result<()> {
         if tokens == 0 {
@@ -280,7 +350,10 @@ impl WorkspaceSetup {
     }
 
     pub fn builder(&self) -> AgentBuilder {
-        AgentBuilder::from_spec(self.spec.clone())
+        AgentBuilder::from_prepared_spec(PreparedAgentSpec::new(
+            self.spec.clone(),
+            self.task_iteration_policy.clone(),
+        ))
     }
 
     // A fixed host-only validation binding cannot become an ordinary model-callable command grant.
@@ -315,6 +388,14 @@ impl WorkspaceSetup {
 
     pub fn source_file(&self) -> &Path {
         &self.source
+    }
+
+    pub fn source_files(&self) -> &[PathBuf] {
+        &self.sources
+    }
+
+    pub fn discovery_enabled(&self) -> bool {
+        self.discovery_enabled
     }
 }
 
@@ -357,18 +438,30 @@ impl CommandRunner for CheckerRunner {
 
 // The existing CLI owns foreground controls; ordinary chat is blocked to avoid unverified edit claims.
 pub async fn run(setup: WorkspaceSetup) -> Result<()> {
-    println!("Selected source: {}", setup.source_file().display());
+    println!("Primary source: {}", setup.source_file().display());
+    for source in setup.source_files() {
+        println!("Authorized source: {}", source.display());
+    }
+    println!("Workspace discovery enabled: {}", setup.discovery_enabled());
     println!("Maximum model output tokens: {}", setup.max_output_tokens());
     println!("Checker timeout: {} ms", setup.checker_timeout_ms());
     println!(
-        "The selected source, instruction snapshot, task messages and checker output may be sent to the chosen provider and may incur costs."
+        "Selected sources, instruction snapshot, task messages and bounded failed-check output may be sent to the chosen provider and may incur costs."
     );
     println!(
         "The external checker runs with host permissions; you are responsible for its independence, isolation and cleanup."
     );
     println!("Only /task commands are enabled; command execution and edits require approval.");
     println!(
-        "Checker output is not automatically sent to the model; provide relevant details when asked."
+        "An eligible failed checker can send bounded untrusted output to the provider; rejected or unavailable checks require guidance."
+    );
+    if setup.discovery_enabled() {
+        println!(
+            "Workspace discovery may share file names and search matches outside the selected edit files."
+        );
+    }
+    println!(
+        "A feedback-bearing provider request is one-shot and does not use automatic retries or fallback."
     );
     println!(
         "Atomic edits preserve ordinary Unix mode bits, not ownership, ACLs or extended attributes."
@@ -384,7 +477,7 @@ pub async fn run(setup: WorkspaceSetup) -> Result<()> {
         .await?;
     agent.set_command_runner(setup.checker_runner());
     CliRepl::new(agent)
-        .welcome("Code Agent: one selected file, one host-owned checker")
+        .welcome("Code Agent: explicitly selected files, one host-owned checker")
         .hint("Start with /task run <objective>; approvals and cancellation stay in this session.")
         .on_command(|input, _| {
             let allowed = input.starts_with("/task run ")

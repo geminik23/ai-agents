@@ -32,10 +32,10 @@ Top-level `autonomy` contains flat default profile fields, optional `default_pro
 | `mode` | enum / `until_complete` when enabled | `disabled`, `until_complete`, `state_until_exit`, `skill_until_complete`; incompatible invocation scopes reject |
 | `objective`, `objective_template` | optional nonempty strings | Mutually exclusive; automatic scopes combine/resolve accepted input, while explicit invocation supplies its accepted objective; templates support accepted `input`, `user_input`, `objective`, current `context` and `state` |
 | `execution.strategy` | enum / scope-dependent | `skill` for skill scope, otherwise `lifecycle` with stages, otherwise `model_led`; incompatible explicit combinations reject |
-| `max_turns` | positive integer / `30` | Work-cycle allowance, not an invoice or a tool counter |
-| `max_active_time_seconds` | positive integer / `900` | Cumulative active allowance; safe human wait does not refill or consume active work allowance |
-| `max_wall_time_seconds` | optional positive integer / absent unless host-bounded | Whole-run expiry keeps advancing during safe waits |
-| `max_llm_calls`, `max_tool_calls`, `max_command_calls` | positive integers / `60`, `120`, `10` | Pre-execution shared admission includes managed auxiliary/child work; command attempts also consume applicable tool admission |
+| `max_turns` | positive integer or `unlimited` / unbounded | Work-cycle allowance, not an invoice or a tool counter |
+| `max_active_time_seconds` | positive integer or `unlimited` / unbounded | Cumulative active allowance; safe human wait does not refill or consume active work allowance |
+| `max_wall_time_seconds` | positive integer or `unlimited` / unbounded | A configured whole-run expiry keeps advancing during safe waits |
+| `max_llm_calls`, `max_tool_calls`, `max_command_calls` | positive integers or `unlimited` / unbounded | Pre-execution shared admission includes managed auxiliary/child work; command attempts also consume applicable tool admission |
 | `max_cost_usd` | optional quoted positive decimal / absent | At most six decimal places; requires an actual host ceiling and bounded priced providers, not merely cost telemetry |
 | `max_declared_write_paths` | optional positive integer / absent | Requires an actual host ceiling and implementation-bound target footprints; not a filesystem sandbox |
 | `supervision.stage_changes`, `.plan_changes` | `inherit` or `require_approval` / inherited | Review cannot skip required work, expand authority or relax gates |
@@ -43,12 +43,12 @@ Top-level `autonomy` contains flat default profile fields, optional `default_pro
 | `validation` | validation mapping / absent | Ordered managed checks and optional built-in shortcuts, described below |
 | `completion` | one gate tree / absent | Only eligible Pass can prove completion; required validation and scope rules still apply |
 | `progress` | progress mapping / built-in evidence observer | Optional domain signals or canonical todo integration, not model self-report |
-| `premature_finish` | policy / `continue` | `action: continue | ask_user | summarize_and_stop | fail`; `max_continuations` defaults to the effective turn allowance; optional custom `prompt` supplies controller guidance |
+| `premature_finish` | policy / `continue` | `action: continue | ask_user | summarize_and_stop | fail`; `max_continuations` defaults to the effective turn allowance or is unbounded when that allowance is absent; optional `validation_feedback` is a separate restricted opt-in described below |
 | `on_limit` | policy / `summarize_and_stop` | `action: summarize_and_stop | fail | ask_user | pause_run`; summaries are deterministic, not unbudgeted model calls |
 | `hitl` | interaction policies / existing review contract | `on_approval_required` and `on_user_question`: `pause_run | reject | auto_if_policy | ask_each_time`; none overrides automatic denial or invents an answer |
 | `persistence` | optional mapping / no automatic restart preparation | See flags and host prerequisites below; a journal alone is not reconstruction authority |
 
-Omitted and null optional profile fields inherit; null is not a general reset operator. Explicit `false` and empty lists are preserved. Completion trees and configured lists replace rather than concatenate. Ordinary nested policy leaves merge; changing a progress adapter binding replaces its associated version/configuration instead of silently inheriting another adapter's config. Setting `objective` replaces an inherited template and vice versa. Gate `eq: null` is different: it is an explicit equality operand.
+Omitted and null optional profile fields inherit; null is not a general reset operator. For the cumulative count and time limits above, an explicit `unlimited` replaces an inherited finite request but never removes a host ceiling. A positive finite request is intersected with any host ceiling; zero, negative values and unknown names reject. Existing saved numeric limits remain finite. Explicit `false` and empty lists are preserved. Completion trees and configured lists replace rather than concatenate. Ordinary nested policy leaves merge; changing a progress adapter binding replaces its associated version/configuration instead of silently inheriting another adapter's config. Setting `objective` replaces an inherited template and vice versa. Gate `eq: null` is different: it is an explicit equality operand.
 
 ### Validation, stages and progress
 
@@ -66,6 +66,10 @@ Built-in adapter configuration is strict:
 | Custom named adapter | installed implementation's validated config | Versioned pure callback returning results, managed observation requests or a typed external wait |
 
 The optional validation shortcuts are `required`, `commands: [string]`, `diagnostics: {enabled, fail_on_error}` and `judge: {enabled, llm, pass_threshold, criteria}`. They do not create separate executors. Prefer named checks when referring to exact IDs, schedules and dependencies.
+
+`premature_finish.validation_feedback` is an opt-in disclosure of bounded failed-check output to the next main model request. Use `action: ask_user` with exactly one effectively required `builtin.command` check, a fixed nonempty `host_binding`, and `completion: {validator_passed: <check_id>}`; lifecycle stages, other checks and stagnation policies are rejected for this restricted path. Fields are `check_id`, `enabled` (default `true`), `max_output_chars` (default `2048`, range `1..=4096`) and `max_retries` (default `3`, range `1..=16`, bounded by total forced continuations). An overlay can use `{enabled: false}` to disable inherited feedback. Only an acknowledged, current, actually executed failed check is eligible; rejection, denial, unavailable/unknown/stale evidence or an exhausted allowance falls back to the configured question/stop behavior. Target-revision-bound checks, agents with a state machine and profiles requiring stage/plan supervision are not projected by this path; they retain the question/stop behavior.
+
+Output is sent as untrusted user-role data after context overflow handling, never as a system instruction or approval. The host must treat it as potentially sensitive: enabling the option permits disclosure to the selected provider. Its tail is bounded and reports truncation. A feedback-bearing provider request is one-shot: no automatic provider retry, corrective call or fallback receives that output. Live mutation and owner checks run through final provider admission; task policies and human approvals still apply independently.
 
 A command check's optional `timeout_ms` is part of its exact requested operation and must be positive and within the tool timeout range. When a fixed host binding is used, include the same value in its authorized arguments. The command and shared executor still apply the current policy, classification, recovery and task/check deadlines, so a stricter effective limit can shorten the attempt. Omitting it retains the command tool's existing 30000 ms request default; changing only the policy ceiling does not increase that default.
 
@@ -264,12 +268,14 @@ system_prompt: |
 
 ### `max_iterations`
 
-Maximum LLM call + tool iterations per user turn. Prevents runaway loops.
+Maximum LLM call + tool iterations per ordinary chat turn. Source-aware autonomous tasks enforce an explicitly declared value but do not apply this implicit default as a task-loop cap.
 
 | Detail | Value |
 |--------|-------|
 | **Type** | `u32` |
-| **Default** | `10` |
+| **Default** | `10` for ordinary chat; source-aware task omission has no root loop cap |
+
+When active reasoning has an explicitly declared `reasoning.max_iterations`, its finite task limit also applies. A typed `AgentSpec` has already materialized defaults; `AgentBuilder::from_spec` conservatively retains those numeric limits unless the host supplies an explicit task iteration policy. YAML source-aware construction keeps omission distinct from an explicit `10` or `5`.
 
 ```yaml
 max_iterations: 20

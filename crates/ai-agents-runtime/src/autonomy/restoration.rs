@@ -95,6 +95,9 @@ pub trait TaskRestoreHost: Send + Sync {
 pub struct TaskRestoreNode {
     pub binding: TaskRestoreBinding,
     pub configuration_digest: String,
+    /// Source-aware loop settings are recovery data; the host must install matching real configuration before publication.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_iteration_policy: Option<crate::spec::TaskIterationPolicy>,
     pub runtime: TaskRuntimeCheckpoint,
     pub session: Value,
     pub registry: Option<String>,
@@ -319,7 +322,7 @@ pub(super) fn validate_startup_candidate(
         return Ok(false);
     };
     let manifest: TaskRestoreManifest = serde_json::from_value(adapter.state.clone())?;
-    if manifest.version != 1
+    if !matches!(manifest.version, 1 | 2)
         || manifest.host != host.identity()
         || !driver::current_host_compatible(request, payload)?
         || !host.compatible_manifest(&manifest)?
@@ -771,6 +774,7 @@ async fn capture_manifest(
             TaskRestoreNode {
                 binding,
                 configuration_digest: runtime.task_restore_configuration()?,
+                task_iteration_policy: Some(runtime.task_iteration_policy().clone()),
                 runtime: checkpoint,
                 session,
                 generations,
@@ -958,7 +962,7 @@ async fn capture_manifest(
         .map(|(id, context)| (id.clone(), capture_message_context(context)))
         .collect();
     let manifest = TaskRestoreManifest {
-        version: 1,
+        version: 2,
         host: host.identity(),
         revision,
         payload_digest: payload_digest(payload)?,
@@ -1194,12 +1198,7 @@ fn claimed_execution(
             .insert(runner.agent.info().id, batch.clone());
     }
     *live.controller.lock() = controller;
-    if let Some(expiry) = paused.whole_expiry {
-        live.expiry_projection = Some(
-            live.expiry_projection
-                .map_or(expiry, |current| current.min(expiry)),
-        );
-    }
+    paused.bind_deadlines(live);
     if let Some(todo) = &paused.todo {
         execution.install_todos(runner.agent.todo_store(), todo.checkpoint()?.binding);
     }
@@ -1229,7 +1228,9 @@ fn charge_reconstruction(
         .active_millis
         .checked_add(payload.clocks.interrupted_interval_millis)
         .ok_or(TaskRunStorageError::AdmissionExpired)?;
-    if consumed >= payload.limits.max_active_time_seconds.saturating_mul(1000) {
+    if payload.limits.max_active_time_seconds.is_some_and(|limit| {
+        std::time::Duration::from_millis(consumed) >= std::time::Duration::from_secs(limit)
+    }) {
         return Err(TaskRunStorageError::AdmissionExpired.into());
     }
     Ok(())

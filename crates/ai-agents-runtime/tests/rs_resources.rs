@@ -106,8 +106,8 @@ fn config(calls: u32) -> (AutonomyConfig, AutonomyHostCeilings) {
         AutonomyConfig {
             defaults: AutonomyProfile {
                 enabled: Some(true),
-                max_turns: Some(4),
-                max_llm_calls: Some(calls),
+                max_turns: Some(ai_agents_core::autonomy::AutonomyLimit::Finite(4)),
+                max_llm_calls: Some(ai_agents_core::autonomy::AutonomyLimit::Finite(calls)),
                 max_cost_usd: Some(cost.clone()),
                 max_declared_write_paths: Some(1),
                 completion: Some(CompletionGate::ResponseContains("done".into())),

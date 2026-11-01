@@ -100,11 +100,7 @@ impl AutonomyRunner {
                     release: true,
                     expires_at: execution.expiry(),
                     evidence: None,
-                    deadline: Some(
-                        std::time::Instant::now()
-                            .checked_add(execution.remaining_duration())
-                            .ok_or_else(|| AgentError::Config("pause deadline overflow".into()))?,
-                    ),
+                    deadline: execution.final_deadline()?,
                 },
             )
             .await
@@ -437,10 +433,7 @@ impl AutonomyRunner {
             let live = Arc::get_mut(&mut execution).ok_or(TaskRunStorageError::Conflict)?;
             live.participants = paused.participants.clone();
             live.targets = paused.targets.clone();
-            live.expiry_projection = match (live.expiry_projection, paused.whole_expiry) {
-                (Some(a), Some(b)) => Some(a.min(b)),
-                (a, b) => a.or(b),
-            };
+            paused.bind_deadlines(live);
             *execution.approval_deadlines.lock() = paused.approval_deadlines.clone();
             if let Some((_, group, _)) = &observation_group {
                 *execution.delegate_frames.lock() = group.frames.clone();

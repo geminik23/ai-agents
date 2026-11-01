@@ -112,8 +112,8 @@ struct Fixture {
 async fn host_control_observation_child_objective_supersession_keeps_parent_custody() {
     for sqlite in super::continuation_test_support::backends() {
         let mut f = Box::pin(fixture()).await;
-        f.config.defaults.max_llm_calls = Some(16);
-        f.config.defaults.max_tool_calls = Some(8);
+        f.config.defaults.max_llm_calls = Some(ai_agents_core::autonomy::AutonomyLimit::Finite(16));
+        f.config.defaults.max_tool_calls = Some(ai_agents_core::autonomy::AutonomyLimit::Finite(8));
         f.store = super::continuation_test_support::store(
             f.root.info().id,
             "observation-message.v1",
@@ -361,7 +361,9 @@ async fn fixture_leaf_policy_membership(
             .unwrap(),
     );
     let mut config = super::runner_tests::config(if repause { 4 } else { 3 });
-    config.defaults.max_tool_calls = Some(if repause { 3 } else { 2 });
+    config.defaults.max_tool_calls = Some(ai_agents_core::autonomy::AutonomyLimit::Finite(
+        if repause { 3 } else { 2 },
+    ));
     config.defaults.validation = Some(
         serde_yaml::from_str(
             if hosted { "checks: [{id: check, adapter: host.message, schedule: each_cycle, config: {host_binding: fixed-message}}]" }

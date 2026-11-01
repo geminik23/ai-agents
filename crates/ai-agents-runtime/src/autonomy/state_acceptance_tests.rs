@@ -259,7 +259,7 @@ async fn state_acceptance_stop_cancel_and_limit_revision_preserve_actual_commit_
                         .unwrap(),
                     _ => {
                         let mut limits = first.run.limits.clone();
-                        limits.max_tool_calls += 1;
+                        *limits.max_tool_calls.as_mut().expect("finite test limit") += 1;
                         let revised = f
                             .runner
                             .revise_limits_paused(
@@ -688,7 +688,8 @@ async fn state_acceptance_provider_failure_deadline_or_drop_prevents_later_actio
         .await;
         if mode == "timeout" {
             let mut config = super::runner_tests::config(16);
-            config.defaults.max_active_time_seconds = Some(1);
+            config.defaults.max_active_time_seconds =
+                Some(ai_agents_core::autonomy::AutonomyLimit::Finite(1));
             f.runner = AutonomyRunner::try_new(
                 f.agent.clone(),
                 config,

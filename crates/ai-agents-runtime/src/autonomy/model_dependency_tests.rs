@@ -494,7 +494,7 @@ async fn root_batch(kind: &str, cancel: bool) {
         ScopedTaskRunStore::in_memory(root.info().id, None, "root-batch.v1".into()).unwrap(),
     );
     let mut config = super::runner_tests::config(20);
-    config.defaults.max_tool_calls = Some(10);
+    config.defaults.max_tool_calls = Some(ai_agents_core::autonomy::AutonomyLimit::Finite(10));
     config.defaults.hitl = Some(AutonomyHitlConfig {
         on_user_question: Some(InteractionAction::PauseRun),
         on_approval_required: Some(InteractionAction::PauseRun),

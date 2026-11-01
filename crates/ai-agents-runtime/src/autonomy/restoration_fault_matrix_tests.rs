@@ -3,71 +3,81 @@
 mod terminal_tests;
 use super::*;
 
-// A committed approval with a lost receipt is not a successful live review; no pending body executes in any failure mode.
+// Finite and unbounded reviews retain custody after a rejected, lost or dropped acknowledgement without executing pending work.
 #[tokio::test]
 async fn restoration_review_reject_lost_and_drop_preserve_custody() {
     for &sqlite in crate::autonomy::continuation_test_support::backends() {
-        for mode in ["reject", "lost", "drop"] {
-            let (host, inner, fault, prepared) = fixture("review", mode, sqlite).await;
-            let (runner, paused) =
-                AutonomyRunner::restore_paused(request(&prepared), fault.clone(), host.clone())
-                    .await
-                    .unwrap();
-            let review = runner
-                .restoration_review(&paused.run.key.run_id)
-                .await
-                .unwrap()
-                .unwrap();
-            let mut work = Box::pin(runner.approve_restoration(
-                &paused.run.key.run_id,
-                paused.run.revision,
-                &review.id,
-                ai_agents_hitl::ApprovalResult::Approved,
-            ));
-            if mode == "drop" {
-                tokio::select! {result=&mut work=>panic!("review returned before selected ACK: {result:?}"),permit=fault.reached.acquire()=>permit.unwrap().forget()}
-                drop(work);
-            } else {
-                assert!(work.await.is_err());
-            }
-            assert!(!fault.armed.load(Ordering::SeqCst));
-            let saved = inner.load(&paused.run.key.run_id).await.unwrap().unwrap();
-            assert_eq!(
-                saved.status,
-                if mode == "reject" {
-                    TaskRunStatus::Running
+        for unbounded in [false, true] {
+            for mode in ["reject", "lost", "drop"] {
+                let selected = if unbounded {
+                    unbounded_config()
                 } else {
-                    TaskRunStatus::Paused
-                }
-            );
-            assert_eq!(saved.owner_token.is_some(), mode == "reject");
-            assert_eq!(host.calls.load(Ordering::SeqCst), 1);
-            assert_eq!(host.effects.load(Ordering::SeqCst), 1);
-            assert!(
-                runner
-                    .resume(
-                        &paused.run.key.run_id,
-                        saved.revision,
-                        TaskResumeInput::UserAnswer {
-                            request_id: paused.run.pending.as_ref().unwrap().id.clone(),
-                            answer: serde_json::json!({"answered":true,"selected":["yes"]})
-                        }
-                    )
+                    config()
+                };
+                let (host, inner, fault, prepared) =
+                    fixture_with_config("review", mode, sqlite, selected.clone()).await;
+                let mut restore_request = request(&prepared);
+                restore_request.config = selected;
+                let (runner, paused) =
+                    AutonomyRunner::restore_paused(restore_request, fault.clone(), host.clone())
+                        .await
+                        .unwrap();
+                let review = runner
+                    .restoration_review(&paused.run.key.run_id)
                     .await
-                    .is_err()
-            );
-            let root = host
-                .staged
-                .lock()
-                .get("RestoreRoot")
-                .unwrap()
-                .upgrade()
-                .unwrap();
-            assert!(root.captured_task_owner().unwrap().is_abandoned());
-            assert!(
-                root.set_context("blocked", serde_json::json!(true))
-                    .is_err()
-            );
+                    .unwrap()
+                    .unwrap();
+                let mut work = Box::pin(runner.approve_restoration(
+                    &paused.run.key.run_id,
+                    paused.run.revision,
+                    &review.id,
+                    ai_agents_hitl::ApprovalResult::Approved,
+                ));
+                if mode == "drop" {
+                    tokio::select! {result=&mut work=>panic!("review returned before selected ACK: {result:?}"),permit=fault.reached.acquire()=>permit.unwrap().forget()}
+                    drop(work);
+                } else {
+                    assert!(work.await.is_err());
+                }
+                assert!(!fault.armed.load(Ordering::SeqCst));
+                let saved = inner.load(&paused.run.key.run_id).await.unwrap().unwrap();
+                assert_eq!(
+                    saved.status,
+                    if mode == "reject" {
+                        TaskRunStatus::Running
+                    } else {
+                        TaskRunStatus::Paused
+                    }
+                );
+                assert_eq!(saved.owner_token.is_some(), mode == "reject");
+                assert_eq!(host.calls.load(Ordering::SeqCst), 1);
+                assert_eq!(host.effects.load(Ordering::SeqCst), 1);
+                assert!(
+                    runner
+                        .resume(
+                            &paused.run.key.run_id,
+                            saved.revision,
+                            TaskResumeInput::UserAnswer {
+                                request_id: paused.run.pending.as_ref().unwrap().id.clone(),
+                                answer: serde_json::json!({"answered":true,"selected":["yes"]})
+                            }
+                        )
+                        .await
+                        .is_err()
+                );
+                let root = host
+                    .staged
+                    .lock()
+                    .get("RestoreRoot")
+                    .unwrap()
+                    .upgrade()
+                    .unwrap();
+                assert!(root.captured_task_owner().unwrap().is_abandoned());
+                assert!(
+                    root.set_context("blocked", serde_json::json!(true))
+                        .is_err()
+                );
+            }
         }
     }
 }

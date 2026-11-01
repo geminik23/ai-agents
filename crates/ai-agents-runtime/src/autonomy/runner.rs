@@ -44,6 +44,112 @@ mod paused_control;
 type ControllerFuture<'a, T> =
     std::pin::Pin<Box<dyn std::future::Future<Output = Result<T>> + Send + 'a>>;
 
+// The controller distinguishes a known unlimited allowance from a finite zero or unavailable measurement.
+fn remaining_count(limit: Option<u32>, consumed: u64) -> serde_json::Value {
+    limit.map_or_else(
+        || json!("unlimited"),
+        |limit| json!(u64::from(limit).saturating_sub(consumed)),
+    )
+}
+
+// Active time remains cumulative even when its aggregate allowance is absent.
+fn remaining_active(limit: Option<u64>, consumed_millis: u64) -> serde_json::Value {
+    limit.map_or_else(
+        || json!("unlimited"),
+        |limit| {
+            json!(
+                std::time::Duration::from_secs(limit)
+                    .saturating_sub(std::time::Duration::from_millis(consumed_millis))
+                    .as_secs()
+            )
+        },
+    )
+}
+
+// The retained effective expiry includes inherited bounds even when the task has no wall-time budget.
+pub(super) fn remaining_wall(
+    expiry: Option<chrono::DateTime<chrono::Utc>>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> serde_json::Value {
+    expiry.map_or_else(
+        || json!("unlimited"),
+        |expiry| json!((expiry - now).num_seconds().max(0)),
+    )
+}
+
+// Only current acknowledged failed command evidence may be projected; denial, unknown, stale or modified requests never trigger retry.
+fn validation_feedback(
+    config: &ValidationFeedbackConfig,
+    evidence: &EvaluationEvidence,
+    scope: &EvaluationScope,
+) -> Option<serde_json::Value> {
+    let validation = latest_validation(&evidence.validations, &config.check_id, scope)?;
+    if validation.outcome != GateOutcome::Fail || validation.identity.target.is_some() {
+        return None;
+    }
+    // A rejected or unavailable operation in this cycle always requires a human decision, even if the checker also failed.
+    if evidence.tools.iter().any(|observation| {
+        observation.identity.key == scope.key
+            && observation.identity.objective_revision == scope.objective_revision
+            && observation.identity.cycle == scope.cycle
+            && (matches!(
+                observation.value.policy.outcome,
+                ai_agents_core::PermissionOutcome::Deny
+                    | ai_agents_core::PermissionOutcome::Unavailable
+            ) || observation.value.approval.as_ref().is_some_and(|approval| {
+                matches!(
+                    approval.status,
+                    ai_agents_core::ToolApprovalStatus::Rejected
+                        | ai_agents_core::ToolApprovalStatus::Timeout
+                        | ai_agents_core::ToolApprovalStatus::Unavailable
+                )
+            }))
+    }) {
+        return None;
+    }
+    let observed = evidence.commands.iter().rev().find(|observation| {
+        observation.complete
+            && observation.value.check_id == config.check_id
+            && observation.identity.attempt == validation.identity.attempt
+            && observation.identity.cycle == validation.identity.cycle
+            && observation.identity.config_identity == validation.identity.config_identity
+            && observation.identity.eligible(scope, true, true)
+    })?;
+    let output: serde_json::Value = serde_json::from_str(&observed.value.record.output).ok()?;
+    let combined = output
+        .get("combined_output")
+        .and_then(serde_json::Value::as_str)
+        .filter(|text| !text.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| {
+            format!(
+                "{}\n{}",
+                output
+                    .get("stdout")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(""),
+                output
+                    .get("stderr")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+            )
+        });
+    let limit = config.max_output_chars as usize;
+    let mut chars = combined.chars().rev();
+    let text: String = chars
+        .by_ref()
+        .take(limit)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    let truncated = chars.next().is_some()
+        || output.get("truncated").and_then(serde_json::Value::as_bool) == Some(true);
+    Some(
+        json!({"check_id":config.check_id,"exit_code":observed.value.exit_code,"text":text,"truncated":truncated,"identity":validation.identity}),
+    )
+}
+
 /// Development API for explicit host invocation; it does not enable automatic state/skill task entry.
 pub struct AutonomyRunner {
     agent: Arc<crate::RuntimeAgent>,
@@ -70,8 +176,24 @@ struct PausedTask {
     group: Option<TaskGroupState>,
     controller: Option<Box<ControllerContinuation>>,
     whole_expiry: Option<std::time::Instant>,
+    inherited_expiry: Option<std::time::Instant>,
     approval_deadlines: BTreeMap<String, std::time::Instant>,
     restoration: Option<restoration::LiveRestoreReview>,
+}
+
+impl PausedTask {
+    // A reentry may narrow either cut but cannot replace the original live parent deadline with a later projection.
+    fn bind_deadlines(&self, execution: &mut RunExecution) {
+        execution.expiry_projection = match (execution.expiry_projection, self.whole_expiry) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        execution.inherited_projection =
+            match (execution.inherited_projection, self.inherited_expiry) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
+    }
 }
 
 impl Drop for PausedTask {
@@ -152,6 +274,14 @@ impl AutonomyRunner {
     fn refresh_pause(&self, paused: &mut PausedTask, execution: &RunExecution) -> Result<()> {
         (paused.batch, paused.group) = self.capture_pause(execution)?;
         paused.controller = execution.controller.lock().clone();
+        paused.whole_expiry = match (paused.whole_expiry, execution.expiry_projection) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        paused.inherited_expiry = match (paused.inherited_expiry, execution.inherited_projection) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
         for (id, deadline) in execution.approval_deadlines.lock().iter() {
             paused
                 .approval_deadlines
@@ -353,12 +483,7 @@ impl AutonomyRunner {
                     .insert(leaf.runtime_id.clone(), leaf.batch.clone());
             }
             *live.approval_deadlines.lock() = paused.approval_deadlines.clone();
-            if let Some(expiry) = whole_expiry {
-                live.expiry_projection = Some(
-                    live.expiry_projection
-                        .map_or(expiry, |current| current.min(expiry)),
-                );
-            }
+            paused.bind_deadlines(live);
         }
         if let Some(todo) = &paused.todo {
             execution.install_todos(self.agent.todo_store(), todo.checkpoint()?.binding);
@@ -1159,7 +1284,11 @@ impl AutonomyRunner {
             .clocks
             .active_millis
             .checked_add(payload.clocks.interrupted_interval_millis)
-            .is_none_or(|used| used >= payload.limits.max_active_time_seconds.saturating_mul(1000))
+            .is_none_or(|used| {
+                payload.limits.max_active_time_seconds.is_some_and(|limit| {
+                    std::time::Duration::from_millis(used) >= std::time::Duration::from_secs(limit)
+                })
+            })
             || payload
                 .clocks
                 .expires_at
@@ -1349,14 +1478,7 @@ impl AutonomyRunner {
             live.participants = paused.participants.clone();
             live.targets = paused.targets.clone();
             *live.approval_deadlines.lock() = paused.approval_deadlines.clone();
-        }
-        if let Some(expiry) = whole_expiry {
-            let execution = Arc::get_mut(&mut execution).ok_or(TaskRunStorageError::Conflict)?;
-            execution.expiry_projection = Some(
-                execution
-                    .expiry_projection
-                    .map_or(expiry, |current| current.min(expiry)),
-            );
+            paused.bind_deadlines(live);
         }
         *self.active.lock() = Some(execution.clone());
         if let Some(todo) = &paused.todo {
@@ -1692,7 +1814,7 @@ impl AutonomyRunner {
                 });
             }
             payload.clocks.active_interval_started_at = Some(now);
-            payload.clocks.expires_at = profile
+            let wall_expiry = profile
                 .max_wall_time_seconds
                 .map(|seconds| {
                     i64::try_from(seconds)
@@ -1702,6 +1824,14 @@ impl AutonomyRunner {
                         .ok_or_else(|| AgentError::Config("task expiry overflow".into()))
                 })
                 .transpose()?;
+            // Preserve the original parent invocation lifetime across waits, pauses and explicit host revisions.
+            let inherited_expiry =
+                super::execution::sample_inherited_deadline()?.map(|sample| sample.0);
+            payload.clocks.inherited_expires_at = inherited_expiry;
+            payload.clocks.expires_at = match (wall_expiry, inherited_expiry) {
+                (Some(wall), Some(inherited)) => Some(wall.min(inherited)),
+                (wall, inherited) => wall.or(inherited),
+            };
             let envelope = TaskRunSnapshot {
                 schema_version: TASK_RUN_SCHEMA_VERSION,
                 key: key.clone(),
@@ -1813,6 +1943,7 @@ impl AutonomyRunner {
                     owner,
                     todo,
                     whole_expiry: execution.expiry_projection,
+                    inherited_expiry: execution.inherited_projection,
                     approval_deadlines: execution.approval_deadlines.lock().clone(),
                     batch,
                     group,
@@ -2035,7 +2166,10 @@ impl AutonomyRunner {
                     if execution.stop_reason().is_none()
                         && resumed_response.is_none()
                         && !resuming_turn
-                        && payload.counters.turns >= u64::from(payload.limits.max_turns)
+                        && payload
+                            .limits
+                            .max_turns
+                            .is_some_and(|limit| payload.counters.turns >= u64::from(limit))
                     {
                         let state = ControllerContinuation::decision(
                             &scope,
@@ -2067,7 +2201,9 @@ impl AutonomyRunner {
                             .await;
                     }
                     if resumed_response.is_none() && !resuming_turn {
-                        scope.cycle += 1;
+                        scope.cycle = scope.cycle.checked_add(1).ok_or_else(|| {
+                            AgentError::Config("controller cycle overflow".into())
+                        })?;
                     }
                     scope.mutation_generation = execution.mutation_generation();
                     scope.stage = profile
@@ -2084,23 +2220,28 @@ impl AutonomyRunner {
                     // This is an advisory view; live admission remains authoritative if time passes before dispatch.
                     let controller = json!({"objective":objective,"stage":scope.stage,"instruction":instruction,
                 "todos":todo.map(RunTodoAdapter::checkpoint).transpose()?,
-                "remaining_turns":(payload.limits.max_turns as u64).saturating_sub(payload.counters.turns),
-                "remaining_llm_calls":(payload.limits.max_llm_calls as u64).saturating_sub(payload.counters.llm_attempts),
-                "remaining_tool_calls":(payload.limits.max_tool_calls as u64).saturating_sub(payload.counters.tool_attempts),
-                "remaining_command_calls":(payload.limits.max_command_calls as u64).saturating_sub(payload.counters.command_attempts),
-                "remaining_active_seconds":payload.limits.max_active_time_seconds.saturating_mul(1000).saturating_sub(execution.consumed_active_millis()?)/1000,
-                "remaining_wall_seconds":payload.clocks.expires_at.map(|expiry|(expiry-chrono::Utc::now()).num_seconds().max(0)),
+                "remaining_turns":remaining_count(payload.limits.max_turns, payload.counters.turns),
+                "remaining_llm_calls":remaining_count(payload.limits.max_llm_calls, payload.counters.llm_attempts),
+                "remaining_tool_calls":remaining_count(payload.limits.max_tool_calls, payload.counters.tool_attempts),
+                "remaining_command_calls":remaining_count(payload.limits.max_command_calls, payload.counters.command_attempts),
+                "remaining_active_seconds":remaining_active(payload.limits.max_active_time_seconds, execution.consumed_active_millis()?),
+                "remaining_wall_seconds":remaining_wall(payload.clocks.expires_at, chrono::Utc::now()),
                 "remaining_micro_usd":payload.limits.max_micro_usd.map(|limit| limit.saturating_sub(payload.counters.charged_micro_usd).saturating_sub(payload.reservations.iter().filter(|reservation| matches!(reservation.state, TaskEffectState::Reserved | TaskEffectState::Dispatched | TaskEffectState::Suspended | TaskEffectState::Uncertain)).map(|reservation| reservation.reserved_micro_usd.saturating_sub(reservation.charged_micro_usd)).sum::<u64>())),
                 "remaining_declared_write_paths":payload.limits.max_declared_write_paths.map(|limit| (limit as usize).saturating_sub(payload.declared_write_targets.len())),
                                 "failed_gates":payload.evidence.records.last().and_then(|record| record.data.get("completion")).cloned(),
+                                "untrusted_validation_feedback":payload.controller_state.get("untrusted_validation_feedback").cloned(),
                 "skill_results":super::automatic::skill_results(&payload),
                 "progress_instruction":profile.settings.progress.as_ref().and_then(|progress| progress.auto_create_todo_prompt.clone()).unwrap_or_else(|| "Before progress-gated work, maintain the run todo list and select exactly one active item when required.".into()),
                 "stage_instruction":profile.settings.lifecycle.as_ref().and_then(|stages| stages.get(lifecycle.current_stage)).and_then(|stage| stage.instruction.clone())});
                     execution
                 .update(|payload| {
-                    if resumed_response.is_none() && !resuming_turn { payload.counters.turns += 1; }
+                    if resumed_response.is_none() && !resuming_turn {
+                        payload.counters.turns = payload.counters.turns.checked_add(1)
+                            .ok_or_else(|| AgentError::Config("turn counter overflow".into()))?;
+                    }
                     if forced_continuation && resumed_response.is_none() && !resuming_turn {
-                        payload.counters.continuations += 1;
+                        payload.counters.continuations = payload.counters.continuations.checked_add(1)
+                            .ok_or_else(|| AgentError::Config("continuation counter overflow".into()))?;
                     }
                     payload.stage = scope.stage.clone();
                     payload.controller_state = controller.clone();
@@ -2558,26 +2699,32 @@ impl AutonomyRunner {
                             && payload.children.iter().all(|child| child.result.is_some()),
                         scope_ended: self.agent.automatic_scope_ended(),
                         additional_work_capacity: execution.stop_reason().is_none()
-                            && payload.counters.turns < u64::from(payload.limits.max_turns)
-                            && payload.counters.llm_attempts
-                                < u64::from(payload.limits.max_llm_calls),
+                            && payload
+                                .limits
+                                .max_turns
+                                .is_none_or(|limit| payload.counters.turns < u64::from(limit))
+                            && payload.limits.max_llm_calls.is_none_or(|limit| {
+                                payload.counters.llm_attempts < u64::from(limit)
+                            }),
                         interaction_available: self.interaction_available(),
                     },
                 )?;
                 // Publish the consumed allowance and selected decision, not the advisory pre-turn values, into the result checkpoint.
                 let consumed_active = execution.consumed_active_millis()?;
                 execution.update(|payload| {
-                payload.controller_state["remaining_turns"] = json!((payload.limits.max_turns as u64).saturating_sub(payload.counters.turns));
-                payload.controller_state["remaining_llm_calls"] = json!((payload.limits.max_llm_calls as u64).saturating_sub(payload.counters.llm_attempts));
-                payload.controller_state["remaining_tool_calls"] = json!((payload.limits.max_tool_calls as u64).saturating_sub(payload.counters.tool_attempts));
-                payload.controller_state["remaining_command_calls"] = json!((payload.limits.max_command_calls as u64).saturating_sub(payload.counters.command_attempts));
+                // A consumed feedback projection cannot silently survive a later mutation, retry or human response.
+                if let Some(controller) = payload.controller_state.as_object_mut() { controller.remove("untrusted_validation_feedback"); }
+                payload.controller_state["remaining_turns"] = remaining_count(payload.limits.max_turns, payload.counters.turns);
+                payload.controller_state["remaining_llm_calls"] = remaining_count(payload.limits.max_llm_calls, payload.counters.llm_attempts);
+                payload.controller_state["remaining_tool_calls"] = remaining_count(payload.limits.max_tool_calls, payload.counters.tool_attempts);
+                payload.controller_state["remaining_command_calls"] = remaining_count(payload.limits.max_command_calls, payload.counters.command_attempts);
                 let reserved = payload.reservations.iter().filter(|reservation| matches!(reservation.state, TaskEffectState::Reserved | TaskEffectState::Dispatched | TaskEffectState::Suspended | TaskEffectState::Uncertain))
                     .try_fold(0u64, |total, reservation| total.checked_add(reservation.reserved_micro_usd.saturating_sub(reservation.charged_micro_usd)))
                     .ok_or_else(|| AgentError::Config("controller commitment overflow".into()))?;
                 payload.controller_state["remaining_micro_usd"] = json!(payload.limits.max_micro_usd.map(|limit| limit.saturating_sub(payload.counters.charged_micro_usd).saturating_sub(reserved)));
                 payload.controller_state["remaining_declared_write_paths"] = json!(payload.limits.max_declared_write_paths.map(|limit| (limit as usize).saturating_sub(payload.declared_write_targets.len())));
-                payload.controller_state["remaining_active_seconds"] = json!(payload.limits.max_active_time_seconds.saturating_mul(1000).saturating_sub(consumed_active)/1000);
-                payload.controller_state["remaining_wall_seconds"] = json!(payload.clocks.expires_at.map(|expiry| (expiry-chrono::Utc::now()).num_seconds().max(0)));
+                payload.controller_state["remaining_active_seconds"] = remaining_active(payload.limits.max_active_time_seconds, consumed_active);
+                payload.controller_state["remaining_wall_seconds"] = remaining_wall(payload.clocks.expires_at, chrono::Utc::now());
                 payload.controller_state["lifecycle"] = serde_json::to_value(&lifecycle)?;
                 payload.controller_state["decision"] = serde_json::to_value(&decision)?;
                 payload.controller_state["progress"] = serde_json::to_value(&progress)?;
@@ -2640,12 +2787,15 @@ impl AutonomyRunner {
                             source,
                             forced_continuation,
                         );
-                        let reason =
-                            if payload.counters.turns >= u64::from(payload.limits.max_turns) {
-                                "turn_capacity"
-                            } else {
-                                "invocation_capacity"
-                            };
+                        let reason = if payload
+                            .limits
+                            .max_turns
+                            .is_some_and(|limit| payload.counters.turns >= u64::from(limit))
+                        {
+                            "turn_capacity"
+                        } else {
+                            "invocation_capacity"
+                        };
                         return Box::pin(self.park_limit(execution, todo, state, reason)).await;
                     }
                     CheckpointDecision::Replan => {
@@ -2723,33 +2873,70 @@ impl AutonomyRunner {
                                         .await;
                                 }
                                 PrematureFinishAction::AskUser => {
-                                    progress.handled_sequence = Some(progress.sequence);
-                                    let state = ControllerContinuation::decision(
-                                        &scope,
-                                        &lifecycle,
-                                        &progress,
-                                        &evidence,
-                                        last_response.as_ref(),
-                                        &instruction,
-                                        source,
-                                        false,
-                                    );
-                                    let blocked = evidence.tools.iter().any(|tool| {
-                                        tool.value.policy.outcome
-                                            == ai_agents_core::PermissionOutcome::Deny
-                                    });
-                                    return Box::pin(self.park_question(execution, todo, state,
+                                    let feedback = policy
+                                        .and_then(|p| p.validation_feedback.as_ref())
+                                        .filter(|config| {
+                                            config.enabled
+                                                && self.agent.state_machine().is_none()
+                                                && payload.settings.supervision.as_ref().is_none_or(
+                                                    |supervision| {
+                                                        supervision.stage_changes
+                                                            != Some(ReviewPolicy::RequireApproval)
+                                                            && supervision.plan_changes
+                                                                != Some(
+                                                                    ReviewPolicy::RequireApproval,
+                                                                )
+                                                    },
+                                                )
+                                                && payload.counters.continuations
+                                                    < u64::from(config.max_retries)
+                                                && !execution.owner.work.unsettled()
+                                                && !execution.participants.unsettled()
+                                                && payload.reservations.iter().all(|reservation| {
+                                                    reservation.state == TaskEffectState::Completed
+                                                })
+                                        })
+                                        .and_then(|config| {
+                                            validation_feedback(config, &evidence, &scope)
+                                        });
+                                    if let Some(mut feedback) = feedback {
+                                        // A live mutation clock also invalidates feedback when a concurrent effect begins before it settles.
+                                        feedback["observation_epoch"] =
+                                            json!(self.agent.task_observation_mutation_epoch());
+                                        // The acknowledged exact failure is retained for pause/resume, but is later projected as untrusted user data.
+                                        execution.update(move |payload| {
+                                            payload.controller_state["untrusted_validation_feedback"] = feedback;
+                                            Ok(())
+                                        }).await?;
+                                    } else {
+                                        progress.handled_sequence = Some(progress.sequence);
+                                        let state = ControllerContinuation::decision(
+                                            &scope,
+                                            &lifecycle,
+                                            &progress,
+                                            &evidence,
+                                            last_response.as_ref(),
+                                            &instruction,
+                                            source,
+                                            false,
+                                        );
+                                        let blocked = evidence.tools.iter().any(|tool| {
+                                            tool.value.policy.outcome
+                                                == ai_agents_core::PermissionOutcome::Deny
+                                        });
+                                        return Box::pin(self.park_question(execution, todo, state,
                                         if blocked { "policy_blocked" } else { "premature_finish" },
                                         "Completion is not proven. Provide guidance for the unmet gates; an answer does not waive validation or authorize denied work.".into(), None)).await;
+                                    }
                                 }
                                 PrematureFinishAction::Continue => {}
                             }
-                            if payload.counters.continuations
-                                >= u64::from(
-                                    policy
-                                        .and_then(|p| p.max_continuations)
-                                        .unwrap_or(payload.limits.max_turns),
-                                )
+                            if policy
+                                .and_then(|p| p.max_continuations)
+                                .or(payload.limits.max_turns)
+                                .is_some_and(|limit| {
+                                    payload.counters.continuations >= u64::from(limit)
+                                })
                             {
                                 return self
                                     .finish(
@@ -2830,21 +3017,20 @@ impl AutonomyRunner {
             let snapshot = execution.load_owned().await?;
             let payload: TaskCheckpointPayload = serde_json::from_value(snapshot.payload)?;
             let monotonic_anchor = std::time::Instant::now();
-            let millis = payload
-                .limits
-                .max_active_time_seconds
-                .saturating_mul(1000)
-                .saturating_sub(execution.consumed_active_millis()?);
-            let deadline = chrono::Utc::now()
-                .checked_add_signed(chrono::Duration::milliseconds(
-                    i64::try_from(millis)
-                        .map_err(|_| AgentError::Config("deadline overflow".into()))?,
-                ))
-                .ok_or_else(|| AgentError::Config("deadline overflow".into()))?;
-            let deadline = payload
-                .clocks
-                .expires_at
-                .map_or(deadline, |expiry| deadline.min(expiry));
+            let remaining = execution.remaining_duration();
+            let deadline = remaining
+                .map(|remaining| {
+                    let delta = chrono::Duration::from_std(remaining)
+                        .map_err(|_| AgentError::Config("validation deadline overflow".into()))?;
+                    chrono::Utc::now()
+                        .checked_add_signed(delta)
+                        .ok_or_else(|| AgentError::Config("validation deadline overflow".into()))
+                })
+                .transpose()?;
+            let deadline = match (deadline, payload.clocks.expires_at) {
+                (Some(active), Some(expiry)) => Some(active.min(expiry)),
+                (active, expiry) => active.or(expiry),
+            };
             let cancellation = ToolCancellationToken::new(
                 execution.cancellation.clone(),
                 Some("task cancellation".into()),
@@ -2858,12 +3044,25 @@ impl AutonomyRunner {
                 contract_version: check.adapter.descriptor().contract_version,
             };
             // The driver also retains the original monotonic run/composition cut; UTC projection must not renew it after journal waits.
-            let monotonic_deadline = monotonic_anchor
-                .checked_add(execution.remaining_duration())
-                .ok_or_else(|| AgentError::Config("validation deadline overflow".into()))?;
-            let bounds = ai_agents_llm::InvocationBounds::new(deadline.into(), monotonic_deadline);
+            let bounds = match (deadline, remaining) {
+                (Some(deadline), Some(remaining)) => {
+                    let projection = monotonic_anchor
+                        .checked_add(remaining)
+                        .ok_or_else(|| AgentError::Config("validation deadline overflow".into()))?;
+                    Some(ai_agents_llm::InvocationBounds::new(
+                        deadline.into(),
+                        projection,
+                    ))
+                }
+                (None, None) => None,
+                _ => {
+                    return Err(AgentError::Config(
+                        "validation clock restrictions disagree".into(),
+                    ));
+                }
+            };
             match ai_agents_llm::scope_invocation_bounds(
-                Some(bounds),
+                bounds,
                 driver.drive(
                     check,
                     &ValidationDriveContext {
@@ -2874,7 +3073,7 @@ impl AutonomyRunner {
                         journal,
                         limits: ValidationDriverLimits::default(),
                         cancellation: &cancellation,
-                        deadline: Some(deadline),
+                        deadline,
                     },
                 ),
             )

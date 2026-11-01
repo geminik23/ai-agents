@@ -31,8 +31,8 @@ tool_security:
       env_passthrough: []
 autonomy:
   enabled: true
-  max_turns: 8  # Bound work cycles; resolved default: 30.
-  max_llm_calls: 20  # All managed model calls share this limit; resolved default: 60.
+  max_turns: 8  # Bound work cycles; resolved default: unlimited.
+  max_llm_calls: 20  # All managed model calls share this limit; resolved default: unlimited.
   # These controller checks use the same executor as model tools; their source is task, not llm.
   validation:
     checks:

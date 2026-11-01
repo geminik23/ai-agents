@@ -11,8 +11,8 @@ llm: {provider: openai, model: gpt-5.4-mini}
 tools: []
 autonomy:
   enabled: true  # Explicit task opt-in; loading this file does not start a run.
-  max_turns: 4  # Work-cycle allowance; resolved default: 30.
-  max_llm_calls: 4  # Includes managed auxiliary calls; resolved default: 60.
+  max_turns: 4  # Work-cycle allowance; resolved default: unlimited.
+  max_llm_calls: 4  # Includes managed auxiliary calls; resolved default: unlimited.
   completion: {response_contains: verified report}
   premature_finish: {action: ask_user, on_unavailable: stop}
   profiles:

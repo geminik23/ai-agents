@@ -397,7 +397,12 @@ impl AgentRegistry {
             if child.spec.llm.router_roles().is_none()
                 && child.agent.llm_registry().router_roles().is_none()
             {
-                match serde_yaml::to_string(&child.spec) {
+                match crate::spec::PreparedAgentSpec::new(
+                    child.spec.clone(),
+                    child.agent.task_iteration_policy().clone(),
+                )
+                .to_persistence_yaml()
+                {
                     Ok(spec_yaml) => entries.push(ai_agents_core::SpawnedAgentEntry {
                         id: child.id.clone(),
                         name: child.spec.name.clone(),
@@ -409,7 +414,11 @@ impl AgentRegistry {
                 }
             } else {
                 let spec = child.agent.prepared_persistence_spec(&child.spec)?;
-                let spec_yaml = serde_yaml::to_string(&spec)?;
+                let spec_yaml = crate::spec::PreparedAgentSpec::new(
+                    spec,
+                    child.agent.task_iteration_policy().clone(),
+                )
+                .to_persistence_yaml()?;
                 entries.push(ai_agents_core::SpawnedAgentEntry {
                     id: child.id.clone(),
                     name: child.spec.name.clone(),

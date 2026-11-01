@@ -301,7 +301,9 @@ async fn fixture_with_targets(
         Arc::new(ScopedTaskRunStore::in_memory(parent.info().id, None, "batch.v1".into()).unwrap());
     let mut config =
         super::runner_tests::config(targets.len() as u32 * if re_pause { 3 } else { 2 } + 2);
-    config.defaults.max_tool_calls = Some(targets.len() as u32 * if re_pause { 3 } else { 2 } + 1);
+    config.defaults.max_tool_calls = Some(ai_agents_core::autonomy::AutonomyLimit::Finite(
+        targets.len() as u32 * if re_pause { 3 } else { 2 } + 1,
+    ));
     config.defaults.hitl = Some(AutonomyHitlConfig {
         on_approval_required: Some(InteractionAction::PauseRun),
         on_user_question: Some(InteractionAction::PauseRun),
@@ -377,6 +379,56 @@ fn assert_parent_results(payload: &TaskCheckpointPayload) {
         .unwrap();
     assert_eq!(exchange.result_ids(), &["parent-a", "parent-b", "tail"]);
     assert!(exchange.is_complete());
+}
+
+// A child response cannot claim a parent message whose live model-loop binding changed, while cleanup can still resolve topology.
+#[tokio::test]
+async fn nested_message_rejects_parent_policy_mismatch_without_blocking_cleanup() {
+    let f = Box::pin(fixture(true, false)).await;
+    let paused = f.runner.run("objective", None).await.unwrap();
+    assert_eq!(paused.run.status, TaskRunStatus::Paused);
+    let initial = payload(&f, &paused.run).await;
+    let group: TaskGroupState = serde_json::from_value(
+        initial
+            .adapters
+            .iter()
+            .find(|adapter| adapter.id == "runtime.group")
+            .unwrap()
+            .state
+            .clone(),
+    )
+    .unwrap();
+    let owner = f.parent.captured_task_owner().unwrap();
+    assert!(f.parent.task_group_child(&group, &owner.targets).is_ok());
+    let mut malformed = group.clone();
+    let frame = malformed
+        .frames
+        .values_mut()
+        .find(|frame| frame.cursor["batch"]["loop_state"].is_object())
+        .expect("expected a retained parent message loop");
+    frame.cursor["batch"]["loop_state"]["task_iteration_policy"] =
+        serde_json::to_value(crate::spec::TaskIterationPolicy::configured()).unwrap();
+    assert!(
+        f.parent
+            .task_group_child(&malformed, &owner.targets)
+            .is_err()
+    );
+    assert!(
+        f.parent
+            .task_group_child_for_cleanup(&malformed, &owner.targets)
+            .is_ok()
+    );
+    let retained = f.store.load(&paused.run.key.run_id).await.unwrap().unwrap();
+    assert_eq!(retained.revision, paused.run.revision);
+    assert_eq!(retained.status, TaskRunStatus::Paused);
+    assert_eq!(f.main.calls.load(Ordering::SeqCst), 1);
+    let cancelled = f
+        .runner
+        .cancel_paused(&paused.run.key.run_id, paused.run.revision)
+        .await
+        .unwrap();
+    assert_eq!(cancelled.run.status, TaskRunStatus::Cancelled);
+    assert_eq!(f.main.calls.load(Ordering::SeqCst), 1);
 }
 
 // Multiple children park simultaneously; native history advances only through the contiguous completed prefix.
@@ -1115,7 +1167,7 @@ async fn model_batch_sqlite_repause_rejects_stale_response() {
         .unwrap(),
     );
     let mut config = super::runner_tests::config(6);
-    config.defaults.max_tool_calls = Some(5);
+    config.defaults.max_tool_calls = Some(ai_agents_core::autonomy::AutonomyLimit::Finite(5));
     config.defaults.hitl = Some(AutonomyHitlConfig {
         on_approval_required: Some(InteractionAction::PauseRun),
         on_user_question: Some(InteractionAction::PauseRun),

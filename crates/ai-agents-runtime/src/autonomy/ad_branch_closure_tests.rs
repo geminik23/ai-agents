@@ -521,8 +521,8 @@ async fn ad_speculative_settlement_and_pause_ack_faults_keep_custody() {
                 let config = AutonomyConfig {
                     defaults: AutonomyProfile {
                         enabled: Some(true),
-                        max_turns: Some(2),
-                        max_llm_calls: Some(8),
+                        max_turns: Some(ai_agents_core::autonomy::AutonomyLimit::Finite(2)),
+                        max_llm_calls: Some(ai_agents_core::autonomy::AutonomyLimit::Finite(8)),
                         completion: Some(CompletionGate::ResponseContains("done".into())),
                         hitl: Some(crate::autonomy::AutonomyHitlConfig {
                             on_approval_required: Some(
@@ -573,8 +573,8 @@ async fn ad_discarded_draft_cannot_supply_completion_credit() {
     let config = AutonomyConfig {
         defaults: AutonomyProfile {
             enabled: Some(true),
-            max_turns: Some(1),
-            max_llm_calls: Some(3),
+            max_turns: Some(ai_agents_core::autonomy::AutonomyLimit::Finite(1)),
+            max_llm_calls: Some(ai_agents_core::autonomy::AutonomyLimit::Finite(3)),
             completion: Some(CompletionGate::ResponseContains("LOSER_ONLY".into())),
             hitl: Some(crate::autonomy::AutonomyHitlConfig {
                 on_approval_required: Some(crate::autonomy::InteractionAction::PauseRun),

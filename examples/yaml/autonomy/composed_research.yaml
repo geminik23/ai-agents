@@ -28,7 +28,7 @@ states:
         aggregation: {strategy: llm_synthesis, synthesizer_llm: router}
 autonomy:
   enabled: true
-  max_turns: 3  # Outer work-cycle allowance; resolved default: 30.
-  max_llm_calls: 4  # Exactly covers children plus synthesis; resolved default: 60.
+  max_turns: 3  # Outer work-cycle allowance; resolved default: unlimited.
+  max_llm_calls: 4  # Exactly covers children plus synthesis; resolved default: unlimited.
   hitl: {on_user_question: pause_run}
   completion: {response_contains: aggregated research}

@@ -65,7 +65,8 @@ async fn live_controller_pause_publication_settles_cancellation_or_expiry_withou
                 let mut config =
                     super::super::super::super::runner_tests::config(if limit { 1 } else { 4 });
                 if expire {
-                    config.defaults.max_active_time_seconds = Some(1);
+                    config.defaults.max_active_time_seconds =
+                        Some(ai_agents_core::autonomy::AutonomyLimit::Finite(1));
                 }
                 if limit {
                     config.defaults.on_limit =

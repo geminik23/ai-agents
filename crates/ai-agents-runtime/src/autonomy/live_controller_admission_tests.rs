@@ -73,7 +73,7 @@ async fn live_controller_capacity_claim_cannot_extend_the_original_judge_deadlin
         )
         .unwrap();
         let mut limits = payload.limits;
-        limits.max_llm_calls = 2;
+        limits.max_llm_calls = Some(2);
         let revised = runner
             .revise_limits_paused(
                 &paused.run.key.run_id,

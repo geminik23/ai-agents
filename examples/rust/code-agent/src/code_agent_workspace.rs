@@ -6,7 +6,7 @@
 
 use ai_agents::AgentBuilder;
 use ai_agents::context::ContextSource;
-use ai_agents::spec::AgentSpec;
+use ai_agents::spec::{AgentSpec, PreparedAgentSpec, TaskIterationPolicy};
 use ai_agents::tool_security::CommandRuleConfig;
 use serde_json::json;
 use std::fs::{self, OpenOptions};
@@ -33,6 +33,7 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 pub struct PreparedConfiguration {
     spec: AgentSpec,
+    task_iteration_policy: TaskIterationPolicy,
     root: PathBuf,
     cargo: PathBuf,
     rustc: PathBuf,
@@ -41,7 +42,10 @@ pub struct PreparedConfiguration {
 impl PreparedConfiguration {
     // The caller supplies providers and runners later; this does not replace an existing eval registry.
     pub fn builder(&self) -> AgentBuilder {
-        AgentBuilder::from_spec(self.spec.clone())
+        AgentBuilder::from_prepared_spec(PreparedAgentSpec::new(
+            self.spec.clone(),
+            self.task_iteration_policy.clone(),
+        ))
     }
 
     // The application configuration and independent fixture check use the same resolved bindings.
@@ -240,7 +244,8 @@ pub fn prepare_configuration(
         command_word(&rustc)?,
     ];
     let command = argv.join(" ");
-    let mut spec = AgentSpec::from_yaml_strict(AGENT_YAML)?;
+    let (mut spec, task_iteration_policy) =
+        PreparedAgentSpec::from_yaml_strict(AGENT_YAML)?.into_parts();
     let root_string = root
         .to_str()
         .ok_or("workspace path must be UTF-8")?
@@ -298,6 +303,7 @@ pub fn prepare_configuration(
     spec.validate()?;
     Ok(PreparedConfiguration {
         spec,
+        task_iteration_policy,
         root,
         cargo,
         rustc,

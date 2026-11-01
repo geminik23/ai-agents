@@ -12,8 +12,8 @@ tools: [domain]
 autonomy:
   enabled: true
   execution: {strategy: lifecycle}
-  max_turns: 8  # Work-cycle allowance; resolved default: 30.
-  max_llm_calls: 20  # Shared managed-call allowance; resolved default: 60.
+  max_turns: 8  # Work-cycle allowance; resolved default: unlimited.
+  max_llm_calls: 20  # Shared managed-call allowance; resolved default: unlimited.
   # Stages are required by default. Passing an alternative completion gate cannot skip verification or review.
   lifecycle: [{id: remediate}, {id: verify}, {id: review}]
   validation:

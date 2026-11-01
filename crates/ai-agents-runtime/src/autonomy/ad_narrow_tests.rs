@@ -9,7 +9,7 @@ async fn ad_narrow_owned_and_spawned_callbacks_use_final_lifecycle_admission() {
                 serde_yaml::from_str("- id: explore\n  required_before_tools: [work_probe]\n")
                     .unwrap(),
             ),
-            max_tool_calls: Some(1),
+            max_tool_calls: Some(ai_agents_core::autonomy::AutonomyLimit::Finite(1)),
             ..Default::default()
         };
         let (agent, execution, calls) = shared_executor_fixture(profile.clone(), false).await;

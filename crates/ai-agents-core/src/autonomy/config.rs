@@ -7,6 +7,58 @@ use serde_yaml::Value;
 
 use super::CompletionGate;
 
+/// An explicit cumulative limit override; absence of the outer option means inherit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutonomyLimit<T> {
+    /// A numeric bound, validated as positive by the profile resolver.
+    Finite(T),
+    /// Remove an inherited task bound without bypassing a host ceiling.
+    Unlimited,
+}
+
+impl<T> From<T> for AutonomyLimit<T> {
+    fn from(value: T) -> Self {
+        Self::Finite(value)
+    }
+}
+
+impl<T> AutonomyLimit<T> {
+    /// Returns the requested bound, with explicit unlimited represented as no bound.
+    pub fn finite(self) -> Option<T> {
+        match self {
+            Self::Finite(value) => Some(value),
+            Self::Unlimited => None,
+        }
+    }
+}
+
+impl<T: Serialize> Serialize for AutonomyLimit<T> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Finite(value) => value.serialize(serializer),
+            Self::Unlimited => serializer.serialize_str("unlimited"),
+        }
+    }
+}
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for AutonomyLimit<T> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Representation<T> {
+            Finite(T),
+            Name(String),
+        }
+        match Representation::deserialize(deserializer)? {
+            Representation::Finite(value) => Ok(Self::Finite(value)),
+            Representation::Name(value) if value == "unlimited" => Ok(Self::Unlimited),
+            Representation::Name(_) => Err(serde::de::Error::custom(
+                "expected a positive integer or unlimited",
+            )),
+        }
+    }
+}
+
 /// A positive decimal USD amount stored without floating-point rounding.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UsdAmount(String);
@@ -285,6 +337,30 @@ pub enum InteractionUnavailableAction {
     Fail,
 }
 
+/// Opt-in projection of an executed failed command check into a later model request as untrusted data.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ValidationFeedbackConfig {
+    #[serde(default = "default_feedback_enabled")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub check_id: String,
+    #[serde(default = "default_feedback_chars")]
+    pub max_output_chars: u32,
+    #[serde(default = "default_feedback_retries")]
+    pub max_retries: u32,
+}
+
+fn default_feedback_enabled() -> bool {
+    true
+}
+fn default_feedback_chars() -> u32 {
+    2048
+}
+fn default_feedback_retries() -> u32 {
+    3
+}
+
 /// Bounded response when gates reject a proposed final answer.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -297,6 +373,8 @@ pub struct PrematureFinishConfig {
     pub max_continuations: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validation_feedback: Option<ValidationFeedbackConfig>,
 }
 
 /// Action when another managed invocation is unavailable.
@@ -368,17 +446,17 @@ pub struct AutonomyProfile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supervision: Option<SupervisionConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_turns: Option<u32>,
+    pub max_turns: Option<AutonomyLimit<u32>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_active_time_seconds: Option<u64>,
+    pub max_active_time_seconds: Option<AutonomyLimit<u64>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_wall_time_seconds: Option<u64>,
+    pub max_wall_time_seconds: Option<AutonomyLimit<u64>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_llm_calls: Option<u32>,
+    pub max_llm_calls: Option<AutonomyLimit<u32>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_tool_calls: Option<u32>,
+    pub max_tool_calls: Option<AutonomyLimit<u32>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_command_calls: Option<u32>,
+    pub max_command_calls: Option<AutonomyLimit<u32>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_cost_usd: Option<UsdAmount>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -537,6 +615,40 @@ mod tests {
         assert!(
             serde_yaml::from_str::<AutonomyOverride>("profile: research\nenabled: nope").is_err()
         );
+    }
+
+    #[test]
+    fn cumulative_limits_preserve_inheritance_finite_and_explicit_unlimited() {
+        let config: AutonomyConfig = serde_yaml::from_str(
+            "max_turns: 20\nmax_llm_calls: null\nprofiles:\n  long: {max_turns: unlimited, max_llm_calls: 60}\n",
+        ).unwrap();
+        assert_eq!(config.defaults.max_turns, Some(AutonomyLimit::Finite(20)));
+        assert_eq!(config.defaults.max_llm_calls, None);
+        assert_eq!(
+            config.profiles["long"].max_turns,
+            Some(AutonomyLimit::Unlimited)
+        );
+        assert_eq!(
+            config.profiles["long"].max_llm_calls,
+            Some(AutonomyLimit::Finite(60))
+        );
+        let yaml = serde_yaml::to_string(&config).unwrap();
+        assert_eq!(
+            serde_yaml::from_str::<AutonomyConfig>(&yaml).unwrap(),
+            config
+        );
+        let json = serde_json::to_string(&config.profiles["long"]).unwrap();
+        assert_eq!(
+            serde_json::from_str::<AutonomyProfile>(&json).unwrap(),
+            config.profiles["long"]
+        );
+        for invalid in ["-1", "1.5", "other", "'60'", "true", "4294967296"] {
+            let input = format!("max_turns: {invalid}");
+            assert!(
+                serde_yaml::from_str::<AutonomyConfig>(&input).is_err(),
+                "{input}"
+            );
+        }
     }
 
     #[test]

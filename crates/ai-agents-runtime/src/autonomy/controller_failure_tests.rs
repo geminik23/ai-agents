@@ -204,7 +204,8 @@ async fn controller_dropped_signal_acknowledgement_keeps_effect_and_callback_pro
 async fn controller_expired_wall_wait_can_be_cancelled_without_callback_or_tool() {
     for mode in ["external", "approval", "question"] {
         let mut f = fixture(mode);
-        f.config.defaults.max_wall_time_seconds = Some(1);
+        f.config.defaults.max_wall_time_seconds =
+            Some(ai_agents_core::autonomy::AutonomyLimit::Finite(1));
         f.runner = AutonomyRunner::try_new(
             f.agent.clone(),
             f.config,

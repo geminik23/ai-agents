@@ -129,7 +129,7 @@ pub(super) fn runner_with_store(
     store: Arc<dyn TaskRunStore>,
 ) -> Arc<AutonomyRunner> {
     let mut config = super::runner_tests::config(32);
-    config.defaults.max_tool_calls = Some(24);
+    config.defaults.max_tool_calls = Some(ai_agents_core::autonomy::AutonomyLimit::Finite(24));
     config.defaults.hitl = Some(AutonomyHitlConfig {
         on_user_question: Some(InteractionAction::PauseRun),
         on_approval_required: Some(InteractionAction::PauseRun),

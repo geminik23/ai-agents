@@ -70,9 +70,9 @@ tool_security:
 # Omitted settings keep their resolved framework defaults.
 autonomy:
   enabled: true        # Enable this task profile; default: false.
-  max_turns: 8         # Maximum work cycles; resolved default: 30.
-  max_llm_calls: 20    # Shared model-call allowance; resolved default: 60.
-  max_command_calls: 8 # Shared command allowance; resolved default: 10.
+  max_turns: 8         # Maximum work cycles; resolved default: unlimited.
+  max_llm_calls: 20    # Shared model-call allowance; resolved default: unlimited.
+  max_command_calls: 8 # Shared command allowance; resolved default: unlimited.
   # Checks are absent by default; the host replaces this placeholder with the exact verifier recipe.
   validation:
     checks:

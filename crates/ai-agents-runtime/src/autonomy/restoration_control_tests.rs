@@ -6,7 +6,9 @@ fn control_fixture(kind: &str) -> Fixture {
     let mut f = fixture("external_tool_free");
     f.config.defaults.validation = None;
     f.config.defaults.completion = Some(CompletionGate::ResponseContains("done".into()));
-    f.config.defaults.max_llm_calls = Some(if kind == "capacity" { 1 } else { 5 });
+    f.config.defaults.max_llm_calls = Some(ai_agents_core::autonomy::AutonomyLimit::Finite(
+        if kind == "capacity" { 1 } else { 5 },
+    ));
     if kind == "capacity" {
         f.config.defaults.on_limit = Some(serde_yaml::from_str("action: pause_run").unwrap());
         f.provider
@@ -129,7 +131,7 @@ async fn restoration_controller_capacity_stage_and_replan_reviews_keep_contract(
                 )
                 .unwrap();
                 let mut limits = payload.limits;
-                limits.max_llm_calls = 2;
+                limits.max_llm_calls = Some(2);
                 paused = restored
                     .revise_limits_paused(
                         &paused.run.key.run_id,

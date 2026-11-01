@@ -106,6 +106,7 @@ pub struct AgentBuilder {
     tools_prompt: Option<String>,
     auto_tools_prompt: bool,
     max_iterations: Option<u32>,
+    task_iteration_policy: crate::spec::TaskIterationPolicy,
     max_context_tokens: Option<u32>,
     recovery_manager: Option<RecoveryManager>,
     tool_security: Option<ToolSecurityEngine>,
@@ -137,6 +138,7 @@ pub struct AgentBuilder {
     automatic_options: crate::autonomy::AutomaticTaskOptions,
     task_hosting_requested: bool,
     task_interaction_delivery: bool,
+    bound_task_scope: Option<crate::autonomy::TaskHostScope>,
 }
 
 impl AgentBuilder {
@@ -147,6 +149,7 @@ impl AgentBuilder {
             automatic_options: Default::default(),
             task_hosting_requested: false,
             task_interaction_delivery: true,
+            bound_task_scope: None,
             reasoning: None,
             reflection: None,
             spec: None,
@@ -161,6 +164,7 @@ impl AgentBuilder {
             tools_prompt: None,
             auto_tools_prompt: true,
             max_iterations: None,
+            task_iteration_policy: crate::spec::TaskIterationPolicy::unbounded(),
             max_context_tokens: None,
             recovery_manager: None,
             tool_security: None,
@@ -234,6 +238,7 @@ impl AgentBuilder {
             automatic_options: Default::default(),
             task_hosting_requested: false,
             task_interaction_delivery: true,
+            bound_task_scope: None,
             llm: None,
             llm_registry: None,
             memory: None,
@@ -245,6 +250,7 @@ impl AgentBuilder {
             tools_prompt: None,
             auto_tools_prompt: true,
             max_iterations,
+            task_iteration_policy: crate::spec::TaskIterationPolicy::configured(),
             max_context_tokens,
             recovery_manager: None,
             tool_security: None,
@@ -281,10 +287,34 @@ impl AgentBuilder {
         builder
     }
 
+    /// Builds from a source-aware specification without changing the stable typed schema or ordinary chat defaults.
+    pub fn from_prepared_spec(prepared: crate::spec::PreparedAgentSpec) -> Self {
+        let (spec, policy) = prepared.into_parts();
+        let mut builder = Self::from_spec(spec);
+        builder.task_iteration_policy = policy;
+        builder
+    }
+
+    /// Resolves relative resources while retaining the source-aware task loop policy.
+    pub fn from_prepared_spec_with_base_dir(
+        prepared: crate::spec::PreparedAgentSpec,
+        base_dir: impl Into<PathBuf>,
+    ) -> Self {
+        let mut builder = Self::from_prepared_spec(prepared);
+        builder.yaml_dir = Some(base_dir.into());
+        builder
+    }
+
+    /// Explicitly sets task-loop semantics for typed callers; numeric chat settings and host resource ceilings are unchanged.
+    pub fn task_iteration_policy(mut self, policy: crate::spec::TaskIterationPolicy) -> Self {
+        self.task_iteration_policy = policy;
+        self
+    }
+
     pub fn from_yaml(yaml_content: &str) -> Result<Self> {
-        let spec = AgentSpec::from_yaml_strict(yaml_content)?;
-        spec.validate()?;
-        Ok(Self::from_spec(spec))
+        let prepared = crate::spec::PreparedAgentSpec::from_yaml_strict(yaml_content)?;
+        prepared.spec().validate()?;
+        Ok(Self::from_prepared_spec(prepared))
     }
 
     pub(crate) fn shared_resource_locks(&mut self) -> ToolResourceLocks {
@@ -301,11 +331,11 @@ impl AgentBuilder {
     pub fn from_yaml_file(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         let content = std::fs::read_to_string(path).map_err(AgentError::IoError)?;
-        let spec = AgentSpec::from_yaml_strict(&content)?;
-        spec.validate()?;
+        let prepared = crate::spec::PreparedAgentSpec::from_yaml_strict(&content)?;
+        prepared.spec().validate()?;
         Ok(match path.parent() {
-            Some(parent) => Self::from_spec_with_base_dir(spec, parent),
-            None => Self::from_spec(spec),
+            Some(parent) => Self::from_prepared_spec_with_base_dir(prepared, parent),
+            None => Self::from_prepared_spec(prepared),
         })
     }
 
@@ -325,9 +355,9 @@ impl AgentBuilder {
 
         let rendered_root = load_and_render(template_name)?;
         let processed = TemplateInheritance::process(&rendered_root, load_and_render)?;
-        let spec = AgentSpec::from_yaml_strict(&processed)?;
-        spec.validate()?;
-        Ok(Self::from_spec(spec))
+        let prepared = crate::spec::PreparedAgentSpec::from_yaml_strict(&processed)?;
+        prepared.spec().validate()?;
+        Ok(Self::from_prepared_spec(prepared))
     }
 
     /// Constructs declared providers without consuming auxiliary routing until registrations are complete.
@@ -723,6 +753,7 @@ impl AgentBuilder {
     }
 
     pub fn max_iterations(mut self, max: u32) -> Self {
+        self.task_iteration_policy = self.task_iteration_policy.with_root_limit(true);
         self.max_iterations = Some(max);
         self
     }
@@ -774,6 +805,7 @@ impl AgentBuilder {
         if self.routing_frozen.is_some() {
             self.routing_dirty = true;
         }
+        self.task_iteration_policy.forget_state_sources();
         self.state_machine = Some(machine);
         self
     }
@@ -821,6 +853,7 @@ impl AgentBuilder {
         if self.routing_frozen.is_some() {
             self.routing_dirty = true;
         }
+        self.task_iteration_policy = self.task_iteration_policy.with_reasoning_limit(true);
         self.reasoning = Some(config);
         self
     }
@@ -1278,7 +1311,9 @@ impl AgentBuilder {
         let spec = self.spec.as_ref().ok_or_else(|| {
             AgentError::Config("declarative task scope requires an agent spec".into())
         })?;
-        self.automatic_options.config_identity = Some(scope.validate_prepared(spec, &self.skills)?);
+        self.automatic_options.config_identity =
+            Some(scope.validate_prepared(spec, &self.skills, &self.task_iteration_policy)?);
+        self.bound_task_scope = Some(scope);
         self.task_hosting_requested = true;
         Ok(self)
     }
@@ -1307,6 +1342,41 @@ impl AgentBuilder {
     // Both public construction paths consume this exact finalized runtime; asynchronous preparation never replays builder effects.
     fn build_prepared(mut self) -> Result<(RuntimeAgent, Option<PreparedTaskHosting>)> {
         self.prepare_routing(false)?;
+        // Late fluent overrides must not reuse a namespace bound to different task-loop semantics or skills.
+        if let Some(scope) = &self.bound_task_scope {
+            let spec = self.spec.as_ref().ok_or_else(|| {
+                AgentError::Config("declarative task scope requires an agent spec".into())
+            })?;
+            scope.validate_prepared(spec, &self.skills, &self.task_iteration_policy)?;
+            let reasoning_matches = self
+                .reasoning
+                .as_ref()
+                .map(serde_json::to_value)
+                .transpose()?
+                .is_none_or(|reasoning| {
+                    serde_json::to_value(&spec.reasoning)
+                        .is_ok_and(|expected| reasoning == expected)
+                });
+            let state_matches = self
+                .state_machine
+                .as_ref()
+                .map(|machine| serde_json::to_value(machine.config()))
+                .transpose()?
+                .is_none_or(|state| {
+                    spec.states
+                        .as_ref()
+                        .and_then(|expected| serde_json::to_value(expected).ok())
+                        == Some(state)
+                });
+            if self.max_iterations.unwrap_or(10) != spec.max_iterations
+                || !reasoning_matches
+                || !state_matches
+            {
+                return Err(AgentError::Config(
+                    "bound task declaration differs from effective loop configuration".into(),
+                ));
+            }
+        }
         let resource_locks = self.shared_resource_locks();
         // Capture actor memory and facts configs before partial moves of spec consume fields.
         let actor_memory_config = self
@@ -1878,6 +1948,8 @@ impl AgentBuilder {
             agent = agent.with_facts_config(actor_memory_config, facts_config);
         }
 
+        // Install the source policy after typed component setters, which conservatively mark their numeric inputs explicit.
+        agent = agent.with_task_iteration_policy(self.task_iteration_policy);
         let hosting = install_automatic.then_some(PreparedTaskHosting {
             config: automatic_config,
             options: self.automatic_options,

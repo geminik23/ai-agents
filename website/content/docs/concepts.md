@@ -413,8 +413,7 @@ llm:
 
 For thinking models, prefer native thinking (`llm.reasoning: true`) over `mode: cot`. A future version will wire `mode: cot` to native thinking when the model supports it, with prompt injection as fallback.
 
-When reasoning is active (cot, react, plan_and_execute, or auto), the iteration loop is capped at the lower of the agent-level `max_iterations` and `reasoning.max_iterations`.
-This keeps the reasoning-specific cap as a tighter limit inside the agent's overall safety cap.
+For ordinary chat, active reasoning uses the lower of agent-level `max_iterations` and `reasoning.max_iterations`, including their existing defaults. Source-aware autonomous task loops apply only limits explicitly declared for the relevant root or replacement reasoning configuration; omitted defaults do not become hidden task caps. A typed specification whose source presence was lost remains conservative unless the host explicitly supplies a task iteration policy. Planning, reflection, context and other structural limits remain separate.
 
 For `plan_and_execute` mode, a plan-level reflection loop retries failed plans.
 When `planning.reflection.enabled` is true and a step fails, the runtime checks `on_step_failure` to decide whether to replan, abort, or skip.

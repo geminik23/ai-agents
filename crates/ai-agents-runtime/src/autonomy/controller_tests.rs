@@ -297,11 +297,13 @@ pub(super) fn fixture_configured(
         ScopedTaskRunStore::in_memory(agent.info().id, None, "controller.v1".into()).unwrap(),
     );
     let mut config = super::runner_tests::config(1);
-    config.defaults.max_tool_calls = Some(if mode == "batch" || mode.starts_with("fallback") {
-        2
-    } else {
-        1
-    });
+    config.defaults.max_tool_calls = Some(ai_agents_core::autonomy::AutonomyLimit::Finite(
+        if mode == "batch" || mode.starts_with("fallback") {
+            2
+        } else {
+            1
+        },
+    ));
     config.defaults.validation = Some(
         serde_yaml::from_str(
             if mode == "host" {

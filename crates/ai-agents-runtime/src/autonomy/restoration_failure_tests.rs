@@ -128,11 +128,26 @@ impl TaskRunStore for RestoreFaultStore {
     }
 }
 
-// Prepare the source with the ordinary store, then replace only the new restorer's adapter.
+// Existing finite fault fixtures continue to use their original configuration.
 async fn fixture(
     phase: &'static str,
     mode: &'static str,
     sqlite: bool,
+) -> (
+    Arc<RestoreHost>,
+    Arc<ScopedTaskRunStore>,
+    Arc<RestoreFaultStore>,
+    TaskRunResult,
+) {
+    fixture_with_config(phase, mode, sqlite, config()).await
+}
+
+// Prepare the source with the ordinary store, then replace only the new restorer's adapter.
+async fn fixture_with_config(
+    phase: &'static str,
+    mode: &'static str,
+    sqlite: bool,
+    config: AutonomyConfig,
 ) -> (
     Arc<RestoreHost>,
     Arc<ScopedTaskRunStore>,
@@ -144,7 +159,7 @@ async fn fixture(
     let inner = super::continuation_test_support::store(root.info().id, "restore.v1", sqlite).await;
     let runner = AutonomyRunner::try_new(
         root,
-        config(),
+        config,
         Default::default(),
         inner.clone(),
         "restore.v1".into(),
@@ -166,6 +181,107 @@ fn request(prepared: &TaskRunResult) -> TaskRestoreRequest {
         config_identity: "restore.v1".into(),
         config: config(),
         ceilings: Default::default(),
+    }
+}
+
+// The fault matrix shares the same absent cumulative budgets without changing unrelated host capabilities.
+fn unbounded_config() -> AutonomyConfig {
+    let mut unbounded = config();
+    unbounded.defaults.max_turns = None;
+    unbounded.defaults.max_active_time_seconds = None;
+    unbounded.defaults.max_wall_time_seconds = None;
+    unbounded.defaults.max_llm_calls = None;
+    unbounded.defaults.max_tool_calls = None;
+    unbounded.defaults.max_command_calls = None;
+    unbounded
+}
+
+// Unbounded resource defaults cannot turn ambiguous reconstruction acknowledgements into replay or completed cleanup.
+#[tokio::test]
+async fn unbounded_restoration_claim_and_publication_faults_preserve_custody() {
+    for &sqlite in super::continuation_test_support::backends() {
+        for phase in ["claim", "checkpoint"] {
+            for mode in ["reject", "lost", "drop"] {
+                let unbounded = unbounded_config();
+                let (host, inner, fault, prepared) =
+                    fixture_with_config(phase, mode, sqlite, unbounded.clone()).await;
+                let before = inner.load(&prepared.run.key.run_id).await.unwrap().unwrap();
+                let mut restore_request = request(&prepared);
+                restore_request.config = unbounded.clone();
+                let mut work = Box::pin(AutonomyRunner::restore_paused(
+                    restore_request,
+                    fault.clone(),
+                    host.clone(),
+                ));
+                if mode == "drop" {
+                    tokio::select! {
+                        result = &mut work => panic!("returned before held {phase}: {:?}", result.err()),
+                        permit = fault.reached.acquire() => permit.unwrap().forget(),
+                    }
+                    drop(work);
+                } else {
+                    assert!(work.await.is_err());
+                }
+                let saved = inner.load(&prepared.run.key.run_id).await.unwrap().unwrap();
+                let expected_status = match (phase, mode) {
+                    ("claim", "reject") | ("checkpoint", "lost" | "drop") => TaskRunStatus::Paused,
+                    _ => TaskRunStatus::Running,
+                };
+                assert_eq!(saved.status, expected_status, "{phase}/{mode}");
+                assert_eq!(
+                    saved.owner_token.is_some(),
+                    expected_status == TaskRunStatus::Running
+                );
+                assert_eq!(
+                    saved.payload["pending"]["kind"],
+                    before.payload["pending"]["kind"]
+                );
+                if phase == "checkpoint" && mode != "reject" {
+                    assert_ne!(
+                        saved.payload["pending"]["id"],
+                        before.payload["pending"]["id"]
+                    );
+                } else {
+                    assert_eq!(
+                        saved.payload["pending"]["id"],
+                        before.payload["pending"]["id"]
+                    );
+                }
+                assert_eq!(saved.payload["counters"], before.payload["counters"]);
+                let batch = |snapshot: &TaskRunSnapshot| {
+                    snapshot.payload["adapters"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|adapter| adapter["id"] == "runtime.tool_batch")
+                        .unwrap()["state"]
+                        .clone()
+                };
+                let saved_batch = batch(&saved);
+                let before_batch = batch(&before);
+                assert_eq!(saved_batch["calls"], before_batch["calls"]);
+                assert_eq!(saved_batch["results"], before_batch["results"]);
+                assert!(saved.payload["limits"]["max_llm_calls"].is_null());
+                assert!(saved.payload["limits"]["max_active_time_seconds"].is_null());
+                assert_eq!(host.calls.load(Ordering::SeqCst), 1);
+                assert_eq!(host.effects.load(Ordering::SeqCst), 1);
+                if phase == "claim" && mode == "reject" {
+                    let mut retry = request(&prepared);
+                    retry.config = unbounded;
+                    let (runner, restored) =
+                        AutonomyRunner::restore_paused(retry, inner.clone(), host.clone())
+                            .await
+                            .unwrap();
+                    let cancelled = runner
+                        .cancel_paused(&restored.run.key.run_id, restored.run.revision)
+                        .await
+                        .unwrap();
+                    assert_eq!(cancelled.run.status, TaskRunStatus::Cancelled);
+                    assert_eq!(host.calls.load(Ordering::SeqCst), 1);
+                    assert_eq!(host.effects.load(Ordering::SeqCst), 1);
+                }
+            }
+        }
     }
 }
 

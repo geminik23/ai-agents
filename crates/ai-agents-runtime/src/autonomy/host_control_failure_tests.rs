@@ -238,7 +238,8 @@ async fn host_control_failure_plan_adoption_rechecks_binding_and_deadline_at_roo
                 let inner = support::store(root.info().id, "plan-race.v1", false).await;
                 let store = FaultStore::new(inner, phase, "hold");
                 let mut config = super::super::runner_tests::config(8);
-                config.defaults.max_tool_calls = Some(8);
+                config.defaults.max_tool_calls =
+                    Some(ai_agents_core::autonomy::AutonomyLimit::Finite(8));
                 config.defaults.supervision = Some(SupervisionConfig {
                     stage_changes: None,
                     plan_changes: Some(ReviewPolicy::RequireApproval),
@@ -547,7 +548,7 @@ async fn host_control_failure_response_limit_and_objective_races_have_one_winner
             let (_, runner, _, provider) = fixture(*sqlite).await;
             let first = runner.run("old", None).await.unwrap();
             let mut limits = first.run.limits.clone();
-            limits.max_turns += 1;
+            *limits.max_turns.as_mut().expect("finite test limit") += 1;
             let control = async {
                 if objective {
                     runner

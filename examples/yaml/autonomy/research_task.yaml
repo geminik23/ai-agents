@@ -20,8 +20,8 @@ tools: [domain]
 autonomy:
   enabled: true
   default_profile: research
-  max_turns: 8  # Bound work cycles; resolved default: 30.
-  max_llm_calls: 24  # Main and judge share this allowance; resolved default: 60.
+  max_turns: 8  # Bound work cycles; resolved default: unlimited.
+  max_llm_calls: 24  # Main and judge share this allowance; resolved default: unlimited.
   profiles:
     research:
       execution: {strategy: model_led}

@@ -205,15 +205,22 @@ impl ValidationObservationExecutor for RuntimeObservationExecutor {
         Ok(match request {
             ValidationObservationRequest::Judge { .. }
             | ValidationObservationRequest::Plan { .. }
-                if payload.counters.llm_attempts >= u64::from(payload.limits.max_llm_calls) =>
+                if payload
+                    .limits
+                    .max_llm_calls
+                    .is_some_and(|limit| payload.counters.llm_attempts >= u64::from(limit)) =>
             {
                 Some("llm_capacity".into())
             }
             ValidationObservationRequest::Tool { tool, .. }
-                if payload.counters.tool_attempts >= u64::from(payload.limits.max_tool_calls)
+                if payload
+                    .limits
+                    .max_tool_calls
+                    .is_some_and(|limit| payload.counters.tool_attempts >= u64::from(limit))
                     || (tool == "command"
-                        && payload.counters.command_attempts
-                            >= u64::from(payload.limits.max_command_calls)) =>
+                        && payload.limits.max_command_calls.is_some_and(|limit| {
+                            payload.counters.command_attempts >= u64::from(limit)
+                        })) =>
             {
                 Some("tool_capacity".into())
             }

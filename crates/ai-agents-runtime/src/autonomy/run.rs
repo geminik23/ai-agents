@@ -12,7 +12,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub const TASK_PAYLOAD_VERSION: u32 = 1;
+pub const TASK_PAYLOAD_VERSION: u32 = 2;
 pub const MAX_TASK_CHECKPOINT_RECORDS: usize = 4096;
 
 /// Exact persisted native-history identity, separate from display and actor-memory projections.
@@ -71,7 +71,9 @@ impl TaskRuntimeCheckpoint {
     pub fn between_turns(snapshot: AgentSnapshot) -> Result<Self> {
         let inspection = inspect_native_history(&snapshot.memory.messages)
             .map_err(|_| TaskRunStorageError::InvalidCheckpoint)?;
-        if inspection.exchanges().iter().any(|e| !e.is_complete()) {
+        if inspection.exchanges().iter().any(|e| !e.is_complete())
+            || inspection.has_incomplete_unsigned()
+        {
             return Err(TaskRunStorageError::InvalidCheckpoint.into());
         }
         let native_exchanges = inspection
@@ -133,7 +135,9 @@ impl TaskRuntimeCheckpoint {
         }
         match &self.continuation {
             TaskContinuation::BetweenTurns => {
-                if inspection.exchanges().iter().any(|e| !e.is_complete()) {
+                if inspection.exchanges().iter().any(|e| !e.is_complete())
+                    || inspection.has_incomplete_unsigned()
+                {
                     return Err(TaskRunStorageError::InvalidCheckpoint.into());
                 }
             }
@@ -426,16 +430,30 @@ pub struct TaskReservation {
     pub result: Option<Value>,
 }
 
-/// Resolved numeric ceilings persist independently from raw settings and are not capability proofs.
+// Explicit null means unbounded; a missing replacement field must never silently erase an existing finite limit.
+fn present_optional<'de, D, T>(deserializer: D) -> std::result::Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::deserialize(deserializer)
+}
+
+/// Resolved ceilings persist independently from raw settings; None means unbounded and never grants capabilities.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TaskRunLimits {
-    pub max_turns: u32,
-    pub max_active_time_seconds: u64,
+    #[serde(deserialize_with = "present_optional")]
+    pub max_turns: Option<u32>,
+    #[serde(deserialize_with = "present_optional")]
+    pub max_active_time_seconds: Option<u64>,
     pub max_wall_time_seconds: Option<u64>,
-    pub max_llm_calls: u32,
-    pub max_tool_calls: u32,
-    pub max_command_calls: u32,
+    #[serde(deserialize_with = "present_optional")]
+    pub max_llm_calls: Option<u32>,
+    #[serde(deserialize_with = "present_optional")]
+    pub max_tool_calls: Option<u32>,
+    #[serde(deserialize_with = "present_optional")]
+    pub max_command_calls: Option<u32>,
     pub max_micro_usd: Option<u64>,
     pub max_declared_write_paths: Option<u32>,
 }
@@ -476,6 +494,9 @@ pub struct TaskClocks {
     pub active_interval_started_at: Option<DateTime<Utc>>,
     pub interrupted_interval_millis: u64,
     pub expires_at: Option<DateTime<Utc>>,
+    /// An original parent invocation bound cannot be extended by later host limit revisions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inherited_expires_at: Option<DateTime<Utc>>,
 }
 
 /// Immutable adapter binding data is checkpointed with its exact opaque recovery state.
@@ -634,7 +655,7 @@ impl TaskCheckpointPayload {
         config_identity: &str,
     ) -> Result<()> {
         let invalid = || AgentError::from(TaskRunStorageError::InvalidCheckpoint);
-        if self.version != TASK_PAYLOAD_VERSION
+        if !matches!(self.version, 1 | TASK_PAYLOAD_VERSION)
             || self.objective.trim().is_empty()
             || self.config_identity.is_empty()
             || self.config_identity != config_identity
@@ -648,11 +669,21 @@ impl TaskCheckpointPayload {
             self.limits.max_tool_calls,
             self.limits.max_command_calls,
         ]
-        .contains(&0)
-            || self.limits.max_active_time_seconds == 0
+        .contains(&Some(0))
+            || self.limits.max_active_time_seconds == Some(0)
             || self.limits.max_wall_time_seconds == Some(0)
             || self.limits.max_micro_usd == Some(0)
             || self.limits.max_declared_write_paths == Some(0)
+        {
+            return Err(invalid());
+        }
+        // Version 1 carried mandatory finite values; missing/null fields must not reinterpret a legacy run as unbounded.
+        if self.version == 1
+            && (self.limits.max_turns.is_none()
+                || self.limits.max_active_time_seconds.is_none()
+                || self.limits.max_llm_calls.is_none()
+                || self.limits.max_tool_calls.is_none()
+                || self.limits.max_command_calls.is_none())
         {
             return Err(invalid());
         }
@@ -771,6 +802,13 @@ impl TaskCheckpointPayload {
                 .clocks
                 .expires_at
                 .is_some_and(|expiry| expiry <= envelope.created_at)
+            || self.clocks.inherited_expires_at.is_some_and(|inherited| {
+                inherited <= envelope.created_at
+                    || self
+                        .clocks
+                        .expires_at
+                        .is_none_or(|expiry| expiry > inherited)
+            })
         {
             return Err(invalid());
         }
@@ -814,16 +852,32 @@ impl TaskCheckpointPayload {
         {
             return Err(invalid());
         }
+        let consumed_active = self
+            .clocks
+            .active_millis
+            .checked_add(self.clocks.interrupted_interval_millis)
+            .ok_or_else(invalid)?;
         if envelope.status == TaskRunStatus::Completed
-            && (self.counters.turns > u64::from(self.limits.max_turns)
-                || self.counters.llm_attempts > u64::from(self.limits.max_llm_calls)
-                || self.counters.tool_attempts > u64::from(self.limits.max_tool_calls)
-                || self.counters.command_attempts > u64::from(self.limits.max_command_calls)
+            && (self
+                .limits
+                .max_turns
+                .is_some_and(|limit| self.counters.turns > u64::from(limit))
                 || self
-                    .clocks
-                    .active_millis
-                    .saturating_add(self.clocks.interrupted_interval_millis)
-                    > self.limits.max_active_time_seconds.saturating_mul(1000)
+                    .limits
+                    .max_llm_calls
+                    .is_some_and(|limit| self.counters.llm_attempts > u64::from(limit))
+                || self
+                    .limits
+                    .max_tool_calls
+                    .is_some_and(|limit| self.counters.tool_attempts > u64::from(limit))
+                || self
+                    .limits
+                    .max_command_calls
+                    .is_some_and(|limit| self.counters.command_attempts > u64::from(limit))
+                || self.limits.max_active_time_seconds.is_some_and(|limit| {
+                    std::time::Duration::from_millis(consumed_active)
+                        > std::time::Duration::from_secs(limit)
+                })
                 || self
                     .limits
                     .max_micro_usd
@@ -936,11 +990,30 @@ impl TaskCheckpointPayload {
         host_control: bool,
     ) -> Result<()> {
         let invalid = || AgentError::from(TaskRunStorageError::InvalidCheckpoint);
+        // A newly inherited parent restriction may only narrow the current expiry; ordinary updates cannot otherwise revise lifetime.
+        let inherited_narrowed = match (
+            previous.clocks.inherited_expires_at,
+            self.clocks.inherited_expires_at,
+        ) {
+            (None, Some(_)) => true,
+            (Some(old), Some(new)) => new < old,
+            _ => false,
+        };
+        let narrowed_expiry = match (previous.clocks.expires_at, self.clocks.inherited_expires_at) {
+            (Some(old), Some(inherited)) => Some(old.min(inherited)),
+            (old, inherited) => old.or(inherited),
+        };
         if self.config_identity != previous.config_identity
             || self.profile != previous.profile
             || (!host_control && self.limits != previous.limits)
             || serde_json::to_value(&self.settings)? != serde_json::to_value(&previous.settings)?
-            || (!host_control && self.clocks.expires_at != previous.clocks.expires_at)
+            || (!host_control
+                && self.clocks.expires_at != previous.clocks.expires_at
+                && !(inherited_narrowed && self.clocks.expires_at == narrowed_expiry))
+            || previous
+                .clocks
+                .inherited_expires_at
+                .is_some_and(|old| self.clocks.inherited_expires_at.is_none_or(|new| new > old))
             || self.clocks.active_millis < previous.clocks.active_millis
             || self.clocks.interrupted_interval_millis < previous.clocks.interrupted_interval_millis
             || self.progress.replans < previous.progress.replans

@@ -93,8 +93,10 @@ async fn host_control_validation_supersession_retires_attempt_and_revalidates_re
     for sqlite in support::backends() {
         for mode in ["external", "approval"] {
             let mut f = super::controller_tests::fixture(mode);
-            f.config.defaults.max_llm_calls = Some(4);
-            f.config.defaults.max_tool_calls = Some(4);
+            f.config.defaults.max_llm_calls =
+                Some(ai_agents_core::autonomy::AutonomyLimit::Finite(4));
+            f.config.defaults.max_tool_calls =
+                Some(ai_agents_core::autonomy::AutonomyLimit::Finite(4));
             f.config.defaults.completion = Some(CompletionGate::ValidationPassed(true));
             f.store = support::store(f.agent.info().id, "controller.v1", *sqlite).await;
             f.runner = AutonomyRunner::try_new(
@@ -294,7 +296,7 @@ async fn host_control_stage_fix_rewind_requires_review_without_repeating_validat
     );
     let store = support::store(agent.info().id, "fix.v1", false).await;
     let mut config = super::runner_tests::config(16);
-    config.defaults.max_turns = Some(8);
+    config.defaults.max_turns = Some(ai_agents_core::autonomy::AutonomyLimit::Finite(8));
     config.defaults.lifecycle = Some(serde_json::from_value(json!([
         {"id":"work"}, {"id":"verify","completion":{"response_contains":"verified"},"retry_on_failure":true,"on_failure_stage":"work","max_fix_cycles":1}
     ])).unwrap());
@@ -652,7 +654,7 @@ async fn fixture(
 /// Reuses ordinary lifecycle scheduling rather than inventing a test-only review source.
 fn runner(agent: Arc<crate::RuntimeAgent>, store: Arc<dyn TaskRunStore>) -> AutonomyRunner {
     let mut config = super::runner_tests::config(32);
-    config.defaults.max_turns = Some(8);
+    config.defaults.max_turns = Some(ai_agents_core::autonomy::AutonomyLimit::Finite(8));
     config.defaults.lifecycle =
         Some(serde_json::from_value(json!([{"id":"work"},{"id":"verify"}])).unwrap());
     config.defaults.supervision = Some(SupervisionConfig {
@@ -937,7 +939,7 @@ async fn host_control_review_stop_cancel_and_limit_revision_preserve_pending_pro
                     .unwrap(),
                 _ => {
                     let mut limits = first.run.limits.clone();
-                    limits.max_turns += 1;
+                    *limits.max_turns.as_mut().expect("finite test limit") += 1;
                     let revised = runner
                         .revise_limits_paused(
                             &first.run.key.run_id,

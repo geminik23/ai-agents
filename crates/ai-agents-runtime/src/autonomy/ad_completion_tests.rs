@@ -66,8 +66,8 @@ fn reviewed_runner(agent: Arc<RuntimeAgent>) -> AutonomyRunner {
     let config = AutonomyConfig {
         defaults: AutonomyProfile {
             enabled: Some(true),
-            max_turns: Some(4),
-            max_llm_calls: Some(8),
+            max_turns: Some(ai_agents_core::autonomy::AutonomyLimit::Finite(4)),
+            max_llm_calls: Some(ai_agents_core::autonomy::AutonomyLimit::Finite(8)),
             completion: Some(CompletionGate::ResponseContains("done".into())),
             hitl: Some(crate::autonomy::AutonomyHitlConfig {
                 on_approval_required: Some(crate::autonomy::InteractionAction::PauseRun),

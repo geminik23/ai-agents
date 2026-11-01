@@ -436,7 +436,7 @@ async fn ev_paused_host_controls_share_revision_and_custody_contracts() {
         let operation = match control {
             "limits" => {
                 let mut limits = paused.run.limits.clone();
-                limits.max_llm_calls += 1;
+                *limits.max_llm_calls.as_mut().expect("finite test limit") += 1;
                 TaskStreamOperation::ReviseLimits {
                     run_id: id,
                     revision,
@@ -692,7 +692,7 @@ async fn ev_cooperative_pending_is_not_terminal_eof() {
     let provider = RecordingProvider::new(&replies);
     let (agent, _, store) = fixture(provider, 65);
     let mut config = super::runner_tests::config(65);
-    config.defaults.max_turns = Some(65);
+    config.defaults.max_turns = Some(ai_agents_core::autonomy::AutonomyLimit::Finite(65));
     let runner = AutonomyRunner::try_new(
         agent,
         config,

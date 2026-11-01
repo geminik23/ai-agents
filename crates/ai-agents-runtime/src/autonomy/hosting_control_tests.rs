@@ -704,12 +704,12 @@ fn host_controls_controller_proposals_have_distinct_typed_prompts() {
         TaskHostPrompt::PlanReview { .. }
     ));
     let limits = TaskRunLimits {
-        max_turns: 1,
-        max_active_time_seconds: 10,
+        max_turns: Some(1),
+        max_active_time_seconds: Some(10),
         max_wall_time_seconds: None,
-        max_llm_calls: 1,
-        max_tool_calls: 1,
-        max_command_calls: 1,
+        max_llm_calls: Some(1),
+        max_tool_calls: Some(1),
+        max_command_calls: Some(1),
         max_micro_usd: None,
         max_declared_write_paths: None,
     };
@@ -728,6 +728,6 @@ fn host_controls_controller_proposals_have_distinct_typed_prompts() {
     )
     .unwrap();
     assert!(
-        matches!(capacity, TaskHostPrompt::Capacity { original_limits, .. } if original_limits.max_turns == 1)
+        matches!(capacity, TaskHostPrompt::Capacity { original_limits, .. } if original_limits.max_turns == Some(1))
     );
 }

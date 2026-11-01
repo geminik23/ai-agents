@@ -55,8 +55,9 @@ async fn fixture(sqlite: bool) -> Fixture {
         Arc::new(ScopedTaskRunStore::in_memory(agent.info().id, None, "limits.v1".into()).unwrap())
     };
     let mut config = runner_tests::config(2);
-    config.defaults.max_turns = Some(1);
-    config.defaults.max_wall_time_seconds = Some(120);
+    config.defaults.max_turns = Some(ai_agents_core::autonomy::AutonomyLimit::Finite(1));
+    config.defaults.max_wall_time_seconds =
+        Some(ai_agents_core::autonomy::AutonomyLimit::Finite(120));
     config.defaults.hitl = Some(AutonomyHitlConfig {
         on_user_question: Some(InteractionAction::PauseRun),
         on_approval_required: Some(InteractionAction::PauseRun),
@@ -100,8 +101,8 @@ async fn revise_and_complete(sqlite: bool) {
     let original = f.store.load(&paused.run.key.run_id).await.unwrap().unwrap();
     let before: TaskCheckpointPayload = serde_json::from_value(original.payload.clone()).unwrap();
     let mut limits = before.limits.clone();
-    limits.max_turns = 3;
-    limits.max_llm_calls = 4;
+    limits.max_turns = Some(3);
+    limits.max_llm_calls = Some(4);
     limits.max_wall_time_seconds = Some(240);
     let revised = f
         .runner
@@ -154,7 +155,7 @@ async fn revise_and_complete(sqlite: bool) {
             .is_err()
     );
     let mut invalid = limits;
-    invalid.max_llm_calls = 0;
+    invalid.max_llm_calls = Some(0);
     assert!(
         f.runner
             .revise_limits_paused(
@@ -312,7 +313,7 @@ async fn paused_limits_dropped_acknowledgement_preserves_protection() {
     let snapshot = f.store.load(&paused.run.key.run_id).await.unwrap().unwrap();
     let payload: TaskCheckpointPayload = serde_json::from_value(snapshot.payload).unwrap();
     let mut limits = payload.limits;
-    limits.max_turns = 3;
+    limits.max_turns = Some(3);
     let mut control = Box::pin(f.runner.revise_limits_paused(
         &paused.run.key.run_id,
         paused.run.revision,

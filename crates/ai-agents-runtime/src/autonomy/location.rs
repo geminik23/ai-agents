@@ -31,6 +31,8 @@ pub(crate) struct TaskModelFinal {
     pub reasoning_mode: ai_agents_reasoning::ReasoningMode,
     pub auto_detected: bool,
     pub iterations: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_iteration_policy: Option<crate::spec::TaskIterationPolicy>,
     pub thinking: Option<String>,
     pub reflection_metadata: Option<ai_agents_reasoning::ReflectionMetadata>,
     pub finalize_on_resume: bool,

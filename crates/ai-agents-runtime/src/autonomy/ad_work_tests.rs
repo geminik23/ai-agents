@@ -136,7 +136,7 @@ async fn ad_work_original_bound_blocks_late_callback_effect() {
         release.add_permits(1);
         assert!(work.await.is_err());
         assert_eq!(calls.load(Ordering::SeqCst), 0);
-        assert!(execution.remaining_duration() > Duration::ZERO);
+        assert!(execution.remaining_duration().is_none_or(|remaining| remaining > Duration::ZERO));
     }).await;
 }
 

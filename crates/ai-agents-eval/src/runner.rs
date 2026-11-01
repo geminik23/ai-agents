@@ -1104,7 +1104,8 @@ impl EvalRunner {
             budget,
         } = params;
         let content = std::fs::read_to_string(agent_path)?;
-        let parsed = AgentSpec::from_yaml_strict(&content)?;
+        let prepared = ai_agents_runtime::spec::PreparedAgentSpec::from_yaml_strict(&content)?;
+        let (parsed, task_policy) = prepared.into_parts();
         let mut spec = attempt_context.interpolate_config(&parsed)?;
         apply_eval_llm_settings(&mut spec, &self.suite.settings);
         isolate_spec_storage(&mut spec, attempt_context);
@@ -1153,13 +1154,16 @@ impl EvalRunner {
         if let Some(host) = &self.host {
             host.validate(&spec)?;
         }
-        let builder = AgentBuilder::from_spec_with_base_dir(spec, agent_base_dir)
-            .llm_registry(llm_registry)
-            .tools(tool_registry)
-            .hooks(Arc::new(EvalRecordHooks {
-                tool_log,
-                approval_log,
-            }));
+        let builder = AgentBuilder::from_prepared_spec_with_base_dir(
+            ai_agents_runtime::spec::PreparedAgentSpec::new(spec, task_policy),
+            agent_base_dir,
+        )
+        .llm_registry(llm_registry)
+        .tools(tool_registry)
+        .hooks(Arc::new(EvalRecordHooks {
+            tool_log,
+            approval_log,
+        }));
         let builder = if let Some(host) = &self.host {
             host.configure(builder, attempt_context)?
         } else {
