@@ -294,6 +294,8 @@ impl RuntimeAgent {
                         .unwrap_or(prompt);
                     let mut messages = self.recent_native_safe_messages(5).await?;
                     messages.push(ChatMessage::user(rendered));
+                    // Refresh only the next prompt; the retained action cursor and committed prefix remain unchanged.
+                    let messages = self.prepare_instruction_messages(messages).await?;
                     self.validate_task_actions(state)?;
                     let response = self
                         .observe_purpose(

@@ -7,7 +7,7 @@ use crate::workspace_guard::WorkspaceGuard;
 use crate::workspace_report::WorkspaceReport;
 use ai_agents::AgentBuilder;
 use ai_agents::autonomy::{AutonomyExtensions, HostRevisionSource, HostValidationBinding};
-use ai_agents::context::ContextSource;
+use ai_agents::context::{ContextManager, ContextSource, ScopedInstructionFiles};
 use ai_agents::spec::{AgentSpec, LLMConfigOrSelector, PreparedAgentSpec, TaskIterationPolicy};
 use ai_agents::tool_security::CommandRuleConfig;
 use ai_agents::tools::{
@@ -42,6 +42,8 @@ pub struct WorkspaceSetup {
     guard: Option<Arc<WorkspaceGuard>>,
     cooperative_revision: bool,
     discovery_enabled: bool,
+    explicit_instructions: bool,
+    automatic_instructions: Option<Arc<ScopedInstructionFiles>>,
     checker: Option<CheckerBinding>,
 }
 
@@ -411,11 +413,46 @@ fn prepare_workspace(
         guard,
         cooperative_revision: false,
         discovery_enabled: false,
+        explicit_instructions: instruction_file.is_some(),
+        automatic_instructions: None,
         checker,
     })
 }
 
 impl WorkspaceSetup {
+    // Auto discovery is a separate host authorization and does not widen the model's file tool grants.
+    pub fn enable_automatic_instructions(&mut self) -> Result<()> {
+        if self.explicit_instructions || self.automatic_instructions.is_some() {
+            return Err(
+                "automatic instructions cannot be combined with an explicit snapshot or repeated"
+                    .into(),
+            );
+        }
+        let targets = self
+            .sources
+            .iter()
+            .map(|path| path.strip_prefix(&self.root).map(Path::to_path_buf))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let provider = ScopedInstructionFiles::new(&self.root, &targets, &["AGENTS.md".into()])?;
+        self.spec.context.insert(
+            "workspace_instructions".into(),
+            ContextSource::Instructions {
+                name: "workspace_instructions".into(),
+            },
+        );
+        match self.spec.context.get_mut("instruction_snapshot") {
+            Some(ContextSource::Runtime { default, .. }) => {
+                *default = Some(json!(
+                    "No explicit snapshot; scoped project instructions are prepared separately."
+                ));
+            }
+            _ => return Err("missing instruction snapshot context".into()),
+        }
+        self.spec.validate()?;
+        self.automatic_instructions = Some(Arc::new(provider));
+        Ok(())
+    }
+
     // The caller is responsible for synchronizing every external checker input for the whole session.
     pub fn assume_exclusive_workspace(&mut self) -> Result<()> {
         if self.checker.is_none() {
@@ -534,10 +571,19 @@ impl WorkspaceSetup {
     }
 
     pub fn builder(&self) -> Result<AgentBuilder> {
-        let builder = AgentBuilder::from_prepared_spec(PreparedAgentSpec::new(
+        let mut builder = AgentBuilder::from_prepared_spec(PreparedAgentSpec::new(
             self.spec.clone(),
             self.task_iteration_policy.clone(),
         ));
+        if let Some(provider) = &self.automatic_instructions {
+            let manager = Arc::new(ContextManager::new(
+                self.spec.context.clone(),
+                self.spec.name.clone(),
+                self.spec.version.clone(),
+            ));
+            manager.register_provider("workspace_instructions", provider.clone());
+            builder = builder.context_manager(manager);
+        }
         Ok(match &self.guard {
             Some(guard) => builder.tools(guard.registry()?),
             None => builder,
@@ -615,6 +661,10 @@ impl WorkspaceSetup {
     pub fn cooperative_revision_enabled(&self) -> bool {
         self.cooperative_revision
     }
+
+    pub fn automatic_instructions_enabled(&self) -> bool {
+        self.automatic_instructions.is_some()
+    }
 }
 
 struct CheckerRunner {
@@ -661,6 +711,10 @@ pub async fn run(setup: WorkspaceSetup) -> Result<()> {
         println!("Authorized source: {}", source.display());
     }
     println!("Workspace discovery enabled: {}", setup.discovery_enabled());
+    println!(
+        "Automatic scoped instructions enabled: {}",
+        setup.automatic_instructions_enabled()
+    );
     println!("Maximum model output tokens: {}", setup.max_output_tokens());
     if let Some(timeout) = setup.checker_timeout_ms() {
         println!("Checker timeout: {timeout} ms");

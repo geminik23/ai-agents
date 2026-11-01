@@ -146,7 +146,7 @@ pub mod agent {
 pub mod context {
     pub use ai_agents_context::{
         BuiltinSource, ContextManager, ContextProvider, ContextSource, RefreshPolicy,
-        TemplateRenderer,
+        ScopedInstructionFiles, TemplateRenderer,
     };
 }
 

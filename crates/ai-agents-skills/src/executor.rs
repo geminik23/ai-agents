@@ -11,6 +11,15 @@ use crate::definition::{SkillContext, SkillDefinition, SkillExecutionCursor, Ski
 #[async_trait::async_trait]
 pub trait SkillExecutionObserver: Send + Sync {
     async fn checkpoint(&self, cursor: &SkillExecutionCursor) -> Result<()>;
+
+    /// Returns an optional exact request to retain across capacity pauses; None preserves ordinary prompt behavior.
+    async fn prepare_prompt(
+        &self,
+        _cursor: &SkillExecutionCursor,
+        _prompt: &str,
+    ) -> Result<Option<Vec<ChatMessage>>> {
+        Ok(None)
+    }
 }
 
 struct UnjournaledSkill;
@@ -146,10 +155,23 @@ impl SkillExecutor {
                         Some(alias) => self.llm_registry.get(alias)?,
                         None => self.llm_registry.default()?,
                     };
+                    let messages = if let Some(messages) = &cursor.prepared_prompt {
+                        messages.clone()
+                    } else if let Some(messages) =
+                        observer.prepare_prompt(cursor, &rendered).await?
+                    {
+                        cursor.prepared_prompt = Some(messages.clone());
+                        cursor.validate(skill)?;
+                        observer.checkpoint(cursor).await?;
+                        messages
+                    } else {
+                        vec![ChatMessage::user(&rendered)]
+                    };
                     let response = provider
-                        .complete(&[ChatMessage::user(&rendered)], None)
+                        .complete(&messages, None)
                         .await
                         .map_err(|error| AgentError::LLM(error.to_string()))?;
+                    cursor.prepared_prompt = None;
                     cursor.context.add_result(
                         index,
                         None,

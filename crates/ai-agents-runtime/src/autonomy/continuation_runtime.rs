@@ -1061,6 +1061,10 @@ impl RuntimeAgent {
         state: &TaskLoopState,
     ) -> Result<crate::spec::TaskIterationPolicy> {
         state.validate_policy_shape()?;
+        if state.prepared_instructions.is_some() && !self.context_manager.has_instruction_sources()
+        {
+            return Err(crate::autonomy::TaskRunStorageError::InvalidCheckpoint.into());
+        }
         match (state.version, state.task_iteration_policy.as_ref()) {
             (1, None)
                 if self.task_iteration_policy == crate::spec::TaskIterationPolicy::configured() =>
@@ -1082,13 +1086,15 @@ impl RuntimeAgent {
         use crate::autonomy::location::TaskStateReturn;
         match position {
             TaskStateReturn::BeforeCalls { saved } => {
-                if saved.state.feedback_hook_completed {
+                if saved.state.feedback_hook_completed
+                    || saved.state.prepared_instructions.is_some()
+                {
                     return Err(crate::autonomy::TaskRunStorageError::InvalidCheckpoint.into());
                 }
                 self.checked_task_loop_policy(&saved.state)?;
             }
             TaskStateReturn::ModelContinue { state } => {
-                if state.feedback_hook_completed {
+                if state.feedback_hook_completed || state.prepared_instructions.is_some() {
                     return Err(crate::autonomy::TaskRunStorageError::InvalidCheckpoint.into());
                 }
                 self.checked_task_loop_policy(state)?;
@@ -1170,14 +1176,32 @@ impl RuntimeAgent {
             })?;
             *self.iteration_count.write() = state.iterations;
             let protocol = self.main_tool_protocol(llm.as_ref(), false).await?;
+            let instructions = match state.prepared_instructions.take() {
+                Some(snapshot) => Some(snapshot),
+                None => self.load_work_instructions().await?,
+            };
             let mut messages = self
-                .build_messages_internal(
+                .build_messages_with_instructions(
                     true,
                     None,
                     protocol.choice.is_none(),
                     state.iterations == 1,
+                    instructions.as_deref(),
                 )
                 .await?;
+            if let Some(execution) = crate::autonomy::current_execution()
+                && execution.is_coordinator(&self.info.id)
+                && crate::autonomy::current_child_operation().is_none()
+            {
+                // A capacity pause must retain the prepared projection, including an empty one, before any completed hook.
+                let mut pending = state.clone();
+                pending.iterations = pending
+                    .iterations
+                    .checked_sub(1)
+                    .ok_or_else(|| AgentError::Config("model iteration underflow".into()))?;
+                pending.prepared_instructions = instructions.clone();
+                *execution.capacity_model.lock() = Some(Box::new(pending));
+            }
             self.inject_reasoning_prompt(
                 &mut messages,
                 &state.reasoning_mode,
@@ -1211,6 +1235,7 @@ impl RuntimeAgent {
                                     AgentError::Config("feedback hook iteration underflow".into())
                                 })?;
                             pending.feedback_hook_completed = true;
+                            pending.prepared_instructions = instructions.clone();
                             *execution.capacity_model.lock() = Some(Box::new(pending));
                         }
                         guard.validate()?;

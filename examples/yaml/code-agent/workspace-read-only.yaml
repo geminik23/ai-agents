@@ -5,6 +5,7 @@ description: "Host-bound read-only code task for explicitly selected workspace f
 # The Rust host binds the workspace and provider without installing a checker or a mutation grant.
 # Flow: select files -> read or discover -> answer under a read-only grant.
 # Optional discovery shares additional path listings and search matches with the selected provider.
+# --auto-instructions separately shares scoped root and selected-path ancestor AGENTS.md files with that provider.
 # A nonempty answer completes this read-only task; it does not prove the answer is correct.
 llm: {provider: openai, model: gpt-5.4-mini}
 

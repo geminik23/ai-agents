@@ -481,6 +481,66 @@ async fn workspace_configuration_is_narrow_and_provider_free() {
 
 // Read-only tasks use the same controller without installing mutation, command or checker authority.
 #[tokio::test]
+async fn automatic_instruction_mode_reaches_real_task_requests_and_updates() {
+    let sandbox = Sandbox::new();
+    fs::create_dir(sandbox.root.join("src")).unwrap();
+    fs::create_dir(sandbox.root.join("other")).unwrap();
+    fs::write(sandbox.root.join("src/code.rs"), "fn main() {}\n").unwrap();
+    fs::write(sandbox.root.join("AGENTS.md"), "root-rule-v1").unwrap();
+    fs::write(sandbox.root.join("src/AGENTS.md"), "nested-rule-v1").unwrap();
+    fs::write(sandbox.root.join("other/AGENTS.md"), "outside-scope-secret").unwrap();
+    let args = vec![
+        sandbox.root.to_str().unwrap().to_string(),
+        "src/code.rs".into(),
+        "openai".into(),
+        "offline-test".into(),
+        "--auto-instructions".into(),
+    ];
+    let setup = crate::workspace_setup(&args, true).unwrap();
+    assert!(setup.automatic_instructions_enabled());
+    let provider = Arc::new(Provider::new(VecDeque::from([
+        "first answer".into(),
+        "second answer".into(),
+    ])));
+    let runner = runner_with_provider(&setup, provider.clone());
+    let first = runner.run("read", None).await.unwrap();
+    assert_eq!(first.run.status, TaskRunStatus::Completed);
+    fs::remove_file(sandbox.root.join("AGENTS.md")).unwrap();
+    fs::write(sandbox.root.join("src/AGENTS.md"), "nested-rule-v2").unwrap();
+    let second = runner.run("read again", None).await.unwrap();
+    assert_eq!(second.run.status, TaskRunStatus::Completed);
+    let requests = provider.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    let first_text = requests[0]
+        .iter()
+        .map(|message| message.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let second_text = requests[1]
+        .iter()
+        .map(|message| message.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(first_text.contains("root-rule-v1") && first_text.contains("nested-rule-v1"));
+    assert!(!first_text.contains("outside-scope-secret"));
+    assert!(second_text.contains("nested-rule-v2"));
+    assert!(!second_text.contains("nested-rule-v1") && !second_text.contains("root-rule-v1"));
+    assert!(!second_text.contains("outside-scope-secret"));
+    drop(requests);
+    drop(runner);
+    let conflicting = vec![
+        sandbox.root.to_str().unwrap().to_string(),
+        "src/code.rs".into(),
+        "openai".into(),
+        "offline-test".into(),
+        "src/AGENTS.md".into(),
+        "--auto-instructions".into(),
+    ];
+    assert!(crate::workspace_setup(&conflicting, true).is_err());
+    sandbox.cleanup();
+}
+
+#[tokio::test]
 async fn read_only_workspace_answers_without_edit_or_checker() {
     let sandbox = Sandbox::new();
     let mut setup = prepare_read_only(

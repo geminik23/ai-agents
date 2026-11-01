@@ -99,6 +99,12 @@ impl RuntimeAgent {
             "disambiguation":self.disambiguation_manager.as_ref().map(|manager| manager.config()),
             "actor_memory":self.actor_memory_config,"facts":self.facts_config,
         });
+        // Instruction declarations participate only when opted in; the restore host still binds the actual live source.
+        let instruction_sources = self.context_manager.instruction_source_bindings();
+        if !instruction_sources.is_empty() {
+            self.context_manager.validate_task_instruction_bindings()?;
+            value["instruction_sources"] = serde_json::to_value(instruction_sources)?;
+        }
         if let Some(manager) = &self.relationship_manager {
             value["relationships"] = serde_json::to_value(manager.config())?;
         }
@@ -409,5 +415,55 @@ impl RuntimeAgent {
     /// Exact lookup of retained owner state allows capture to distinguish actual members from unstarted pinned targets.
     pub(crate) fn captured_task_owner(&self) -> Option<Arc<crate::autonomy::RunOwner>> {
         self.autonomy_owner.read().clone()
+    }
+}
+
+#[cfg(test)]
+mod instruction_reconstruction_tests {
+    use super::*;
+    use ai_agents_context::{ContextManager, ContextProvider, ContextSource};
+    use ai_agents_llm::mock::MockLLMProvider;
+
+    struct SafeProvider;
+    #[async_trait::async_trait]
+    impl ContextProvider for SafeProvider {
+        async fn get(&self, _: &str, _: &Value) -> Result<Value> {
+            Ok(Value::String("rules".into()))
+        }
+        fn task_instruction_safe(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn reconstruction_digest_binds_instruction_declarations_and_requires_live_task_provider() {
+        let provider = Arc::new(MockLLMProvider::new("same-provider"));
+        let baseline = crate::AgentBuilder::new()
+            .system_prompt("same")
+            .llm(provider.clone())
+            .build()
+            .unwrap();
+        let manager = Arc::new(ContextManager::new(
+            std::collections::HashMap::from([(
+                "rules".into(),
+                ContextSource::Instructions {
+                    name: "host".into(),
+                },
+            )]),
+            "test".into(),
+            "1".into(),
+        ));
+        let staged = crate::AgentBuilder::new()
+            .system_prompt("same")
+            .llm(provider)
+            .context_manager(manager.clone())
+            .build()
+            .unwrap();
+        assert!(staged.task_restore_configuration().is_err());
+        manager.register_provider("host", Arc::new(SafeProvider));
+        assert_ne!(
+            baseline.task_restore_configuration().unwrap(),
+            staged.task_restore_configuration().unwrap()
+        );
     }
 }

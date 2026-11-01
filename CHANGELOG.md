@@ -3,6 +3,7 @@
 ## Unreleased
 
 ### Added
+- Scoped instructions: opt-in host-bound workspace rules refresh for supported model work without widening tool authority
 - Code agent example: run the scripted sample or connect selected workspace files and a provider to an approved host-owned checker
 - Foreground task observations: opt-in REPL hosts prepare per-task local observations and report acknowledged results without adding execution authority
 - Task evaluation: development typed operations and foreground child decisions share configured hosts, exact continuation, isolated domain bindings and bounded redacted results without replacing the parent's response
@@ -40,6 +41,7 @@
 - Task validation: development-only tri-state checks, tool/fallback/child observation continuation and external signals preserve post-turn controller progress; fixed host permits and single logical journal charges survive re-pause, without adding a second executor or inferring completion from unavailable evidence
 
 ### Changed
+- Rust instruction compatibility: context source matches and skill cursor literals account for the new instruction source and retained prompt field
 - Task execution defaults: new autonomous tasks omit cumulative count and time limits unless explicitly configured or host-bounded; ordinary chat and saved finite limits retain their contracts
 - Code agent workflow: add checker-free read-only tasks, selected new-file creation, local per-task change observations and an explicitly cooperative revision option alongside scoped edits and bounded failed-check feedback
 - Rust task approval compatibility: development `TaskHostPrompt::Approval` patterns include the retained `trigger` field; exact trigger data is sensitive

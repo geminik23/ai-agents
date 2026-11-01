@@ -43,6 +43,33 @@ ai-agents = { version = "1.1.2", features = ["full"] }
 
 ---
 
+## Host-bound instructions (development only)
+
+A YAML `context` entry with `type: instructions` names a host-installed `ContextProvider`; the declaration itself neither opens files nor grants tool access. Unlike ordinary context values, the instruction projection is prepared for supported work-generating model requests and is not inserted into ordinary context snapshots or conversation history. Omission leaves existing agents unchanged. The host must register the provider under the declared name before starting work.
+
+The scoped file provider accepts a canonicalized workspace root, explicit workspace-relative target paths and literal instruction filenames. For example, the following binding expects the `workspace_rules` declaration shown in the [YAML reference](@/docs/yaml-reference.md#type-instructions-development-only):
+
+```rust
+use std::{path::{Path, PathBuf}, sync::Arc};
+use ai_agents::{AgentBuilder, context::{ContextManager, ScopedInstructionFiles}, spec::PreparedAgentSpec};
+
+fn bind_rules(prepared: PreparedAgentSpec, root: &Path, targets: &[PathBuf]) -> ai_agents::Result<AgentBuilder> {
+    let (spec, policy) = prepared.into_parts();
+    let source = ScopedInstructionFiles::new(root, targets, &["AGENTS.md".to_owned()])?;
+    let manager = Arc::new(ContextManager::new(spec.context.clone(), spec.name.clone(), spec.version.clone()));
+    manager.register_provider("workspace_rules", Arc::new(source));
+    Ok(AgentBuilder::from_prepared_spec(PreparedAgentSpec::new(spec, policy)).context_manager(manager))
+}
+```
+
+The source reads only the root and ancestor directories of selected targets, with root entries first and explicit scope labels for nested entries. It does not walk unrelated directories or follow symlinks. The host must prevent concurrent untrusted replacement of validated paths; these checks are not an OS sandbox or an atomic external snapshot. Up to 128 targets, 256 candidate paths, 32 existing files, 64 KiB per file and 256 KiB of total source content are accepted. The combined serialized projection is separately capped at 256 KiB. Missing optional candidates are omitted; unavailable directories, read errors, invalid UTF-8 and exceeded limits fail the request. Preparation has a 15-second cooperative timeout.
+
+The runtime applies the current projection to main blocking/streaming work, state actions, skill prompts, planning and plan steps, and response rewriting. Independent routers, judges, summarizers, custom providers and other agents do not automatically receive it. Each new work request prepares a fresh projection; retries of a prepared request retain it. A capacity-paused model or skill request retains its exact prepared projection in trusted task checkpoint data, which can contain sensitive instruction text and needs host protection. A question or tool result followed by a new model request prepares a new projection. Existing user messages, completed effects, approvals, deadlines and accounting are not replayed or replaced. The existing context-size estimate is checked again for instruction-bearing final messages and native tool definitions; it is an estimate, not the provider's exact tokenizer or an unlimited context guarantee.
+
+Custom providers used for autonomous tasks must explicitly implement `ContextProvider::task_instruction_safe()` only when their work is effect-free, cooperatively cancellable, has no hidden model calls and leaves no untracked effects or detached disclosures after drop. The runtime rejects unsupported task providers. The host remains responsible for that assertion and for provider privacy. Fresh-process task reconstruction requires a matching instruction declaration and a live task-safe binding; the restore host must bind the actual root, targets and provider implementation in its existing runtime binding. Serialized names and checkpoint data are not filesystem authority. Ordinary File context retains its previous missing-value behavior.
+
+Rust consumers matching every `ContextSource` variant must handle `Instructions`. `SkillExecutionCursor` struct literals must include `prepared_prompt: None`; older serialized cursors without it still deserialize. The new defaulted skill-observer method preserves existing observer implementations. Treat source text, trusted hooks and exact checkpoints as potentially sensitive.
+
 ## Auxiliary routing migration (1.1)
 
 Version 1.1.0 introduces hierarchical routing with an explicitly approved, one-time Rust source-compatibility exception. This is not an ordinarily source-compatible SemVer minor. The following migration applies to Rust consumers moving from 1.0.x; scalar YAML selection retains legacy behavior.

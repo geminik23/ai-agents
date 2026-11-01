@@ -96,6 +96,9 @@ pub struct SkillExecutionCursor {
     pub context: SkillContext,
     pub next_step: usize,
     pub pending: Option<ai_agents_core::ToolExecutionRequest>,
+    /// The prepared next prompt is retained only when its observer requires exact retry input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prepared_prompt: Option<Vec<ai_agents_core::ChatMessage>>,
     pub response: Option<String>,
 }
 
@@ -108,6 +111,7 @@ impl SkillExecutionCursor {
             context: SkillContext::new(input).with_extra(extra),
             next_step: 0,
             pending: None,
+            prepared_prompt: None,
             response: None,
         }
     }
@@ -128,6 +132,24 @@ impl SkillExecutionCursor {
         {
             return Err(ai_agents_core::AgentError::Skill(
                 "invalid or changed skill continuation".into(),
+            ));
+        }
+        if let Some(messages) = &self.prepared_prompt
+            && (self.pending.is_some()
+                || !matches!(
+                    skill.steps.get(self.next_step),
+                    Some(SkillStep::Prompt { .. })
+                )
+                || messages.is_empty()
+                || messages.len() > 16
+                || messages
+                    .iter()
+                    .map(|message| message.content.len())
+                    .sum::<usize>()
+                    > 1024 * 1024)
+        {
+            return Err(ai_agents_core::AgentError::Skill(
+                "invalid retained skill prompt".into(),
             ));
         }
         if let Some(request) = &self.pending

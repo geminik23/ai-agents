@@ -48,6 +48,32 @@ struct TaskSkillJournal<'a> {
 }
 #[async_trait]
 impl SkillExecutionObserver for TaskSkillJournal<'_> {
+    /// Prepares only the next prompt under its original skill generation without altering the retained cursor.
+    async fn prepare_prompt(
+        &self,
+        cursor: &SkillExecutionCursor,
+        prompt: &str,
+    ) -> Result<Option<Vec<ChatMessage>>> {
+        if !self.agent.context_manager.has_instruction_sources() {
+            return Ok(None);
+        }
+        self.agent.validate_skill_cursor_binding(
+            cursor,
+            self.actions.as_deref(),
+            self.generation,
+        )?;
+        let messages = self
+            .agent
+            .prepare_instruction_messages(vec![ChatMessage::user(prompt)])
+            .await?;
+        self.agent.validate_skill_cursor_binding(
+            cursor,
+            self.actions.as_deref(),
+            self.generation,
+        )?;
+        Ok(Some(messages))
+    }
+
     /// Completed results retain their original binding before publication and after storage acknowledgement, including final prompt results.
     async fn checkpoint(&self, cursor: &SkillExecutionCursor) -> Result<()> {
         self.agent.validate_skill_cursor_binding(
@@ -347,22 +373,19 @@ impl RuntimeAgent {
                 .insert(self.info.id.clone(), guard.clone());
         }
         let skill = cursor.definition.clone();
+        let invoker = TaskSkillInvoker(self);
+        let journal = TaskSkillJournal {
+            agent: self,
+            context: context.clone(),
+            actions: actions.clone(),
+            generation,
+        };
+        // Erase the nested script future without detaching it or changing its owner and cancellation scope.
+        let work: std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send + '_>> =
+            Box::pin(executor.execute_resumable_with_invoker(&skill, cursor, &invoker, &journal));
         let result = ai_agents_llm::scope_invocation_evidence(
             vec![guard.clone()],
-            self.observe_purpose(
-                ObservationPurpose::SkillPrompt,
-                Box::pin(executor.execute_resumable_with_invoker(
-                    &skill,
-                    cursor,
-                    &TaskSkillInvoker(self),
-                    &TaskSkillJournal {
-                        agent: self,
-                        context: context.clone(),
-                        actions: actions.clone(),
-                        generation,
-                    },
-                )),
-            ),
+            self.observe_purpose(ObservationPurpose::SkillPrompt, work),
         )
         .await;
         self.validate_skill_cursor_binding(cursor, actions.as_deref(), generation)?;

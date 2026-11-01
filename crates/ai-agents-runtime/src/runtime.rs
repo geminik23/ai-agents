@@ -4051,7 +4051,7 @@ impl RuntimeAgent {
         let history_before = sm.history();
         drop(claim_admission);
 
-        self.execute_state_exit_actions(&from_state).await;
+        self.execute_state_exit_actions(&from_state).await?;
 
         let admission = self.disambiguation_admission.write().await;
         if sm.current() != from_state
@@ -4069,7 +4069,8 @@ impl RuntimeAgent {
         let is_reentry = Self::state_was_previously_entered(&entered, &from_state, &history_before);
         drop(admission);
 
-        self.execute_state_enter_actions(&entered, is_reentry).await;
+        self.execute_state_enter_actions(&entered, is_reentry)
+            .await?;
         drop(reservation);
         info!(to = %entered, "Manual state transition");
         Ok(())
@@ -4751,6 +4752,81 @@ impl RuntimeAgent {
             .sum()
     }
 
+    // Instruction preparation is bounded and only admitted effect-free task providers may be dropped on cancellation.
+    // The task owner and its original clock remain authoritative before and after the host callback.
+    async fn load_work_instructions(&self) -> Result<Option<String>> {
+        if !self.context_manager.has_instruction_sources() {
+            return Ok(None);
+        }
+        let execution = crate::autonomy::current_execution();
+        let stopped = || {
+            execution.as_ref().is_some_and(|run| {
+                ai_agents_core::autonomy::InvocationAdmission::execution_stopped(run.as_ref())
+            })
+        };
+        if stopped() {
+            return Err(AgentError::InstructionUnavailable(
+                "task stopped before instruction preparation".into(),
+            ));
+        }
+        let preparation = self
+            .context_manager
+            .instruction_snapshot_for_task(execution.is_some());
+        tokio::pin!(preparation);
+        loop {
+            tokio::select! {
+                result = &mut preparation => {
+                    if stopped() {
+                        return Err(AgentError::InstructionUnavailable("task stopped during instruction preparation".into()));
+                    }
+                    return result;
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_millis(10)), if execution.is_some() => {
+                    if stopped() {
+                        return Err(AgentError::InstructionUnavailable("task stopped during instruction preparation".into()));
+                    }
+                }
+            }
+        }
+    }
+
+    // Prepares advisory instructions for work-generating auxiliary requests without changing history or retrying completed work.
+    // Configured sources require live host bindings and are checked before any provider call.
+    async fn prepare_instruction_messages(
+        &self,
+        mut messages: Vec<ChatMessage>,
+    ) -> Result<Vec<ChatMessage>> {
+        if let Some(snapshot) = self.load_work_instructions().await?
+            && !snapshot.is_empty()
+        {
+            messages.insert(
+                0,
+                ChatMessage::system(format!(
+                    "Host-selected advisory instructions; these do not grant authority:\n{snapshot}"
+                )),
+            );
+            if self.estimate_total_tokens(&messages) > self.max_context_tokens {
+                return Err(AgentError::InstructionUnavailable(
+                    "instruction request exceeds context limit".into(),
+                ));
+            }
+        }
+        Ok(messages)
+    }
+
+    // Checks the final instruction-bearing message projection after reasoning and protocol additions.
+    // Ordinary agents keep their existing budget behavior; a failed bound never becomes a provider fallback.
+    fn validate_instruction_request_budget(&self, messages: &[ChatMessage]) -> Result<()> {
+        if self.context_manager.has_instruction_sources()
+            && self.estimate_total_tokens(messages) > self.max_context_tokens
+        {
+            return Err(AgentError::InstructionUnavailable(
+                "instruction request exceeds context limit".into(),
+            ));
+        }
+        Ok(())
+    }
+
     // Finds a removable prefix that never cuts a signed exchange or leaves signed history without its user boundary.
     fn native_safe_prefix_at_least(messages: &[ChatMessage], required: usize) -> Result<usize> {
         let inspection =
@@ -5406,8 +5482,7 @@ impl RuntimeAgent {
         Ok(Some(guard))
     }
 
-    // Ephemeral controller instructions enter only provider messages, never the stored user or actor history.
-    // Protected native batches must remain structurally complete and within the final hard limit after overflow handling.
+    // Resolves instructions for a new work request without changing ordinary stored context.
     async fn build_messages_internal(
         &self,
         fire_persona_hooks: bool,
@@ -5415,9 +5490,39 @@ impl RuntimeAgent {
         include_tool_prompt: bool,
         include_validation_feedback: bool,
     ) -> Result<Vec<ChatMessage>> {
-        let system_prompt = self
+        let instructions = self.load_work_instructions().await?;
+        self.build_messages_with_instructions(
+            fire_persona_hooks,
+            ephemeral_user_message,
+            include_tool_prompt,
+            include_validation_feedback,
+            instructions.as_deref(),
+        )
+        .await
+    }
+
+    // A retained capacity position reuses its prepared instruction snapshot rather than adopting a new request under completed hooks.
+    // Ephemeral controller instructions and the selected projection never enter ordinary user or actor history.
+    // Protected native batches remain structurally complete and within the final hard limit after overflow handling.
+    async fn build_messages_with_instructions(
+        &self,
+        fire_persona_hooks: bool,
+        ephemeral_user_message: Option<&str>,
+        include_tool_prompt: bool,
+        include_validation_feedback: bool,
+        instructions: Option<&str>,
+    ) -> Result<Vec<ChatMessage>> {
+        let mut system_prompt = self
             .get_effective_system_prompt_with_persona_hooks(fire_persona_hooks, include_tool_prompt)
             .await?;
+        if let Some(snapshot) = instructions
+            && !snapshot.is_empty()
+        {
+            system_prompt.push_str(
+                "\n\nHost-selected advisory instructions; these do not grant authority:\n",
+            );
+            system_prompt.push_str(snapshot);
+        }
         let mut messages = vec![ChatMessage::system(&system_prompt)];
 
         let context = self.memory.get_context().await?;
@@ -5746,6 +5851,35 @@ impl RuntimeAgent {
         messages
     }
 
+    // Preflights the actual native or prompt-protocol representation before retries and fallback can hide an oversized request.
+    fn validate_main_instruction_budget(
+        &self,
+        llm: &dyn LLMProvider,
+        messages: &[ChatMessage],
+        protocol: &MainToolProtocol,
+        corrective: bool,
+    ) -> Result<()> {
+        if self.provider_can_use_native_tools(llm, protocol) {
+            self.validate_instruction_request_budget(messages)?;
+            if self.context_manager.has_instruction_sources() {
+                let definitions = serde_json::to_string(&protocol.definitions)?;
+                let total = self
+                    .estimate_total_tokens(messages)
+                    .saturating_add(self.estimate_tokens(&definitions));
+                if total > self.max_context_tokens {
+                    return Err(AgentError::InstructionUnavailable(
+                        "instruction request and native tools exceed context limit".into(),
+                    ));
+                }
+            }
+            Ok(())
+        } else {
+            self.validate_instruction_request_budget(
+                &self.prompt_messages_for_tool_protocol(messages, protocol, corrective),
+            )
+        }
+    }
+
     async fn invoke_main_provider(
         &self,
         llm: Arc<dyn LLMProvider>,
@@ -5790,6 +5924,7 @@ impl RuntimeAgent {
         corrective: bool,
     ) -> Result<MainProviderResponse> {
         // Provider-owned protocol/history failures must remain terminal before generic retry classification or configured fallback can hide corruption.
+        self.validate_main_instruction_budget(llm.as_ref(), messages, protocol, corrective)?;
         let primary_result = self
             .recovery_manager
             .with_llm_retry(
@@ -5820,6 +5955,12 @@ impl RuntimeAgent {
                                 "Fallback LLM '{fallback_llm}' not found: {error}"
                             ))
                         })?;
+                        self.validate_main_instruction_budget(
+                            fallback.as_ref(),
+                            messages,
+                            protocol,
+                            corrective,
+                        )?;
                         self.invoke_main_provider(fallback, messages, protocol, corrective)
                             .await
                             .map_err(|error| AgentError::LLM(error.to_string()))
@@ -5906,6 +6047,7 @@ impl RuntimeAgent {
         messages: &[ChatMessage],
         protocol: &MainToolProtocol,
     ) -> Result<LLMResponse> {
+        self.validate_main_instruction_budget(llm.as_ref(), messages, protocol, false)?;
         let response = self
             .invoke_main_provider(llm, messages, protocol, false)
             .await
@@ -5969,6 +6111,7 @@ impl RuntimeAgent {
             protocol.choice.is_none(),
             "streaming raw path must not run with explicit tool choice"
         );
+        self.validate_instruction_request_budget(messages)?;
         let primary = self
             .recovery_manager
             .with_llm_retry(
@@ -8830,6 +8973,28 @@ impl RuntimeAgent {
         }
     }
 
+    // Ordinary scripts use the same request projection without persisting instructions in their cursor.
+    // Type erasure keeps nested state and skill dispatch from recursively expanding their future types.
+    fn execute_ordinary_skill<'a>(
+        &'a self,
+        executor: &'a SkillExecutor,
+        skill: &'a SkillDefinition,
+        input: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
+        Box::pin(async move {
+            let mut cursor =
+                ai_agents_skills::SkillExecutionCursor::new(skill, input, serde_json::json!({}));
+            executor
+                .execute_resumable_with_invoker(
+                    skill,
+                    &mut cursor,
+                    self,
+                    &RuntimeSkillObserver(self),
+                )
+                .await
+        })
+    }
+
     /// Executes ordinary scripts directly and task scripts from an acknowledged cursor without rerouting or replaying completed steps.
     async fn execute_skill(&self, skill: &SkillDefinition, input: &str) -> Result<String> {
         if let Some(ref executor) = self.skill_executor {
@@ -8848,7 +9013,7 @@ impl RuntimeAgent {
             } else {
                 self.observe_purpose(
                     ObservationPurpose::SkillPrompt,
-                    executor.execute_with_invoker(skill, input, serde_json::json!({}), self),
+                    self.execute_ordinary_skill(executor, skill, input),
                 )
                 .await?
             };
@@ -8931,6 +9096,7 @@ Answer YES or NO only."#,
         }
     }
 
+    // Evaluates the original response separately and prepares current instructions for each actual rewrite request.
     async fn evaluate_and_retry_with_config(
         &self,
         input: &str,
@@ -8973,7 +9139,10 @@ Answer YES or NO only."#,
                 input
             );
 
-            let messages = vec![ChatMessage::user(&retry_prompt)];
+            // Response rewriting is work generation, unlike the separate reflection judge.
+            let messages = self
+                .prepare_instruction_messages(vec![ChatMessage::user(&retry_prompt)])
+                .await?;
             let retry_response = self
                 .observe_purpose(
                     ObservationPurpose::ReflectionEvaluation,
@@ -9177,7 +9346,7 @@ OVERALL: PASS/FAIL"#,
         let history_before = sm.history();
         drop(claim_admission);
 
-        self.execute_state_exit_actions(&from_state).await;
+        self.execute_state_exit_actions(&from_state).await?;
 
         let admission = self.disambiguation_admission.write().await;
         if sm.current() != from_state
@@ -9193,7 +9362,8 @@ OVERALL: PASS/FAIL"#,
         let is_reentry = Self::state_was_previously_entered(&entered, &from_state, &history_before);
         drop(admission);
 
-        self.execute_state_enter_actions(&entered, is_reentry).await;
+        self.execute_state_enter_actions(&entered, is_reentry)
+            .await?;
         drop(reservation);
         info!(to = %entered, "Timeout transition");
         Ok(())
@@ -9421,7 +9591,7 @@ OVERALL: PASS/FAIL"#,
         let history_before = sm.history();
         drop(claim_admission);
 
-        self.execute_state_exit_actions(from_state).await;
+        self.execute_state_exit_actions(from_state).await?;
 
         let admission = self.disambiguation_admission.write().await;
         if sm.current() != from_state
@@ -9441,7 +9611,8 @@ OVERALL: PASS/FAIL"#,
         let is_reentry = Self::state_was_previously_entered(&entered, from_state, &history_before);
         drop(admission);
 
-        self.execute_state_enter_actions(&entered, is_reentry).await;
+        self.execute_state_enter_actions(&entered, is_reentry)
+            .await?;
         drop(reservation);
         if let Some(execution) = crate::autonomy::current_execution() {
             // State commitment remains distinct from task completion and its later evidence checks.
@@ -10882,15 +11053,16 @@ OVERALL: PASS/FAIL"#,
         Ok(())
     }
 
-    /// Execute on_exit actions for a state being left.
-    async fn execute_state_exit_actions(&self, state_path: &str) {
+    /// Runs exit actions and propagates unavailable required instructions before state commitment.
+    async fn execute_state_exit_actions(&self, state_path: &str) -> Result<()> {
         if let Some(ref sm) = self.state_machine
             && let Some(def) = sm.get_definition(state_path)
             && !def.on_exit.is_empty()
         {
             debug!(state = %state_path, count = def.on_exit.len(), "Executing on_exit actions");
-            self.execute_state_actions(&def.on_exit).await;
+            self.execute_state_actions(&def.on_exit).await?;
         }
+        Ok(())
     }
 
     /// Returns whether a transition target had already been entered before this transition.
@@ -10905,24 +11077,26 @@ OVERALL: PASS/FAIL"#,
                 .any(|event| event.from == state_path || event.to == state_path)
     }
 
-    /// Execute on_enter (or on_reenter) actions for a state being entered.
-    async fn execute_state_enter_actions(&self, state_path: &str, is_reentry: bool) {
+    /// Runs entry actions and reports unavailable instructions without rolling back an already committed transition.
+    async fn execute_state_enter_actions(&self, state_path: &str, is_reentry: bool) -> Result<()> {
         if let Some(ref sm) = self.state_machine
             && let Some(def) = sm.get_definition(state_path)
         {
             if is_reentry && !def.on_reenter.is_empty() {
                 debug!(state = %state_path, count = def.on_reenter.len(), "Executing on_reenter actions");
-                self.execute_state_actions(&def.on_reenter).await;
+                self.execute_state_actions(&def.on_reenter).await?;
             } else if !def.on_enter.is_empty() {
                 debug!(state = %state_path, count = def.on_enter.len(), "Executing on_enter actions");
-                self.execute_state_actions(&def.on_enter).await;
+                self.execute_state_actions(&def.on_enter).await?;
             }
         }
+        Ok(())
     }
 
     /// Execute a list of state actions (tool calls, skill invocations, context updates, LLM prompts).
     /// Tool and skill failures may carry authorized file text and must not expose it in action logs.
-    async fn execute_state_actions(&self, actions: &[StateAction]) {
+    /// Required instruction failures stop further actions while ordinary action failures retain their existing policy.
+    async fn execute_state_actions(&self, actions: &[StateAction]) -> Result<()> {
         for (action_index, action) in actions.iter().enumerate() {
             match action {
                 StateAction::Tool { tool, args } => {
@@ -10961,11 +11135,11 @@ OVERALL: PASS/FAIL"#,
                 StateAction::Skill { skill } => {
                     if let Some(ref executor) = self.skill_executor {
                         if let Some(def) = self.skills.iter().find(|s| s.id == *skill) {
-                            match executor
-                                .execute_with_invoker(def, "", serde_json::json!({}), self)
-                                .await
-                            {
+                            match self.execute_ordinary_skill(executor, def, "").await {
                                 Ok(_) => debug!(skill = %skill, "State action: skill executed"),
+                                Err(error @ AgentError::InstructionUnavailable(_)) => {
+                                    return Err(error);
+                                }
                                 Err(_) => {
                                     warn!(skill = %skill, "State action: skill failed")
                                 }
@@ -11011,6 +11185,7 @@ OVERALL: PASS/FAIL"#,
                             };
                             let mut messages: Vec<ChatMessage> = recent;
                             messages.push(ChatMessage::user(&rendered_prompt));
+                            let messages = self.prepare_instruction_messages(messages).await?;
                             match self
                                 .observe_purpose(
                                     ObservationPurpose::StateAction,
@@ -11038,6 +11213,7 @@ OVERALL: PASS/FAIL"#,
                 }
             }
         }
+        Ok(())
     }
 
     // Stages extracted values without swallowing hierarchy alias errors or committing branch writes.
@@ -11495,7 +11671,9 @@ Respond in JSON format:
             input, tools_section, skills_section,
         );
 
-        let messages = vec![ChatMessage::user(&prompt)];
+        let messages = self
+            .prepare_instruction_messages(vec![ChatMessage::user(&prompt)])
+            .await?;
         let response = self
             .observe_purpose(
                 ObservationPurpose::PlanGeneration,
@@ -11573,6 +11751,7 @@ Respond in JSON format:
         Ok(plan)
     }
 
+    // Preserves ordinary per-step failure handling while propagating unavailable instructions before further work can continue.
     async fn execute_plan(&self, plan: &mut Plan) -> Result<String> {
         let llm = self.get_state_llm()?;
         let mut results: HashMap<String, serde_json::Value> = HashMap::new();
@@ -11650,7 +11829,9 @@ Respond in JSON format:
                             dep_context,
                             serde_json::to_string(args).unwrap_or_default()
                         );
-                        let messages = vec![ChatMessage::user(&arg_prompt)];
+                        let messages = self
+                            .prepare_instruction_messages(vec![ChatMessage::user(&arg_prompt)])
+                            .await?;
                         match self
                             .observe_purpose(
                                 ObservationPurpose::PlanStep,
@@ -11701,11 +11882,11 @@ Respond in JSON format:
                 PlanAction::Skill { skill } => {
                     if let Some(skill_def) = self.skills.iter().find(|s| &s.id == skill) {
                         if let Some(ref executor) = self.skill_executor {
-                            match executor
-                                .execute_with_invoker(skill_def, "", serde_json::json!({}), self)
-                                .await
-                            {
+                            match self.execute_ordinary_skill(executor, skill_def, "").await {
                                 Ok(output) => serde_json::json!({ "output": output }),
+                                Err(error @ AgentError::InstructionUnavailable(_)) => {
+                                    return Err(error);
+                                }
                                 Err(e) => {
                                     plan.steps[step_idx].mark_failed(e.to_string());
                                     continue;
@@ -11727,7 +11908,9 @@ Respond in JSON format:
                         .join("\n");
 
                     let think_prompt = format!("Context:\n{}\n\nTask: {}", context, prompt);
-                    let messages = vec![ChatMessage::user(&think_prompt)];
+                    let messages = self
+                        .prepare_instruction_messages(vec![ChatMessage::user(&think_prompt)])
+                        .await?;
 
                     match self
                         .observe_purpose(
@@ -11754,7 +11937,9 @@ Respond in JSON format:
                         "Based on this context:\n{}\n\nGenerate a response following this template/instruction: {}",
                         context, template
                     );
-                    let messages = vec![ChatMessage::user(&respond_prompt)];
+                    let messages = self
+                        .prepare_instruction_messages(vec![ChatMessage::user(&respond_prompt)])
+                        .await?;
 
                     match self
                         .observe_purpose(
@@ -11820,7 +12005,9 @@ Respond in JSON format:
             "You completed a multi-step plan for: \"{}\"\n\nStep results:\n{}\n\nProvide a coherent final response that synthesizes these results.",
             plan.goal, context
         );
-        let messages = vec![ChatMessage::user(&prompt)];
+        let messages = self
+            .prepare_instruction_messages(vec![ChatMessage::user(&prompt)])
+            .await?;
         match self
             .observe_purpose(ObservationPurpose::PlanStep, llm.complete(&messages, None))
             .await
@@ -13008,6 +13195,7 @@ Respond in JSON format:
                         native_exchanges: self.task_native_expectations(),
                         deferred_final: None,
                         feedback_hook_completed: false,
+                        prepared_instructions: None,
                     };
                     let position = crate::autonomy::location::TaskStateReturn::BeforeCalls {
                         saved: Box::new(crate::autonomy::interaction::TaskModelCalls {
@@ -13205,6 +13393,7 @@ Respond in JSON format:
                 native_exchanges: Vec::new(),
                 deferred_final: None,
                 feedback_hook_completed: false,
+                prepared_instructions: None,
             }),
         )
         .await
@@ -13570,6 +13759,7 @@ Respond in JSON format:
                     native_exchanges: self.task_native_expectations(),
                     deferred_final: Some(state),
                     feedback_hook_completed: false,
+                    prepared_instructions: None,
                 }),
             )
             .await?;
@@ -13587,10 +13777,10 @@ Respond in JSON format:
                 && let Some(system_msg) = new_messages.first()
                 && system_msg.role == ai_agents_core::Role::System
             {
+                // System prompts may include host instructions and must not be copied into tracing output.
                 debug!(
-                    prompt_preview =
-                        &system_msg.content[system_msg.content.len().saturating_sub(200)..],
-                    "Post-transition system prompt (last 200 chars)"
+                    prompt_bytes = system_msg.content.len(),
+                    "Post-transition system prompt prepared"
                 );
             }
 
@@ -16522,6 +16712,32 @@ async fn poll_scoped_chunk<'a>(
         }
     })
     .await
+}
+
+// Ordinary skill prompts use live host instruction bindings but do not create task checkpoints.
+struct RuntimeSkillObserver<'a>(&'a RuntimeAgent);
+
+#[async_trait]
+impl ai_agents_skills::SkillExecutionObserver for RuntimeSkillObserver<'_> {
+    /// Ordinary scripts have no task journal to acknowledge.
+    async fn checkpoint(&self, _: &ai_agents_skills::SkillExecutionCursor) -> Result<()> {
+        Ok(())
+    }
+
+    /// Resolves the current projection for the next actual skill prompt.
+    async fn prepare_prompt(
+        &self,
+        _: &ai_agents_skills::SkillExecutionCursor,
+        prompt: &str,
+    ) -> Result<Option<Vec<ChatMessage>>> {
+        if !self.0.context_manager.has_instruction_sources() {
+            return Ok(None);
+        }
+        self.0
+            .prepare_instruction_messages(vec![ChatMessage::user(prompt)])
+            .await
+            .map(Some)
+    }
 }
 
 #[async_trait]

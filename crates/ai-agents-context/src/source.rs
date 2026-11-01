@@ -62,6 +62,10 @@ pub enum ContextSource {
         #[serde(default)]
         refresh: RefreshPolicy,
     },
+    /// A host-installed provider supplies advisory instructions at each supported work request.
+    Instructions {
+        name: String,
+    },
 }
 
 fn default_method() -> String {
@@ -77,6 +81,7 @@ impl ContextSource {
             ContextSource::Http { refresh, .. } => refresh.clone(),
             ContextSource::Env { .. } => RefreshPolicy::Once,
             ContextSource::Callback { refresh, .. } => refresh.clone(),
+            ContextSource::Instructions { .. } => RefreshPolicy::Once,
         }
     }
 
@@ -88,6 +93,19 @@ impl ContextSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn instruction_source_is_strict_and_host_named() {
+        let source: ContextSource =
+            serde_yaml::from_str("type: instructions\nname: host_rules\n").unwrap();
+        assert!(matches!(source, ContextSource::Instructions { name } if name == "host_rules"));
+        assert!(
+            serde_yaml::from_str::<ContextSource>(
+                "type: instructions\nname: host_rules\npath: /\n"
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn test_runtime_source() {

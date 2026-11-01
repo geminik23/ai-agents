@@ -13,6 +13,7 @@
 // cargo run --manifest-path examples/Cargo.toml -p example-code-agent --bin code-agent-setup --offline -- check-workspace "$WORKSPACE" "$SOURCE" "$CHECKER" openai gpt-5.4-mini
 // cargo run --manifest-path examples/Cargo.toml -p example-code-agent --bin code-agent-setup --offline -- run-workspace --trust-checker --share-source "$WORKSPACE" "$SOURCE" "$CHECKER" openai gpt-5.4-mini
 // Optionally repeat --file RELATIVE_PATH or --new-file RELATIVE_PATH and configure discovery or limits.
+// --auto-instructions separately authorizes sharing root and selected-path ancestor AGENTS.md contents with the model.
 // --assume-exclusive-workspace is valid only when the caller controls all relevant writers and immutable checker inputs.
 // Output tokens default to 2000 and checker timeout to 30000 ms; other applicable limits still apply.
 // Use /task run in the interactive session.
@@ -37,12 +38,12 @@ fn workspace_setup(
 ) -> Result<workspace_agent::WorkspaceSetup, Box<dyn std::error::Error>> {
     let (root, source, checker, provider, model, rest) = if read_only {
         let [root, source, provider, model, rest @ ..] = args else {
-            return Err("expected WORKSPACE SOURCE PROVIDER MODEL [INSTRUCTIONS] [--file PATH] [--allow-discovery] [--max-output-tokens N]".into());
+            return Err("expected WORKSPACE SOURCE PROVIDER MODEL [INSTRUCTIONS | --auto-instructions] [--file PATH] [--allow-discovery] [--max-output-tokens N]".into());
         };
         (root, source, None, provider, model, rest)
     } else {
         let [root, source, checker, provider, model, rest @ ..] = args else {
-            return Err("expected WORKSPACE SOURCE CHECKER PROVIDER MODEL [INSTRUCTIONS] [--file PATH] [--new-file PATH] [--assume-exclusive-workspace] [--allow-discovery] [--max-output-tokens N] [--checker-timeout-ms N]".into());
+            return Err("expected WORKSPACE SOURCE CHECKER PROVIDER MODEL [INSTRUCTIONS | --auto-instructions] [--file PATH] [--new-file PATH] [--assume-exclusive-workspace] [--allow-discovery] [--max-output-tokens N] [--checker-timeout-ms N]".into());
         };
         (root, source, Some(checker), provider, model, rest)
     };
@@ -50,6 +51,7 @@ fn workspace_setup(
     let mut sources = vec![PathBuf::from(source)];
     let mut new_files = Vec::new();
     let mut allow_discovery = false;
+    let mut automatic_instructions = false;
     let mut assume_exclusive_workspace = false;
     let mut max_output_tokens = None;
     let mut checker_timeout_ms = None;
@@ -63,6 +65,11 @@ fn workspace_setup(
                 return Err("--allow-discovery may be supplied only once".into());
             }
             allow_discovery = true;
+        } else if !positional_only && arg == "--auto-instructions" {
+            if automatic_instructions {
+                return Err("--auto-instructions may be supplied only once".into());
+            }
+            automatic_instructions = true;
         } else if !positional_only && arg == "--assume-exclusive-workspace" {
             if read_only || assume_exclusive_workspace {
                 return Err("--assume-exclusive-workspace requires an edit task and may be supplied only once".into());
@@ -157,6 +164,9 @@ fn workspace_setup(
     if allow_discovery {
         setup.enable_discovery()?;
     }
+    if automatic_instructions {
+        setup.enable_automatic_instructions()?;
+    }
     if assume_exclusive_workspace {
         setup.assume_exclusive_workspace()?;
     }
@@ -184,6 +194,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
             println!("Selected source files: {}", setup.source_files().len());
             println!("Workspace discovery enabled: {}", setup.discovery_enabled());
+            println!(
+                "Automatic scoped instructions enabled: {}",
+                setup.automatic_instructions_enabled()
+            );
             println!(
                 "Cooperative revision assumed: {}",
                 setup.cooperative_revision_enabled()
@@ -218,6 +232,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
             println!("Selected source files: {}", setup.source_files().len());
             println!("Workspace discovery enabled: {}", setup.discovery_enabled());
+            println!(
+                "Automatic scoped instructions enabled: {}",
+                setup.automatic_instructions_enabled()
+            );
             println!("Maximum model output tokens: {}", setup.max_output_tokens());
         }
         [action, share, rest @ ..] if action == "run-read-only" && share == "--share-source" => {
@@ -274,7 +292,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
         _ => {
-            return Err("usage: code-agent-setup prepare NEW_ABSOLUTE_PATH | check-config WORKSPACE CARGO RUSTC | verify WORKSPACE CARGO RUSTC | run-offline WORKSPACE CARGO RUSTC | check-workspace WORKSPACE SOURCE CHECKER PROVIDER MODEL [INSTRUCTIONS] [--file PATH] [--new-file PATH] [--assume-exclusive-workspace] [--allow-discovery] [--max-output-tokens N] [--checker-timeout-ms N] | run-workspace --trust-checker --share-source WORKSPACE SOURCE CHECKER PROVIDER MODEL [INSTRUCTIONS] [--file PATH] [--new-file PATH] [--assume-exclusive-workspace] [--allow-discovery] [--max-output-tokens N] [--checker-timeout-ms N] | check-read-only WORKSPACE SOURCE PROVIDER MODEL [INSTRUCTIONS] [--file PATH] [--allow-discovery] [--max-output-tokens N] | run-read-only --share-source WORKSPACE SOURCE PROVIDER MODEL [INSTRUCTIONS] [--file PATH] [--allow-discovery] [--max-output-tokens N]".into());
+            return Err("usage: code-agent-setup prepare NEW_ABSOLUTE_PATH | check-config WORKSPACE CARGO RUSTC | verify WORKSPACE CARGO RUSTC | run-offline WORKSPACE CARGO RUSTC | check-workspace WORKSPACE SOURCE CHECKER PROVIDER MODEL [INSTRUCTIONS | --auto-instructions] [--file PATH] [--new-file PATH] [--assume-exclusive-workspace] [--allow-discovery] [--max-output-tokens N] [--checker-timeout-ms N] | run-workspace --trust-checker --share-source WORKSPACE SOURCE CHECKER PROVIDER MODEL [INSTRUCTIONS | --auto-instructions] [--file PATH] [--new-file PATH] [--assume-exclusive-workspace] [--allow-discovery] [--max-output-tokens N] [--checker-timeout-ms N] | check-read-only WORKSPACE SOURCE PROVIDER MODEL [INSTRUCTIONS | --auto-instructions] [--file PATH] [--allow-discovery] [--max-output-tokens N] | run-read-only --share-source WORKSPACE SOURCE PROVIDER MODEL [INSTRUCTIONS | --auto-instructions] [--file PATH] [--allow-discovery] [--max-output-tokens N]".into());
         }
     }
     Ok(())

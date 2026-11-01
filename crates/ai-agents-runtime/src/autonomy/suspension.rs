@@ -74,6 +74,9 @@ pub(crate) struct TaskLoopState {
     // A completed feedback hook is retained only for the first provider position after a capacity pause.
     #[serde(default, skip_serializing_if = "feedback_hook_not_completed")]
     pub feedback_hook_completed: bool,
+    // A capacity pause retains the already prepared advisory projection; it is trusted checkpoint data, not authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prepared_instructions: Option<String>,
 }
 
 // Omit the new marker from legacy cursor images unless it protects completed callback work.
@@ -85,6 +88,13 @@ impl TaskLoopState {
     // A v1 cursor has no source witness; the feedback marker only describes the first provider position.
     pub(crate) fn validate_policy_shape(&self) -> Result<()> {
         if self.feedback_hook_completed && (self.iterations != 0 || self.deferred_final.is_some()) {
+            return Err(TaskRunStorageError::InvalidCheckpoint.into());
+        }
+        if self
+            .prepared_instructions
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.len() > 256 * 1024)
+        {
             return Err(TaskRunStorageError::InvalidCheckpoint.into());
         }
         if matches!(
@@ -435,7 +445,9 @@ impl TaskBatchState {
             || self.appended > self.calls.len()
             || self.results[..self.appended].iter().any(Option::is_none)
             || self.loop_state.as_ref().is_some_and(|state| {
-                state.feedback_hook_completed || state.validate_policy_shape().is_err()
+                state.feedback_hook_completed
+                    || state.prepared_instructions.is_some()
+                    || state.validate_policy_shape().is_err()
             })
         {
             return Err(TaskRunStorageError::InvalidCheckpoint.into());

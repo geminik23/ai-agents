@@ -1413,6 +1413,19 @@ context:
     name: weather_provider
 ```
 
+### `type: instructions` (development only)
+
+Declares an advisory instruction source whose actual provider must be installed by the Rust host. Omission preserves existing behavior. The name is not filesystem authority, and a missing provider fails supported work requests rather than silently dropping instructions.
+
+```yaml
+context:
+  project_rules:
+    type: instructions
+    name: workspace_rules
+```
+
+The host chooses the source, access scope and disclosure policy; the YAML declaration alone does not enable filesystem discovery or grant tools. See [host-bound instructions](@/docs/rust-api.md#host-bound-instructions-development-only) for the scoped file provider, request boundaries, limits and task-safe host contract. Instructions remain advisory and cannot relax grants, policy, approvals, completion gates or host ceilings. This source is distinct from ordinary File context and is not refreshed by `per_turn` or `refresh_per_session`.
+
 ### `type: file`
 
 Load context from a file on disk.

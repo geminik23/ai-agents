@@ -15,6 +15,7 @@ description: "Host-bound code task for explicitly selected workspace files and a
 # The host does not enforce or detect violations of that assumption; use an appropriately isolated host.
 # Set --max-output-tokens N or --checker-timeout-ms N for the selected provider and checker.
 # --allow-discovery additionally shares path listings and search matches under the workspace root with the chosen provider.
+# --auto-instructions separately shares root and selected-path ancestor AGENTS.md files and refreshes them before supported work requests.
 # Omitted output and checker settings use 2000 tokens and 30000 ms; other applicable limits still apply.
 # In the interactive session, use /task run followed by the requested objective.
 # Configuration checks never construct a provider; a live run sends selected content to the chosen provider and may cost money.
