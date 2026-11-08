@@ -289,19 +289,12 @@ impl Tool for FileWriteTool {
         if exists && !policy.overwrite_existing && !input.dry_run {
             return ToolResult::error("overwrite_existing policy is false for this target");
         }
-        if let Some(parent) = path.parent()
-            && !parent.exists()
-        {
-            if !(input.create_parent_dirs && policy.create_parent_dirs) {
-                return ToolResult::error(
-                    "parent directory does not exist or create_parent_dirs is not allowed",
-                );
-            }
-            if !input.dry_run
-                && let Err(error) = fs::create_dir_all(parent)
-            {
-                return ToolResult::error(format!("Create parent directory error: {}", error));
-            }
+        // Every check that can reject the call runs before the first filesystem change, so these plain errors prove no effect.
+        let missing_parent = path.parent().filter(|parent| !parent.exists());
+        if missing_parent.is_some() && !(input.create_parent_dirs && policy.create_parent_dirs) {
+            return ToolResult::error(
+                "parent directory does not exist or create_parent_dirs is not allowed",
+            );
         }
         if exists
             && !input.dry_run
@@ -336,16 +329,25 @@ impl Tool for FileWriteTool {
         let version = if input.dry_run {
             None
         } else {
-            if exists {
-                if let Err(error) = atomic_write(&path, input.content.as_bytes()) {
-                    return ToolResult::error(format!("Write error: {}", error));
-                }
-            } else if let Err(error) = atomic_create(&path, input.content.as_bytes()) {
-                let message = format!("Write error: {}", error.error);
+            let parents = match missing_parent {
+                Some(parent) => match CreatedParents::create(parent) {
+                    Ok(parents) => parents,
+                    Err(failure) => return failure.into_result(),
+                },
+                None => CreatedParents::none(),
+            };
+            let written = if exists {
+                atomic_write(&path, input.content.as_bytes())
+            } else {
+                atomic_create(&path, input.content.as_bytes())
+            };
+            if let Err(error) = written {
+                // A published file or leftover temporary file keeps this call's parents in place and stays uncertain.
+                let message = format!("Write error: {}", error);
                 return if error.uncertain {
-                    ToolResult::error_with_uncertain_effect(message)
+                    EffectFailure::new(message, true).into_result()
                 } else {
-                    ToolResult::error(message)
+                    parents.fail(message, false).into_result()
                 };
             }
             match file_version_evidence(&path, input.content.as_bytes()) {
@@ -356,7 +358,7 @@ impl Tool for FileWriteTool {
                 Err(_) => None,
             }
         };
-        json_result(&MutationOutput {
+        let result = json_result(&MutationOutput {
             path: Some(input.path.clone()),
             dry_run: input.dry_run,
             mutation_performed: !input.dry_run,
@@ -376,7 +378,8 @@ impl Tool for FileWriteTool {
             changed_paths: vec![input.path],
             version,
             near_matches: Vec::new(),
-        })
+        });
+        settle_performed_effect(result, !input.dry_run)
     }
 }
 
@@ -570,7 +573,8 @@ impl Tool for FileEditTool {
             None
         } else {
             if let Err(error) = atomic_write(&path, edited.as_bytes()) {
-                return ToolResult::error(format!("Write error: {}", error));
+                return EffectFailure::new(format!("Write error: {}", error), error.uncertain)
+                    .into_result();
             }
             match file_version_evidence(&path, edited.as_bytes()) {
                 Ok(version) => {
@@ -580,7 +584,7 @@ impl Tool for FileEditTool {
                 Err(_) => None,
             }
         };
-        file_edit_result(
+        let result = file_edit_result(
             MutationOutput {
                 path: Some(input.path.clone()),
                 dry_run: input.dry_run,
@@ -600,7 +604,8 @@ impl Tool for FileEditTool {
             },
             true,
             ctx.limits.max_output_chars,
-        )
+        );
+        settle_performed_effect(result, !input.dry_run)
     }
 }
 
@@ -804,8 +809,8 @@ impl Tool for PatchTool {
             }
         }
         if !input.dry_run {
-            if let Err(error) = apply_patch_transaction(&outputs) {
-                return ToolResult::error(error);
+            if let Err(failure) = apply_patch_transaction(&outputs) {
+                return failure.into_result();
             }
             for output in &outputs {
                 if let Some((path, content)) = output.written_file()
@@ -816,7 +821,8 @@ impl Tool for PatchTool {
             }
         }
         let diff_summary = summarize_patch(&files, DEFAULT_MAX_OUTPUT_CHARS);
-        json_result(&MutationOutput {
+        let performed = !input.dry_run && !files.is_empty();
+        let result = json_result(&MutationOutput {
             path: Some(base_path.to_string_lossy().to_string()),
             dry_run: input.dry_run,
             mutation_performed: !input.dry_run && !files.is_empty(),
@@ -839,7 +845,8 @@ impl Tool for PatchTool {
             changed_paths,
             version: None,
             near_matches: Vec::new(),
-        })
+        });
+        settle_performed_effect(result, performed)
     }
 }
 
@@ -936,20 +943,22 @@ enum PatchRollback {
     },
 }
 
-fn apply_patch_transaction(outputs: &[PatchApply]) -> Result<(), String> {
+// Each failure reports whether anything from this call could remain after rollback.
+fn apply_patch_transaction(outputs: &[PatchApply]) -> Result<(), EffectFailure> {
     let mut rollbacks = Vec::new();
     let mut created_directories = Vec::new();
     for output in outputs {
         match output {
             PatchApply::Delete { path, expected } => {
                 if let Err(error) = verify_present_snapshot(path, expected, "pre-apply") {
-                    return fail_patch_transaction(error, &rollbacks, &created_directories);
+                    return fail_patch_transaction(error, &rollbacks, &created_directories, false);
                 }
                 if let Err(error) = fs::remove_file(path) {
                     return fail_patch_transaction(
                         format!("Patch delete error: {}", error),
                         &rollbacks,
                         &created_directories,
+                        false,
                     );
                 }
                 rollbacks.push(PatchRollback::RestoreDelete {
@@ -968,6 +977,7 @@ fn apply_patch_transaction(outputs: &[PatchApply]) -> Result<(), String> {
                     let missing = missing_directories(parent);
                     if let Err(error) = fs::create_dir_all(parent) {
                         let cleanup_error = cleanup_created_directories(&missing).err();
+                        let residual = cleanup_error.is_some();
                         let error = match cleanup_error {
                             Some(cleanup_error) => format!(
                                 "Create parent directory error: {}; partial directory creation may remain: {}",
@@ -975,12 +985,17 @@ fn apply_patch_transaction(outputs: &[PatchApply]) -> Result<(), String> {
                             ),
                             None => format!("Create parent directory error: {}", error),
                         };
-                        return fail_patch_transaction(error, &rollbacks, &created_directories);
+                        return fail_patch_transaction(
+                            error,
+                            &rollbacks,
+                            &created_directories,
+                            residual,
+                        );
                     }
                     created_directories.extend(missing);
                 }
                 if let Err(error) = verify_expected_state(path, expected, "pre-apply") {
-                    return fail_patch_transaction(error, &rollbacks, &created_directories);
+                    return fail_patch_transaction(error, &rollbacks, &created_directories, false);
                 }
                 let written_metadata = match atomic_write(path, content.as_bytes()) {
                     Ok(metadata) => metadata,
@@ -989,6 +1004,7 @@ fn apply_patch_transaction(outputs: &[PatchApply]) -> Result<(), String> {
                             format!("Patch write error: {}", error),
                             &rollbacks,
                             &created_directories,
+                            error.uncertain,
                         );
                     }
                 };
@@ -1008,6 +1024,7 @@ fn apply_patch_transaction(outputs: &[PatchApply]) -> Result<(), String> {
                                 format!("Patch permission restore error: {}", error),
                                 &rollbacks,
                                 &created_directories,
+                                false,
                             );
                         }
                         rollbacks.push(rollback);
@@ -1026,23 +1043,36 @@ fn apply_patch_transaction(outputs: &[PatchApply]) -> Result<(), String> {
     Ok(())
 }
 
+// Removing only this call's empty directories undoes them, but a restored file has a new identity and other metadata, so it stays uncertain.
 fn fail_patch_transaction(
     error: String,
     rollbacks: &[PatchRollback],
     created_directories: &[PathBuf],
-) -> Result<(), String> {
+    residual: bool,
+) -> Result<(), EffectFailure> {
     match rollback_patch(rollbacks, created_directories) {
-        Ok(()) if rollbacks.is_empty() && created_directories.is_empty() => Err(format!(
-            "{}; no target changes required rollback; any reported temporary artifacts may remain",
-            error
+        Ok(()) if rollbacks.is_empty() && created_directories.is_empty() => {
+            Err(EffectFailure::new(
+                format!(
+                    "{}; no target changes required rollback; any reported temporary artifacts may remain",
+                    error
+                ),
+                residual,
+            ))
+        }
+        Ok(()) => Err(EffectFailure::new(
+            format!(
+                "{}; patch rollback restored file contents and permissions where applicable; other metadata may have changed",
+                error
+            ),
+            residual || !rollbacks.is_empty(),
         )),
-        Ok(()) => Err(format!(
-            "{}; patch rollback restored file contents and permissions where applicable; other metadata may have changed",
-            error
-        )),
-        Err(rollback_error) => Err(format!(
-            "{}; partial patch application may remain because rollback failed: {}",
-            error, rollback_error
+        Err(rollback_error) => Err(EffectFailure::new(
+            format!(
+                "{}; partial patch application may remain because rollback failed: {}",
+                error, rollback_error
+            ),
+            true,
         )),
     }
 }
@@ -1281,7 +1311,7 @@ fn cleanup_created_directories(paths: &[PathBuf]) -> Result<(), String> {
             && error.kind() != std::io::ErrorKind::NotFound
         {
             errors.push(format!(
-                "Patch rollback directory cleanup conflict for {}: {}",
+                "Created directory cleanup conflict for {}: {}",
                 path.display(),
                 error
             ));
@@ -1473,14 +1503,14 @@ fn create_atomic_temp(parent: &Path, restricted: bool) -> std::io::Result<(fs::F
 
 // A published destination or a failed temporary cleanup must remain distinct from a known no-effect failure.
 #[derive(Debug)]
-struct AtomicCreateError {
+struct AtomicFileError {
     error: std::io::Error,
     uncertain: bool,
 }
 
 // Publish a complete new file without replacing an entry created after the caller's existence check.
 // Filesystems that cannot link the temporary file fail closed instead of falling back to replacement.
-fn atomic_create(path: &Path, bytes: &[u8]) -> Result<fs::Metadata, AtomicCreateError> {
+fn atomic_create(path: &Path, bytes: &[u8]) -> Result<fs::Metadata, AtomicFileError> {
     atomic_create_with_cleanup(path, bytes, |temp| fs::remove_file(temp))
 }
 
@@ -1489,13 +1519,12 @@ fn atomic_create_with_cleanup(
     path: &Path,
     bytes: &[u8],
     cleanup: impl FnOnce(&Path) -> std::io::Result<()>,
-) -> Result<fs::Metadata, AtomicCreateError> {
+) -> Result<fs::Metadata, AtomicFileError> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let (mut file, temp) =
-        create_atomic_temp(parent, false).map_err(|error| AtomicCreateError {
-            error,
-            uncertain: false,
-        })?;
+    let (mut file, temp) = create_atomic_temp(parent, false).map_err(|error| AtomicFileError {
+        error,
+        uncertain: false,
+    })?;
     let result = (|| {
         file.write_all(bytes)?;
         file.sync_all()?;
@@ -1507,7 +1536,7 @@ fn atomic_create_with_cleanup(
     match result {
         Ok(metadata) => match cleanup(&temp) {
             Ok(()) => Ok(metadata),
-            Err(error) => Err(AtomicCreateError {
+            Err(error) => Err(AtomicFileError {
                 error: std::io::Error::new(
                     error.kind(),
                     format!(
@@ -1519,17 +1548,17 @@ fn atomic_create_with_cleanup(
             }),
         },
         Err(error) => match cleanup(&temp) {
-            Ok(()) => Err(AtomicCreateError {
+            Ok(()) => Err(AtomicFileError {
                 error,
                 uncertain: false,
             }),
             Err(cleanup) if cleanup.kind() == std::io::ErrorKind::NotFound => {
-                Err(AtomicCreateError {
+                Err(AtomicFileError {
                     error,
                     uncertain: false,
                 })
             }
-            Err(cleanup) => Err(AtomicCreateError {
+            Err(cleanup) => Err(AtomicFileError {
                 error: std::io::Error::new(
                     error.kind(),
                     format!(
@@ -1543,13 +1572,29 @@ fn atomic_create_with_cleanup(
     }
 }
 
+impl AtomicFileError {
+    // Failures before the temporary file exists cannot leave anything behind.
+    fn settled(error: std::io::Error) -> Self {
+        Self {
+            error,
+            uncertain: false,
+        }
+    }
+}
+
+impl std::fmt::Display for AtomicFileError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(formatter)
+    }
+}
+
 // Preserve ordinary Unix mode bits without exposing an initially broader temporary file.
-fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<fs::Metadata> {
+fn atomic_write(path: &Path, bytes: &[u8]) -> Result<fs::Metadata, AtomicFileError> {
     #[cfg(unix)]
     let original = match fs::metadata(path) {
         Ok(metadata) => Some(metadata.permissions()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => return Err(error),
+        Err(error) => return Err(AtomicFileError::settled(error)),
     };
     #[cfg(not(unix))]
     let original: Option<fs::Permissions> = None;
@@ -1561,12 +1606,24 @@ fn atomic_write_with_permissions(
     path: &Path,
     bytes: &[u8],
     permissions: Option<&fs::Permissions>,
-) -> std::io::Result<fs::Metadata> {
+) -> Result<fs::Metadata, AtomicFileError> {
+    atomic_write_with_cleanup(path, bytes, permissions, |temp| fs::remove_file(temp))
+}
+
+// The rename is the only commit point; before it, the destination is untouched and only a failed temporary cleanup can leave residue.
+// Injecting cleanup makes that residue boundary testable without changing filesystem permissions.
+fn atomic_write_with_cleanup(
+    path: &Path,
+    bytes: &[u8],
+    permissions: Option<&fs::Permissions>,
+    cleanup: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> Result<fs::Metadata, AtomicFileError> {
     if let Some(permissions) = permissions {
-        validate_replacement_permissions(permissions)?;
+        validate_replacement_permissions(permissions).map_err(AtomicFileError::settled)?;
     }
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let (mut file, temp) = create_atomic_temp(parent, permissions.is_some())?;
+    let (mut file, temp) =
+        create_atomic_temp(parent, permissions.is_some()).map_err(AtomicFileError::settled)?;
     let result = (|| {
         if let Some(permissions) = permissions {
             file.set_permissions(permissions.clone())?;
@@ -1580,24 +1637,102 @@ fn atomic_write_with_permissions(
     })();
     match result {
         Ok(metadata) => Ok(metadata),
-        Err(error) => Err(cleanup_failed_atomic_temp(&temp, error)),
+        Err(error) => Err(cleanup_failed_atomic_temp(&temp, error, cleanup)),
     }
 }
 
 // Keep failed cleanup visible because an uncommitted temporary file can still contain data.
-fn cleanup_failed_atomic_temp(temp: &Path, error: std::io::Error) -> std::io::Error {
-    match fs::remove_file(temp) {
-        Ok(()) => error,
-        Err(cleanup) if cleanup.kind() == std::io::ErrorKind::NotFound => error,
-        Err(cleanup) => std::io::Error::new(
-            error.kind(),
-            format!(
-                "{}; failed to remove temporary file {}: {}; partial data may remain",
-                error,
-                temp.display(),
-                cleanup
+fn cleanup_failed_atomic_temp(
+    temp: &Path,
+    error: std::io::Error,
+    cleanup: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> AtomicFileError {
+    match cleanup(temp) {
+        Ok(()) => AtomicFileError::settled(error),
+        Err(cleanup) if cleanup.kind() == std::io::ErrorKind::NotFound => {
+            AtomicFileError::settled(error)
+        }
+        Err(cleanup) => AtomicFileError {
+            error: std::io::Error::new(
+                error.kind(),
+                format!(
+                    "{}; failed to remove temporary file {}: {}; partial data may remain",
+                    error,
+                    temp.display(),
+                    cleanup
+                ),
             ),
-        ),
+            uncertain: true,
+        },
+    }
+}
+
+/// A failure after a filesystem change may have started.
+/// `residual` is false only when the tool proved that no change from this call remains.
+#[derive(Debug)]
+struct EffectFailure {
+    message: String,
+    residual: bool,
+}
+
+impl EffectFailure {
+    fn new(message: impl Into<String>, residual: bool) -> Self {
+        Self {
+            message: message.into(),
+            residual,
+        }
+    }
+
+    // Plain errors tell the shared executor that nothing remains to settle, so any possible residue must be reported as uncertain.
+    fn into_result(self) -> ToolResult {
+        if self.residual {
+            ToolResult::error_with_uncertain_effect(self.message)
+        } else {
+            ToolResult::error(self.message)
+        }
+    }
+}
+
+// A failed result produced after a performed mutation must not read as a harmless failure.
+fn settle_performed_effect(result: ToolResult, performed: bool) -> ToolResult {
+    if performed && !result.success && !result.has_uncertain_effect() {
+        ToolResult::error_with_uncertain_effect(result.output)
+    } else {
+        result
+    }
+}
+
+/// Parent directories created by one call, so a later failure can remove exactly those empty directories.
+struct CreatedParents {
+    directories: Vec<PathBuf>,
+}
+
+impl CreatedParents {
+    // Create missing parents only after all no-effect validation passed; a partial creation is cleaned before reporting failure.
+    fn create(parent: &Path) -> Result<Self, EffectFailure> {
+        let directories = missing_directories(parent);
+        if let Err(error) = fs::create_dir_all(parent) {
+            let created = Self { directories };
+            return Err(created.fail(format!("Create parent directory error: {}", error), false));
+        }
+        Ok(Self { directories })
+    }
+
+    fn none() -> Self {
+        Self {
+            directories: Vec::new(),
+        }
+    }
+
+    // Remove this call's empty parents; a directory that cannot be removed remains residue of the failed call.
+    fn fail(self, message: String, residual: bool) -> EffectFailure {
+        match cleanup_created_directories(&self.directories) {
+            Ok(()) => EffectFailure::new(message, residual),
+            Err(cleanup) => EffectFailure::new(
+                format!("{message}; created parent directories may remain: {cleanup}"),
+                true,
+            ),
+        }
     }
 }
 
@@ -2547,23 +2682,22 @@ impl Tool for CopyPathTool {
         if destination_exists && !policy.overwrite_existing && !input.dry_run {
             return ToolResult::error("overwrite_existing policy is false for this destination");
         }
-        if let Some(parent) = destination.parent()
-            && !parent.exists()
-        {
-            if !(input.create_parent_dirs && policy.create_parent_dirs) {
-                return ToolResult::error(
-                    "destination parent directory does not exist or create_parent_dirs is not allowed",
-                );
-            }
-            if !input.dry_run
-                && let Err(error) = fs::create_dir_all(parent)
-            {
-                return ToolResult::error(format!("Create parent directory error: {}", error));
-            }
+        let missing_parent = destination.parent().filter(|parent| !parent.exists());
+        if missing_parent.is_some() && !(input.create_parent_dirs && policy.create_parent_dirs) {
+            return ToolResult::error(
+                "destination parent directory does not exist or create_parent_dirs is not allowed",
+            );
         }
         let mut cleanup_warning = None;
         let mut retained_backup_path = None;
         if !input.dry_run {
+            let parents = match missing_parent {
+                Some(parent) => match CreatedParents::create(parent) {
+                    Ok(parents) => parents,
+                    Err(failure) => return failure.into_result(),
+                },
+                None => CreatedParents::none(),
+            };
             if destination_exists {
                 match replace_copy_path(&source, &destination) {
                     ReplacementOutcome::Committed {
@@ -2574,13 +2708,19 @@ impl Tool for CopyPathTool {
                         retained_backup_path = backup;
                     }
                     ReplacementOutcome::Unchanged(error) => {
-                        return ToolResult::error(format!("Copy error: {}", error));
+                        return parents
+                            .fail(format!("Copy error: {}", error), false)
+                            .into_result();
+                    }
+                    ReplacementOutcome::Residual(error) => {
+                        return EffectFailure::new(format!("Copy error: {}", error), true)
+                            .into_result();
                     }
                     ReplacementOutcome::RecoveryIncomplete {
                         error,
                         retained_backup_path,
                     } => {
-                        return json_error_result(&PathMutationOutput {
+                        let receipt = json_error_result(&PathMutationOutput {
                             source_path: Some(input.source_path.clone()),
                             destination_path: Some(input.destination_path.clone()),
                             path: None,
@@ -2601,13 +2741,20 @@ impl Tool for CopyPathTool {
                             cleanup_warning: None,
                             retained_backup_path: Some(retained_backup_path),
                         });
+                        return settle_performed_effect(receipt, true);
                     }
                 }
             } else if let Err(error) = copy_path(&source, &destination) {
-                return ToolResult::error(format!("Copy error: {}", error));
+                // A partial copy is not removed because this call cannot prove it owns whatever now occupies the destination.
+                let message = format!("Copy error: {}", error);
+                return if path_entry_exists(&destination) {
+                    EffectFailure::new(message, true).into_result()
+                } else {
+                    parents.fail(message, false).into_result()
+                };
             }
         }
-        json_result(&PathMutationOutput {
+        let result = json_result(&PathMutationOutput {
             source_path: Some(input.source_path.clone()),
             destination_path: Some(input.destination_path.clone()),
             path: None,
@@ -2635,7 +2782,8 @@ impl Tool for CopyPathTool {
             error: None,
             cleanup_warning,
             retained_backup_path,
-        })
+        });
+        settle_performed_effect(result, !input.dry_run)
     }
 }
 
@@ -2737,19 +2885,11 @@ impl Tool for MovePathTool {
         if destination_exists && !policy.overwrite_existing && !input.dry_run {
             return ToolResult::error("overwrite_existing policy is false for this destination");
         }
-        if let Some(parent) = destination.parent()
-            && !parent.exists()
-        {
-            if !(input.create_parent_dirs && policy.create_parent_dirs) {
-                return ToolResult::error(
-                    "destination parent directory does not exist or create_parent_dirs is not allowed",
-                );
-            }
-            if !input.dry_run
-                && let Err(error) = fs::create_dir_all(parent)
-            {
-                return ToolResult::error(format!("Create parent directory error: {}", error));
-            }
+        let missing_parent = destination.parent().filter(|parent| !parent.exists());
+        if missing_parent.is_some() && !(input.create_parent_dirs && policy.create_parent_dirs) {
+            return ToolResult::error(
+                "destination parent directory does not exist or create_parent_dirs is not allowed",
+            );
         }
         let recursive = source.is_dir();
         let bytes_affected = path_size(&source).unwrap_or(0);
@@ -2757,6 +2897,13 @@ impl Tool for MovePathTool {
         let mut cleanup_warning = None;
         let mut retained_backup_path = None;
         if !input.dry_run {
+            let parents = match missing_parent {
+                Some(parent) => match CreatedParents::create(parent) {
+                    Ok(parents) => parents,
+                    Err(failure) => return failure.into_result(),
+                },
+                None => CreatedParents::none(),
+            };
             if destination_exists {
                 match replace_moved_path(&source, &destination) {
                     ReplacementOutcome::Committed {
@@ -2767,13 +2914,19 @@ impl Tool for MovePathTool {
                         retained_backup_path = backup;
                     }
                     ReplacementOutcome::Unchanged(error) => {
-                        return ToolResult::error(format!("Move error: {}", error));
+                        return parents
+                            .fail(format!("Move error: {}", error), false)
+                            .into_result();
+                    }
+                    ReplacementOutcome::Residual(error) => {
+                        return EffectFailure::new(format!("Move error: {}", error), true)
+                            .into_result();
                     }
                     ReplacementOutcome::RecoveryIncomplete {
                         error,
                         retained_backup_path,
                     } => {
-                        return json_error_result(&PathMutationOutput {
+                        let receipt = json_error_result(&PathMutationOutput {
                             source_path: Some(input.source_path.clone()),
                             destination_path: Some(input.destination_path.clone()),
                             path: None,
@@ -2794,13 +2947,17 @@ impl Tool for MovePathTool {
                             cleanup_warning: None,
                             retained_backup_path: Some(retained_backup_path),
                         });
+                        return settle_performed_effect(receipt, true);
                     }
                 }
             } else if let Err(error) = fs::rename(&source, &destination) {
-                return ToolResult::error(format!("Move error: {}", error));
+                // A failed rename leaves source and destination untouched, so only created parents need cleanup.
+                return parents
+                    .fail(format!("Move error: {}", error), false)
+                    .into_result();
             }
         }
-        json_result(&PathMutationOutput {
+        let result = json_result(&PathMutationOutput {
             source_path: Some(input.source_path.clone()),
             destination_path: Some(input.destination_path.clone()),
             path: None,
@@ -2828,7 +2985,8 @@ impl Tool for MovePathTool {
             error: None,
             cleanup_warning,
             retained_backup_path,
-        })
+        });
+        settle_performed_effect(result, !input.dry_run)
     }
 }
 
@@ -2914,10 +3072,12 @@ impl Tool for DeletePathTool {
                 fs::remove_file(&path)
             };
             if let Err(error) = result {
-                return ToolResult::error(format!("Delete error: {}", error));
+                // A failed file unlink changes nothing, but a recursive removal may stop after deleting part of the tree.
+                return EffectFailure::new(format!("Delete error: {}", error), recursive)
+                    .into_result();
             }
         }
-        json_result(&PathMutationOutput {
+        let result = json_result(&PathMutationOutput {
             source_path: None,
             destination_path: None,
             path: Some(input.path.clone()),
@@ -2945,7 +3105,8 @@ impl Tool for DeletePathTool {
             error: None,
             cleanup_warning: None,
             retained_backup_path: None,
-        })
+        });
+        settle_performed_effect(result, !input.dry_run)
     }
 }
 
@@ -3064,29 +3225,50 @@ enum ReplacementOutcome {
         retained_backup_path: Option<String>,
     },
     Unchanged(String),
+    /// The destination is unchanged, but a staged sibling from this call could not be removed.
+    Residual(String),
     RecoveryIncomplete {
         error: String,
         retained_backup_path: String,
     },
 }
 
+// A staged copy that cannot be removed turns an otherwise unchanged replacement into residue of this call.
 fn replace_copy_path(source: &Path, destination: &Path) -> ReplacementOutcome {
+    replace_copy_path_with(source, destination, remove_path)
+}
+
+// Injecting staged cleanup makes the residue boundary testable without changing filesystem permissions.
+fn replace_copy_path_with(
+    source: &Path,
+    destination: &Path,
+    remove_staged: impl Fn(&Path) -> std::io::Result<()>,
+) -> ReplacementOutcome {
     let staged = unique_sibling_path(destination, "copy");
-    if let Err(error) = copy_path(source, &staged) {
-        if path_entry_exists(&staged) {
-            let _ = remove_path(&staged);
+    let discard_staged = |error: String| -> ReplacementOutcome {
+        match path_entry_exists(&staged).then(|| remove_staged(&staged)) {
+            Some(Err(cleanup)) => ReplacementOutcome::Residual(format!(
+                "{}; staged copy cleanup failed for {}: {}",
+                error,
+                staged.display(),
+                cleanup
+            )),
+            _ => ReplacementOutcome::Unchanged(error),
         }
-        return ReplacementOutcome::Unchanged(error.to_string());
+    };
+    if let Err(error) = copy_path(source, &staged) {
+        return discard_staged(error.to_string());
     }
-    let outcome = replace_existing_path(&staged, destination);
-    if matches!(
-        outcome,
-        ReplacementOutcome::Unchanged(_) | ReplacementOutcome::RecoveryIncomplete { .. }
-    ) && path_entry_exists(&staged)
-    {
-        let _ = remove_path(&staged);
+    match replace_existing_path(&staged, destination) {
+        ReplacementOutcome::Unchanged(error) => discard_staged(error),
+        outcome @ ReplacementOutcome::RecoveryIncomplete { .. } => {
+            if path_entry_exists(&staged) {
+                let _ = remove_staged(&staged);
+            }
+            outcome
+        }
+        outcome => outcome,
     }
-    outcome
 }
 
 fn replace_moved_path(source: &Path, destination: &Path) -> ReplacementOutcome {
@@ -4587,8 +4769,13 @@ mod tests {
             },
         ];
         let error = apply_patch_transaction(&outputs).unwrap_err();
-        assert!(error.contains("patch rollback restored file contents and permissions"));
-        assert!(error.contains("other metadata may have changed"));
+        assert!(
+            error
+                .message
+                .contains("patch rollback restored file contents and permissions")
+        );
+        assert!(error.message.contains("other metadata may have changed"));
+        assert!(error.residual, "a restored file is a new identity");
         assert_eq!(fs::read_to_string(&first).unwrap(), "old\n");
         #[cfg(unix)]
         {
@@ -4626,8 +4813,13 @@ mod tests {
             },
         ];
         let error = apply_patch_transaction(&outputs).unwrap_err();
-        assert!(error.contains("patch rollback restored file contents and permissions"));
-        assert!(error.contains("other metadata may have changed"));
+        assert!(
+            error
+                .message
+                .contains("patch rollback restored file contents and permissions")
+        );
+        assert!(error.message.contains("other metadata may have changed"));
+        assert!(error.residual, "a restored file is a new identity");
         assert_eq!(fs::read_to_string(&path).unwrap(), "private data\n");
         assert_eq!(
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
@@ -4725,10 +4917,159 @@ mod tests {
     fn atomic_temp_cleanup_failure_is_reported() {
         let dir = tempdir().unwrap();
         let original = std::io::Error::other("write failed");
-        let error = cleanup_failed_atomic_temp(dir.path(), original);
+        let error = cleanup_failed_atomic_temp(dir.path(), original, |temp| fs::remove_file(temp));
         assert!(error.to_string().contains("write failed"));
         assert!(error.to_string().contains("partial data may remain"));
+        assert!(error.uncertain);
         assert!(dir.path().is_dir());
+    }
+
+    #[test]
+    fn atomic_replacement_is_uncertain_only_when_its_temporary_file_may_remain() {
+        let dir = tempdir().unwrap();
+        // Renaming a file over a directory fails after the temporary file was written.
+        let blocker = dir.path().join("blocker");
+        fs::create_dir(&blocker).unwrap();
+        let cleaned =
+            atomic_write_with_cleanup(&blocker, b"agent", None, |temp| fs::remove_file(temp))
+                .unwrap_err();
+        assert!(!cleaned.uncertain);
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+
+        let leaked = atomic_write_with_cleanup(&blocker, b"agent", None, |_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "fixture cleanup failure",
+            ))
+        })
+        .unwrap_err();
+        assert!(leaked.uncertain);
+        assert!(leaked.to_string().contains("partial data may remain"));
+        assert!(blocker.is_dir());
+    }
+
+    #[tokio::test]
+    async fn file_write_rejects_limits_before_creating_parent_directories() {
+        let dir = tempdir().unwrap();
+        let parent = dir.path().join("new").join("nested");
+        let mut ctx = mutation_context("file_write", dir.path());
+        ctx.limits.max_changed_lines = Some(1);
+        let result = FileWriteTool::new()
+            .execute(
+                serde_json::json!({
+                    "path": parent.join("file.txt").to_string_lossy(),
+                    "content": "one\ntwo\nthree\n",
+                    "create_parent_dirs": true
+                }),
+                ctx,
+            )
+            .await;
+        assert!(!result.success);
+        assert!(
+            result.output.contains("changed-line cap"),
+            "{}",
+            result.output
+        );
+        assert!(!result.has_uncertain_effect());
+        assert!(!dir.path().join("new").exists());
+    }
+
+    #[test]
+    fn created_parents_are_removed_or_reported_as_residue() {
+        let dir = tempdir().unwrap();
+        let parent = dir.path().join("a").join("b");
+        let failure = CreatedParents::create(&parent)
+            .unwrap()
+            .fail("write failed".into(), false);
+        assert!(!failure.residual);
+        assert!(!dir.path().join("a").exists());
+
+        let parents = CreatedParents::create(&parent).unwrap();
+        fs::write(parent.join("external.txt"), "user").unwrap();
+        let failure = parents.fail("write failed".into(), false);
+        assert!(failure.residual);
+        assert!(
+            failure
+                .message
+                .contains("created parent directories may remain")
+        );
+        assert!(failure.into_result().has_uncertain_effect());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_copy_that_cannot_be_removed_is_residue() {
+        let dir = tempdir().unwrap();
+        // The copy creates the staged directory and then fails on the unsupported link.
+        let source = dir.path().join("source");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("file.txt"), "data").unwrap();
+        std::os::unix::fs::symlink(source.join("file.txt"), source.join("link")).unwrap();
+        let destination = dir.path().join("destination");
+        fs::write(&destination, "user").unwrap();
+
+        let outcome = replace_copy_path_with(&source, &destination, |_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "fixture cleanup failure",
+            ))
+        });
+        assert!(
+            matches!(outcome, ReplacementOutcome::Residual(ref error) if error.contains("staged copy cleanup failed"))
+        );
+        assert_eq!(fs::read_to_string(&destination).unwrap(), "user");
+
+        for entry in fs::read_dir(dir.path()).unwrap() {
+            let path = entry.unwrap().path();
+            if path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .contains(".copy.")
+            {
+                fs::remove_dir_all(path).unwrap();
+            }
+        }
+        let outcome = replace_copy_path(&source, &destination);
+        assert!(matches!(outcome, ReplacementOutcome::Unchanged(_)));
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn recursive_delete_failure_is_uncertain() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let tree = dir.path().join("tree");
+        let locked = tree.join("locked");
+        fs::create_dir_all(&locked).unwrap();
+        fs::write(tree.join("first.txt"), "data").unwrap();
+        fs::write(locked.join("kept.txt"), "data").unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o555)).unwrap();
+        // A privileged user ignores directory permissions, so the partial failure cannot be produced.
+        let privileged = fs::write(locked.join("probe"), "x").is_ok();
+        if !privileged {
+            let result = DeletePathTool
+                .execute(
+                    serde_json::json!({"path": tree.to_string_lossy(), "recursive": true}),
+                    mutation_context("delete_path", dir.path()),
+                )
+                .await;
+            assert!(!result.success);
+            assert!(result.has_uncertain_effect(), "{}", result.output);
+        }
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let file = dir.path().join("missing-parent").join("file.txt");
+        let result = DeletePathTool
+            .execute(
+                serde_json::json!({"path": file.to_string_lossy()}),
+                mutation_context("delete_path", dir.path()),
+            )
+            .await;
+        assert!(!result.success);
+        assert!(!result.has_uncertain_effect());
     }
 
     #[test]
@@ -4802,7 +5143,8 @@ mod tests {
         };
         fs::write(&existing, "external\n").unwrap();
         let error = apply_patch_transaction(&[existing_output]).unwrap_err();
-        assert!(error.contains("pre-apply conflict"));
+        assert!(error.message.contains("pre-apply conflict"));
+        assert!(!error.residual);
         assert_eq!(fs::read_to_string(&existing).unwrap(), "external\n");
 
         let created_output = PatchApply::Write {
@@ -4812,7 +5154,8 @@ mod tests {
         };
         fs::write(&created, "external\n").unwrap();
         let error = apply_patch_transaction(&[created_output]).unwrap_err();
-        assert!(error.contains("pre-apply conflict"));
+        assert!(error.message.contains("pre-apply conflict"));
+        assert!(!error.residual);
         assert_eq!(fs::read_to_string(&created).unwrap(), "external\n");
     }
 

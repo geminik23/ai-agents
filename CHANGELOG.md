@@ -5,7 +5,7 @@
 ### Added
 - Workspace file protection: development Rust hosts can confine built-in file tools to one workspace root or selected entries, track created files and expose a cooperative mutation revision without adding write authority
 - Scoped instructions: opt-in host-bound workspace rules refresh for supported model work without widening tool authority
-- Code agent example: run the scripted sample or connect selected workspace files and a provider to an approved host-owned checker
+- Code agent example: run the scripted sample or connect selected workspace files, or a whole workspace root with protected checker inputs, and a provider to an approved host-owned checker
 - Foreground task observations: opt-in REPL hosts prepare per-task local observations and report acknowledged results without adding execution authority
 - Task evaluation: development typed operations and foreground child decisions share configured hosts, exact continuation, isolated domain bindings and bounded redacted results without replacing the parent's response
 - Task observability: development task lifecycle facts carry run, profile and stage attribution through existing aggregation without replacing authoritative invocation accounting

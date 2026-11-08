@@ -166,3 +166,33 @@ async fn guarded_creation_advances_the_validation_target_revision() {
     assert!(source.revision().is_err());
     assert!(guard.requires_reconciliation());
 }
+
+#[tokio::test]
+async fn ordinary_tool_rejections_settle_without_effect_on_both_layers() {
+    let fixture = Fixture::new();
+    let guard = WorkspaceGuard::new(fixture.root.clone(), WorkspaceScope::Root, vec![]).unwrap();
+    let agent = agent(&fixture, &guard);
+    let source: Arc<dyn HostRevisionSource> = guard.clone();
+
+    // A common model mistake reaches the tool body and is rejected before any filesystem change.
+    let existing = fixture.root.join("lib.rs");
+    std::fs::write(&existing, "user").unwrap();
+    let rejected = write(&agent, "missing-overwrite", &existing, false).await;
+    assert!(rejected.executed && !rejected.success);
+    assert!(
+        rejected.output.contains("overwrite must be true"),
+        "{}",
+        rejected.output
+    );
+    // The executor and the guard read the same plain failure as settled with no effect.
+    assert!(!rejected.metadata.contains_key("task_effect_uncertain"));
+    assert_eq!(std::fs::read_to_string(&existing).unwrap(), "user");
+    assert_eq!(source.revision().unwrap(), "0");
+    assert!(!guard.requires_reconciliation());
+
+    // The same session continues and a real mutation still advances the validation target.
+    let created = fixture.root.join("src").join("feature.rs");
+    let record = write(&agent, "create", &created, false).await;
+    assert!(record.executed && record.success, "{}", record.output);
+    assert_eq!(source.revision().unwrap(), "2");
+}

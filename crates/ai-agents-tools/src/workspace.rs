@@ -85,8 +85,9 @@ struct State {
 
 /// Confines built-in file tools to one workspace and maintains a cooperative mutation revision.
 ///
-/// Every guarded mutation makes the revision unavailable while it runs and advances it to a never-reused value afterwards.
-/// An unverifiable effect, a dropped mutation or a replaced created file poisons the guard until the host reconciles outside this session.
+/// Every guarded mutation makes the revision unavailable while it runs.
+/// A performed or uncertain effect advances it to a never-reused value, while a failure that the tool reports without uncertainty leaves it unchanged.
+/// An uncertain effect, a success without a structured receipt, a dropped mutation or a replaced created file poisons the guard until the host reconciles outside this session.
 /// The revision only reflects mutations made through the guarded tools; it is valid as freshness evidence only when the host controls all other writers.
 pub struct WorkspaceGuard {
     root: PathBuf,
@@ -379,10 +380,12 @@ impl WorkspaceGuard {
         if state.poisoned || state.in_flight || state.revision >= u64::MAX - 1 {
             return Err("workspace mutation or revision is unavailable".into());
         }
+        let previous = state.revision;
         state.revision += 1;
         state.in_flight = true;
         Ok(MutationLease {
             guard: self.clone(),
+            previous,
             finished: false,
         })
     }
@@ -390,46 +393,72 @@ impl WorkspaceGuard {
 
 struct MutationLease {
     guard: Arc<WorkspaceGuard>,
+    // Restored only when the call provably changed nothing.
+    previous: u64,
     finished: bool,
 }
 
+/// How one guarded call settled under the shared tool-effect contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Settlement {
+    // A plain failure or a receipt with `mutation_performed: false` changed nothing.
+    NoEffect,
+    Performed,
+    Unknown,
+}
+
+// Built-in file tools report possible residue through `task_effect_uncertain`, which is also what the shared executor retains.
+// A plain failure therefore proves no change, while a success must still carry a structured receipt to be trusted.
+fn settle(result: &ToolResult) -> Settlement {
+    if result.has_uncertain_effect() {
+        return Settlement::Unknown;
+    }
+    let performed = serde_json::from_str::<Value>(&result.output)
+        .ok()
+        .and_then(|value| value.get("mutation_performed").and_then(Value::as_bool));
+    match (result.success, performed) {
+        // A failure that still claims a mutation contradicts the contract and is never treated as settled.
+        (false, Some(true)) => Settlement::Unknown,
+        (false, _) | (true, Some(false)) => Settlement::NoEffect,
+        (true, Some(true)) => Settlement::Performed,
+        (true, None) => Settlement::Unknown,
+    }
+}
+
 impl MutationLease {
-    // Only a structured receipt settles the effect; a failure without one, an uncertain effect or an unobservable creation poisons the guard.
+    // A no-effect call restores the pre-call revision because the in-flight value was never observable and the workspace is unchanged.
+    // Any performed or unknown effect keeps the advanced, never-reused revision, and an unknown or unobservable creation poisons the guard.
     fn finish(mut self, path: &Path, result: &ToolResult) {
-        let receipt = (!result.has_uncertain_effect())
-            .then(|| serde_json::from_str::<Value>(&result.output).ok())
-            .flatten();
-        let performed = receipt
-            .as_ref()
-            .and_then(|value| value.get("mutation_performed").and_then(Value::as_bool));
-        // A failed call that still claims a mutation has an unknown final state.
-        let performed = if !result.success && performed == Some(true) {
-            None
-        } else {
-            performed
-        };
-        let reported_create = receipt
-            .as_ref()
-            .and_then(|value| value.get("created").and_then(Value::as_bool))
-            == Some(true);
+        let settlement = settle(result);
+        let reported_create = result.success
+            && serde_json::from_str::<Value>(&result.output)
+                .ok()
+                .and_then(|value| value.get("created").and_then(Value::as_bool))
+                == Some(true);
         let tracked = self
             .guard
             .state
             .lock()
             .map(|state| state.created.contains_key(path))
             .unwrap_or(false);
-        let identity =
-            (performed == Some(true) && (tracked || reported_create)).then(|| file_identity(path));
+        let identity = (settlement == Settlement::Performed && (tracked || reported_create))
+            .then(|| file_identity(path));
         if let Ok(mut state) = self.guard.state.lock() {
-            match (performed, identity) {
-                (Some(true), Some(Ok(identity))) => {
+            match (settlement, identity) {
+                (Settlement::NoEffect, _) => state.revision = self.previous,
+                (Settlement::Performed, Some(Ok(identity))) => {
                     state.created.insert(path.to_path_buf(), Some(identity));
                     state.reads.remove(path);
+                    state.revision = state.revision.saturating_add(1);
                 }
-                (Some(true), Some(Err(_))) | (None, _) => state.poisoned = true,
-                _ => {}
+                (Settlement::Performed, None) => {
+                    state.revision = state.revision.saturating_add(1);
+                }
+                (Settlement::Performed, Some(Err(_))) | (Settlement::Unknown, _) => {
+                    state.poisoned = true;
+                    state.revision = state.revision.saturating_add(1);
+                }
             }
-            state.revision = state.revision.saturating_add(1);
             state.in_flight = false;
             self.finished = true;
         }
@@ -759,17 +788,30 @@ mod tests {
     }
 
     #[test]
-    fn revision_is_unavailable_in_flight_and_never_reused() {
+    fn revision_is_unavailable_in_flight_and_only_advances_for_effects() {
         let fixture = Fixture::new();
+        let path = fixture.root.join("x");
         let guard =
             WorkspaceGuard::new(fixture.root.clone(), WorkspaceScope::Root, vec![]).unwrap();
         let lease = guard.begin().unwrap();
         assert_eq!(guard.revision(), None);
         assert!(guard.begin().is_err());
-        lease.finish(
-            &fixture.root.join("x"),
-            &ToolResult::error(r#"{"mutation_performed":false}"#),
-        );
+        lease.finish(&path, &ToolResult::error("overwrite must be true"));
+        assert_eq!(guard.revision().as_deref(), Some("0"));
+        guard
+            .begin()
+            .unwrap()
+            .finish(&path, &ToolResult::ok(r#"{"mutation_performed":false}"#));
+        assert_eq!(guard.revision().as_deref(), Some("0"));
+        guard
+            .begin()
+            .unwrap()
+            .finish(&path, &ToolResult::ok(r#"{"mutation_performed":true}"#));
+        assert_eq!(guard.revision().as_deref(), Some("2"));
+        guard
+            .begin()
+            .unwrap()
+            .finish(&path, &ToolResult::error(r#"{"mutation_performed":false}"#));
         assert_eq!(guard.revision().as_deref(), Some("2"));
         assert!(!guard.requires_reconciliation());
     }
@@ -779,8 +821,8 @@ mod tests {
         let fixture = Fixture::new();
         let path = fixture.root.join("x");
         for result in [
-            ToolResult::error_with_uncertain_effect(r#"{"mutation_performed":false}"#),
-            ToolResult::error("write failed"),
+            ToolResult::error_with_uncertain_effect("write failed; partial data may remain"),
+            ToolResult::ok("written"),
             ToolResult::error(r#"{"mutation_performed":true}"#),
         ] {
             let guard =
@@ -795,6 +837,53 @@ mod tests {
         drop(guard.begin().unwrap());
         assert!(guard.requires_reconciliation());
         assert!(guard.authorize(&path, Access::Write).is_err());
+    }
+
+    #[tokio::test]
+    async fn ordinary_tool_rejections_keep_the_revision_and_allow_recovery() {
+        let fixture = Fixture::new();
+        let root = &fixture.root;
+        let existing = root.join("lib.rs");
+        std::fs::write(&existing, "old").unwrap();
+        let guard = WorkspaceGuard::new(root.clone(), WorkspaceScope::Root, vec![]).unwrap();
+        let registry = installed(&guard);
+
+        let missing_overwrite =
+            write(&registry, root, json!({"path":existing,"content":"new"})).await;
+        assert!(
+            missing_overwrite.output.contains("overwrite must be true"),
+            "{}",
+            missing_overwrite.output
+        );
+        let mut limited = ToolExecutionContext::test("file_write");
+        limited.policy_snapshot = json!({"write_paths":[root],"create_parent_dirs":true,"allow_without_confirmation":true});
+        limited.limits.max_changed_lines = Some(1);
+        let new_file = root.join("src").join("new.rs");
+        let over_limit = registry
+            .get("file_write")
+            .unwrap()
+            .execute(
+                json!({"path":new_file,"content":"a\nb\nc\n","create_parent_dirs":true}),
+                limited,
+            )
+            .await;
+        assert!(
+            over_limit.output.contains("changed-line cap"),
+            "{}",
+            over_limit.output
+        );
+        assert!(!root.join("src").exists());
+        assert_eq!(guard.revision().as_deref(), Some("0"));
+        assert!(!guard.requires_reconciliation());
+
+        let created = write(
+            &registry,
+            root,
+            json!({"path":new_file,"content":"a","create_parent_dirs":true}),
+        )
+        .await;
+        assert!(created.success, "{}", created.output);
+        assert_eq!(guard.revision().as_deref(), Some("2"));
     }
 
     #[tokio::test]
