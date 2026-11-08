@@ -1187,7 +1187,9 @@ async fn selected_new_file_and_repair_report_dirty_baseline() {
     assert_eq!(exits.len(), 2);
     assert_ne!(exits[0], 0);
     assert_eq!(exits[1], 0);
-    assert_eq!(revision.revision().unwrap(), "8");
+    // Three performed mutations advance the token; the mismatched edit changed nothing and keeps it.
+    assert_eq!(revision.revision().unwrap(), "6");
+    assert!(!revision.requires_reconciliation());
     assert_eq!(git(&["--no-pager", "show", ":source.rs"]), staged);
     assert!(
         fs::read_to_string(&sandbox.source)
@@ -3522,6 +3524,451 @@ async fn rejecting_edit_keeps_source_and_never_reports_completion() {
             .any(|e| e.record.canonical_id == "file_edit" && e.record.executed)
     );
     cancel_if_paused(&runner, &done).await;
+    drop(runner);
+    sandbox.cleanup();
+}
+
+// Root mode keeps the acceptance test inside the workspace, so protecting checker inputs is observable rather than assumed.
+struct RootSandbox {
+    parent: PathBuf,
+    root: PathBuf,
+    checker: PathBuf,
+    acceptance: PathBuf,
+}
+
+impl RootSandbox {
+    fn new() -> Self {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let parent = PathBuf::from("/tmp").join(format!(
+            "code-agent-root-test-{}-{nonce}-{}",
+            std::process::id(),
+            NEXT_SANDBOX.fetch_add(1, Ordering::Relaxed)
+        ));
+        let root = parent.join("workspace");
+        let checker_root = parent.join("checker");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(root.join("tests")).unwrap();
+        fs::create_dir(&checker_root).unwrap();
+        for name in ["a.rs", "b.rs"] {
+            fs::write(root.join("src").join(name), "pub fn value() -> i32 { 1 }\n").unwrap();
+        }
+        let acceptance = root.join("tests").join("acceptance.rs");
+        fs::write(&acceptance, "#[path = \"../src/a.rs\"] mod a;\n#[path = \"../src/b.rs\"] mod b;\n#[path = \"../src/c.rs\"] mod c;\n#[test] fn expected_values() { assert_eq!(a::value(), 2); assert_eq!(b::value(), 3); assert_eq!(c::value(), 4); }\n").unwrap();
+        let rustc = fs::canonicalize(env!("CARGO"))
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("rustc");
+        let binary = checker_root.join("root-acceptance");
+        let checker = checker_root.join("check.sh");
+        // The fixed checker receives only the workspace root and compiles the protected test inside it.
+        fs::write(&checker, format!("#!/bin/sh\nset -eu\nPATH=/usr/bin:/bin\nexport PATH\n'{}' --edition 2024 --test \"$1/tests/acceptance.rs\" -o '{}'\nexec '{}' --test-threads=1\n", rustc.display(), binary.display(), binary.display())).unwrap();
+        fs::set_permissions(&checker, fs::Permissions::from_mode(0o700)).unwrap();
+        Self {
+            parent,
+            root,
+            checker,
+            acceptance,
+        }
+    }
+
+    fn setup(&self) -> WorkspaceSetup {
+        let mut setup = prepare_root(
+            &self.root,
+            &[PathBuf::from("tests")],
+            &self.checker,
+            "openai",
+            "offline-test",
+            None,
+        )
+        .unwrap();
+        setup.assume_exclusive_workspace().unwrap();
+        setup
+    }
+
+    fn git(&self, args: &[&str]) -> Vec<u8> {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&self.root)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git fixture failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    }
+
+    fn cleanup(self) {
+        fs::remove_dir_all(self.parent).unwrap();
+    }
+}
+
+// Approve every retained request and answer a guidance question, returning the order of tool approvals and questions.
+async fn settle_prompts(
+    runner: &AutonomyRunner,
+    mut result: TaskRunResult,
+    guidance: &str,
+) -> (TaskRunResult, Vec<String>) {
+    let mut prompts = Vec::new();
+    while result.run.status == TaskRunStatus::Paused {
+        let interaction = runner
+            .task_interaction(&result.run.key.run_id, result.run.revision)
+            .await
+            .unwrap()
+            .expect("retained interaction");
+        assert!(prompts.len() <= 12, "unbounded prompts: {prompts:?}");
+        result = match &interaction.prompt {
+            TaskHostPrompt::Approval { trigger, .. } => {
+                prompts.push(
+                    trigger
+                        .get("name")
+                        .and_then(|name| name.as_str())
+                        .unwrap_or("unnamed")
+                        .to_string(),
+                );
+                respond(runner, result, ApprovalResult::Approved).await
+            }
+            TaskHostPrompt::Question(_) => {
+                prompts.push("question".into());
+                runner
+                    .resume(
+                        &result.run.key.run_id,
+                        result.run.revision,
+                        TaskResumeInput::UserAnswer {
+                            request_id: interaction.request_id,
+                            answer: json!(guidance),
+                        },
+                    )
+                    .await
+                    .unwrap()
+            }
+            other => panic!("unexpected prompt after {prompts:?}: {other:?}"),
+        };
+    }
+    (result, prompts)
+}
+
+fn tool_record<'a>(
+    result: &'a TaskRunResult,
+    tool: &str,
+    path: &Path,
+) -> Vec<&'a ai_agents::tools::ToolExecutionRecord> {
+    result
+        .run
+        .evidence
+        .tool_calls
+        .iter()
+        .map(|entry| &entry.record)
+        .filter(|record| {
+            record.canonical_id == tool && record.arguments.get("path") == Some(&json!(path))
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn root_mode_configuration_binds_the_root_and_protects_checker_inputs() {
+    let sandbox = RootSandbox::new();
+    let reject = |protected: &[&str], checker: &Path| {
+        let protected: Vec<_> = protected.iter().map(PathBuf::from).collect();
+        prepare_root(
+            &sandbox.root,
+            &protected,
+            checker,
+            "openai",
+            "offline-test",
+            None,
+        )
+        .err()
+        .map(|error| error.to_string())
+        .expect("configuration must be rejected")
+    };
+    assert!(reject(&[], &sandbox.checker).contains("at least one protected"));
+    assert!(reject(&["tests", "tests"], &sandbox.checker).contains("repeated"));
+    assert!(reject(&["../outside"], &sandbox.checker).contains("normal components"));
+    assert!(!reject(&["missing"], &sandbox.checker).is_empty());
+    std::os::unix::fs::symlink(sandbox.root.join("tests"), sandbox.root.join("alias")).unwrap();
+    assert!(reject(&["alias"], &sandbox.checker).contains("symlinked"));
+    let inside = sandbox.root.join("check.sh");
+    fs::copy(&sandbox.checker, &inside).unwrap();
+    assert!(reject(&["tests"], &inside).contains("outside the workspace"));
+
+    let mut setup = sandbox.setup();
+    let root = sandbox.root.to_str().unwrap();
+    let protected = sandbox.root.join("tests");
+    let policies = &setup.spec.tool_security.tools;
+    for name in ["file_edit", "file_write"] {
+        assert_eq!(policies[name].write_paths, vec![root]);
+        assert_eq!(policies[name].paths.deny, vec![protected.to_str().unwrap()]);
+        assert!(policies[name].require_confirmation);
+    }
+    assert!(!policies["file_write"].overwrite_existing);
+    assert!(policies["file_edit"].require_read_before_write);
+    for name in ["file_read", "file_list", "glob", "grep"] {
+        assert_eq!(policies[name].read_paths, vec![root]);
+    }
+    assert_eq!(
+        setup.checker.as_ref().unwrap().argv,
+        vec![sandbox.checker.to_str().unwrap(), root]
+    );
+    assert!(setup.discovery_enabled());
+    assert!(setup.cooperative_revision_enabled());
+    assert_eq!(setup.source_file(), None);
+    assert!(setup.enable_discovery().is_err());
+    assert!(setup.enable_automatic_instructions().is_err());
+    // The guard binds exactly one runtime, so a second builder cannot share its revision.
+    let _builder = setup.builder().unwrap();
+    assert!(setup.builder().is_err());
+    sandbox.cleanup();
+}
+
+// The model finds files itself, recovers from an ordinary tool rejection, cannot weaken the protected test and needs a fresh real check after repair.
+// Its denied attempt on the checker input turns the failed check into a human question instead of automatic feedback.
+#[tokio::test]
+async fn root_mode_discovers_repairs_files_and_keeps_user_work_and_checker_inputs() {
+    use ai_agents_cli::CliTaskObserver;
+    let sandbox = RootSandbox::new();
+    let a = sandbox.root.join("src/a.rs");
+    let b = sandbox.root.join("src/b.rs");
+    let c = sandbox.root.join("src/c.rs");
+    let scratch = sandbox.root.join("scratch.txt");
+    sandbox.git(&["init", "--quiet"]);
+    sandbox.git(&["add", "--", "src", "tests"]);
+    sandbox.git(&[
+        "-c",
+        "user.name=Fixture",
+        "-c",
+        "user.email=fixture@example.invalid",
+        "-c",
+        "core.hooksPath=/dev/null",
+        "commit",
+        "--quiet",
+        "--no-gpg-sign",
+        "-m",
+        "fixture baseline",
+    ]);
+    fs::write(&a, "pub fn value() -> i32 { 1 } // staged note\n").unwrap();
+    sandbox.git(&["add", "--", "src/a.rs"]);
+    let staged = ["src/a.rs", "src/b.rs", "tests/acceptance.rs"]
+        .map(|file| sandbox.git(&["--no-pager", "show", &format!(":{file}")]));
+    fs::write(
+        &a,
+        "pub fn value() -> i32 { 1 } // staged note + unstaged note\n",
+    )
+    .unwrap();
+    fs::write(&scratch, "untracked user data\n").unwrap();
+    let acceptance = fs::read_to_string(&sandbox.acceptance).unwrap();
+
+    let setup = sandbox.setup();
+    let guard = setup.guard.as_ref().unwrap().clone();
+    let provider = Arc::new(Provider::new(VecDeque::from([
+        json!({"tool":"grep","arguments":{"path":sandbox.root,"pattern":"fn value"}}).to_string(),
+        json!({"tool":"file_write","arguments":{"path":sandbox.acceptance,"content":"#[test] fn expected_values() {}\n","overwrite":true}}).to_string(),
+        json!({"tool":"file_write","arguments":{"path":a,"content":"pub fn value() -> i32 { 2 }\n"}}).to_string(),
+        json!({"tool":"file_read","arguments":{"path":a}}).to_string(),
+        json!({"tool":"file_edit","arguments":{"path":a,"old_text":"{ 1 }","new_text":"{ 1 + 1 }"}}).to_string(),
+        json!({"tool":"file_read","arguments":{"path":b}}).to_string(),
+        json!({"tool":"file_edit","arguments":{"path":b,"old_text":"{ 1 }","new_text":"{ 1 + 1 }"}}).to_string(),
+        json!({"tool":"file_write","arguments":{"path":c,"content":"pub fn value() -> i32 { 4 }\n"}}).to_string(),
+        "Ready for checking.".into(),
+        json!({"tool":"file_read","arguments":{"path":b}}).to_string(),
+        json!({"tool":"file_edit","arguments":{"path":b,"old_text":"{ 1 + 1 }","new_text":"{ 1 + 2 }"}}).to_string(),
+        "Repair ready.".into(),
+    ])));
+    let runner = runner_with_provider(&setup, provider.clone());
+    let report = crate::workspace_report::WorkspaceReport::new(sandbox.root.clone(), Vec::new());
+    report.before_task().await.unwrap();
+    let started = runner
+        .run("Make the acceptance test pass.", None)
+        .await
+        .unwrap();
+    let guidance = "Leave the acceptance test unchanged and fix the source so it returns 3.";
+    let (done, prompts) = settle_prompts(&runner, started, guidance).await;
+    assert_eq!(
+        done.run.status,
+        TaskRunStatus::Completed,
+        "{:?} after {prompts:?}",
+        done.run.stop_reason
+    );
+    assert_eq!(
+        prompts,
+        [
+            "file_write",
+            "file_edit",
+            "file_edit",
+            "file_write",
+            "command",
+            "question",
+            "file_edit",
+            "command"
+        ]
+    );
+
+    // Discovery ran, the protected input was denied before approval and the ordinary rejection settled without effect.
+    assert!(
+        tool_record(&done, "grep", &sandbox.root)
+            .iter()
+            .any(|record| record.executed && record.success)
+    );
+    let denied = tool_record(&done, "file_write", &sandbox.acceptance);
+    assert!(!denied.is_empty() && denied.iter().all(|record| !record.executed));
+    let rejected = tool_record(&done, "file_write", &a);
+    assert_eq!(rejected.len(), 1);
+    assert!(rejected[0].executed && !rejected[0].success);
+    assert!(
+        rejected[0].output.contains("overwrite must be true"),
+        "{}",
+        rejected[0].output
+    );
+    assert!(!rejected[0].metadata.contains_key("task_effect_uncertain"));
+
+    // One real failing check and one fresh passing check, with the token advanced only by the four performed changes.
+    let exits: Vec<_> = done
+        .run
+        .evidence
+        .tool_calls
+        .iter()
+        .filter(|entry| entry.record.canonical_id == "command" && entry.record.executed)
+        .map(|entry| {
+            serde_json::from_str::<serde_json::Value>(&entry.record.output).unwrap()["exit_code"]
+                .as_i64()
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(exits.len(), 2);
+    assert_ne!(exits[0], 0);
+    assert_eq!(exits[1], 0);
+    assert_eq!(guard.revision().as_deref(), Some("8"));
+    assert!(!guard.requires_reconciliation());
+
+    assert_eq!(
+        fs::read_to_string(&a).unwrap(),
+        "pub fn value() -> i32 { 1 + 1 } // staged note + unstaged note\n"
+    );
+    assert_eq!(
+        fs::read_to_string(&b).unwrap(),
+        "pub fn value() -> i32 { 1 + 2 }\n"
+    );
+    assert_eq!(
+        fs::read_to_string(&c).unwrap(),
+        "pub fn value() -> i32 { 4 }\n"
+    );
+    assert_eq!(fs::read_to_string(&sandbox.acceptance).unwrap(), acceptance);
+    assert_eq!(
+        fs::read_to_string(&scratch).unwrap(),
+        "untracked user data\n"
+    );
+    for (index, file) in ["src/a.rs", "src/b.rs", "tests/acceptance.rs"]
+        .into_iter()
+        .enumerate()
+    {
+        assert_eq!(
+            sandbox.git(&["--no-pager", "show", &format!(":{file}")]),
+            staged[index]
+        );
+    }
+    let text = report.after_task(Some(&done)).await.unwrap();
+    for target in ["src/a.rs", "src/b.rs", "src/c.rs"] {
+        assert!(
+            text.contains(&format!("Recorded mutation target {target:?}")),
+            "{text}"
+        );
+    }
+    assert!(!text.contains("tests/acceptance.rs\""), "{text}");
+    let requests = provider.requests.lock().unwrap();
+    assert!(requests.iter().flatten().all(|message| {
+        !message
+            .content
+            .contains("Untrusted output from a failed authorized validation check")
+    }));
+    assert!(
+        requests
+            .iter()
+            .flatten()
+            .any(|message| message.content.contains(guidance))
+    );
+    drop(requests);
+    drop(runner);
+    sandbox.cleanup();
+}
+
+// An external replacement of an agent-created file makes the bound revision unavailable, so no later check can complete the task.
+#[tokio::test]
+async fn root_mode_external_replacement_prevents_completion() {
+    let sandbox = RootSandbox::new();
+    let c = sandbox.root.join("src/c.rs");
+    let d = sandbox.root.join("src/d.rs");
+    let setup = sandbox.setup();
+    let guard = setup.guard.as_ref().unwrap().clone();
+    let provider = Arc::new(Provider::new(VecDeque::from([
+        json!({"tool":"file_write","arguments":{"path":c,"content":"pub fn value() -> i32 { 4 }\n"}}).to_string(),
+        json!({"tool":"file_write","arguments":{"path":d,"content":"pub fn other() {}\n"}}).to_string(),
+        json!({"tool":"file_read","arguments":{"path":c}}).to_string(),
+        "Ready for checking.".into(),
+    ])));
+    let runner = runner_with_provider(&setup, provider);
+    let first = runner.run("Create the file.", None).await.unwrap();
+    assert_eq!(first.run.status, TaskRunStatus::Paused);
+    let second = respond(&runner, first, ApprovalResult::Approved).await;
+    assert_eq!(second.run.status, TaskRunStatus::Paused);
+    assert_eq!(guard.revision().as_deref(), Some("2"));
+
+    // Another writer replaces the created file while the task waits for approval.
+    let replacement = sandbox.root.join("replacement.rs");
+    fs::write(&replacement, "pub fn value() -> i32 { 99 }\n").unwrap();
+    fs::rename(&replacement, &c).unwrap();
+    let run_id = second.run.key.run_id.clone();
+    let interaction = runner
+        .task_interaction(&run_id, second.run.revision)
+        .await
+        .unwrap()
+        .unwrap();
+    let resumed = runner
+        .resume(
+            &run_id,
+            second.run.revision,
+            TaskResumeInput::Approval {
+                request_id: interaction.request_id,
+                result: ApprovalResult::Approved,
+            },
+        )
+        .await;
+    // The unavailable target may surface as an error or a non-completed result, but never as completion.
+    if let Ok(result) = &resumed {
+        assert_ne!(result.run.status, TaskRunStatus::Completed);
+    }
+    let display = runner.task_display(&run_id).await.unwrap();
+    assert_ne!(display.summary.status, TaskRunStatus::Completed);
+    assert!(guard.requires_reconciliation());
+    assert_eq!(guard.revision(), None);
+    assert_eq!(
+        fs::read_to_string(&c).unwrap(),
+        "pub fn value() -> i32 { 99 }\n"
+    );
+    assert!(d.exists());
+    // The checker writes its test binary when it runs, so its absence shows no check was attempted.
+    assert!(!sandbox.parent.join("checker/root-acceptance").exists());
+    // A resumed run that fails this way stays retained for explicit recovery; only a paused run is cancelled here.
+    if display.summary.status == TaskRunStatus::Paused {
+        let cancelled = runner
+            .cancel_task(&run_id, display.summary.revision)
+            .await
+            .unwrap();
+        assert_eq!(
+            cancelled.disposition,
+            ai_agents::CancellationDisposition::Acknowledged
+        );
+    }
     drop(runner);
     sandbox.cleanup();
 }

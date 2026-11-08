@@ -289,6 +289,8 @@ impl CliTaskObserver for WorkspaceReport {
         let mut failed_checks = 0;
         let mut unknown_checks = 0;
         let mut uncertain = 0;
+        // Root mode has no selected list, so the report names each path that carries an actual mutation receipt.
+        let mut targets = std::collections::BTreeSet::new();
         for evidence in &result.run.evidence.tool_calls {
             let record = &evidence.record;
             if matches!(
@@ -307,6 +309,13 @@ impl CliTaskObserver for WorkspaceReport {
                         == Some(true)
                 {
                     mutations += 1;
+                    if let Some(path) = record
+                        .executed_arguments
+                        .get("path")
+                        .and_then(|value| value.as_str())
+                    {
+                        targets.insert(PathBuf::from(path));
+                    }
                 } else if record.timed_out || record.cancelled || !record.success {
                     uncertain += 1;
                 }
@@ -323,6 +332,16 @@ impl CliTaskObserver for WorkspaceReport {
                     None => unknown_checks += 1,
                 }
             }
+        }
+        for target in targets.iter().take(32) {
+            let relative = target.strip_prefix(&self.root).unwrap_or(target);
+            let name: String = relative.to_string_lossy().chars().take(160).collect();
+            report.push_str(&format!("  Recorded mutation target {:?}.\n", name));
+        }
+        if targets.len() > 32 {
+            report.push_str(
+                "  Additional recorded mutation targets were omitted from this bounded report.\n",
+            );
         }
         report.push_str(&format!("  Recorded actual mutation receipts: {mutations}; executed commands: {checks}; failed/cancelled mutation attempts: {uncertain}.\n"));
         report.push_str(&format!("  Command exits: {passed_checks} zero, {failed_checks} nonzero, {unknown_checks} unavailable or interrupted; these are not independent proof of completion.\n"));

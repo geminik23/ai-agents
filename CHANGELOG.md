@@ -74,6 +74,8 @@
 - Rust configuration compatibility: typed autonomy fields, validation driver bounds and objective-bound todo identities require affected struct literals to be updated; these development additions are not the published stable API
 
 ### Fixed
+- File mutation effects: built-in file mutation tools validate limits before creating parent directories, remove only the directories they created and report any failure that may leave a change behind as an uncertain task effect
+- Workspace file protection: ordinary file tool rejections no longer stop a guarded session or change its revision
 - Long-task context: retain controller state and incomplete native history across compaction and context recovery without treating missing results as execution proof
 - Task validation feedback: preserve host target revisions and completed hooks across one-shot feedback and capacity pauses without replay or stale provider results
 - Task continuation: preserve legacy capacity-review identity and reject changed model-loop bindings before consuming pending work

@@ -1,9 +1,8 @@
-// Bind explicitly selected workspace files to an actual provider and a host-owned checker.
+// Bind explicitly selected workspace files, or a whole workspace root with protected checker inputs, to a provider and a host-owned checker.
 // Flow: validate explicit paths -> prepare a provider-free builder -> start a task with typed approvals.
 // The checker is trusted host code; the caller must provide any required isolation and independent tests.
 
 use crate::code_agent_workspace::command_word;
-use crate::workspace_guard::WorkspaceGuard;
 use crate::workspace_report::WorkspaceReport;
 use ai_agents::AgentBuilder;
 use ai_agents::autonomy::{AutonomyExtensions, HostRevisionSource, HostValidationBinding};
@@ -11,7 +10,8 @@ use ai_agents::context::{ContextManager, ContextSource, ScopedInstructionFiles};
 use ai_agents::spec::{AgentSpec, LLMConfigOrSelector, PreparedAgentSpec, TaskIterationPolicy};
 use ai_agents::tool_security::CommandRuleConfig;
 use ai_agents::tools::{
-    CommandRequest, CommandResponse, CommandRunner, ProcessCommandRunner, ToolExecutionContext,
+    CommandRequest, CommandResponse, CommandRunner, CommandTool, FileListTool, GlobTool, GrepTool,
+    ProcessCommandRunner, ToolExecutionContext, ToolRegistry, WorkspaceGuard, WorkspaceScope,
 };
 use ai_agents_cli::{CliApprovalHandler, CliRepl, CommandResult};
 use async_trait::async_trait;
@@ -23,6 +23,7 @@ use std::sync::Arc;
 
 const YAML: &str = include_str!("../../../yaml/code-agent/workspace.yaml");
 const READ_ONLY_YAML: &str = include_str!("../../../yaml/code-agent/workspace-read-only.yaml");
+const ROOT_YAML: &str = include_str!("../../../yaml/code-agent/workspace-root.yaml");
 const CHECKER_LIMIT: u64 = 8 * 1024 * 1024;
 const INSTRUCTIONS_LIMIT: u64 = 64 * 1024;
 
@@ -36,9 +37,12 @@ pub struct WorkspaceSetup {
     spec: AgentSpec,
     task_iteration_policy: TaskIterationPolicy,
     root: PathBuf,
-    source: PathBuf,
+    // Root mode has no host-selected primary file; the agent discovers its own targets.
+    source: Option<PathBuf>,
     sources: Vec<PathBuf>,
     new_files: Vec<PathBuf>,
+    // Checker inputs that root mode denies to every file mutation; empty in selected-file mode.
+    protected: Vec<PathBuf>,
     guard: Option<Arc<WorkspaceGuard>>,
     cooperative_revision: bool,
     discovery_enabled: bool,
@@ -103,6 +107,43 @@ fn selected_new_file(root: &Path, relative: &Path) -> Result<PathBuf> {
         }
     }
     Ok(path)
+}
+
+// A protected checker input must already exist inside the root as a file or directory reached without symlinks.
+fn protected_path(root: &Path, relative: &Path) -> Result<PathBuf> {
+    if relative.as_os_str().is_empty() || relative.is_absolute() {
+        return Err("protected paths must be nonempty paths relative to the workspace".into());
+    }
+    let mut path = root.to_path_buf();
+    for component in relative.components() {
+        let Component::Normal(part) = component else {
+            return Err("protected paths must contain only normal components".into());
+        };
+        path.push(part);
+        if fs::symlink_metadata(&path)?.file_type().is_symlink() {
+            return Err("symlinked workspace paths are unsupported".into());
+        }
+    }
+    Ok(path)
+}
+
+// Provider names come from the host command line, so reject values that would silently select another provider.
+fn validate_provider(provider: &str, model: &str) -> Result<()> {
+    if provider.trim() != provider
+        || provider.is_empty()
+        || model.trim() != model
+        || model.is_empty()
+        || model.len() > 256
+    {
+        return Err("provider and model must be nonempty names".into());
+    }
+    let provider_type = ai_agents::ProviderType::from_str(provider)?;
+    if provider_type == ai_agents::ProviderType::OpenAICompatible {
+        return Err(
+            "openai-compatible requires a base URL, which this example does not configure".into(),
+        );
+    }
+    Ok(())
 }
 
 // Checker bytes are retained so a replaced host program is refused before execution.
@@ -275,20 +316,7 @@ fn prepare_workspace(
             Ok((path, bytes))
         })
         .transpose()?;
-    if provider.trim() != provider
-        || provider.is_empty()
-        || model.trim() != model
-        || model.is_empty()
-        || model.len() > 256
-    {
-        return Err("provider and model must be nonempty names".into());
-    }
-    let provider_type = ai_agents::ProviderType::from_str(provider)?;
-    if provider_type == ai_agents::ProviderType::OpenAICompatible {
-        return Err(
-            "openai-compatible requires a base URL, which this example does not configure".into(),
-        );
-    }
+    validate_provider(provider, model)?;
     let snapshot = instructions(&root, instruction_file)?;
     let root_string = command_word(&root)?;
     let source_strings = selected
@@ -401,15 +429,23 @@ fn prepare_workspace(
         }
     }
     spec.validate()?;
-    let guard = (!selected_new.is_empty())
-        .then(|| WorkspaceGuard::new(root.clone(), selected.clone(), selected_new.clone()));
+    let guard = if selected_new.is_empty() {
+        None
+    } else {
+        Some(WorkspaceGuard::new(
+            root.clone(),
+            WorkspaceScope::Selected(selected.clone()),
+            selected_new.clone(),
+        )?)
+    };
     Ok(WorkspaceSetup {
         spec,
         task_iteration_policy,
         root,
-        source,
+        source: Some(source),
         sources: selected,
         new_files: selected_new,
+        protected: Vec::new(),
         guard,
         cooperative_revision: false,
         discovery_enabled: false,
@@ -419,9 +455,164 @@ fn prepare_workspace(
     })
 }
 
+// The agent may discover, read and propose changes anywhere under the root, but declared checker inputs stay read-only.
+// File effects go through the framework workspace guard, so targets stay inside the root and created files remain host-tracked.
+pub fn prepare_root(
+    root: &Path,
+    protected: &[PathBuf],
+    checker: &Path,
+    provider: &str,
+    model: &str,
+    instruction_file: Option<&Path>,
+) -> Result<WorkspaceSetup> {
+    if !root.is_absolute() || !checker.is_absolute() {
+        return Err("workspace and checker must be absolute paths".into());
+    }
+    let root = fs::canonicalize(root)?;
+    if !root.is_dir() || root.parent().is_none() {
+        return Err("workspace must be a directory below the filesystem root".into());
+    }
+    // Without a protected input the agent could edit whatever the checker relies on, so its pass would not be evidence.
+    if protected.is_empty() {
+        return Err("root mode needs at least one protected checker input".into());
+    }
+    let mut protected_paths = Vec::with_capacity(protected.len());
+    for relative in protected {
+        let path = protected_path(&root, relative)?;
+        if protected_paths.contains(&path) {
+            return Err("protected paths must not be repeated".into());
+        }
+        protected_paths.push(path);
+    }
+    let checker = fs::canonicalize(checker)?;
+    if checker.starts_with(&root) {
+        return Err("the trusted checker must be outside the workspace".into());
+    }
+    let checker_bytes = checker_snapshot(&checker)?;
+    validate_provider(provider, model)?;
+    let snapshot = instructions(&root, instruction_file)?;
+    let root_string = command_word(&root)?;
+    let protected_strings = protected_paths
+        .iter()
+        .map(|path| command_word(path))
+        .collect::<Result<Vec<_>>>()?;
+    // The checker receives only the root because the agent, not the host, chooses which files change.
+    let argv = vec![command_word(&checker)?, root_string.clone()];
+    let checker = CheckerBinding {
+        command: argv.join(" "),
+        path: checker,
+        bytes: checker_bytes,
+        argv,
+        timeout_ms: None,
+    };
+    let (mut spec, task_iteration_policy) =
+        PreparedAgentSpec::from_yaml_strict(ROOT_YAML)?.into_parts();
+    match &mut spec.llm {
+        LLMConfigOrSelector::Config(config) => {
+            config.provider = provider.to_string();
+            config.model = model.to_string();
+        }
+        _ => return Err("workspace example needs a direct provider configuration".into()),
+    }
+    // The YAML owns approval and overwrite behavior; the host binds only paths it has validated.
+    for name in ["file_read", "file_list", "glob", "grep"] {
+        spec.tool_security
+            .tools
+            .get_mut(name)
+            .ok_or("missing discovery policy")?
+            .read_paths = vec![root_string.clone()];
+    }
+    for name in ["file_edit", "file_write"] {
+        let policy = spec
+            .tool_security
+            .tools
+            .get_mut(name)
+            .ok_or("missing mutation policy")?;
+        if name == "file_edit" {
+            policy.read_paths = vec![root_string.clone()];
+        }
+        policy.write_paths = vec![root_string.clone()];
+        policy.paths.deny = protected_strings.clone();
+    }
+    let policy = spec
+        .tool_security
+        .tools
+        .get_mut("command")
+        .ok_or("missing command policy")?;
+    policy.allowed_commands = vec![CommandRuleConfig {
+        argv: checker.argv.clone(),
+    }];
+    policy.working_dirs = vec![root_string.clone()];
+    let checks = spec
+        .autonomy
+        .defaults
+        .validation
+        .as_mut()
+        .and_then(|v| v.checks.as_mut())
+        .ok_or("missing validation check")?;
+    if checks.len() != 1 || checks[0].id != "acceptance" {
+        return Err("unexpected validation configuration".into());
+    }
+    checks[0].config = Some(
+        json!({"command":checker.command,"cwd":root_string,"host_binding":"workspace-checker"}),
+    );
+    for (key, value) in [
+        ("workspace_root", root_string),
+        (
+            "protected_paths",
+            serde_json::to_string(&protected_strings)?,
+        ),
+        ("instruction_snapshot", snapshot),
+    ] {
+        match spec.context.get_mut(key) {
+            Some(ContextSource::Runtime { default, .. }) => {
+                *default = Some(serde_json::Value::String(value))
+            }
+            _ => return Err(format!("missing runtime context: {key}").into()),
+        }
+    }
+    spec.validate()?;
+    let guard = WorkspaceGuard::new(root.clone(), WorkspaceScope::Root, Vec::new())?;
+    Ok(WorkspaceSetup {
+        spec,
+        task_iteration_policy,
+        root,
+        source: None,
+        sources: Vec::new(),
+        new_files: Vec::new(),
+        protected: protected_paths,
+        guard: Some(guard),
+        cooperative_revision: false,
+        discovery_enabled: true,
+        explicit_instructions: instruction_file.is_some(),
+        automatic_instructions: None,
+        checker: Some(checker),
+    })
+}
+
+// A guarded runtime receives only the guarded file tools, read-only discovery and the host-bound command tool.
+fn guarded_registry(guard: &Arc<WorkspaceGuard>) -> Result<ToolRegistry> {
+    let mut registry = ToolRegistry::new();
+    guard.install(&mut registry)?;
+    registry.register(Arc::new(FileListTool::new()))?;
+    registry.register(Arc::new(GlobTool::new()))?;
+    registry.register(Arc::new(GrepTool::new()))?;
+    let command = CommandTool::new(registry.command_runner_slot());
+    registry.register(Arc::new(command))?;
+    Ok(registry)
+}
+
 impl WorkspaceSetup {
+    fn root_mode(&self) -> bool {
+        !self.protected.is_empty()
+    }
+
     // Auto discovery is a separate host authorization and does not widen the model's file tool grants.
     pub fn enable_automatic_instructions(&mut self) -> Result<()> {
+        // Scoped discovery needs host-selected targets, which root mode intentionally does not have.
+        if self.root_mode() {
+            return Err("automatic instructions need selected files; supply an explicit instruction file in root mode".into());
+        }
         if self.explicit_instructions || self.automatic_instructions.is_some() {
             return Err(
                 "automatic instructions cannot be combined with an explicit snapshot or repeated"
@@ -461,9 +652,9 @@ impl WorkspaceSetup {
         if self.guard.is_none() {
             self.guard = Some(WorkspaceGuard::new(
                 self.root.clone(),
-                self.sources.clone(),
+                WorkspaceScope::Selected(self.sources.clone()),
                 self.new_files.clone(),
-            ));
+            )?);
         }
         self.cooperative_revision = true;
         Ok(())
@@ -471,6 +662,9 @@ impl WorkspaceSetup {
 
     // Explicit opt-in permits path discovery and content search under the root, but never widens file_read or write grants.
     pub fn enable_discovery(&mut self) -> Result<()> {
+        if self.root_mode() {
+            return Err("root mode always grants discovery under the workspace root".into());
+        }
         let root = command_word(&self.root)?;
         let mut spec = self.spec.clone();
         let tools = spec.tools.as_mut().ok_or("missing tool grants")?;
@@ -585,7 +779,7 @@ impl WorkspaceSetup {
             builder = builder.context_manager(manager);
         }
         Ok(match &self.guard {
-            Some(guard) => builder.tools(guard.registry()?),
+            Some(guard) => builder.tools(guarded_registry(guard)?),
             None => builder,
         })
     }
@@ -646,8 +840,12 @@ impl WorkspaceSetup {
         })
     }
 
-    pub fn source_file(&self) -> &Path {
-        &self.source
+    pub fn source_file(&self) -> Option<&Path> {
+        self.source.as_deref()
+    }
+
+    pub fn protected_paths(&self) -> &[PathBuf] {
+        &self.protected
     }
 
     pub fn source_files(&self) -> &[PathBuf] {
@@ -706,9 +904,17 @@ impl CommandRunner for CheckerRunner {
 
 // The existing CLI owns foreground controls; ordinary chat is blocked to avoid unverified edit claims.
 pub async fn run(setup: WorkspaceSetup) -> Result<()> {
-    println!("Primary source: {}", setup.source_file().display());
+    if let Some(source) = setup.source_file() {
+        println!("Primary source: {}", source.display());
+    }
     for source in setup.source_files() {
         println!("Authorized source: {}", source.display());
+    }
+    if setup.root_mode() {
+        println!("Workspace root: {}", setup.root.display());
+        for path in setup.protected_paths() {
+            println!("Protected checker input: {}", path.display());
+        }
     }
     println!("Workspace discovery enabled: {}", setup.discovery_enabled());
     println!(
@@ -721,9 +927,18 @@ pub async fn run(setup: WorkspaceSetup) -> Result<()> {
     } else {
         println!("Read-only mode: no edit grant or checker is installed.");
     }
-    println!(
-        "Selected sources, instruction snapshot and task messages may be sent to the chosen provider and may incur costs."
-    );
+    if setup.root_mode() {
+        println!(
+            "Any file name, search match or file content under the root, the instruction snapshot and task messages may be sent to the chosen provider and may incur costs."
+        );
+        println!(
+            "Changes anywhere under the root except the protected inputs need approval; existing files change only through exact edits."
+        );
+    } else {
+        println!(
+            "Selected sources, instruction snapshot and task messages may be sent to the chosen provider and may incur costs."
+        );
+    }
     if setup.checker.is_some() {
         println!(
             "The external checker runs with host permissions; you are responsible for its independence, isolation and cleanup."
@@ -741,7 +956,7 @@ pub async fn run(setup: WorkspaceSetup) -> Result<()> {
             "Only /task commands are enabled; this read-only task cannot edit files or run a checker."
         );
     }
-    if setup.discovery_enabled() {
+    if setup.discovery_enabled() && !setup.root_mode() {
         println!(
             "Workspace discovery may share file names and search matches outside the selected edit files."
         );
@@ -781,9 +996,14 @@ fn workspace_repl(setup: &WorkspaceSetup, agent: ai_agents::RuntimeAgent) -> Cli
         setup.root.clone(),
         setup.sources.clone(),
     ));
+    let welcome = if setup.root_mode() {
+        "Code Agent: workspace root with protected checker inputs"
+    } else {
+        "Code Agent: explicitly selected workspace files"
+    };
     CliRepl::new(agent)
         .task_observer(observer)
-        .welcome("Code Agent: explicitly selected workspace files")
+        .welcome(welcome)
         .hint("Start with /task run <objective>; approvals and cancellation stay in this session.")
         .on_command(|input, _| {
             let allowed = input.starts_with("/task run ")
