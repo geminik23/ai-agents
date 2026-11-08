@@ -1,14 +1,15 @@
 use super::*;
-use ai_agents::ApprovalResult;
 use ai_agents::autonomy::{
-    AutonomyHostCeilings, AutonomyRunner, ScopedTaskRunStore, TaskHostPrompt, TaskResumeInput,
-    TaskRunResult, TaskRunStatus,
+    AutonomyHostCeilings, AutonomyRunner, ScopedTaskRunStore, TaskCheckpointPayload,
+    TaskHostPrompt, TaskResumeInput, TaskRunMutation, TaskRunResult, TaskRunSnapshot,
+    TaskRunStatus, TaskRunStore, TaskRunSummary,
 };
 use ai_agents::llm::{
     ChatMessage, FinishReason, LLMChunk, LLMConfig, LLMError, LLMFeature, LLMProvider, LLMResponse,
 };
 use ai_agents::tool_security::{SecurityCheckResult, ToolSecurityEngine};
 use ai_agents::tools::ToolCallSource;
+use ai_agents::{Agent, ApprovalResult};
 use std::collections::VecDeque;
 use std::os::unix::fs::PermissionsExt;
 use std::sync::{
@@ -3902,6 +3903,164 @@ async fn root_mode_discovers_repairs_files_and_keeps_user_work_and_checker_input
     sandbox.cleanup();
 }
 
+struct FailedTerminalStore {
+    inner: Arc<ScopedTaskRunStore>,
+    mode: &'static str,
+    reached: tokio::sync::Semaphore,
+}
+
+#[async_trait]
+impl TaskRunStore for FailedTerminalStore {
+    // Forward setup and ordinary checkpoints without changing their guards or identity.
+    async fn create(&self, snapshot: &TaskRunSnapshot) -> ai_agents::Result<()> {
+        self.inner.create(snapshot).await
+    }
+    async fn load(&self, id: &str) -> ai_agents::Result<Option<TaskRunSnapshot>> {
+        self.inner.load(id).await
+    }
+    // Only the resumed execution-error terminal write is rejected, loses its receipt or is dropped after commit.
+    async fn mutate(
+        &self,
+        id: &str,
+        mutation: &TaskRunMutation,
+    ) -> ai_agents::Result<TaskRunSnapshot> {
+        let selected = matches!(
+            mutation,
+            TaskRunMutation::FinalCheckpoint {
+                status: TaskRunStatus::Failed,
+                ..
+            }
+        );
+        if selected && self.mode == "reject" {
+            self.reached.add_permits(1);
+            return Err(ai_agents::AgentError::Persistence(
+                "rejected terminal receipt".into(),
+            ));
+        }
+        let saved = self.inner.mutate(id, mutation).await?;
+        if selected {
+            self.reached.add_permits(1);
+            if self.mode == "drop" {
+                std::future::pending::<()>().await;
+            }
+            return Err(ai_agents::AgentError::Persistence(
+                "lost terminal receipt".into(),
+            ));
+        }
+        Ok(saved)
+    }
+    async fn list(&self) -> ai_agents::Result<Vec<TaskRunSummary>> {
+        self.inner.list().await
+    }
+    async fn delete(&self, id: &str, revision: u64) -> ai_agents::Result<()> {
+        self.inner.delete(id, revision).await
+    }
+}
+
+// Failure settlement must keep live custody after a missing terminal ACK without replaying approvals or refunding completed work.
+#[tokio::test]
+async fn root_mode_resume_error_terminal_ack_failure_keeps_custody() {
+    for mode in ["reject", "lost", "drop"] {
+        let sandbox = RootSandbox::new();
+        let c = sandbox.root.join("src/c.rs");
+        let d = sandbox.root.join("src/d.rs");
+        let setup = sandbox.setup();
+        let provider = Arc::new(Provider::new(VecDeque::from([
+            json!({"tool":"file_write","arguments":{"path":c,"content":"pub fn value() -> i32 { 4 }\n"}}).to_string(),
+            json!({"tool":"file_write","arguments":{"path":d,"content":"pub fn other() {}\n"}}).to_string(),
+            json!({"tool":"file_read","arguments":{"path":c}}).to_string(),
+            "Ready for checking.".into(),
+        ])));
+        let prepared = runner_with_provider(&setup, provider.clone());
+        let agent = prepared.runtime().clone();
+        let store = Arc::new(FailedTerminalStore {
+            inner: Arc::new(
+                ScopedTaskRunStore::in_memory(agent.info().id, None, "workspace-test.v1".into())
+                    .unwrap(),
+            ),
+            mode,
+            reached: tokio::sync::Semaphore::new(0),
+        });
+        let runner = AutonomyRunner::try_new(
+            agent.clone(),
+            setup.spec.autonomy.clone(),
+            Default::default(),
+            store.clone(),
+            "workspace-test.v1".into(),
+        )
+        .unwrap();
+        drop(prepared);
+        let first = runner.run("Create the files.", None).await.unwrap();
+        let first_request = first.run.pending.as_ref().unwrap().id.clone();
+        let second = respond(&runner, first, ApprovalResult::Approved).await;
+        let id = second.run.key.run_id.clone();
+        let request_id = second.run.pending.as_ref().unwrap().id.clone();
+        let mut resumed = Box::pin(runner.resume(
+            &id,
+            second.run.revision,
+            TaskResumeInput::Approval {
+                request_id: request_id.clone(),
+                result: ApprovalResult::Approved,
+            },
+        ));
+        let replacement = sandbox.root.join("replacement.rs");
+        fs::write(&replacement, "user replacement\n").unwrap();
+        fs::rename(replacement, &c).unwrap();
+        if mode == "drop" {
+            tokio::select! {
+                result = &mut resumed => panic!("unacknowledged terminal returned: {result:?}"),
+                permit = store.reached.acquire() => permit.unwrap().forget(),
+            }
+        } else {
+            assert!(matches!(
+                resumed.as_mut().await,
+                Err(ai_agents::AgentError::Persistence(_))
+            ));
+            store.reached.acquire().await.unwrap().forget();
+        }
+        drop(resumed);
+        let snapshot = store.load(&id).await.unwrap().unwrap();
+        assert_eq!(
+            snapshot.status,
+            if mode == "reject" {
+                TaskRunStatus::Running
+            } else {
+                TaskRunStatus::Failed
+            }
+        );
+        let payload: TaskCheckpointPayload = serde_json::from_value(snapshot.payload).unwrap();
+        assert_eq!(
+            payload.consumed_request_ids,
+            vec![first_request, request_id.clone()]
+        );
+        assert!(payload.pending.is_none());
+        assert_eq!(payload.counters.tool_attempts, 3);
+        assert_eq!(payload.counters.llm_attempts, 4);
+        assert_eq!(provider.requests.lock().unwrap().len(), 4);
+        assert!(agent.chat("blocked").await.is_err());
+        assert!(
+            runner
+                .resume(
+                    &id,
+                    second.run.revision,
+                    TaskResumeInput::Approval {
+                        request_id,
+                        result: ApprovalResult::Approved
+                    }
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(provider.requests.lock().unwrap().len(), 4);
+        assert_eq!(fs::read_to_string(&c).unwrap(), "user replacement\n");
+        assert_eq!(fs::read_to_string(&d).unwrap(), "pub fn other() {}\n");
+        assert!(!sandbox.parent.join("checker/root-acceptance").exists());
+        drop(runner);
+        drop(agent);
+        sandbox.cleanup();
+    }
+}
+
 // An external replacement of an agent-created file makes the bound revision unavailable, so no later check can complete the task.
 #[tokio::test]
 async fn root_mode_external_replacement_prevents_completion() {
@@ -3943,12 +4102,12 @@ async fn root_mode_external_replacement_prevents_completion() {
             },
         )
         .await;
-    // The unavailable target may surface as an error or a non-completed result, but never as completion.
-    if let Ok(result) = &resumed {
-        assert_ne!(result.run.status, TaskRunStatus::Completed);
-    }
+    let failed = resumed.unwrap();
+    assert_eq!(failed.run.status, TaskRunStatus::Failed);
+    assert_eq!(failed.run.stop_reason.as_deref(), Some("execution_error"));
     let display = runner.task_display(&run_id).await.unwrap();
-    assert_ne!(display.summary.status, TaskRunStatus::Completed);
+    assert_eq!(display.summary.status, TaskRunStatus::Failed);
+    assert!(!display.locally_retained);
     assert!(guard.requires_reconciliation());
     assert_eq!(guard.revision(), None);
     assert_eq!(
@@ -3958,17 +4117,14 @@ async fn root_mode_external_replacement_prevents_completion() {
     assert!(d.exists());
     // The checker writes its test binary when it runs, so its absence shows no check was attempted.
     assert!(!sandbox.parent.join("checker/root-acceptance").exists());
-    // A resumed run that fails this way stays retained for explicit recovery; only a paused run is cancelled here.
-    if display.summary.status == TaskRunStatus::Paused {
-        let cancelled = runner
-            .cancel_task(&run_id, display.summary.revision)
+    // Settled effects can fail normally even while the guard still requires host reconciliation before reuse.
+    assert!(
+        runner
+            .task_interaction(&run_id, failed.run.revision)
             .await
-            .unwrap();
-        assert_eq!(
-            cancelled.disposition,
-            ai_agents::CancellationDisposition::Acknowledged
-        );
-    }
+            .unwrap()
+            .is_none()
+    );
     drop(runner);
     sandbox.cleanup();
 }

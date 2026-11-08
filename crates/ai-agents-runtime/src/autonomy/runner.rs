@@ -1261,6 +1261,7 @@ impl AutonomyRunner {
     }
 
     // The retained gate is released before optional restart preparation reacquires it; pending work remains owner-protected throughout.
+    // Only controller reentry after an acknowledged response uses entry's terminal settlement; interrupted interactions retain their exact live cursor for recovery.
     async fn resume_inner(
         &self,
         run_id: &str,
@@ -1598,18 +1599,21 @@ impl AutonomyRunner {
                         Ok(())
                     })
                     .await?;
-                self.execute(
-                    &owner,
-                    &execution,
-                    &bound,
-                    &profile,
-                    &snapshot.key,
-                    &payload.objective,
-                    lifecycle,
-                    paused.todo.as_ref(),
-                    Some(response),
-                )
-                .await
+                // The response and completed batch are acknowledged above; earlier interaction errors must not be normalized into a releasable stop.
+                let result = self
+                    .execute(
+                        &owner,
+                        &execution,
+                        &bound,
+                        &profile,
+                        &snapshot.key,
+                        &payload.objective,
+                        lifecycle,
+                        paused.todo.as_ref(),
+                        Some(response),
+                    )
+                    .await;
+                self.finish_execution_error(&execution, result).await
             }),
         )
         .await;
@@ -1911,26 +1915,7 @@ impl AutonomyRunner {
             )),
         )
         .await;
-        let result = match result {
-            Err(error)
-                if !execution.has_storage_failure()
-                    && !matches!(
-                        &error,
-                        AgentError::Persistence(_) | AgentError::TaskRunStorage(_)
-                    ) =>
-            {
-                self.finish(
-                    &execution,
-                    Self::stopped_status(&execution),
-                    execution
-                        .stop_reason()
-                        .unwrap_or_else(|| "execution_error".into()),
-                    None,
-                )
-                .await
-            }
-            result => result,
-        };
+        let result = self.finish_execution_error(&execution, result).await;
         if result
             .as_ref()
             .is_ok_and(|result| result.run.status == TaskRunStatus::Paused)
@@ -3200,6 +3185,38 @@ impl AutonomyRunner {
         }
     }
 
+    // Entry and controller reentry after a fully acknowledged tool-batch response share terminal settlement after a returned execution error.
+    // Storage failures retain their original error and custody; terminal settlement itself preserves uncertain effects, children and maintenance for recovery.
+    // Erase the settlement future so its checkpoint state does not enlarge root or nested continuation polling frames.
+    fn finish_execution_error<'a>(
+        &'a self,
+        execution: &'a RunExecution,
+        result: Result<TaskRunResult>,
+    ) -> ControllerFuture<'a, TaskRunResult> {
+        Box::pin(async move {
+            match result {
+                Err(error)
+                    if !execution.has_storage_failure()
+                        && !matches!(
+                            &error,
+                            AgentError::Persistence(_) | AgentError::TaskRunStorage(_)
+                        ) =>
+                {
+                    self.finish(
+                        execution,
+                        Self::stopped_status(execution),
+                        execution
+                            .stop_reason()
+                            .unwrap_or_else(|| "execution_error".into()),
+                        None,
+                    )
+                    .await
+                }
+                result => result,
+            }
+        })
+    }
+
     /// Returns only the committed status; limit summaries are deterministic and consume no extra provider attempt.
     async fn finish(
         &self,
@@ -3232,8 +3249,79 @@ impl AutonomyRunner {
 #[cfg(test)]
 mod feedback_tests {
     use super::*;
+    use crate::Agent;
     use crate::autonomy::evaluation_tests::{identity, record, scope};
     use serde_json::json;
+
+    // Error normalization cannot erase dispatched or uncertain effects, or turn a storage error into an acknowledged terminal result.
+    #[tokio::test]
+    async fn execution_error_settlement_preserves_recovery_and_storage_custody() {
+        for mode in [
+            "dispatched",
+            "uncertain",
+            "storage",
+            "persistence",
+            "journal",
+        ] {
+            let (agent, execution, _) =
+                crate::autonomy::continuation_tests::shared_executor_fixture(
+                    AutonomyProfile::default(),
+                    false,
+                )
+                .await;
+            let runner = AutonomyRunner::try_new(
+                agent.clone(),
+                crate::autonomy::runner_tests::config(2),
+                Default::default(),
+                execution.store.clone(),
+                "shared-v1".into(),
+            )
+            .unwrap();
+            let effect = execution.admit(Some("effect")).await.unwrap();
+            if mode == "uncertain" {
+                execution
+                    .settle(&effect, json!({"partial":true}), true)
+                    .await
+                    .unwrap();
+            }
+            let error = match mode {
+                "storage" => {
+                    execution.storage_failure();
+                    AgentError::IoError(std::io::Error::other("storage receipt lost"))
+                }
+                "persistence" => AgentError::Persistence("storage receipt lost".into()),
+                "journal" => TaskRunStorageError::Conflict.into(),
+                _ => AgentError::Config("host revision unavailable".into()),
+            };
+            let before = execution.load_owned().await.unwrap();
+            let result = runner.finish_execution_error(&execution, Err(error)).await;
+            let saved = execution
+                .store
+                .load(&execution.run_id)
+                .await
+                .unwrap()
+                .unwrap();
+            if matches!(mode, "dispatched" | "uncertain") {
+                assert_eq!(result.unwrap().run.status, TaskRunStatus::RecoveryRequired);
+                assert_eq!(saved.status, TaskRunStatus::RecoveryRequired);
+            } else {
+                let error = result.unwrap_err();
+                assert!(match mode {
+                    "storage" => matches!(error, AgentError::IoError(_)),
+                    "persistence" => matches!(error, AgentError::Persistence(_)),
+                    _ => matches!(error, AgentError::TaskRunStorage(_)),
+                });
+                assert_eq!(
+                    serde_json::to_value(&saved).unwrap(),
+                    serde_json::to_value(&before).unwrap()
+                );
+            }
+            let payload: TaskCheckpointPayload = serde_json::from_value(saved.payload).unwrap();
+            assert_eq!(payload.counters.tool_attempts, 1);
+            assert_eq!(payload.reservations.len(), 1);
+            assert!(agent.chat("blocked").await.is_err());
+        }
+    }
 
     // Feedback must come from the same live target and attempt as the failed fixed validation.
     #[test]
