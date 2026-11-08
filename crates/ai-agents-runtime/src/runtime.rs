@@ -4264,9 +4264,26 @@ impl RuntimeAgent {
         Ok(snapshot)
     }
 
+    /// Rejects incompatible memory snapshots before other restored state or pending work is changed.
+    pub(crate) fn validate_incomplete_memory_restore(
+        &self,
+        snapshot: &ai_agents_core::MemorySnapshot,
+    ) -> Result<()> {
+        if (!snapshot.incomplete_native_exchanges.is_empty()
+            || ai_agents_memory::has_legacy_incomplete_summary(snapshot.summary.as_deref()))
+            && !self.memory.supports_incomplete_native_restore()
+        {
+            return Err(AgentError::MemoryError(
+                "memory cannot restore retained incomplete native observations".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Restores ordinary session state only outside a foreground task; it is not task continuation resume.
     pub async fn restore_state(&self, snapshot: AgentSnapshot) -> Result<()> {
         self.check_autonomy_access()?;
+        self.validate_incomplete_memory_restore(&snapshot.memory)?;
         let _mutations = self.autonomy_mutations.read().await;
         self.check_autonomy_access()?;
         let _admission = self.disambiguation_admission.write().await;
@@ -4814,25 +4831,51 @@ impl RuntimeAgent {
         Ok(messages)
     }
 
-    // Checks the final instruction-bearing message projection after reasoning and protocol additions.
-    // Ordinary agents keep their existing budget behavior; a failed bound never becomes a provider fallback.
-    fn validate_instruction_request_budget(&self, messages: &[ChatMessage]) -> Result<()> {
-        if self.context_manager.has_instruction_sources()
+    // Task and instruction-bearing work must enforce the final protocol budget without changing ordinary chat defaults.
+    fn needs_work_request_budget_check(&self) -> bool {
+        self.context_manager.has_instruction_sources()
+            || crate::autonomy::current_turn_input(&self.root_turn_gate).is_some()
+    }
+
+    // Keeps instruction-source failures distinct while preventing any over-budget task request from dispatching.
+    fn work_request_budget_error(&self, message: &str) -> AgentError {
+        if self.context_manager.has_instruction_sources() {
+            AgentError::InstructionUnavailable(message.into())
+        } else {
+            AgentError::LLM(message.into())
+        }
+    }
+
+    // Checks the final task or instruction-bearing projection after reasoning and protocol additions.
+    fn validate_work_request_budget(&self, messages: &[ChatMessage]) -> Result<()> {
+        if self.needs_work_request_budget_check()
             && self.estimate_total_tokens(messages) > self.max_context_tokens
         {
-            return Err(AgentError::InstructionUnavailable(
-                "instruction request exceeds context limit".into(),
-            ));
+            return Err(self.work_request_budget_error("work request exceeds context limit"));
         }
         Ok(())
     }
 
-    // Finds a removable prefix that never cuts a signed exchange or leaves signed history without its user boundary.
+    // Finds a removable prefix without splitting signed history or discarding an unrecorded result.
     fn native_safe_prefix_at_least(messages: &[ChatMessage], required: usize) -> Result<usize> {
         let inspection =
             inspect_native_history(messages).map_err(|error| AgentError::LLM(error.to_string()))?;
         let has_signed_history = !inspection.exchanges().is_empty();
+        let incomplete_start = inspection
+            .exchanges()
+            .iter()
+            .filter(|exchange| !exchange.is_complete())
+            .map(|exchange| {
+                messages[..exchange.message_start()]
+                    .iter()
+                    .rposition(|message| message.role == ai_agents_core::Role::User)
+                    .unwrap_or(0)
+            })
+            .min();
         for count in required.min(messages.len())..=messages.len() {
+            if incomplete_start.is_some_and(|start| count > start) {
+                continue;
+            }
             if has_signed_history
                 && count < messages.len()
                 && messages[count].role != ai_agents_core::Role::User
@@ -4850,6 +4893,48 @@ impl RuntimeAgent {
         ))
     }
 
+    // Overflow recovery may keep more than the requested tail for protected native batches, then enforce the final hard limit.
+    fn native_safe_prefix_for_recovery(messages: &[ChatMessage], required: usize) -> Result<usize> {
+        match Self::native_safe_prefix_at_least(messages, required) {
+            Ok(count) => Ok(count),
+            Err(error) => {
+                let inspection = inspect_native_history(messages)
+                    .map_err(|cause| AgentError::LLM(cause.to_string()))?;
+                let Some(start) = inspection
+                    .exchanges()
+                    .iter()
+                    .filter(|exchange| !exchange.is_complete())
+                    .map(|exchange| {
+                        messages[..exchange.message_start()]
+                            .iter()
+                            .rposition(|message| message.role == ai_agents_core::Role::User)
+                            .unwrap_or(0)
+                    })
+                    .chain(inspection.protected_suffix_start())
+                    .min()
+                else {
+                    return Err(error);
+                };
+                let has_signed_history = !inspection.exchanges().is_empty();
+                for count in (0..=start.min(required)).rev() {
+                    if has_signed_history
+                        && count > 0
+                        && count < messages.len()
+                        && messages[count].role != ai_agents_core::Role::User
+                    {
+                        continue;
+                    }
+                    if inspection.is_safe_prefix_len(count)
+                        && inspect_native_history(&messages[count..]).is_ok()
+                    {
+                        return Ok(count);
+                    }
+                }
+                Err(error)
+            }
+        }
+    }
+
     // Limited provider context must not cut a native batch; an active group that cannot fit fails rather than silently dropping evidence.
     async fn recent_native_safe_messages(&self, limit: usize) -> Result<Vec<ChatMessage>> {
         let messages = self.memory.get_messages(None).await?;
@@ -4865,7 +4950,7 @@ impl RuntimeAgent {
         }
         let system_msg = messages.remove(0);
         let required = messages.len().saturating_sub(keep_recent);
-        let to_remove = Self::native_safe_prefix_at_least(messages, required)?;
+        let to_remove = Self::native_safe_prefix_for_recovery(messages, required)?;
         messages.drain(..to_remove);
         messages.insert(0, system_msg);
         Ok(())
@@ -4905,7 +4990,7 @@ impl RuntimeAgent {
             messages.insert(0, system_msg);
             return Ok(());
         }
-        let to_summarize_count = Self::native_safe_prefix_at_least(messages, required)?;
+        let to_summarize_count = Self::native_safe_prefix_for_recovery(messages, required)?;
 
         let recent_msgs: Vec<ChatMessage> = messages.drain(to_summarize_count..).collect();
         let mut to_summarize = std::mem::take(messages);
@@ -5503,6 +5588,7 @@ impl RuntimeAgent {
 
     // A retained capacity position reuses its prepared instruction snapshot rather than adopting a new request under completed hooks.
     // Ephemeral controller instructions and the selected projection never enter ordinary user or actor history.
+    // Live controller and retained incomplete-history observations stay out of history recovery and are restored before the final hard limit check.
     // Protected native batches remain structurally complete and within the final hard limit after overflow handling.
     async fn build_messages_with_instructions(
         &self,
@@ -5525,7 +5611,9 @@ impl RuntimeAgent {
         }
         let mut messages = vec![ChatMessage::system(&system_prompt)];
 
-        let context = self.memory.get_context().await?;
+        let mut context = self.memory.get_context().await?;
+        let incomplete_native = context.incomplete_native_message();
+        context.incomplete_native_exchanges.clear();
         let history = if let Some(ref budget) = self.memory_token_budget {
             context.to_llm_messages_with_allocation(&budget.allocation)
         } else {
@@ -5536,6 +5624,7 @@ impl RuntimeAgent {
             messages.push(ChatMessage::user(user_message));
         }
         let mut untrusted_feedback = None;
+        let mut has_controller = false;
         if let Some(input) = crate::autonomy::current_turn_input(&self.root_turn_gate)
             && !input.controller_message.is_empty()
         {
@@ -5552,6 +5641,7 @@ impl RuntimeAgent {
             messages.push(ChatMessage::system(format!(
                 "Autonomy controller instruction (not a user statement):\n{controller}"
             )));
+            has_controller = true;
             if include_validation_feedback && let Some(mut feedback) = feedback {
                 let identity = feedback
                     .as_object_mut()
@@ -5580,7 +5670,11 @@ impl RuntimeAgent {
             }
         }
 
-        let total_tokens = self.estimate_total_tokens(&messages);
+        let total_tokens = self.estimate_total_tokens(&messages).saturating_add(
+            incomplete_native
+                .as_ref()
+                .map_or(0, |message| self.estimate_tokens(&message.content)),
+        );
 
         if total_tokens > self.max_context_tokens {
             debug!(
@@ -5589,6 +5683,9 @@ impl RuntimeAgent {
                 "Context overflow"
             );
 
+            // The current controller must not be dropped or delegated to a summarizer.
+            let protected_count = usize::from(has_controller);
+            let protected = messages.split_off(messages.len() - protected_count);
             match &self.recovery_manager.config().llm.on_context_overflow {
                 ContextOverflowAction::Error => {
                     return Err(AgentError::LLM(format!(
@@ -5617,6 +5714,12 @@ impl RuntimeAgent {
                     .await?;
                 }
             }
+            messages.extend(protected);
+        }
+
+        // Place untrusted historical IDs before conversation history so they cannot create a new active-turn boundary.
+        if let Some(incomplete_native) = incomplete_native {
+            messages.insert(1, incomplete_native);
         }
 
         if let Some((feedback, identity, epoch)) = untrusted_feedback {
@@ -5852,7 +5955,7 @@ impl RuntimeAgent {
     }
 
     // Preflights the actual native or prompt-protocol representation before retries and fallback can hide an oversized request.
-    fn validate_main_instruction_budget(
+    fn validate_main_work_budget(
         &self,
         llm: &dyn LLMProvider,
         messages: &[ChatMessage],
@@ -5860,21 +5963,21 @@ impl RuntimeAgent {
         corrective: bool,
     ) -> Result<()> {
         if self.provider_can_use_native_tools(llm, protocol) {
-            self.validate_instruction_request_budget(messages)?;
-            if self.context_manager.has_instruction_sources() {
+            self.validate_work_request_budget(messages)?;
+            if self.needs_work_request_budget_check() {
                 let definitions = serde_json::to_string(&protocol.definitions)?;
                 let total = self
                     .estimate_total_tokens(messages)
                     .saturating_add(self.estimate_tokens(&definitions));
                 if total > self.max_context_tokens {
-                    return Err(AgentError::InstructionUnavailable(
-                        "instruction request and native tools exceed context limit".into(),
+                    return Err(self.work_request_budget_error(
+                        "work request and native tools exceed context limit",
                     ));
                 }
             }
             Ok(())
         } else {
-            self.validate_instruction_request_budget(
+            self.validate_work_request_budget(
                 &self.prompt_messages_for_tool_protocol(messages, protocol, corrective),
             )
         }
@@ -5924,7 +6027,7 @@ impl RuntimeAgent {
         corrective: bool,
     ) -> Result<MainProviderResponse> {
         // Provider-owned protocol/history failures must remain terminal before generic retry classification or configured fallback can hide corruption.
-        self.validate_main_instruction_budget(llm.as_ref(), messages, protocol, corrective)?;
+        self.validate_main_work_budget(llm.as_ref(), messages, protocol, corrective)?;
         let primary_result = self
             .recovery_manager
             .with_llm_retry(
@@ -5955,7 +6058,7 @@ impl RuntimeAgent {
                                 "Fallback LLM '{fallback_llm}' not found: {error}"
                             ))
                         })?;
-                        self.validate_main_instruction_budget(
+                        self.validate_main_work_budget(
                             fallback.as_ref(),
                             messages,
                             protocol,
@@ -6047,7 +6150,7 @@ impl RuntimeAgent {
         messages: &[ChatMessage],
         protocol: &MainToolProtocol,
     ) -> Result<LLMResponse> {
-        self.validate_main_instruction_budget(llm.as_ref(), messages, protocol, false)?;
+        self.validate_main_work_budget(llm.as_ref(), messages, protocol, false)?;
         let response = self
             .invoke_main_provider(llm, messages, protocol, false)
             .await
@@ -6111,7 +6214,7 @@ impl RuntimeAgent {
             protocol.choice.is_none(),
             "streaming raw path must not run with explicit tool choice"
         );
-        self.validate_instruction_request_budget(messages)?;
+        self.validate_work_request_budget(messages)?;
         let primary = self
             .recovery_manager
             .with_llm_retry(

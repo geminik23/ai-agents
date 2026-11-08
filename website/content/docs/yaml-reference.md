@@ -283,7 +283,7 @@ max_iterations: 20
 
 ### `max_context_tokens`
 
-Maximum tokens the conversation history can contribute to the prompt. When exceeded, `error_recovery.llm.on_context_overflow` kicks in.
+Maximum estimated tokens in the assembled prompt. When exceeded, `error_recovery.llm.on_context_overflow` kicks in. Development task requests and instruction-bearing requests also check the final prompt-protocol additions or native tool definitions before dispatch; an oversized request is rejected before provider retry or fallback. The estimate is not an exact provider tokenizer or a guarantee about provider-internal overhead. Ordinary chat without host-bound instructions retains its existing protocol-budget behavior.
 
 | Detail | Value |
 |--------|-------|
@@ -1524,7 +1524,9 @@ memory:
   summarizer_llm: router
 ```
 
-When `max_recent_messages < compress_threshold`, the requested recent tail is preserved and only the older eligible prefix is summarized. When the requested tail is at least the threshold, the runtime clamps it to `compress_threshold - min(max(summarize_batch_size, 1), compress_threshold)` so compression still makes batch progress. With the defaults `50 / 30 / 10`, the effective protected tail is 20 and each threshold cycle summarizes 10 messages. Compression, add, restore, clear, snapshot, and eviction operations are serialized so a summarizer cannot remove a stale message prefix. Snapshots preserve both the rolling summary and the summarized-message count.
+When `max_recent_messages < compress_threshold`, the requested recent tail is preserved and only the older eligible prefix is summarized. When the requested tail is at least the threshold, the runtime clamps it to `compress_threshold - min(max(summarize_batch_size, 1), compress_threshold)` so compression still makes batch progress. With the defaults `50 / 30 / 10`, the effective protected tail is 20 and each threshold cycle summarizes 10 messages. Compression, add, restore, clear, snapshot, and eviction operations are serialized so a summarizer cannot remove a stale message prefix. Snapshots preserve the rolling summary, summarized-message count, and structured observations of incomplete signed native exchanges.
+
+In the development tree, incomplete signed exchanges remain intact until they can be compacted into separately retained advisory observations. Those observations survive later summary merges, summary allocation, and runtime overflow recovery; if they or protected native history cannot fit the final estimated context limit, the request fails rather than silently dropping them. Budgeted helper methods may exceed their soft allocation to preserve this data. Older snapshot suffixes matching the former incomplete-status format are retained as **unverified legacy text** because their origin cannot be established. A missing result does not prove that a tool did not execute, that cleanup completed, or that retry is authorized. General semantic summaries remain lossy and do not replace task evidence.
 
 ### `token_budget`
 

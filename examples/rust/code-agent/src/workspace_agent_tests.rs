@@ -831,6 +831,182 @@ async fn failed_validation_allows_another_edit_and_fresh_checker_success() {
     sandbox.cleanup();
 }
 
+// Compaction and overflow must preserve actual failed-check feedback and the current controller and instructions.
+#[tokio::test]
+async fn long_context_retains_actual_checker_feedback_and_latest_edit() {
+    let sandbox = Sandbox::new();
+    fs::write(
+        sandbox.root.join("AGENTS.md"),
+        "HOST-RULE: preserve the protected file",
+    )
+    .unwrap();
+    let mut setup = sandbox.setup();
+    setup.enable_automatic_instructions().unwrap();
+    setup.spec.max_context_tokens = 2500;
+    setup.spec.error_recovery.llm.on_context_overflow =
+        serde_json::from_value(json!({"action":"truncate","keep_recent":4})).unwrap();
+    setup.spec.memory.token_budget = Some(ai_agents::MemoryTokenBudget {
+        total: 200_000,
+        allocation: ai_agents::TokenAllocation {
+            summary: 32,
+            recent_messages: 10_000,
+            facts: 0,
+            relationships: 0,
+        },
+        ..Default::default()
+    });
+    let memory = Arc::new(ai_agents::CompactingMemory::new(
+        Arc::new(ai_agents::NoopSummarizer),
+        ai_agents::CompactingMemoryConfig {
+            max_recent_messages: 1,
+            compress_threshold: 3,
+            summarize_batch_size: 2,
+            max_summary_length: 2000,
+        },
+    ));
+    let memory_handle: Arc<dyn ai_agents::Memory> = memory.clone();
+    memory_handle
+        .add_message(ChatMessage::user(
+            "discardable earlier discussion ".repeat(500),
+        ))
+        .await
+        .unwrap();
+    for index in 0..4 {
+        memory_handle
+            .add_message(ChatMessage::user(format!("earlier turn {index}")))
+            .await
+            .unwrap();
+    }
+    let responses = VecDeque::from([
+        json!({"tool":"file_read","arguments":{"path":sandbox.source}}).to_string(),
+        json!({"tool":"file_edit","arguments":{"path":sandbox.source,"old_text":"{ 1 }","new_text":"{ 1 + 2 }","dry_run":false}}).to_string(),
+        "The first edit is ready for validation.".to_string(),
+        json!({"tool":"file_read","arguments":{"path":sandbox.source}}).to_string(),
+        json!({"tool":"file_edit","arguments":{"path":sandbox.source,"old_text":"{ 1 + 2 }","new_text":"{ 1 + 1 }","dry_run":false}}).to_string(),
+        "The repaired edit is ready for validation.".to_string(),
+    ]);
+    let provider = Arc::new(Provider::new(responses));
+    let agent = Arc::new(
+        setup
+            .builder()
+            .unwrap()
+            .llm(provider.clone())
+            .memory(memory.clone())
+            .auto_configure_features()
+            .unwrap()
+            .autonomy_extensions(setup.extensions().unwrap())
+            .build()
+            .unwrap(),
+    );
+    agent.set_command_runner(setup.checker_runner().unwrap());
+    let store = Arc::new(
+        ScopedTaskRunStore::in_memory(agent.info().id, None, "workspace-context-test.v1".into())
+            .unwrap(),
+    );
+    let runner = AutonomyRunner::try_new(
+        agent,
+        setup.spec.autonomy.clone(),
+        AutonomyHostCeilings::default(),
+        store,
+        "workspace-context-test.v1".into(),
+    )
+    .unwrap();
+
+    let first_edit = runner
+        .run("CURRENT-OBJECTIVE: fix the selected function", None)
+        .await
+        .unwrap();
+    assert_eq!(
+        first_edit.run.status,
+        TaskRunStatus::Paused,
+        "{:?}",
+        first_edit.run.stop_reason
+    );
+    let first_check = respond(&runner, first_edit, ApprovalResult::Approved).await;
+    let repair_edit = respond(&runner, first_check, ApprovalResult::Approved).await;
+    assert_eq!(
+        repair_edit.run.status,
+        TaskRunStatus::Paused,
+        "{:?}",
+        repair_edit.run.stop_reason
+    );
+    assert_eq!(
+        fs::read_to_string(&sandbox.source).unwrap(),
+        "pub fn value() -> i32 { 1 + 2 }\n"
+    );
+    {
+        let requests = provider.requests.lock().unwrap();
+        assert!(
+            !requests[0]
+                .iter()
+                .any(|message| message.content.contains("discardable earlier discussion"))
+        );
+        let repair = requests
+            .iter()
+            .find(|messages| {
+                messages.iter().any(|message| {
+                    message
+                        .content
+                        .contains("Untrusted output from a failed authorized validation check")
+                })
+            })
+            .expect("actual failed checker must reach the next request");
+        let text = repair
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("CURRENT-OBJECTIVE: fix the selected function"));
+        assert!(text.contains("HOST-RULE: preserve the protected file"));
+        assert!(text.contains("left: 3"));
+        assert!(
+            text.contains("1 + 2"),
+            "latest modification missing from repair request: {text}"
+        );
+    }
+    let second_check = respond(&runner, repair_edit, ApprovalResult::Approved).await;
+    let done = respond(&runner, second_check, ApprovalResult::Approved).await;
+    assert_eq!(
+        done.run.status,
+        TaskRunStatus::Completed,
+        "{:?}",
+        done.run.stop_reason
+    );
+    assert_eq!(
+        fs::read_to_string(&sandbox.source).unwrap(),
+        "pub fn value() -> i32 { 1 + 1 }\n"
+    );
+    assert_eq!(
+        fs::read_to_string(&sandbox.outside).unwrap(),
+        "user data stays unchanged\n"
+    );
+    let edits = done
+        .run
+        .evidence
+        .tool_calls
+        .iter()
+        .filter(|e| e.record.canonical_id == "file_edit" && e.record.executed && e.record.success)
+        .count();
+    let checks = done
+        .run
+        .evidence
+        .tool_calls
+        .iter()
+        .filter(|e| {
+            e.record.canonical_id == "command"
+                && e.record.executed
+                && matches!(&e.record.source, ToolCallSource::Task)
+        })
+        .count();
+    assert_eq!((edits, checks), (2, 2));
+    assert!(
+        !memory.compression_history().is_empty(),
+        "the test must actually compact history"
+    );
+    drop(runner);
+    sandbox.cleanup();
+}
+
 // The fixture host owns revision changes; it does not claim to observe arbitrary filesystem writes.
 struct WorkspaceRevision(AtomicU64);
 impl ai_agents::autonomy::HostRevisionSource for WorkspaceRevision {

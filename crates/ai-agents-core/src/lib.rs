@@ -23,7 +23,7 @@ pub use native_history::{
     set_response_provider_state, take_response_provider_state,
 };
 pub use traits::llm::{LLMCapability, LLMError, LLMProvider, TaskContext, ToolSelection};
-pub use traits::memory::{Memory, MemorySnapshot};
+pub use traits::memory::{IncompleteNativeExchange, Memory, MemorySnapshot};
 pub use traits::storage::{
     AgentSnapshot, AgentStorage, NoopStorage, SpawnedAgentEntry, StorageCapability,
 };

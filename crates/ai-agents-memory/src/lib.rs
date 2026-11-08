@@ -17,6 +17,7 @@ pub use events::{
     EvictionReason, FactExtractedEvent, MemoryBudgetEvent, MemoryCompressEvent, MemoryEvictEvent,
 };
 pub use in_memory::InMemoryStore;
+pub use native::has_legacy_incomplete_summary;
 pub use summarizer::{LLMSummarizer, NoopSummarizer, Summarizer};
 pub use token_budget::{MemoryBudgetState, MemoryTokenBudget, OverflowStrategy, TokenAllocation};
 
@@ -26,6 +27,12 @@ pub trait Memory: ai_agents_core::Memory {
     /// Declares preserved message provenance and managed admission for every internal provider call.
     /// Custom implementations default to unsupported rather than letting a task silently bypass its ledger.
     fn supports_task_admission(&self) -> bool {
+        false
+    }
+
+    /// Declares that restore and context projection retain structured incomplete native observations.
+    /// The observations remain advisory and must never authorize execution or prove cleanup.
+    fn supports_incomplete_native_restore(&self) -> bool {
         false
     }
 

@@ -197,7 +197,7 @@ pub mod memory {
 
     use ai_agents_core::LLMProvider;
 
-    pub use ai_agents_core::MemorySnapshot;
+    pub use ai_agents_core::{IncompleteNativeExchange, MemorySnapshot};
     pub use ai_agents_memory::{
         CompactingMemory, CompactingMemoryConfig, CompressResult, CompressionEvent,
         ConversationContext, EvictionReason, FactExtractedEvent, InMemoryStore, LLMSummarizer,
@@ -610,11 +610,11 @@ pub use autonomy::{
 pub use error::{AgentError, Result};
 pub use memory::{
     CompactingMemory, CompactingMemoryConfig, CompressResult, CompressionEvent,
-    ConversationContext, EvictionReason, FactExtractedEvent, InMemoryStore, LLMSummarizer, Memory,
-    MemoryBudgetEvent, MemoryBudgetState, MemoryCompressEvent, MemoryEvictEvent, MemoryTokenBudget,
-    NoopSummarizer, OverflowStrategy, Summarizer, TokenAllocation, create_memory,
-    create_memory_from_config, create_memory_from_config_with_llm, estimate_message_tokens,
-    estimate_tokens,
+    ConversationContext, EvictionReason, FactExtractedEvent, InMemoryStore,
+    IncompleteNativeExchange, LLMSummarizer, Memory, MemoryBudgetEvent, MemoryBudgetState,
+    MemoryCompressEvent, MemoryEvictEvent, MemoryTokenBudget, NoopSummarizer, OverflowStrategy,
+    Summarizer, TokenAllocation, create_memory, create_memory_from_config,
+    create_memory_from_config_with_llm, estimate_message_tokens, estimate_tokens,
 };
 pub use skill::{SkillDefinition, SkillExecutor, SkillLoader, SkillRef, SkillRouter, SkillStep};
 pub use spec::{

@@ -41,6 +41,7 @@
 - Task validation: development-only tri-state checks, tool/fallback/child observation continuation and external signals preserve post-turn controller progress; fixed host permits and single logical journal charges survive re-pause, without adding a second executor or inferring completion from unavailable evidence
 
 ### Changed
+- Rust memory compatibility: `MemorySnapshot` and `ConversationContext` literals include defaulted incomplete-history observations; custom memory implementations explicitly opt into restoring them
 - Rust instruction compatibility: context source matches and skill cursor literals account for the new instruction source and retained prompt field
 - Task execution defaults: new autonomous tasks omit cumulative count and time limits unless explicitly configured or host-bounded; ordinary chat and saved finite limits retain their contracts
 - Code agent workflow: add checker-free read-only tasks, selected new-file creation, local per-task change observations and an explicitly cooperative revision option alongside scoped edits and bounded failed-check feedback
@@ -72,6 +73,7 @@
 - Rust configuration compatibility: typed autonomy fields, validation driver bounds and objective-bound todo identities require affected struct literals to be updated; these development additions are not the published stable API
 
 ### Fixed
+- Long-task context: retain controller state and incomplete native history across compaction and context recovery without treating missing results as execution proof
 - Task validation feedback: preserve host target revisions and completed hooks across one-shot feedback and capacity pauses without replay or stale provider results
 - Task continuation: preserve legacy capacity-review identity and reject changed model-loop bindings before consuming pending work
 - Task allowance display: distinguish unbounded wall time and show cumulative command and model usage alongside configured limits

@@ -271,6 +271,7 @@ impl RuntimeAgent {
                 "task reconstruction lacks actual owner".into(),
             ));
         }
+        self.validate_incomplete_memory_restore(&runtime.snapshot.memory)?;
         self.memory.restore(runtime.snapshot.memory.clone()).await?;
         if let (Some(machine), Some(state)) = (&self.state_machine, &runtime.snapshot.state_machine)
             && !state.current_state.is_empty()

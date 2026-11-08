@@ -603,10 +603,17 @@ fn convert_messages(
 
     let mut contents = Vec::new();
     let mut pending: Option<PendingExchange> = None;
+    let mut remaining_users = messages
+        .iter()
+        .filter(|message| message.role == Role::User)
+        .count();
     for message in messages
         .iter()
         .filter(|message| message.role != Role::System)
     {
+        if message.role == Role::User {
+            remaining_users -= 1;
+        }
         if matches!(message.role, Role::Tool | Role::Function)
             && let Some(results) = decode_native_tool_result_markers(&message.content)?
         {
@@ -618,7 +625,12 @@ fn convert_messages(
             continue;
         }
 
-        flush_pending(&mut contents, pending.take(), message.role == Role::User)?;
+        // A later user boundary makes an unfinished exchange historical even when its turn has trailing assistant text.
+        flush_pending(
+            &mut contents,
+            pending.take(),
+            message.role == Role::User || remaining_users > 0,
+        )?;
         if message.role == Role::Assistant
             && let Some(call_markers) = decode_native_tool_call_markers(&message.content)?
         {
@@ -1939,10 +1951,16 @@ mod tests {
         ];
         let error = convert_messages(&current, "gemini-3.7-flash", &base_url).unwrap_err();
         assert!(matches!(error, LLMError::Serialization(_)));
+        let mut current_with_tail = current;
+        current_with_tail.push(ChatMessage::assistant("unfinished current turn"));
+        let error =
+            convert_messages(&current_with_tail, "gemini-3.7-flash", &base_url).unwrap_err();
+        assert!(matches!(error, LLMError::Serialization(_)));
 
         let historical = vec![
             ChatMessage::user("old request"),
-            ChatMessage::assistant(assistant),
+            ChatMessage::assistant(&assistant),
+            ChatMessage::assistant("previous turn ended without a result"),
             ChatMessage::user("new request"),
         ];
         let (_, contents) = convert_messages(&historical, "gemini-3.7-flash", &base_url).unwrap();

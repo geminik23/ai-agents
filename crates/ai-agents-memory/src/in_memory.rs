@@ -34,6 +34,7 @@ impl InMemoryStore {
         }
         inspection
             .safe_prefix_len_between(required, messages.len())
+            .filter(|count| inspection.incomplete_suffix_start().is_none_or(|start| *count <= start))
             .ok_or_else(|| {
                 ai_agents_core::AgentError::MemoryError(
                     "message limit cannot preserve the protected signed native exchange or unsigned batch".to_string(),
@@ -85,6 +86,14 @@ impl ai_agents_core::Memory for InMemoryStore {
     }
 
     async fn restore(&self, snapshot: MemorySnapshot) -> Result<()> {
+        if !snapshot.incomplete_native_exchanges.is_empty()
+            || super::native::has_legacy_incomplete_summary(snapshot.summary.as_deref())
+        {
+            return Err(ai_agents_core::AgentError::MemoryError(
+                "in-memory store cannot restore retained incomplete native observations"
+                    .to_string(),
+            ));
+        }
         let mut prospective = snapshot.messages;
         let evict_count = Self::bounded_eviction_count(&prospective, self.max_messages)?;
         prospective.drain(..evict_count);
@@ -102,6 +111,7 @@ impl ai_agents_core::Memory for InMemoryStore {
         } else {
             inspection
                 .safe_prefix_len_between(requested, messages.len())
+                .filter(|count| inspection.incomplete_suffix_start().is_none_or(|start| *count <= start))
                 .ok_or_else(|| {
                     ai_agents_core::AgentError::MemoryError(
                         "eviction would split the protected signed native exchange or unsigned batch".to_string(),
@@ -169,6 +179,53 @@ mod tests {
                 encode_native_tool_result_marker(&call, serde_json::json!({"ok":true})).unwrap(),
             ),
         )
+    }
+
+    #[tokio::test]
+    async fn unsupported_incomplete_snapshot_restore_is_rejected_before_mutation() {
+        let store = InMemoryStore::new(10);
+        store
+            .add_message(make_message("preserve existing"))
+            .await
+            .unwrap();
+        let before = serde_json::to_value(store.snapshot().await.unwrap()).unwrap();
+        let structured = MemorySnapshot::new(vec![make_message("replace")])
+            .with_incomplete_native_exchanges(vec![ai_agents_core::IncompleteNativeExchange {
+                exchange_id: Some("exchange".into()),
+                missing_result_ids: vec!["call".into()],
+                unverified_legacy: false,
+            }]);
+        assert!(store.restore(structured).await.is_err());
+        let legacy = MemorySnapshot::default().with_summary(
+            r#"old
+{"description":"final execution result was not recorded","missing_result_ids":["call"],"native_exchange_status":"incomplete"}"#.into(),
+        );
+        assert!(store.restore(legacy).await.is_err());
+        assert_eq!(
+            serde_json::to_value(store.snapshot().await.unwrap()).unwrap(),
+            before
+        );
+    }
+
+    #[tokio::test]
+    async fn ended_incomplete_signed_turn_cannot_be_evicted_by_capacity_or_explicit_request() {
+        let store = InMemoryStore::new(4);
+        let (call, _) = signed_exchange("ended-incomplete");
+        for message in [
+            make_message("original"),
+            call,
+            ChatMessage::assistant("finished without a recorded tool result"),
+            make_message("next"),
+        ] {
+            store.add_message(message).await.unwrap();
+        }
+        let before = serde_json::to_value(store.snapshot().await.unwrap()).unwrap();
+        assert!(store.add_message(make_message("overflow")).await.is_err());
+        assert!(store.evict_oldest(1).await.is_err());
+        assert_eq!(
+            serde_json::to_value(store.snapshot().await.unwrap()).unwrap(),
+            before
+        );
     }
 
     // Unsigned native batches still require exact call/result correlation even though they carry no signed replay state.

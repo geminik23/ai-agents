@@ -1,8 +1,8 @@
 use std::ops::Range;
 
 use ai_agents_core::{
-    AgentError, ChatMessage, NativeHistoryInspection, Role, inspect_native_history,
-    native_readable_projection,
+    AgentError, ChatMessage, IncompleteNativeExchange, NativeHistoryInspection, Role,
+    inspect_native_history, native_readable_projection,
 };
 
 /// Memory-specific view of native history that treats an entire signed user turn as one unit.
@@ -48,6 +48,21 @@ impl NativeRetentionInspection {
         self.core.protected_suffix_start()
     }
 
+    /// Finds the earliest signed user turn with an unrecorded result, including ended turns.
+    pub(crate) fn incomplete_suffix_start(&self) -> Option<usize> {
+        self.core
+            .exchanges()
+            .iter()
+            .filter(|exchange| !exchange.is_complete())
+            .filter_map(|exchange| {
+                self.signed_turns
+                    .iter()
+                    .find(|range| range.contains(&exchange.message_start()))
+                    .map(|range| range.start)
+            })
+            .min()
+    }
+
     /// Reports whether removing this prefix preserves core exchanges and whole signed user turns.
     pub(crate) fn is_safe_prefix_len(&self, count: usize) -> bool {
         self.core.is_safe_prefix_len(count)
@@ -77,8 +92,8 @@ impl NativeRetentionInspection {
         self.safe_prefix_len_at_most(start.saturating_sub(1))
     }
 
-    /// Returns signed assistant indexes and call IDs whose final result was not recorded.
-    pub(crate) fn incomplete_exchanges(&self) -> Vec<(usize, Vec<String>)> {
+    /// Returns signed assistant indexes and observations whose final result was not recorded.
+    pub(crate) fn incomplete_exchanges(&self) -> Vec<(usize, IncompleteNativeExchange)> {
         self.core
             .exchanges()
             .iter()
@@ -86,11 +101,15 @@ impl NativeRetentionInspection {
             .map(|exchange| {
                 (
                     exchange.message_start(),
-                    exchange
-                        .missing_result_ids()
-                        .into_iter()
-                        .map(str::to_string)
-                        .collect(),
+                    IncompleteNativeExchange {
+                        exchange_id: Some(exchange.state().exchange_id().to_string()),
+                        missing_result_ids: exchange
+                            .missing_result_ids()
+                            .into_iter()
+                            .map(str::to_string)
+                            .collect(),
+                        unverified_legacy: false,
+                    },
                 )
             })
             .collect()
@@ -112,6 +131,62 @@ pub(crate) fn readable_projection(
             Ok(message)
         })
         .collect()
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyIncompleteStatus {
+    native_exchange_status: String,
+    missing_result_ids: Vec<String>,
+    description: String,
+}
+
+// Old summaries carry only ambiguous text, so recovered observations must remain explicitly unverified.
+pub(crate) fn extract_legacy_incomplete(
+    summary: Option<String>,
+) -> (Option<String>, Vec<IncompleteNativeExchange>) {
+    let Some(text) = summary else {
+        return (None, Vec::new());
+    };
+    let mut remaining = text.as_str();
+    let mut observations = Vec::new();
+    loop {
+        let (prefix, line) = remaining.rsplit_once('\n').unwrap_or(("", remaining));
+        let Ok(status) = serde_json::from_str::<LegacyIncompleteStatus>(line) else {
+            break;
+        };
+        if status.native_exchange_status != "incomplete"
+            || status.description != "final execution result was not recorded"
+            || status.missing_result_ids.is_empty()
+        {
+            break;
+        }
+        observations.push(IncompleteNativeExchange {
+            exchange_id: None,
+            missing_result_ids: status.missing_result_ids,
+            unverified_legacy: true,
+        });
+        remaining = prefix;
+        if remaining.is_empty() {
+            break;
+        }
+    }
+    if observations.is_empty() {
+        return (Some(text), observations);
+    }
+    observations.reverse();
+    (
+        (!remaining.is_empty()).then(|| remaining.to_string()),
+        observations,
+    )
+}
+
+/// Reports whether a legacy summary ends with an unverified incomplete-exchange marker.
+/// Such text may originate from a model or user and cannot prove execution or authorize a retry.
+pub fn has_legacy_incomplete_summary(summary: Option<&str>) -> bool {
+    !extract_legacy_incomplete(summary.map(str::to_string))
+        .1
+        .is_empty()
 }
 
 fn memory_error(error: impl std::fmt::Display) -> AgentError {

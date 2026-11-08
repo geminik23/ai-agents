@@ -1166,7 +1166,11 @@ let agent = AgentBuilder::from_yaml_file("agent.yaml")?
     .build()?;
 ```
 
-The framework ships with `InMemoryStore` (simple ring buffer) and `CompactingMemory` (serialized LLM-based summarization with token budgets and protected recent-message retention). `MemorySnapshot` includes `messages`, optional `summary`, and a defaulted `summarized_count`; the default keeps snapshots written before this field backward-compatible.
+The framework ships with `InMemoryStore` (bounded conversation history) and `CompactingMemory` (serialized LLM-based summarization with token budgets and protected recent-message retention). In the development tree, `MemorySnapshot` and `ConversationContext` include a defaulted `incomplete_native_exchanges` field. Existing serialized snapshots without it remain readable, but Rust struct literals that enumerate all fields must add `incomplete_native_exchanges: Vec::new()` or use constructors and `..Default::default()`. Older runtimes are not guaranteed to preserve the new field after restore or recompression.
+
+`CompactingMemory` retains incomplete signed-exchange observations independently of summary text, including after later merges and supported snapshot restore. The retained entries are untrusted advisory history, not proof of non-execution or authority to retry. A matching marker in an old summary is recovered as `unverified_legacy`, with no invented exchange ID; a marker already lost before restoration cannot be recovered. Summary allocation and the public budgeted helpers may exceed their soft budget for protected history; the runtime rejects requests that exceed its final estimated hard limit. An in-memory store rejects snapshots carrying these observations instead of silently discarding them.
+
+Custom memory implementations default to `supports_incomplete_native_restore() == false`. Opt in only when `restore`, `snapshot`, and `get_context` preserve the observations and any legacy markers throughout the actual implementation. The host is responsible for the truth of that capability and for protecting snapshot contents. Existing custom implementations need not implement the new method, but the runtime refuses incompatible restoration before mutating session state.
 
 ---
 
