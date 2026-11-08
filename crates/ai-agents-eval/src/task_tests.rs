@@ -503,7 +503,9 @@ async fn cleanup_read_failure_retains_files_even_without_a_live_owner() {
     let workspace = crate::fixtures::AttemptWorkspace::create(None).unwrap();
     let path = workspace.workspace.clone();
     let spec = ai_agents_runtime::spec::AgentSpec::from_yaml_strict(AGENT).unwrap();
+    // The default fixture mode is real; this cleanup-ownership test must never construct or call a live provider.
     let fixtures = crate::fixtures::LlmFixtureConfig {
+        mode: crate::fixtures::LlmFixtureMode::Mock,
         responses: vec!["verified report".into()],
         ..Default::default()
     };
