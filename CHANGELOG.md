@@ -3,6 +3,7 @@
 ## Unreleased
 
 ### Added
+- Workspace file protection: development Rust hosts can confine built-in file tools to one workspace root or selected entries, track created files and expose a cooperative mutation revision without adding write authority
 - Scoped instructions: opt-in host-bound workspace rules refresh for supported model work without widening tool authority
 - Code agent example: run the scripted sample or connect selected workspace files and a provider to an approved host-owned checker
 - Foreground task observations: opt-in REPL hosts prepare per-task local observations and report acknowledged results without adding execution authority

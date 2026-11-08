@@ -531,7 +531,8 @@ pub mod tools {
         ToolRegistry, ToolSchemaPromptMode, TrustLevel, UnavailableCommandRunner,
         UnavailableDiagnosticsProvider, WebFetchTool, WebSearchProvider, WebSearchProviderSlot,
         WebSearchRequest, WebSearchResponse, WebSearchResultItem, WebSearchSafeSearch,
-        WebSearchTool, create_builtin_registry, file_version_evidence,
+        WebSearchTool, WorkspaceGuard, WorkspaceScope, create_builtin_registry,
+        file_version_evidence,
     };
     pub use ai_agents_tools::{HttpTool, generate_schema};
 }

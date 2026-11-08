@@ -13,6 +13,16 @@ pub trait HostRevisionSource: Send + Sync {
     fn revision(&self) -> Result<String>;
 }
 
+/// Exposes the tools-layer workspace guard as a cooperative validation target revision.
+/// The token covers only mutations made through the guard's own tools; an in-flight or poisoned guard is unavailable rather than stale-but-valid.
+/// It remains valid freshness evidence only while the host prevents every other writer to the workspace and checker inputs.
+impl HostRevisionSource for ai_agents_tools::WorkspaceGuard {
+    fn revision(&self) -> Result<String> {
+        ai_agents_tools::WorkspaceGuard::revision(self)
+            .ok_or_else(|| AgentError::Config("workspace revision unavailable".into()))
+    }
+}
+
 /// Explicit host-confirmed loss of delivery is distinct from an ordinary delayed signal.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ExternalUnavailablePolicy {

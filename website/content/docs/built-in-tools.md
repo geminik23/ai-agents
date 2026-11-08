@@ -106,6 +106,8 @@ All six split mutation tools require an explicit allowed write root for an actua
 
 The v1 filesystem contract assumes a host-owned workspace without concurrent untrusted external replacement of validated files, directories, or parent paths. Runtime locks serialize framework-owned conflicting mutations, but they are not OS directory handles or a filesystem sandbox; use process, container, mount, and permission isolation when another process can modify the workspace concurrently. Atomic replacement and patch rollback attempts are tool-specific best efforts, not a runtime-wide rollback guarantee. Timeout, cancellation, external modification, cleanup failure, or process/network side effects can leave externally visible effects.
 
+In the development tree, Rust hosts can install a `WorkspaceGuard` around `file_read`, `file_write`, and `file_edit` for one canonical workspace root (see the [Rust API](@/docs/rust-api.md#workspace-file-protection-development-only)). The guard runs after the unchanged tool policy and additionally confines targets to the root or to selected entries, rejects symlinked components, tracks files it created, and maintains a cooperative revision. It does not add write permission, replace `paths.deny` or approvals, watch external writers, or provide OS isolation.
+
 
 `file_write`, `file_edit`, and `patch` share read-version evidence with `file_read`. When `require_read_before_write: true`, an existing file must have been read and must still match that version before apply.
 

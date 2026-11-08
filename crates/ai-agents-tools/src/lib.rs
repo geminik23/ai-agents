@@ -9,6 +9,7 @@ mod provider;
 mod registry;
 pub mod security;
 mod types;
+mod workspace;
 
 pub use ai_agents_core::{
     CommandBindingKind, CommandPolicyBinding, DomainPolicyBinding, PathAccessMode, PathBindingKind,
@@ -36,6 +37,8 @@ pub use types::{
     WebSearchResultItem, WebSearchSafeSearch, current_task_todo_store, file_version_evidence,
     scope_task_todos,
 };
+
+pub use workspace::{WorkspaceGuard, WorkspaceScope};
 
 pub use builtin::HttpTool;
 pub use builtin::{
