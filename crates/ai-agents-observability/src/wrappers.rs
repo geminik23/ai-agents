@@ -277,6 +277,19 @@ impl ObservedTool {
     pub fn new(inner: Arc<dyn Tool>, manager: Arc<ObservabilityManager>) -> Self {
         Self { inner, manager }
     }
+
+    // Apply output permission consistently before any error/payload reaches retention or export, without changing the actual result.
+    fn record_result(&self, span: &mut crate::SpanGuard, result: &ToolResult) {
+        if !result.success {
+            span.set_error(ObservationError::new(
+                "tool_error",
+                crate::redaction::tool_error_text(&self.manager.config().privacy, &result.output),
+            ));
+        }
+        if self.manager.config().privacy.include_tool_outputs {
+            span.set_payload(serde_json::json!({"output": result.output.clone()}));
+        }
+    }
 }
 
 #[async_trait]
@@ -337,12 +350,7 @@ impl Tool for ObservedTool {
             span.set_payload(serde_json::json!({"args":args.clone()}));
         }
         let result = self.inner.execute_task_question(args, answer, ctx).await;
-        if !result.success {
-            span.set_error(ObservationError::new("tool_error", result.output.clone()));
-        }
-        if self.manager.config().privacy.include_tool_outputs {
-            span.set_payload(serde_json::json!({"output":result.output.clone()}));
-        }
+        self.record_result(&mut span, &result);
         result
     }
 
@@ -406,16 +414,15 @@ impl Tool for ObservedTool {
         }
         let result = self.inner.execute_task(args, ctx).await;
         match &result {
-            Ok(output) => {
-                if !output.success {
-                    span.set_error(ObservationError::new("tool_error", output.output.clone()));
-                }
-                if self.manager.config().privacy.include_tool_outputs {
-                    span.set_payload(serde_json::json!({"output":output.output.clone()}));
-                }
-            }
+            Ok(output) => self.record_result(&mut span, output),
             Err(ai_agents_core::AgentError::TaskSuspended(_)) => {}
-            Err(error) => span.set_error(ObservationError::new("tool_error", error.to_string())),
+            Err(error) => span.set_error(ObservationError::new(
+                "tool_error",
+                crate::redaction::tool_error_text(
+                    &self.manager.config().privacy,
+                    &error.to_string(),
+                ),
+            )),
         }
         result
     }
@@ -434,12 +441,7 @@ impl Tool for ObservedTool {
             span.set_payload(serde_json::json!({"args": args.clone()}));
         }
         let result = self.inner.execute(args, ctx).await;
-        if !result.success {
-            span.set_error(ObservationError::new("tool_error", result.output.clone()));
-        }
-        if self.manager.config().privacy.include_tool_outputs {
-            span.set_payload(serde_json::json!({"output": result.output.clone()}));
-        }
+        self.record_result(&mut span, &result);
         result
     }
 }

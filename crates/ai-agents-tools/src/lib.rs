@@ -26,16 +26,16 @@ pub use condition::{
 pub use provider::{ProviderHealth, ToolDescriptor, ToolProvider, ToolProviderError};
 pub use registry::{ResolvedTool, ToolIdentity, ToolRegistry, ToolSchemaPromptMode};
 pub use types::{
-    CommandRequest, CommandResponse, CommandRunner, CommandRunnerSlot, DiagnosticItem,
-    DiagnosticSeverity, DiagnosticsProvider, DiagnosticsProviderSlot, DiagnosticsRequest,
-    DiagnosticsResponse, FileVersionEvidence, FileVersionStore, ProcessCommandRunner,
-    QuestionHandler, QuestionHandlerSlot, QuestionRequest, QuestionResponse, StaticCommandRunner,
-    StaticDiagnosticsProvider, StaticWebSearchProvider, TodoItem, TodoRunBinding, TodoStatus,
-    TodoStore, ToolAliases, ToolContext, ToolMetadata, ToolProviderType, TrustLevel,
-    UnavailableCommandRunner, UnavailableDiagnosticsProvider, UnavailableWebSearchProvider,
-    WebSearchProvider, WebSearchProviderSlot, WebSearchRequest, WebSearchResponse,
-    WebSearchResultItem, WebSearchSafeSearch, current_task_todo_store, file_version_evidence,
-    scope_task_todos,
+    CommandExecutionState, CommandRequest, CommandResponse, CommandRunner, CommandRunnerSlot,
+    DiagnosticItem, DiagnosticSeverity, DiagnosticsProvider, DiagnosticsProviderSlot,
+    DiagnosticsRequest, DiagnosticsResponse, FileVersionEvidence, FileVersionStore,
+    ProcessCommandRunner, QuestionHandler, QuestionHandlerSlot, QuestionRequest, QuestionResponse,
+    StaticCommandRunner, StaticDiagnosticsProvider, StaticWebSearchProvider, TodoItem,
+    TodoRunBinding, TodoStatus, TodoStore, ToolAliases, ToolContext, ToolMetadata,
+    ToolProviderType, TrustLevel, UnavailableCommandRunner, UnavailableDiagnosticsProvider,
+    UnavailableWebSearchProvider, WebSearchProvider, WebSearchProviderSlot, WebSearchRequest,
+    WebSearchResponse, WebSearchResultItem, WebSearchSafeSearch, current_task_todo_store,
+    file_version_evidence, scope_task_todos,
 };
 
 pub use workspace::{WorkspaceGuard, WorkspaceScope};

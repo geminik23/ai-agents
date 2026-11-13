@@ -252,11 +252,9 @@ impl AgentHooks for LoggingHooks {
         );
     }
 
+    // Approval bodies belong to the exact local reviewer, not the default tracing sink.
     async fn on_approval_requested(&self, request: &ApprovalRequest) {
-        info!(
-            "{} Approval requested [{}]: {}",
-            self.prefix, request.id, request.message
-        );
+        info!("{} Approval requested [{}]", self.prefix, request.id);
     }
 
     async fn on_approval_result(&self, request_id: &str, result: &ApprovalResult) {
@@ -264,11 +262,8 @@ impl AgentHooks for LoggingHooks {
             ApprovalResult::Approved => {
                 info!("{} Approval [{}]: approved", self.prefix, request_id);
             }
-            ApprovalResult::Rejected { reason } => {
-                warn!(
-                    "{} Approval [{}]: rejected ({:?})",
-                    self.prefix, request_id, reason
-                );
+            ApprovalResult::Rejected { .. } => {
+                warn!("{} Approval [{}]: rejected", self.prefix, request_id);
             }
             ApprovalResult::Modified { .. } => {
                 info!(

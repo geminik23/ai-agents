@@ -75,6 +75,8 @@ Output is sent as untrusted user-role data after context overflow handling, neve
 
 A command check's optional `timeout_ms` is part of its exact requested operation and must be positive and within the tool timeout range. When a fixed host binding is used, include the same value in its authorized arguments. The command and shared executor still apply the current policy, classification, recovery and task/check deadlines, so a stricter effective limit can shorten the attempt. Omitting it retains the command tool's existing 30000 ms request default; changing only the policy ceiling does not increase that default.
 
+Development command host results may include `execution_state`. Explicit `not_started` or `uncertain` cannot prove a command gate, while legacy missing state retains the existing normal-exit contract. Interrupted/ambiguous legacy host results use the existing uncertain-effect protection. This reporting does not grant or renew a call; see [command host migration](@/docs/rust-api.md#command-execution-state-development-only).
+
 Each lifecycle stage has required `id`; optional `instruction`, `completion`, `commands`, `validation`, `suggested_tools`, `required_before_tools`, `retry_on_failure`, `on_failure_stage`, and `max_fix_cycles`. Stages are required by default. Suggested tools do not grant them; required-before-tool constraints are enforced. Repair targets must name an existing earlier stage and their cycle allowance is bounded. A passing task gate cannot skip required validation/review stages. This is ordered lifecycle control, not a DAG language.
 
 `progress` supports `adapter` (default `builtin.evidence`), `contract_version` (default `1`), adapter `config`, optional canonical `todo_tool`, `require_todos`, `require_active_todo`, `enforce_for_tools`, `auto_create_todo_prompt`, and positive `max_open_todos`. Todos are not required when these policies/gates do not request them. Built-in evidence signals select `id`, upstream `validator`, typed `path` and comparison such as `increase` or `change`. High-water marks and bounded observed fingerprints prevent duplicate/oscillating observations from becoming new progress.
@@ -2841,8 +2843,8 @@ observability:
 | `aggregation.window_size` | `usize` | `1000` | Rolling event window used for aggregate metrics |
 | `privacy.include_prompts` | `bool` | `false` | Retain redacted prompt text in raw event payloads |
 | `privacy.include_responses` | `bool` | `false` | Retain redacted response text in raw event payloads |
-| `privacy.include_tool_args` | `bool` | `false` | Retain redacted tool arguments |
-| `privacy.include_tool_outputs` | `bool` | `false` | Retain redacted tool output |
+| `privacy.include_tool_args` | `bool` | `false` | Retain redacted tool arguments, including tool approval arguments and modified arguments |
+| `privacy.include_tool_outputs` | `bool` | `false` | Retain redacted tool output and tool/skill failure bodies, including copied error text |
 | `privacy.max_text_chars` | `usize` | `0` | Maximum retained characters for text fields; `0` means no raw text retention |
 | `privacy.hash_inputs` | `bool` | `true` | Store stable text hashes for correlation without raw text |
 | `export.formats` | `list` | `[json]` | Output formats: `json`, `csv`, `jsonl`, `prometheus` |
@@ -2854,6 +2856,8 @@ observability:
 | `buffer.raw_event_limit` | `usize` | `10000` | Maximum raw events retained for raw export |
 | `buffer.pending_branch_event_limit` | `usize` | `1024` | Maximum delayed branch events retained before unfinalized branch events are counted as dropped |
 | `buffer.drop_on_full` | `bool` | `true` | Drop and count events when buffers are full instead of blocking |
+
+Positive `privacy.max_text_chars` is a retention limit, not blanket permission for excluded input/output bodies. Source permissions apply before errors, hooks or payloads enter memory/export. Approval completion events retain decision states and trigger structure rather than free-form review/rejection/error text; tool args and modified args use `include_tool_args`. Skipped-tool policy events retain reason presence and structural status, not the free-form reason. Exact local approval and trusted custom hooks are separate surfaces; observability privacy does not configure arbitrary tracing sinks, and the default tracing hooks independently omit approval bodies/rejection reasons.
 
 ### Pricing file example
 

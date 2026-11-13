@@ -88,6 +88,7 @@ impl AgentHooks for ObservabilityHooks {
         Some(vec![])
     }
 
+    // Skipped calls retain structural policy/approval facts, not free-form reasons that may contain an exact human decision body.
     async fn on_tool_execution_record(&self, record: &ToolExecutionRecord) {
         if !self.manager.config().latency.track_tools || record.executed {
             return;
@@ -103,7 +104,9 @@ impl AgentHooks for ObservabilityHooks {
         let payload = Some(serde_json::json!({
             "call_id": record.call_id,
             "approval_status": record.approval.as_ref().map(|approval| format!("{:?}", approval.status).to_ascii_lowercase()),
-            "policy_reason": record.policy.reason,
+            "policy_reason_present": record.policy.reason.is_some(),
+            "requires_user_action": record.policy.requires_user_action,
+            "retryable": record.policy.retryable,
         }));
         self.manager.record_lifecycle_event(
             EventType::ToolCall {
@@ -130,14 +133,20 @@ impl AgentHooks for ObservabilityHooks {
         );
     }
 
+    // A tool/skill body remains output even when the runtime publishes it through the generic error hook.
     async fn on_error(&self, error: &AgentError) {
+        let message = if matches!(error, AgentError::Tool(_) | AgentError::Skill(_)) {
+            crate::redaction::tool_error_text(&self.manager.config().privacy, &error.to_string())
+        } else {
+            error.to_string()
+        };
         self.manager.record_lifecycle_event(
             EventType::Error,
             ObservationPurpose::default(),
             EventStatus::Error,
             0,
             HashMap::new(),
-            Some(serde_json::json!({"kind": "agent_error", "message": error.to_string()})),
+            Some(serde_json::json!({"kind": "agent_error", "message": message})),
         );
     }
 
@@ -179,6 +188,8 @@ impl AgentHooks for ObservabilityHooks {
         );
     }
 
+    // Preserve raw/effective decision status, not exact human text; tool arguments and modified arguments require their own opt-in.
+    // The authenticated reviewer and custom hooks still receive the original request/result objects unchanged.
     async fn on_approval_resolved(
         &self,
         request: &ApprovalRequest,
@@ -207,6 +218,30 @@ impl AgentHooks for ObservabilityHooks {
         } else {
             EventStatus::Success
         };
+        let include_args = self.manager.config().privacy.include_tool_args
+            && matches!(request.trigger, ApprovalTrigger::Tool { .. });
+        let mut raw_projection = serde_json::json!({"status": approval_result_label(raw_result)});
+        let mut outcome_projection = serde_json::json!({"status": approval_outcome_label(outcome)});
+        if include_args {
+            if let ApprovalResult::Modified { changes } = raw_result {
+                raw_projection["changes"] = serde_json::json!(changes);
+            }
+            if let ApprovalResolvedOutcome::Modified { changes } = outcome {
+                outcome_projection["changes"] = serde_json::json!(changes);
+            }
+        }
+        let trigger_projection = match &request.trigger {
+            ApprovalTrigger::Tool { name, args } if include_args => {
+                serde_json::json!({"type":"tool","name":name,"args":args})
+            }
+            ApprovalTrigger::Tool { name, .. } => serde_json::json!({"type":"tool","name":name}),
+            ApprovalTrigger::Condition { name, .. } => {
+                serde_json::json!({"type":"condition","name":name})
+            }
+            ApprovalTrigger::State { from, to } => {
+                serde_json::json!({"type":"state","from":from,"to":to})
+            }
+        };
         self.manager.record_lifecycle_event(
             EventType::HitlApproval {
                 trigger: "resolved".to_string(),
@@ -216,9 +251,9 @@ impl AgentHooks for ObservabilityHooks {
             0,
             tags,
             Some(serde_json::json!({
-                "raw_result": raw_result,
-                "outcome": outcome,
-                "request_trigger": &request.trigger,
+                "raw_result": raw_projection,
+                "outcome": outcome_projection,
+                "request_trigger": trigger_projection,
             })),
         );
     }

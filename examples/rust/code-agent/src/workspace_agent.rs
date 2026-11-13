@@ -893,6 +893,7 @@ impl CommandRunner for CheckerRunner {
             return CommandResponse {
                 success: false,
                 termination: "unavailable".into(),
+                execution_state: ai_agents::tools::CommandExecutionState::NotStarted,
                 stderr: "trusted checker binding is unavailable or changed".into(),
                 cwd: request.cwd,
                 ..Default::default()

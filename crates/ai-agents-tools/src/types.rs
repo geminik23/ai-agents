@@ -11,6 +11,10 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
 
+#[cfg(test)]
+#[path = "process_lifetime_tests.rs"]
+mod process_lifetime_tests;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolProviderType {
@@ -773,9 +777,35 @@ pub struct CommandRequest {
     pub reason: Option<String>,
 }
 
+/// Runner-reported foreground execution state, separate from exit success and output completeness.
+/// Reports are trusted host data, not execution authority, rollback receipts or proof that arbitrary descendants stopped.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum CommandExecutionState {
+    /// Legacy hosts retain normal exited-result compatibility; interrupted or ambiguous results remain uncertain.
+    #[default]
+    Unspecified,
+    /// The runner established that command work did not start; the enclosing tool attempt was still invoked and charged.
+    NotStarted,
+    /// The host established completion of its supported foreground work and owned resources, not rollback.
+    Finished,
+    /// Work may have started and effects or required cleanup remain unconfirmed.
+    Uncertain,
+}
+
+impl CommandExecutionState {
+    fn is_unspecified(&self) -> bool {
+        *self == Self::Unspecified
+    }
+}
+
 /// Result returned by a host command runner.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
 pub struct CommandResponse {
+    /// Explicit host execution/cleanup report; missing legacy data cannot certify an interrupted command's settlement.
+    #[serde(default, skip_serializing_if = "CommandExecutionState::is_unspecified")]
+    pub execution_state: CommandExecutionState,
     /// Whether the process completed with exit code 0.
     pub success: bool,
     /// Process exit code when available.
@@ -860,6 +890,7 @@ impl CommandRunner for UnavailableCommandRunner {
         CommandResponse {
             success: false,
             termination: "unavailable".to_string(),
+            execution_state: CommandExecutionState::NotStarted,
             cwd: request.cwd,
             argv_redacted: redact_argv(&request.argv),
             ..CommandResponse::default()
@@ -920,6 +951,7 @@ impl CommandRunner for StaticCommandRunner {
             return CommandResponse {
                 success: false,
                 termination: "unavailable".to_string(),
+                execution_state: CommandExecutionState::NotStarted,
                 cwd: request.cwd,
                 argv_redacted: redact_argv(&request.argv),
                 ..CommandResponse::default()
@@ -932,6 +964,7 @@ impl CommandRunner for StaticCommandRunner {
                 success: false,
                 exit_code: Some(127),
                 termination: "not_found".to_string(),
+                execution_state: CommandExecutionState::NotStarted,
                 stderr: "mock command not found".to_string(),
                 combined_output: "mock command not found".to_string(),
                 cwd: request.cwd,
@@ -947,6 +980,8 @@ pub struct ProcessCommandRunner;
 
 #[async_trait]
 impl CommandRunner for ProcessCommandRunner {
+    // Own wait and pipe futures together under one original work deadline; dropping closes readers without detaching tasks.
+    // Timeout cleanup can reap the direct child but cannot certify descendant effects, so it narrows settlement to uncertain.
     async fn run_command(
         &self,
         request: CommandRequest,
@@ -956,6 +991,7 @@ impl CommandRunner for ProcessCommandRunner {
             return CommandResponse {
                 success: false,
                 termination: "error".to_string(),
+                execution_state: CommandExecutionState::NotStarted,
                 stderr: "argv must not be empty".to_string(),
                 combined_output: "argv must not be empty".to_string(),
                 cwd: request.cwd,
@@ -991,6 +1027,7 @@ impl CommandRunner for ProcessCommandRunner {
                 return CommandResponse {
                     success: false,
                     termination: "error".to_string(),
+                    execution_state: CommandExecutionState::NotStarted,
                     stderr: error.to_string(),
                     combined_output: error.to_string(),
                     cwd: request.cwd,
@@ -1001,45 +1038,39 @@ impl CommandRunner for ProcessCommandRunner {
         };
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
-        let stdout_task = tokio::spawn(read_pipe_bounded(stdout, max_output_chars));
-        let stderr_task = tokio::spawn(read_pipe_bounded(stderr, max_output_chars));
-        let status = tokio::time::timeout(Duration::from_millis(timeout_ms), child.wait()).await;
-        match status {
-            Ok(Ok(status)) => {
-                let stdout = stdout_task.await.unwrap_or_else(|_| {
-                    let mut captured = BoundedProcessOutput::new(max_output_chars);
-                    captured.read_failed = true;
-                    captured
-                });
-                let stderr = stderr_task.await.unwrap_or_else(|_| {
-                    let mut captured = BoundedProcessOutput::new(max_output_chars);
-                    captured.read_failed = true;
-                    captured
-                });
+        let result = tokio::time::timeout(
+            Duration::from_millis(timeout_ms),
+            collect_process_output(child.wait(), stdout, stderr, max_output_chars),
+        )
+        .await;
+        match result {
+            Ok(Ok((status, stdout, stderr))) => {
                 command_output_response(status, stdout, stderr, request, max_output_chars)
             }
-            Ok(Err(error)) => CommandResponse {
-                success: false,
-                termination: "error".to_string(),
-                stderr: error.to_string(),
-                combined_output: error.to_string(),
-                cwd: request.cwd,
-                argv_redacted: redact_argv(&request.argv),
-                ..CommandResponse::default()
-            },
-            Err(_) => {
-                let _ = child.kill().await;
-                let _ = child.wait().await;
-                stdout_task.abort();
-                stderr_task.abort();
-                let message = "command timed out; process cleanup requested".to_string();
+            interrupted => {
+                let timed_out = interrupted.is_err();
+                let cause = match interrupted {
+                    Ok(Err(error)) => format!("command wait failed: {error}"),
+                    _ => "command timed out".into(),
+                };
+                // This is cleanup of admitted work, not a renewed execution deadline or permission to retry.
+                // Outer executor cancellation/drop can interrupt this await and retains its own original custody.
+                let cleanup = match child.kill().await {
+                    Ok(()) => "direct child reaped",
+                    Err(_) => match child.try_wait() {
+                        Ok(Some(_)) => "direct child already reaped",
+                        _ => "direct child cleanup unconfirmed",
+                    },
+                };
+                let message = format!("{cause}; {cleanup}; descendant effects remain unconfirmed");
                 CommandResponse {
+                    execution_state: CommandExecutionState::Uncertain,
                     success: false,
-                    termination: "timeout".to_string(),
+                    termination: if timed_out { "timeout" } else { "error" }.into(),
                     stderr: message.clone(),
                     combined_output: message,
                     truncated: true,
-                    timed_out: true,
+                    timed_out,
                     cwd: request.cwd,
                     argv_redacted: redact_argv(&request.argv),
                     ..CommandResponse::default()
@@ -1051,6 +1082,30 @@ impl CommandRunner for ProcessCommandRunner {
 
 /// Shared slot used by `command` to find the active host runner.
 pub type CommandRunnerSlot = Arc<RwLock<Arc<dyn CommandRunner>>>;
+
+// The wait and both readers are owned by this future, so wait failure or cancellation closes the read ends synchronously.
+// Reader I/O failures stay partial captures rather than aborting otherwise running work or implying uncertain effects.
+async fn collect_process_output<W, O, E>(
+    wait: W,
+    stdout: Option<O>,
+    stderr: Option<E>,
+    limit: usize,
+) -> std::io::Result<(
+    std::process::ExitStatus,
+    BoundedProcessOutput,
+    BoundedProcessOutput,
+)>
+where
+    W: std::future::Future<Output = std::io::Result<std::process::ExitStatus>>,
+    O: tokio::io::AsyncRead + Unpin,
+    E: tokio::io::AsyncRead + Unpin,
+{
+    tokio::try_join!(
+        wait,
+        async { Ok(read_pipe_bounded(stdout, limit).await) },
+        async { Ok(read_pipe_bounded(stderr, limit).await) },
+    )
+}
 
 // Retain both ends while draining the entire pipe; the configured character bound does not grow with process output.
 struct BoundedProcessOutput {
@@ -1230,6 +1285,7 @@ fn command_output_response(
     let (stdout_text, stdout_truncated) = stdout.render();
     let (stderr_text, stderr_truncated) = stderr.render();
     CommandResponse {
+        execution_state: CommandExecutionState::Finished,
         success: status.success(),
         exit_code: status.code(),
         termination: "exited".to_string(),

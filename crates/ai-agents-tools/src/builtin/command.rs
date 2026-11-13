@@ -11,7 +11,9 @@ use ai_agents_core::{
 };
 
 use crate::generate_schema;
-use crate::types::{CommandRequest, CommandResponse, CommandRunnerSlot, truncate_head_tail};
+use crate::types::{
+    CommandExecutionState, CommandRequest, CommandResponse, CommandRunnerSlot, truncate_head_tail,
+};
 
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_MAX_OUTPUT_CHARS: usize = 20_000;
@@ -55,6 +57,8 @@ struct CommandInput {
 
 #[derive(Debug, Serialize)]
 struct CommandToolOutput {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    execution_state: Option<CommandExecutionState>,
     success: bool,
     exit_code: Option<i32>,
     termination: String,
@@ -264,6 +268,8 @@ fn strings_at(value: &Value, field: &str) -> Vec<String> {
         .collect()
 }
 
+// Preserve factual exit observations separately from host settlement; an invoked-but-not-started command still consumes its tool attempt.
+// Missing legacy state preserves ordinary exited results but cannot silently certify interrupted or ambiguous work.
 fn command_response_to_result(
     response: CommandResponse,
     cwd: String,
@@ -271,7 +277,17 @@ fn command_response_to_result(
     reason: Option<String>,
     output_limit: Option<usize>,
 ) -> ToolResult {
+    let execution_state = response.execution_state;
+    let uncertain = match execution_state {
+        CommandExecutionState::Uncertain => true,
+        CommandExecutionState::Unspecified => {
+            response.timed_out || response.termination != "exited"
+        }
+        CommandExecutionState::NotStarted | CommandExecutionState::Finished => false,
+    };
     let mut output = CommandToolOutput {
+        execution_state: (execution_state != CommandExecutionState::Unspecified)
+            .then_some(execution_state),
         success: response.success,
         exit_code: response.exit_code,
         termination: response.termination,
@@ -290,15 +306,26 @@ fn command_response_to_result(
     };
     let json = match serialize_bounded_command_output(&mut output, output_limit) {
         Ok(json) => json,
-        Err(error) => return ToolResult::error(format!("Serialization error: {}", error)),
+        Err(error) => {
+            return ToolResult::error_with_uncertain_effect(format!(
+                "Serialization error after command execution: {error}"
+            ));
+        }
     };
     let mut metadata = HashMap::new();
+    metadata.insert(
+        "command_execution_state".into(),
+        serde_json::json!(execution_state),
+    );
+    if uncertain {
+        metadata.insert("task_effect_uncertain".into(), Value::Bool(true));
+    }
     metadata.insert("truncated".to_string(), Value::Bool(output.truncated));
     metadata.insert("timed_out".to_string(), Value::Bool(output.timed_out));
     metadata.insert(
         "timeout_cleanup".to_string(),
         Value::String(if output.timed_out {
-            "kill_on_drop".to_string()
+            "see_execution_state".to_string()
         } else {
             "not_needed".to_string()
         }),
@@ -549,6 +576,7 @@ mod tests {
     #[test]
     fn output_and_edit_regression_preserves_a_short_error_before_duplicate_output() {
         let output = CommandToolOutput {
+            execution_state: None,
             success: false,
             exit_code: Some(1),
             termination: "exited".into(),
@@ -585,6 +613,7 @@ mod tests {
         let error = "ERROR-01234567890123456789012345";
         let text = format!("{}{error}", "x".repeat(200));
         let output = CommandToolOutput {
+            execution_state: None,
             success: false,
             exit_code: Some(1),
             termination: "exited".into(),
@@ -616,6 +645,7 @@ mod tests {
     #[test]
     fn output_and_edit_regression_empty_logs_do_not_claim_truncation() {
         let mut output = CommandToolOutput {
+            execution_state: None,
             success: true,
             exit_code: Some(0),
             termination: "exited".into(),

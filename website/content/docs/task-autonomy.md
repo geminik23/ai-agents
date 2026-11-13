@@ -105,6 +105,8 @@ A returned ordinary execution error in an admitted entry, or in controller reent
 
 On shutdown, distinguish a running cancellation request from acknowledged paused cleanup. Continue polling the original work. Timeout, drop, abort and a stored terminal row do not prove quiescence, rollback or exactly-once external effects. Uncertain work can require explicit recovery and retain protection.
 
+Command host execution state is separate from exit success and output completeness. A known pre-start refusal still consumes an invoked tool/command attempt; a normal nonzero exit or partial log does not by itself imply unfinished effects. Uncertain command effects retain the existing recovery protection without replay. The built-in runner's timeout/wait-error cleanup cannot certify descendants, so its interrupted results are conservative. Exact local decisions and trusted execution records remain available even when first-party log/observation projections omit their bodies; copied error text follows output permission and approval arguments follow argument permission.
+
 ## 5. Evaluate that same integration
 
 ```sh

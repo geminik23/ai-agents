@@ -1057,6 +1057,19 @@ let control = agent.runtime_control();
 
 `ToolProvider` is a different contract from `LLMProvider`: it advertises a collection of tool descriptors and resolves executable `Tool` objects. Provider registration and refresh validate the complete raw descriptor snapshot before publishing anything. Duplicate descriptor IDs and IDs owned by another registration reject the entire update even when `get_tool()` returns `None`; a valid unique descriptor whose executable object is unavailable is omitted. Refreshes for one registration are serialized, and a refresh started before unregister/re-register cannot publish into the replacement registration. Tool, provider, display-name, alias, and registry-version changes become visible together. Exact canonical IDs take priority; normalized names and aliases resolve only when one tool owns the claim. `map_tools()` captures one registry snapshot and invokes the wrapper callback after releasing registry locks.
 
+### Command execution state (development only)
+
+`ai_agents::tools::CommandResponse` adds `execution_state: CommandExecutionState`, also exported by `ai-agents-tools`. Complete Rust struct literals must include it; `..Default::default()` and old serialized fixtures retain `Unspecified`, which is omitted when serialized again. Unknown enum strings reject rather than becoming cleanup proof. Existing normal `exited` observations remain compatible, including nonzero exits and partial logs. Interrupted/ambiguous legacy responses conservatively retain uncertain effects; a custom runner must provide an explicit report when its supported work is known to have settled.
+
+| State | Host responsibility |
+|---|---|
+| `Unspecified` | Legacy compatibility only; absence is not a new cleanup acknowledgement |
+| `NotStarted` | Known refusal before command work started; the tool invocation still consumes its actual attempt |
+| `Finished` | Supported foreground work and owned resources finished; not rollback or arbitrary process-tree certification |
+| `Uncertain` | Effects or required cleanup remain unconfirmed; managed execution retains protection |
+
+The built-in process runner reports `NotStarted` on pre-spawn failure, `Finished` after observed child exit and completed reader futures, and `Uncertain` on wait failure/timeout. A read error or log cap by itself makes output partial, not effects uncertain. The command work timeout covers wait plus pipe drain. Dropping closes readers without detached tasks; direct-child kill/wait cleanup can itself be interrupted by the enclosing executor's original timeout/cancellation. Neither a report nor a cleanup wait extends grants, fixed bindings, the original deadline or completion eligibility. Exact task outcomes continue to require acknowledged settlement.
+
 ### Direct subcrate boundaries
 
 The curated `ai-agents` facade exports normal host integration for questions, diagnostics, commands, and web search, including `WebSearchProvider` request and response types. Add a matching direct `ai-agents-tools` dependency only for lower-level custom web-fetch transport or resolver injection (`WebFetchTransport`, `WebFetchResolver`, and their request/response types) or eval-oriented `StaticWebSearchProvider` and `UnavailableWebSearchProvider` helpers. A custom web-fetch transport must return one HTTP response per call without automatically following redirects so `WebFetchTool` can validate every hop. A socket-opening implementation must override validated sending, connect only to the supplied approved addresses, and honor `max_response_bytes` while reading each response; the compatibility default cannot enforce a host transport's DNS, proxy, or egress behavior.
@@ -1651,6 +1664,10 @@ let agent = AgentBuilder::new()
 `ObservabilityManager::render_prometheus()` returns Prometheus text exposition format as a string. The framework does not start a scrape server for you yet. To connect Prometheus in a Rust host, expose that string from your own `/metrics` HTTP route or write it to a `.prom` file for the node_exporter textfile collector.
 
 Key exported types live under `ai_agents::observability`: `ObservabilityConfig`, `ObservabilityManager`, `ObservabilityReport`, `AggregatedMetrics`, `ObservationEvent`, `ObservationPurpose`, `SpanContext`, `ObservedLLMProvider`, `ObservedTool`, `ObservabilityHooks`, `with_observation_context`, `with_observation_purpose`, and `with_updated_observation_context()`.
+
+First-party tool/skill error text follows `privacy.include_tool_outputs`, even when copied into an error event rather than an output payload. Approval completion events preserve raw/effective status and trigger structure; tool args and modified args require `include_tool_args`. Exact review messages, rejection reasons, condition matched text and approval-resolution error bodies are not exported through those events. Skipped-tool observations expose structural policy facts and reason presence, not free-form reasons. Text caps and redaction apply after this source permission check; disabling raw file export does not disable the redacted rolling-memory window.
+
+Default tracing hooks and stock auto-reject/auto-approve handlers omit approval bodies and free-form rejection reasons independently of observability configuration. The exact local CLI/UI, custom trusted handlers/hooks, execution records and checkpoints retain their existing contracts. Hosts remain responsible for any separate custom integration that logs or exports those exact objects.
 
 ### Extending Observability
 

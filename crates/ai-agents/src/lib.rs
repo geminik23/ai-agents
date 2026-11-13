@@ -516,9 +516,9 @@ pub mod tools {
         ToolSideEffectLevel,
     };
     pub use ai_agents_tools::{
-        AskUserTool, CalculatorTool, CommandRequest, CommandResponse, CommandRunner,
-        CommandRunnerSlot, CommandTool, ConditionEvaluator, CopyPathTool, DateTimeTool,
-        DeletePathTool, DiagnosticItem, DiagnosticSeverity, DiagnosticsProvider,
+        AskUserTool, CalculatorTool, CommandExecutionState, CommandRequest, CommandResponse,
+        CommandRunner, CommandRunnerSlot, CommandTool, ConditionEvaluator, CopyPathTool,
+        DateTimeTool, DeletePathTool, DiagnosticItem, DiagnosticSeverity, DiagnosticsProvider,
         DiagnosticsProviderSlot, DiagnosticsRequest, DiagnosticsResponse, DiagnosticsTool,
         EchoTool, EvaluationContext, FileEditTool, FileInfoTool, FileListTool, FileReadTool,
         FileTool, FileVersionEvidence, FileVersionStore, FileWriteTool, GitDiffTool, GitStatusTool,

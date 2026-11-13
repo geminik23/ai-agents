@@ -70,7 +70,8 @@ impl BuiltinValidator {
         }
     }
 }
-// Conflicting host-reported process fields cannot turn an otherwise eligible command record into completion proof.
+// Conflicting process fields or explicit not-started/uncertain work cannot turn an otherwise eligible command record into completion proof.
+// Legacy observations without execution state retain their existing exit/timeout predicate; this check never grants execution authority.
 pub(super) fn command_output_consistent(output: &Value) -> bool {
     let timeout_consistent = output
         .get("timed_out")
@@ -86,7 +87,10 @@ pub(super) fn command_output_consistent(output: &Value) -> bool {
             _ => false,
         },
     };
-    timeout_consistent && success_consistent
+    let execution_consistent = output
+        .get("execution_state")
+        .is_none_or(|value| matches!(value.as_str(), Some("finished" | "unspecified")));
+    timeout_consistent && success_consistent && execution_consistent
 }
 
 // Result caps may be lowered by policy without changing the query, but narrowed severity or changed paths cannot prove the original check.

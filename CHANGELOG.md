@@ -42,6 +42,8 @@
 - Task validation: development-only tri-state checks, tool/fallback/child observation continuation and external signals preserve post-turn controller progress; fixed host permits and single logical journal charges survive re-pause, without adding a second executor or inferring completion from unavailable evidence
 
 ### Changed
+- Rust command compatibility: command response literals include a defaulted execution state; legacy exited observations remain compatible while ambiguous interruptions retain recovery protection
+- Observation privacy: approval completion events retain decision states rather than free-form reasons, and tool arguments or copied failure bodies follow their respective disclosure opt-ins
 - Rust memory compatibility: `MemorySnapshot` and `ConversationContext` literals include defaulted incomplete-history observations; custom memory implementations explicitly opt into restoring them
 - Rust instruction compatibility: context source matches and skill cursor literals account for the new instruction source and retained prompt field
 - Task execution defaults: new autonomous tasks omit cumulative count and time limits unless explicitly configured or host-bounded; ordinary chat and saved finite limits retain their contracts
@@ -74,6 +76,8 @@
 - Rust configuration compatibility: typed autonomy fields, validation driver bounds and objective-bound todo identities require affected struct literals to be updated; these development additions are not the published stable API
 
 ### Fixed
+- Command lifetimes: keep output readers under the original work deadline and caller lifetime, with explicit uncertain effects after unconfirmed cleanup
+- Default approval logging: omit approval bodies and rejection reasons while preserving exact local review and trusted execution records
 - Task diagnostics: preserve partial-result and path-filter semantics, reject changed-query or fallback completion proof, and distinguish output limits from malformed host results
 - Task resume errors: settle returned controller failures after acknowledged tool-batch continuation without replaying work, while interrupted interactions, uncertain effects and storage failures retain recovery protection
 - File mutation effects: built-in file mutation tools validate limits before creating parent directories, remove only the directories they created and report any failure that may leave a change behind as an uncertain task effect
