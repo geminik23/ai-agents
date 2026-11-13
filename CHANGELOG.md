@@ -74,6 +74,7 @@
 - Rust configuration compatibility: typed autonomy fields, validation driver bounds and objective-bound todo identities require affected struct literals to be updated; these development additions are not the published stable API
 
 ### Fixed
+- Task diagnostics: preserve partial-result and path-filter semantics, reject changed-query or fallback completion proof, and distinguish output limits from malformed host results
 - Task resume errors: settle returned controller failures after acknowledged tool-batch continuation without replaying work, while interrupted interactions, uncertain effects and storage failures retain recovery protection
 - File mutation effects: built-in file mutation tools validate limits before creating parent directories, remove only the directories they created and report any failure that may leave a change behind as an uncertain task effect
 - Workspace file protection: ordinary file tool rejections no longer stop a guarded session or change its revision

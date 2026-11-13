@@ -378,7 +378,7 @@ pub struct DiagnosticsResponse {
     /// Diagnostics matching the request.
     #[serde(default)]
     pub diagnostics: Vec<DiagnosticItem>,
-    /// Optional message for unavailable or partial results.
+    /// Optional message for unavailable or partial results; providers must set this when matching diagnostics were omitted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
 }
@@ -400,7 +400,7 @@ pub trait DiagnosticsProvider: Send + Sync {
         true
     }
 
-    /// Return diagnostics for the supplied request.
+    /// Return diagnostics for the supplied request, marking omitted matching items as partial through `message`.
     async fn diagnostics(&self, request: DiagnosticsRequest) -> DiagnosticsResponse;
 }
 
@@ -474,6 +474,8 @@ impl DiagnosticsProvider for StaticDiagnosticsProvider {
         self.available
     }
 
+    // Fixtures use component-wise lexical paths without filesystem I/O; an empty or dot scope includes every known diagnostic.
+    // Apply limits after filtering and retain a partial signal even when the returned prefix fits the tool's own limit.
     async fn diagnostics(&self, request: DiagnosticsRequest) -> DiagnosticsResponse {
         if !self.available {
             return DiagnosticsResponse {
@@ -490,7 +492,7 @@ impl DiagnosticsProvider for StaticDiagnosticsProvider {
                 request
                     .path
                     .as_ref()
-                    .is_none_or(|path| item.path.starts_with(path))
+                    .is_none_or(|path| diagnostic_path_matches(&item.path, path))
             })
             .filter(|item| {
                 request
@@ -501,6 +503,9 @@ impl DiagnosticsProvider for StaticDiagnosticsProvider {
             .cloned()
             .collect();
 
+        let partial = request
+            .max_results
+            .is_some_and(|limit| diagnostics.len() > limit);
         if let Some(max_results) = request.max_results {
             diagnostics.truncate(max_results);
         }
@@ -508,9 +513,20 @@ impl DiagnosticsProvider for StaticDiagnosticsProvider {
         DiagnosticsResponse {
             available: true,
             diagnostics,
-            message: None,
+            message: partial.then(|| "diagnostics result limit omitted matching items".into()),
         }
     }
+}
+
+// Match complete lexical path components so src never includes src2; relative dot components do not require a real workspace.
+fn diagnostic_path_matches(path: &str, scope: &str) -> bool {
+    let meaningful =
+        |component: &std::path::Component<'_>| *component != std::path::Component::CurDir;
+    let mut path = Path::new(path).components().filter(meaningful);
+    Path::new(scope)
+        .components()
+        .filter(meaningful)
+        .all(|component| path.next() == Some(component))
 }
 
 /// Shared slot used by `diagnostics` to find the active provider.

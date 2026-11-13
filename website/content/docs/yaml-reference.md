@@ -59,11 +59,13 @@ Built-in adapter configuration is strict:
 | Adapter | `config` fields | Evidence contract |
 |---|---|---|
 | `builtin.command` | required `command`; optional `cwd`, `host_binding`, positive `timeout_ms`; `expected_exit: 0` | Exact authorized command result; approved replacement argv/cwd/env or configured timeout cannot validate the original command |
-| `builtin.diagnostics` | optional `path`, `severity`, `host_binding`; severity is `error`, `warning`, `info`, `hint` or `all` | Available, complete, fresh observations; no host capability is a preflight refusal, not an empty diagnostic result |
+| `builtin.diagnostics` | optional `path`, `severity`, `host_binding`; severity is `error`, `warning`, `info`, `hint` or `all` | Original path, canonical all-severity observation, completeness and freshness; unavailable capability is not an empty diagnostic result |
 | `builtin.judge` | required nonempty `criteria`; optional `llm`, `pass_threshold` | Managed semantic quality; declared alias and all calls share actual admission |
 | `builtin.evidence` | required `assertion` path matcher; optional upstream `validator` | Pure current context or eligible upstream metrics; no ambient I/O |
 | `builtin.artifact` | required `path`; optional `host_binding` | Authorized `file_info` observation; existence alone does not validate content |
 | Custom named adapter | installed implementation's validated config | Versioned pure callback returning results, managed observation requests or a typed external wait |
+
+Diagnostics checks query all severities and apply the configured severity predicate to the complete observation. The validator and `diagnostics_clear` projection reject changed paths, narrowed severity queries and different fallback implementations, even if the returned JSON looks compatible. Policy-lowered result caps do not change the query, but omitted diagnostics or a non-null partial message cannot establish clean results. Explicit contradictory counts and invalid diagnostic severities remain malformed host errors; output-cap parsing failures report incomplete observations with unknown original validity rather than being relabeled as malformed host data. Fixed host permits retain exact argument binding independently of the tool's severity case normalization.
 
 The optional validation shortcuts are `required`, `commands: [string]`, `diagnostics: {enabled, fail_on_error}` and `judge: {enabled, llm, pass_threshold, criteria}`. They do not create separate executors. Prefer named checks when referring to exact IDs, schedules and dependencies.
 

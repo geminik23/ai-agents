@@ -89,6 +89,62 @@ pub(super) fn command_output_consistent(output: &Value) -> bool {
     timeout_consistent && success_consistent
 }
 
+// Result caps may be lowered by policy without changing the query, but narrowed severity or changed paths cannot prove the original check.
+// Direct gates can ask about any severity, so only an actual canonical all-severity query supplies their shared observation.
+// Match the tool's ASCII case normalization without relaxing the fixed host permit's separate exact-argument contract.
+pub(super) fn diagnostics_query_matches(
+    requested: &Value,
+    record: &ai_agents_core::ToolExecutionRecord,
+) -> bool {
+    record.canonical_id == "diagnostics"
+        && requested.get("path").and_then(Value::as_str).unwrap_or(".")
+            == record
+                .executed_arguments
+                .get("path")
+                .and_then(Value::as_str)
+                .unwrap_or(".")
+        && requested
+            .get("severity")
+            .and_then(Value::as_str)
+            .unwrap_or("all")
+            .eq_ignore_ascii_case("all")
+        && record
+            .executed_arguments
+            .get("severity")
+            .and_then(Value::as_str)
+            .unwrap_or("all")
+            .eq_ignore_ascii_case("all")
+}
+
+// Both completion consumers count the same recognized severities and reject contradictory explicit totals.
+// Missing count remains compatible with existing host observations, but malformed data never becomes a zero count.
+pub(super) fn diagnostics_counts(
+    output: &Value,
+) -> Option<std::collections::BTreeMap<String, usize>> {
+    let mut counts = std::collections::BTreeMap::from([
+        ("error".into(), 0),
+        ("warning".into(), 0),
+        ("info".into(), 0),
+        ("hint".into(), 0),
+        ("all".into(), 0),
+    ]);
+    for item in output.get("diagnostics")?.as_array()? {
+        let severity = item.get("severity")?.as_str()?;
+        if severity == "all" {
+            return None;
+        }
+        *counts.get_mut(severity)? += 1;
+        *counts.get_mut("all")? += 1;
+    }
+    if output
+        .get("count")
+        .is_some_and(|count| count.as_u64() != Some(counts["all"] as u64))
+    {
+        return None;
+    }
+    Some(counts)
+}
+
 impl AutonomyValidator for BuiltinValidator {
     /// Implementations cannot change identity after registry binding.
     fn descriptor(&self) -> &AdapterDescriptor {
@@ -149,7 +205,8 @@ impl AutonomyValidator for BuiltinValidator {
     }
     /// Denied, unavailable, partial and stale observations cannot become passing validation.
     /// A configured command timeout belongs to the same original operation as its command and working directory.
-    /// A truncated command envelope remains incomplete and cannot establish whether the original response was valid.
+    /// Truncated command and diagnostics envelopes cannot establish original response validity; malformed untruncated hosts remain errors.
+    /// Diagnostics must retain their canonical all-severity query, not just compatible JSON from modified arguments or a fallback.
     fn evaluate(&self, input: &ValidationInput<'_>) -> Result<ValidationDecision> {
         self.validate_config(input.config)?;
         let complete = |outcome, metrics| ValidationDecision::Complete {
@@ -271,29 +328,27 @@ impl AutonomyValidator for BuiltinValidator {
                 }
                 ("diagnostics", ObservationResult::Tool { record }) => {
                     let config: DiagnosticsConfig = serde_json::from_value(input.config.clone())?;
-                    let output: Value = match serde_json::from_str(&record.output) {
-                        Ok(v) => v,
-                        Err(_) if !record.executed => {
-                            return Ok(complete(GateOutcome::Unknown, json!({})));
+                    if !super::evidence::executed(record) {
+                        return Ok(complete(GateOutcome::Unknown, json!({})));
+                    }
+                    let output: Value = serde_json::from_str(&record.output).map_err(|_| {
+                        if record.output_truncated {
+                            AgentError::Config(
+                                "diagnostics observation exceeded the output limit; original result validity is unknown".into(),
+                            )
+                        } else {
+                            AgentError::Config("malformed diagnostics observation output".into())
                         }
-                        Err(_) => {
-                            return Err(AgentError::Config(
-                                "malformed diagnostics observation output".into(),
-                            ));
-                        }
-                    };
+                    })?;
                     let available = output.get("available").and_then(Value::as_bool) == Some(true)
                         && output.get("truncated").and_then(Value::as_bool) == Some(false)
                         && output.get("message").is_none_or(Value::is_null);
-                    let Some(items) = output.get("diagnostics").and_then(Value::as_array) else {
+                    let Some(_) = output.get("diagnostics").and_then(Value::as_array) else {
                         return Ok(complete(GateOutcome::Unknown, json!({})));
                     };
-                    if record
-                        .executed_arguments
-                        .get("path")
-                        .and_then(Value::as_str)
-                        != Some(config.path.as_deref().unwrap_or("."))
-                    {
+                    let requested =
+                        json!({"path": config.path.as_deref().unwrap_or("."), "severity":"all"});
+                    if !diagnostics_query_matches(&requested, record) {
                         return Ok(complete(GateOutcome::Unknown, json!({})));
                     }
                     if !available
@@ -303,23 +358,10 @@ impl AutonomyValidator for BuiltinValidator {
                     {
                         return Ok(complete(GateOutcome::Unknown, json!({})));
                     }
-                    let severity = config.severity.as_deref().unwrap_or("error");
-                    let count = items
-                        .iter()
-                        .filter(|d| {
-                            severity == "all"
-                                || d.get("severity").and_then(Value::as_str) == Some(severity)
-                        })
-                        .count();
-                    if items.iter().any(|d| {
-                        d.get("severity")
-                            .and_then(Value::as_str)
-                            .is_none_or(|s| !matches!(s, "error" | "warning" | "info" | "hint"))
-                    }) {
-                        return Err(AgentError::Config(
-                            "invalid diagnostic observation item".into(),
-                        ));
-                    }
+                    let counts = diagnostics_counts(&output).ok_or_else(|| {
+                        AgentError::Config("invalid diagnostic observation item".into())
+                    })?;
+                    let count = counts[config.severity.as_deref().unwrap_or("error")];
                     Ok(complete(
                         if count == 0 {
                             GateOutcome::Pass

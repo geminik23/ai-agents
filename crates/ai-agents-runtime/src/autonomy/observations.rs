@@ -6,7 +6,8 @@ use serde_json::Value;
 
 impl EvaluationEvidence {
     /// Uses acknowledged executor records and attempt identity, never a requested operation relabeled with a replacement's result.
-    /// Changed command operands or an explicitly bound timeout cannot prove the original validation, even through direct command gates.
+    /// Changed command operands or diagnostics queries cannot prove the original validation, even through direct gates.
+    /// Canonical diagnostics and all-severity query binding survive projection; policy result caps are not query-scope changes.
     pub fn collect_validation(&mut self, state: &ValidationDriverState) -> Result<()> {
         if !state.publication_acknowledged() {
             return Err(AgentError::Persistence(
@@ -74,31 +75,10 @@ impl EvaluationEvidence {
                 }
                 if tool == "diagnostics" {
                     let output: Value = serde_json::from_str(&record.output).unwrap_or(Value::Null);
-                    let mut counts = std::collections::BTreeMap::from([
-                        ("error".into(), 0),
-                        ("warning".into(), 0),
-                        ("info".into(), 0),
-                        ("hint".into(), 0),
-                        ("all".into(), 0),
-                    ]);
-                    let mut valid = true;
-                    if let Some(items) = output.get("diagnostics").and_then(Value::as_array) {
-                        for item in items {
-                            if let Some(severity) = item.get("severity").and_then(Value::as_str)
-                                && counts.contains_key(severity)
-                                && severity != "all"
-                            {
-                                *counts.get_mut(severity).unwrap() += 1;
-                                *counts.get_mut("all").unwrap() += 1;
-                            } else {
-                                valid = false;
-                            }
-                        }
-                    } else {
-                        valid = false;
-                    }
+                    let counts = super::builtins::diagnostics_counts(&output);
                     let available = output.get("available").and_then(Value::as_bool) == Some(true);
-                    let complete = valid
+                    let complete = counts.is_some()
+                        && super::builtins::diagnostics_query_matches(arguments, record)
                         && available
                         && output.get("truncated").and_then(Value::as_bool) == Some(false)
                         && output.get("message").is_none_or(Value::is_null)
@@ -114,7 +94,7 @@ impl EvaluationEvidence {
                             check_id: state.check_id.clone(),
                             available,
                             complete,
-                            severity_counts: counts,
+                            severity_counts: counts.unwrap_or_default(),
                             record: record.as_ref().clone(),
                         },
                     });

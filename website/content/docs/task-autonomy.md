@@ -128,6 +128,8 @@ Use `!task` for explicit run/skill/control steps and returned foreground pauses.
 | Safe display/event/report | Bounded projected observations | Raw recovery data or execution authority |
 | Cancellation requested | The request was accepted | Acknowledged cleanup or rollback |
 
+For diagnostics, an empty retained list is not enough: completion requires an acknowledged, current, canonical all-severity observation of the original path with no omitted items or partial message. Approval can authorize a different query without making its result proof of the original check, and compatible JSON from another fallback tool is not diagnostics proof. Provider/list omission, a final output cap and an originally malformed host response remain distinct. Hosts still own actual collection/cache freshness; these checks do not install an LSP host or make command-only workspace profiles require diagnostics.
+
 Development report schema 3 separates parent turns, participant controls, task outcomes and collection errors. Exact results, validator data, prompts and provider requests remain trusted-host/assertion-only evidence. Keep shared reports redacted. An interrupted foreground operation may retain completed control evidence without any parent response. Unacknowledged cleanup retains attempt files and blocks automatic retry/reset; inspect them only in an authorized host context.
 
 ## Troubleshooting and boundaries
