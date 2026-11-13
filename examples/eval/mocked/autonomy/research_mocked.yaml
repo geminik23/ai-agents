@@ -1,5 +1,6 @@
 # Eval host: task-domain-evals
 # The Rust host supplies actual attempt-local records and versioned domain adapters; no provider, socket or file tools run.
+# Duplicate IDs, missing citations and an unrecorded citation cannot establish completion.
 name: Research Task Evidence
 agent: ../../../yaml/autonomy/research_task.yaml
 settings: {timeout_per_turn_ms: 10000, retries: 0}
@@ -13,6 +14,8 @@ fixtures:
         - '{"tool":"domain","arguments":{"op":"source","value":"A"}}'
         - '{"sources":["A"]}'
         - '{"tool":"domain","arguments":{"op":"source","value":"B"}}'
+        - '{"sources":["A"]}'
+        - '{"sources":["A","B","unrecorded-source"]}'
         - '{"sources":["A","B"]}'
       judge: ['{"overall_score":0.9}']
 scenarios:
@@ -26,7 +29,7 @@ scenarios:
             - response_contains: '"sources":["A","B"]'
             - task:
                 status: completed
-                counters: {path: turns, eq: 3}
+                counters: {path: turns, eq: 5}
                 checks: [{id: records, outcome: pass}, {id: quality, outcome: pass}]
                 event_result_parity: true
                 events_include: [validation_completed, completion_gate_checked, progress_observed]

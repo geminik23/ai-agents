@@ -89,7 +89,7 @@ From the repository root:
 cargo run --manifest-path examples/Cargo.toml -p example-custom-llm --bin task-domain-host --locked --offline
 ```
 
-This executable loads `support_resolution.yaml`, installs that same domain module, then uses a finite offline provider. It starts an automatic state task, obtains the actual typed question, delivers a fixture answer, executes the domain tool and completes only after the actual ticket validator passes. It asserts cumulative model usage and prints a bounded safe display. It opens no socket and uses no customer system or provider credentials. Fixed replies prove this protocol, not live answer quality.
+This executable loads `support_resolution.yaml`, installs that same domain module, then uses a finite offline provider. It records a ticket source reference before asking the actual typed question, retains the same installation across the answer, and completes only after the actual ticket validator passes. It checks that the original reference survived, each domain operation ran once, limits stayed unchanged and model usage accumulated, then prints a bounded safe display. It opens no socket and uses no customer system or provider credentials. Fixed replies prove this protocol, not live answer quality.
 
 For a normal application, configure providers/features first, install your domain before final construction, declare whether you can service responses, and retain the runtime/runner across pauses. `build_task_host().await` prepares configured task-capable storage; it does not start an objective or install production restart support.
 
@@ -115,6 +115,10 @@ sh examples/eval/mocked/run_mocked_evals.sh --category autonomy
 ```
 
 `task-domain-evals` calls `EvalRunner::with_host`. Its `EvalHost::configure` delegates to the same `install_domain`, preserving the eval-provided providers, budgets, hooks, workspace and policies. New attempts/resets install fresh isolated domain state; resume retains the current state and task. To add a domain, use your own executable with the same public traits. Do not modify the repository helper or add a core gate variant. The helper's fixed marker selects only this repository-owned binary; it is not a dynamic program/plugin loader.
+
+The research fixture verifies deduplicated recorded source IDs and rejects missing or unrecorded citations before accepting the matching answer; it does not authenticate web sources or measure real research quality. The support fixture checks pre-question state and cumulative usage across resume. The operations fixture preserves failed health while a real isolated escalation satisfies the alternative goal; the required verification and review stages still run. Its host does not implement a health-recovery operation.
+
+For stronger consumer acceptance, run `cargo test --manifest-path examples/Cargo.toml -p example-custom-llm --test task_domain_acceptance`. These tests consume the same installer and suites, inspect exact controller checkpoints and ordered stage events in memory, and execute the offline application rather than counting its compilation as a round trip. The lower enclosing-budget case verifies an exact provider refusal and the retained cleanup-unacknowledged error, not successful task completion or clean cancellation. Exact domain data remain outside serialized reports.
 
 Use `!task` for explicit run/skill/control steps and returned foreground pauses. Use scenario `interactions` when an ordinary parent still awaits independently hosted child decisions. See [typed steps](@/docs/evaluation.md#typed-steps-and-exact-continuation) and [foreground controls](@/docs/evaluation.md#foreground-participant-controls).
 

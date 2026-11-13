@@ -25,5 +25,10 @@ scenarios:
                 events_include: [stage_started, stage_completed]
                 event_result_parity: true
             - tool_called: {id: domain, count: 1, executed: true, success: true}
+            - tool_called:
+                id: domain
+                args_executed: {path: op, eq: incident}
+                result_path: {path: incident.status, eq: open}
+            - tool_called: {id: domain, result_path: {path: health, eq: down}}
             - response_contains: remaining outage
             - tool_not_called: command

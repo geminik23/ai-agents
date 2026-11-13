@@ -49,6 +49,7 @@ impl LLMProvider for Provider {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let provider = Provider(Mutex::new(VecDeque::from([
+        r#"{"tool":"domain","arguments":{"op":"source","value":"ticket://request-context"}}"#,
         r#"{"tool":"ask_user","arguments":{"question":"Confirm resolution","options":["yes"]}}"#,
         r#"{"tool":"domain","arguments":{"op":"resolve"}}"#,
         "The actual ticket record is resolved.",
@@ -68,6 +69,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .automatic_task_result()
         .ok_or("missing actual task result")?;
     assert_eq!(paused.run.status, TaskRunStatus::Paused);
+    assert_eq!(paused.run.counters.llm_attempts, 2);
     let interaction = agent
         .task_interaction(&paused.run.key.run_id, paused.run.revision)
         .await?
@@ -88,7 +90,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .await?;
     assert_eq!(done.run.status, TaskRunStatus::Completed);
-    assert_eq!(done.run.counters.llm_attempts, 3);
+    assert_eq!(done.run.key, paused.run.key);
+    assert_eq!(done.run.counters.llm_attempts, 4);
+    assert_eq!(
+        serde_json::to_value(&done.run.limits)?,
+        serde_json::to_value(&paused.run.limits)?
+    );
+    // Actual record outputs, not a reused run ID, prove the pre-question context survived the retained pause.
+    let records: Vec<_> = done
+        .run
+        .evidence
+        .tool_calls
+        .iter()
+        .filter(|entry| entry.record.canonical_id == "domain" && entry.record.executed)
+        .collect();
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0].record.executed_arguments["op"], "source");
+    assert_eq!(records[1].record.executed_arguments["op"], "resolve");
+    let resolved: serde_json::Value = serde_json::from_str(&records[1].record.output)?;
+    assert_eq!(resolved["ticket"], "resolved");
+    assert_eq!(
+        resolved["sources"],
+        serde_json::json!(["ticket://request-context"])
+    );
     println!(
         "{}",
         serde_json::to_string(&runner.task_display(&done.run.key.run_id).await?)?
