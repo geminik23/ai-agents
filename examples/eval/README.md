@@ -34,6 +34,10 @@ cargo run -p ai-agents-cli -- eval \
 
 Most suites declare their own `agent:` path, so `--agent` is optional unless you intentionally want to override it.
 
+Host-required domain suites also build the separate examples workspace. Prepare its local lock explicitly when absent or stale with `cargo +1.97.0 update --manifest-path examples/Cargo.toml --workspace`, then validate with `cargo +1.97.0 test --manifest-path examples/Cargo.toml --workspace --locked`. Preserve existing lock evidence and inspect any required changes rather than deleting it; add `--offline` when packages and the index are cached. See `examples/README.md` for the workspace/toolchain boundary.
+
+The context-overflow suite distinguishes two contracts: admissible messages accumulate into compressible old history while the recent tail remains intact, and an oversized first input is refused without a provider request. The former asserts the configured summarizer and actual final request contents; the latter uses `expect_error` plus zero captured LLM requests, not a canned success response.
+
 ## Development task suites
 
 `mocked/autonomy/` exercises typed task operations, automatic state/skill entry, retained decisions, shared composition, domain evidence and isolated real file effects. These APIs are development-only, not the published 1.1.1 contract. Sequential task steps and scenario foreground controls consume the same runtime controller; they do not install production restart hosting.

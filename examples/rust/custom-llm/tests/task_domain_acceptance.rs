@@ -34,15 +34,18 @@ impl EvalHost for DomainHost {
     }
 }
 
-// Resolve the actual source so a non-publishable local validation manifest exercises these same files.
+// Locate declared repository sources from the manifest, independent of Cargo's workspace-relative file!() paths.
+// Both the ordinary examples workspace and an external local validation manifest exercise the same fixtures.
 fn repository() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join(file!())
-        .canonicalize()
-        .unwrap()
         .ancestors()
-        .nth(5)
-        .unwrap()
+        .find(|directory| {
+            directory
+                .join("examples/rust/custom-llm/src/task_domain.rs")
+                .is_file()
+                && directory.join("crates/ai-agents/Cargo.toml").is_file()
+        })
+        .expect("the validation manifest must be inside the source repository")
         .to_path_buf()
 }
 

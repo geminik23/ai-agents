@@ -36,6 +36,17 @@ cargo run --bin simple-chat
 ```
 
 
+### Validate the Rust examples workspace
+
+The examples are a separate, non-publishable workspace validated with Rust 1.97.0; the framework's root MSRV is a separate contract. `examples/Cargo.lock` is local and git-ignored. On first use, or when changed path-package manifests make an existing lock stale, prepare it explicitly before locked validation:
+
+```sh
+cargo +1.97.0 update --manifest-path examples/Cargo.toml --workspace
+cargo +1.97.0 test --manifest-path examples/Cargo.toml --workspace --locked
+```
+
+For an existing lock, `update --workspace` preserves external dependency pins unless a manifest change requires otherwise; inspect its changes and preserve any lock needed to reproduce earlier results. Add `--offline` when the required index and packages are cached. Do not delete the lock or run a general dependency update just to bypass a locked-validation error. A fresh lock may require registry access; preparing it constructs no LLM provider and executes no example application. Tests and mocked evals are separate from live-provider examples.
+
 ## Evaluation Examples
 
 Evaluation suites run an agent against declarative scenarios and write reports for CI, debugging, and release checks. Suites are organized by run mode first, then by the YAML example category.
@@ -329,7 +340,7 @@ Production-essential error recovery - from automatic retries to LLM failover and
 
 Note: Error recovery is transparent and works behind the scenes.
 Set `RUST_LOG=ai_agents_recovery=warn` to see retry attempts and fallback activations, or `RUST_LOG=debug` for context overflow and summarization details.
-`context_overflow.yaml` uses a deliberately low token limit (2048) so overflow triggers within a few turns.
+`context_overflow.yaml` uses a deliberately low token limit (2048) so accumulated admissible messages trigger recovery. Its mocked suite checks actual summarization and intact recent messages, plus refusal before provider dispatch when a first input cannot fit. Summarization is not a guarantee that every input fits; `max_summary_tokens` requests a summary length while the final assembled context limit remains enforced.
 
 Examples:
 

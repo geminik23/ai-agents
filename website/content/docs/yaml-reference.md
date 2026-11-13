@@ -2108,7 +2108,9 @@ error_recovery:
 
 #### `on_context_overflow`
 
-What to do when conversation history exceeds `max_context_tokens`.
+What to do when conversation history exceeds `max_context_tokens`. Recovery must still produce an assembled request within that limit; it is not permission to dispatch an oversized prompt. `keep_recent` preserves a recent tail at a valid native-history boundary and can retain more than the requested message count to keep an exchange intact. If that tail, the system prompt or other protected context cannot fit, the runtime returns a context-overflow error before the main response dispatch rather than silently dropping protected data. A summarizer may already have run when an older prefix was available. In particular, an oversized first input has no older history to summarize.
+
+For `summarize`, `max_summary_tokens` is the target length requested in the summarizer prompt, not an independently enforced output cap. The final assembled context check remains the hard local boundary. Overflow recovery changes the request being built, not stored conversation history; use compacting memory when persistent summarization is needed.
 
 | Action | Description |
 |--------|-------------|

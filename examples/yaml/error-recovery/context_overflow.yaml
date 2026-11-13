@@ -7,7 +7,7 @@ description: "Summarize or truncate when the conversation exceeds the context wi
 # keep long conversations coherent.
 #
 # When the conversation history grows beyond max_context_tokens, the framework can truncate old messages or summarize them with a fast LLM.
-# The agent keeps working without errors; the user just continues the conversation naturally.
+# Recovery continues only if the assembled request fits afterward; an oversized protected recent tail is rejected before main-response dispatch.
 #
 # This example uses summarization. A cheap LLM compresses older messages into a short summary while the most recent messages are kept verbatim.
 #
@@ -45,8 +45,10 @@ max_context_tokens: 2048
 
 # Overflow policy: summarize old messages rather than dropping them.
 # summarizer_llm: which LLM alias runs the compression (use a fast/cheap one).
-# max_summary_tokens: caps how much space the rolling summary can consume.
-# keep_recent: the N most recent messages are always kept word for word.
+# max_summary_tokens: target length requested in the summarizer prompt, not a hard summary-output cap.
+# max_context_tokens still bounds the assembled result after recovery.
+# keep_recent: preserve the recent tail at a safe native-history boundary, which may retain more than N messages.
+# A first input that exceeds the whole window cannot be summarized as old history; shorten the input or select an appropriate model/window.
 error_recovery:
   llm:
     on_context_overflow:
