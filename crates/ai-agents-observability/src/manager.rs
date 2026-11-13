@@ -252,6 +252,31 @@ impl ObservabilityManager {
         ScopedObservationSnapshot { events, report }
     }
 
+    /// Returns one exact ingestion cut for acknowledged incremental consumers without advancing their cursor.
+    /// The caller advances only after its own durable ACK; dropped or evicted events make the cut incomplete.
+    pub fn checkpoint_since(
+        &self,
+        cursor: ObservabilityCursor,
+    ) -> (ObservabilityCursor, Vec<ObservationEvent>, bool) {
+        self.drain_pending();
+        let dropped_before = self.dropped_events();
+        let (ingested_events, events, retained) =
+            self.aggregator.checkpoint_since(cursor.ingested_events);
+        // A concurrent queue overflow cannot disappear between the loss sample and the ingestion cut.
+        let dropped = self.dropped_events();
+        (
+            ObservabilityCursor {
+                ingested_events,
+                dropped_events: dropped,
+            },
+            events,
+            self.config.enabled
+                && retained
+                && dropped == dropped_before
+                && dropped == cursor.dropped_events,
+        )
+    }
+
     /// Builds the user-facing report from the current rolling event window.
     pub fn generate_report(&self) -> ObservabilityReport {
         self.drain_pending();

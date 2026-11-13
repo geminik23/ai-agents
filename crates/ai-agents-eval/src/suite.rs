@@ -37,6 +37,27 @@ pub struct EvalSuite {
 }
 
 impl EvalSuite {
+    /// Cross-checks declarative task references without building providers, tools or a runtime.
+    pub(crate) fn validate_agent(&self, spec: &ai_agents_runtime::spec::AgentSpec) -> Result<()> {
+        if let Some(policy) = &self.fixtures.workspace_policy
+            && policy
+                .read_tools
+                .iter()
+                .chain(&policy.write_tools)
+                .any(|tool| !spec.tool_security.tools.contains_key(tool))
+        {
+            return Err(EvalError::Config(
+                "workspace_policy requires existing named tool policies".into(),
+            ));
+        }
+        for step in self.scenarios.iter().flat_map(|scenario| &scenario.steps) {
+            if let ScenarioStep::Task(task) = step {
+                task.operation.validate(&spec.autonomy)?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn validate(&self, cli_agent: Option<&PathBuf>) -> Result<()> {
         if self.name.trim().is_empty() {
             return Err(EvalError::Config(
@@ -132,10 +153,39 @@ impl EvalSuite {
                 )));
             }
             scenario.budget.validate(&scenario.id)?;
+            if scenario.interactions.len() > 256 {
+                return Err(EvalError::Config(
+                    "at most 256 task interactions per scenario".into(),
+                ));
+            }
+            if !scenario.interactions.is_empty()
+                && self.settings.isolation != IsolationMode::Scenario
+            {
+                return Err(EvalError::Config(
+                    "task interactions require scenario isolation".into(),
+                ));
+            }
+            for (index, script) in scenario.interactions.iter().enumerate() {
+                crate::interactions::validate(script, index)?;
+            }
             for (turn_index, turn) in scenario.turns.iter().enumerate() {
                 validate_turn_assertion(turn, &scenario.id, &format!("turns[{turn_index}]"))?;
             }
             for (step_index, step) in scenario.steps.iter().enumerate() {
+                if let ScenarioStep::Task(task) = step {
+                    task.assertions.validate(&format!(
+                        "scenario '{}'.steps[{step_index}].task.assert",
+                        scenario.id
+                    ))?;
+                    if task.timeout_ms == Some(0) {
+                        return Err(EvalError::Config("task.timeout_ms must be positive".into()));
+                    }
+                    if self.settings.isolation != IsolationMode::Scenario {
+                        return Err(EvalError::Config(
+                            "task steps require scenario isolation".into(),
+                        ));
+                    }
+                }
                 if let ScenarioStep::Run(run) = step {
                     for (turn_index, turn) in run.turns.iter().enumerate() {
                         validate_turn_assertion(
@@ -252,6 +302,9 @@ pub struct Scenario {
     /// Turns executed by this scenario or step.
     #[serde(default)]
     pub turns: Vec<Turn>,
+    /// Typed controls for independently hosted participants while a foreground turn is pending.
+    #[serde(default)]
+    pub interactions: Vec<crate::interactions::TaskInteraction>,
     /// Advanced steps executed after direct turns.
     #[serde(default)]
     pub steps: Vec<ScenarioStep>,
@@ -452,9 +505,15 @@ pub enum ScenarioStep {
     ResetAgent(ResetStepConfig),
     SaveSession(String),
     LoadSession(String),
-    SetContext { values: Value },
-    SetActor { actor: String },
+    SetContext {
+        values: Value,
+    },
+    SetActor {
+        actor: String,
+    },
     CleanupExpired,
+    /// Drives the existing configured task controller, preserving its retained owner between steps.
+    Task(Box<crate::task::TaskStep>),
 }
 
 /// Advanced step that runs turns and can save a session.
@@ -597,6 +656,11 @@ pub struct TurnResult {
     /// Optional response or tool metadata.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<Value>,
+    /// Safe task projection; exact task and validator data remain assertion-only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task: Option<crate::task::TaskReport>,
+    /// Separate participant results do not replace the parent's response or task result.
+    pub interactions: Vec<crate::interactions::TaskInteractionResult>,
     /// Full assertion-time evidence for this turn.
     #[serde(skip_serializing)]
     pub evidence: TurnEvidence,
@@ -654,6 +718,7 @@ mod tests {
                     timeout_ms: None,
                     assertions: None,
                 }],
+                interactions: Vec::new(),
                 steps: Vec::new(),
             }],
         }

@@ -27,3 +27,24 @@ scenarios:
                 result_path:
                   path: dry_run
                   eq: true
+            - tool_called:
+                id: file_edit
+                executed: true
+                success: true
+                result_path:
+                  path: mutation_performed
+                  eq: false
+            - tool_called:
+                id: file_edit
+                executed: true
+                success: true
+                result_path:
+                  path: diff_summary
+                  contains: '-3:"Status: draft"'
+            - tool_called:
+                id: file_edit
+                executed: true
+                success: true
+                result_path:
+                  path: diff_summary
+                  contains: '+3:"Status: reviewed"'

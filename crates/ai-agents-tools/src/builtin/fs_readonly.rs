@@ -355,6 +355,16 @@ struct FileInfoOutput {
 
 #[async_trait]
 impl Tool for GlobTool {
+    fn declared_write_footprint(
+        &self,
+        _args: &Value,
+        _ctx: &ToolExecutionContext,
+        _max_targets: usize,
+    ) -> ai_agents_core::Result<Option<ai_agents_core::autonomy::ToolWriteFootprint>> {
+        Ok(Some(ai_agents_core::autonomy::ToolWriteFootprint::empty(
+            "builtin.glob.v1",
+        )))
+    }
     fn id(&self) -> &str {
         "glob"
     }
@@ -473,6 +483,16 @@ impl Tool for GlobTool {
 
 #[async_trait]
 impl Tool for GrepTool {
+    fn declared_write_footprint(
+        &self,
+        _args: &Value,
+        _ctx: &ToolExecutionContext,
+        _max_targets: usize,
+    ) -> ai_agents_core::Result<Option<ai_agents_core::autonomy::ToolWriteFootprint>> {
+        Ok(Some(ai_agents_core::autonomy::ToolWriteFootprint::empty(
+            "builtin.grep.v1",
+        )))
+    }
     fn id(&self) -> &str {
         "grep"
     }
@@ -652,6 +672,16 @@ impl Tool for GrepTool {
 
 #[async_trait]
 impl Tool for FileReadTool {
+    fn declared_write_footprint(
+        &self,
+        _args: &Value,
+        _ctx: &ToolExecutionContext,
+        _max_targets: usize,
+    ) -> ai_agents_core::Result<Option<ai_agents_core::autonomy::ToolWriteFootprint>> {
+        Ok(Some(ai_agents_core::autonomy::ToolWriteFootprint::empty(
+            "builtin.file_read.v1",
+        )))
+    }
     fn id(&self) -> &str {
         "file_read"
     }
@@ -759,6 +789,16 @@ impl Tool for FileReadTool {
 
 #[async_trait]
 impl Tool for FileListTool {
+    fn declared_write_footprint(
+        &self,
+        _args: &Value,
+        _ctx: &ToolExecutionContext,
+        _max_targets: usize,
+    ) -> ai_agents_core::Result<Option<ai_agents_core::autonomy::ToolWriteFootprint>> {
+        Ok(Some(ai_agents_core::autonomy::ToolWriteFootprint::empty(
+            "builtin.file_list.v1",
+        )))
+    }
     fn id(&self) -> &str {
         "file_list"
     }
@@ -922,6 +962,16 @@ impl Tool for FileListTool {
 
 #[async_trait]
 impl Tool for FileInfoTool {
+    fn declared_write_footprint(
+        &self,
+        _args: &Value,
+        _ctx: &ToolExecutionContext,
+        _max_targets: usize,
+    ) -> ai_agents_core::Result<Option<ai_agents_core::autonomy::ToolWriteFootprint>> {
+        Ok(Some(ai_agents_core::autonomy::ToolWriteFootprint::empty(
+            "builtin.file_info.v1",
+        )))
+    }
     fn id(&self) -> &str {
         "file_info"
     }

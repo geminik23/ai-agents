@@ -31,6 +31,12 @@ label = "No API key"
 description = "Exercise the runtime with fixed model responses and inspect the reports."
 path = "docs/getting-started.md"
 anchor = "start-with-a-mocked-evaluation"
+[[extra.starts]]
+title = "Build, host and evaluate a task"
+label = "Development checkout"
+description = "Connect YAML objectives, actual domain evidence, typed human decisions and the same evaluation host."
+path = "docs/task-autonomy.md"
+anchor = "from-an-objective-to-verified-work"
 +++
 
 Start with the smallest agent your task needs. Add behavior, execution controls, memory, and collaboration as the application grows. The guides below connect each decision to runnable examples and the full reference.

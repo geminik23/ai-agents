@@ -2,7 +2,7 @@
 
 Examples are organized by usage style:
 
-- `yaml/` - YAML-first examples run with `ai-agents-cli`
+- `yaml/` - YAML-first declarations; stock examples run with `ai-agents-cli`, while domain autonomy examples document their required Rust host
 - `rust/` - Rust examples for embedding, extension, and custom integrations
 
 Browse by goal: [YAML agents](#yaml-examples), [Rust integration](#rust-examples), or [evaluation suites](#evaluation-examples).
@@ -36,6 +36,17 @@ cargo run --bin simple-chat
 ```
 
 
+### Validate the Rust examples workspace
+
+The examples are a separate, non-publishable workspace validated with Rust 1.97.0; the framework's root MSRV is a separate contract. `examples/Cargo.lock` is local and git-ignored. On first use, or when changed path-package manifests make an existing lock stale, prepare it explicitly before locked validation:
+
+```sh
+cargo +1.97.0 update --manifest-path examples/Cargo.toml --workspace
+cargo +1.97.0 test --manifest-path examples/Cargo.toml --workspace --locked
+```
+
+For an existing lock, `update --workspace` preserves external dependency pins unless a manifest change requires otherwise; inspect its changes and preserve any lock needed to reproduce earlier results. Add `--offline` when the required index and packages are cached. Do not delete the lock or run a general dependency update just to bypass a locked-validation error. A fresh lock may require registry access; preparing it constructs no LLM provider and executes no example application. Tests and mocked evals are separate from live-provider examples.
+
 ## Evaluation Examples
 
 Evaluation suites run an agent against declarative scenarios and write reports for CI, debugging, and release checks. Suites are organized by run mode first, then by the YAML example category.
@@ -52,7 +63,7 @@ Use `eval/mocked/**/*.yaml` for default no-key checks. Do not glob all of `eval/
 
 ### Mocked no-key suites
 
-Mocked suites cover every runnable YAML example category: basic, context, disambiguation, error-recovery, HITL, memory, observability, orchestration, persona, process, reasoning, relationships, runtime-optimization, session, skills, spawner, state-machine, and tools. Each suite uses a mock LLM provider, requires no API keys, and runs deterministically. Suites verify structural runtime evidence such as tool calls, state transitions, context paths, orchestration metadata, observability counts, relationship scores, fact extraction, disambiguation status, and persona secret gating.
+Mocked suites cover every runnable YAML example category: autonomy, basic, context, disambiguation, error-recovery, HITL, memory, observability, orchestration, persona, process, reasoning, relationships, runtime-optimization, session, skills, spawner, state-machine, and tools. Each suite uses a mock LLM provider, requires no API keys, and runs deterministically. Suites verify structural runtime evidence such as tool calls, state transitions, context paths, orchestration metadata, observability counts, relationship scores, fact extraction, disambiguation status, and persona secret gating.
 
 Run all mocked suites with the convenience helper:
 
@@ -329,7 +340,7 @@ Production-essential error recovery - from automatic retries to LLM failover and
 
 Note: Error recovery is transparent and works behind the scenes.
 Set `RUST_LOG=ai_agents_recovery=warn` to see retry attempts and fallback activations, or `RUST_LOG=debug` for context overflow and summarization details.
-`context_overflow.yaml` uses a deliberately low token limit (2048) so overflow triggers within a few turns.
+`context_overflow.yaml` uses a deliberately low token limit (2048) so accumulated admissible messages trigger recovery. Its mocked suite checks actual summarization and intact recent messages, plus refusal before provider dispatch when a first input cannot fit. Summarization is not a guarantee that every input fits; `max_summary_tokens` requests a summary length while the final assembled context limit remains enforced.
 
 Examples:
 
@@ -579,9 +590,110 @@ cargo run -p ai-agents-cli -- run examples/yaml/orchestration/support_handoff.ya
 cargo run -p ai-agents-cli -- run examples/yaml/orchestration/team_coordinator.yaml
 ```
 
+### `yaml/autonomy/`
+
+Development-only task profiles use the existing controller, not a coding-specific execution loop. The no-key suites provide their actual fixtures; normal application hosts must supply authorized providers/tools/domain bindings and any requested resource ceilings. These examples do not complete the whole task product or install default production restart hosting.
+
+| File | Description |
+|------|-------------|
+| `research_task.yaml` | Named profile with actual source deduplication/citation evidence, semantic quality checks and custom progress; Rust domain host required |
+| `support_resolution.yaml` | Automatic state-owned ticket resolution with an exact retained question; Rust domain host required |
+| `artifact_generation.yaml` | Actual isolated file creation, repair and managed content validation with an explicit one-path host ceiling; Rust domain host required |
+| `report_records.yaml` | Non-filesystem artifact reference plus a separate report-content predicate; Rust domain host required |
+| `code_fix.yaml` | Actual isolated discovery/read/edit with fixture-backed command and diagnostics checks; no real shell execution in its mocked suite |
+
+| `ops_remediation.yaml` | Required remediation/verification/review stages and actual escalation evidence; Rust domain host required |
+| `world_state.yaml` | Host revision-bound world predicate, not response claims; Rust domain host required |
+| `tool_free_analysis.yaml` | Iterative analysis with semantic judge feedback and one shared call allowance; no tools or todos |
+| `skill_task.yaml` | Automatic selected-skill entry with one-time scripted preparation and retained continuation |
+| `state_task.yaml` | State-scope exit with an explicit post-exit gate, without unrelated destination work |
+| `approval_task.yaml` | Exact task approval/rejection; its mocked suite replaces approved HTTP output and opens no socket |
+| `controlled_analysis.yaml` | Tool-free objective/limit revisions, explicit Continue, stop/cancel and bounded reviewed replanning |
+| `unrelated_exit.yaml` | Negative state-scope control: movement into an unrelated destination is incomplete, not success |
+| `independent_research.yaml` | Ordinary parent with two independent state-task questions serviced while its original future is pending |
+| `agents/independent_a.yaml` | First independently hosted researcher; selected through actual session participation, not a label-derived runner |
+| `agents/independent_b.yaml` | Second independently hosted researcher with a distinct inherited provider alias |
+| `composed_research.yaml` | Concurrent child findings, one coordinating question, no completed-prefix replay and an exact shared four-call cap |
+| `agents/source_a.yaml` | Ordinary research participant A; inherits the coordinating owner in the composed profile, not a separate task host |
+| `agents/source_b.yaml` | Ordinary research participant B; inherits the coordinating owner in the composed profile, not a separate task host |
+
+From the repository root:
+
+```sh
+sh examples/eval/mocked/run_mocked_evals.sh --category autonomy
+cargo run --manifest-path examples/Cargo.toml -p example-custom-llm --bin task-domain-evals -- examples/eval/mocked/autonomy/research_mocked.yaml target/eval/research
+```
+
+`rust/custom-llm/src/task_domain.rs` is shared by the embedded `task-domain-host` and `task-domain-evals`; customize its real record integration and pure predicates without modifying the controller, core gates or eval helper. Its consumer acceptance is `cargo test --manifest-path examples/Cargo.toml -p example-custom-llm --test task_domain_acceptance`: recorded-source/citation rejection, pre-question state and cumulative usage, required operations stage order, protected budget refusal and actual offline application execution. These isolated records do not certify web-source authenticity, health recovery or live model quality. Follow `website/content/docs/task-autonomy.md` for configuration, typed delivery, evidence interpretation and your own host executable.
+
+
+The helper's fixed host marker selects that Rust application only where adapters/ceilings are required; it still uses the same `EvalRunner`. Top-level autonomy defaults/profile loading does not turn every ordinary input into a task. Explicit invocations start task profiles, while the state/skill examples declare automatic scoped entry. `{{ eval.workspace }}` in file/command profiles is a generated eval token: replace it with the application's authorized path outside the eval harness. Keep attempt-local file fixtures and command/HTTP/approval fixtures intact. Compile/build-only validation does not prove live model quality or production restart support.
+
+### `yaml/code-agent/`
+
+| File | Description |
+|------|-------------|
+| `agent.yaml` | Offline scripted code task using the included sample project |
+| `workspace.yaml` | Host-bound task for explicitly selected files and a trusted external checker |
+| `workspace-read-only.yaml` | Host-bound question over selected files without edit or checker authority |
+| `workspace-root.yaml` | Host-bound task over a whole workspace root with protected checker inputs and a trusted external checker |
+
+All four definitions are consumed by the companion Rust host below. They do not replace the separate command-and-diagnostics contract in `yaml/autonomy/code_fix.yaml`.
+
 ## Rust Examples
 
 Rust examples are for embedding and extension scenarios.
+
+### `rust/code-agent/`
+
+The `example-code-agent` package contains the Rust host and a small test target under `rust/code-agent/sample-project/`. `run-offline` loads `agent.yaml` and uses scripted model responses, but performs the actual `file_read`, `file_edit` and command validation through the shared runtime. It first checks that the sample fails, then checks the actual edit and a fresh acceptance. This verifies the execution path, not a live model's ability to solve code tasks.
+
+On Linux or WSL, choose a new path under `/tmp` and use absolute paths to co-located trusted `cargo` and `rustc` binaries from the same toolchain. `rustup which cargo` and `rustup which rustc` show the paths; set `CARGO_BIN` and `RUSTC_BIN` to those values before the commands below.
+
+```sh
+cargo run --manifest-path examples/Cargo.toml -p example-code-agent --bin code-agent-setup --offline -- prepare /tmp/code-agent-sample
+cargo run --manifest-path examples/Cargo.toml -p example-code-agent --bin code-agent-setup --offline -- check-config /tmp/code-agent-sample "$CARGO_BIN" "$RUSTC_BIN"
+cargo run --manifest-path examples/Cargo.toml -p example-code-agent --bin code-agent-setup --offline -- run-offline /tmp/code-agent-sample "$CARGO_BIN" "$RUSTC_BIN"
+```
+
+`prepare` refuses to overwrite an existing path. `check-config` neither constructs a provider nor starts a task. `run-offline` requires the original failing sample and cannot be repeated on the already fixed workspace; prepare a new directory for another run.
+
+The sample verifier accepts only the original source or its exact reviewed reference correction. It checks the protected manifest, lockfile, instructions and test bytes, rejects extra entries and source changes during verification, and requires all five named tests. The verifier retains temporary evidence; timeout or a dropped process does not prove descendant cleanup.
+
+For a read-only question about existing files, choose an absolute `WORKSPACE`, a relative primary `SOURCE` inside it, and a provider and model. The read-only declaration grants `file_read`, optionally grants bounded discovery, and installs neither an edit tool grant nor a checker. The host selects this configuration explicitly; the model's wording cannot grant edits. A nonempty answer is not proof of correctness.
+
+```sh
+cargo run --manifest-path examples/Cargo.toml -p example-code-agent --bin code-agent-setup --offline -- check-read-only "$WORKSPACE" "$SOURCE" openai gpt-5.4-mini
+cargo run --manifest-path examples/Cargo.toml -p example-code-agent --bin code-agent-setup --offline -- run-read-only --share-source "$WORKSPACE" "$SOURCE" openai gpt-5.4-mini
+```
+
+`check-read-only` does not construct a provider, install a checker or start a task. `run-read-only` requires explicit source-sharing consent and opens the same task-only foreground controls. Repeat `--file RELATIVE_PATH`, optionally select one workspace-relative instruction file or opt into `--auto-instructions`, and opt into `--allow-discovery` or `--max-output-tokens N` as needed. The selected content, objective, instructions and any discovery results may be sent to the provider and incur costs. An edit requires starting a separately authorized edit configuration; changing a prompt does not grant it.
+
+For edits to explicitly selected files in an existing workspace, the host instead loads `workspace.yaml` and a selected provider. Choose an absolute `WORKSPACE`, a relative primary `SOURCE` inside it, and an absolute executable `CHECKER` outside it. Repeat `--file RELATIVE_PATH` to add existing regular files to the read/edit scope, or `--new-file RELATIVE_PATH` to authorize creation of an absent file under an existing directory. New-file ownership is supported on Unix; the host refuses an existing entry or symlinked parent and requires an actual host-owned creation before the path can be read or edited. A created file requires a successful `file_read` before each edit, and all mutations still require approval. This is an exact selected-path grant, not general workspace creation. Optionally append a workspace-relative instruction file for the existing initial snapshot, or use `--auto-instructions` instead. Paths containing whitespace or shell metacharacters are not supported by either workspace configuration.
+
+`--auto-instructions` separately authorizes reading and sharing `AGENTS.md` from the canonical workspace root and ancestor directories of selected existing or new paths. It does not recursively walk unrelated directories or widen file tool grants. Each supported new work request prepares a bounded snapshot, so changes and deletions are reflected; a failed read, invalid UTF-8, symlink or exceeded limit stops the request rather than silently reusing stale instructions. A capacity-paused request retains its already prepared snapshot. The root and instruction contents may be sensitive; review the selection before using `--share-source`. The caller must prevent concurrent untrusted path replacement; this is not a sandbox or an atomic external filesystem snapshot. Automatic mode and an explicit instruction file are mutually exclusive.
+
+```sh
+cargo run --manifest-path examples/Cargo.toml -p example-code-agent --bin code-agent-setup --offline -- check-workspace "$WORKSPACE" "$SOURCE" "$CHECKER" openai gpt-5.4-mini
+cargo run --manifest-path examples/Cargo.toml -p example-code-agent --bin code-agent-setup --offline -- run-workspace --trust-checker --share-source "$WORKSPACE" "$SOURCE" "$CHECKER" openai gpt-5.4-mini
+```
+
+`check-workspace` validates configuration without constructing a provider or executing the checker. Append `--max-output-tokens N` to choose a positive output limit supported by the selected model, and `--checker-timeout-ms N` to choose a positive checker attempt timeout; omitted values remain 2000 tokens and 30000 ms. The host binds a supplied checker timeout into the check, tool policy and fixed approval request, while other applicable task or tool limits can still shorten execution. `check-workspace` displays the effective configured values without running the checker. `--allow-discovery` additionally grants bounded `file_list`, `glob` and `grep` access under the workspace root. This can send file names and search matches outside the selected edit files, including sensitive content, to the provider; omit it unless that broader disclosure is authorized.
+
+The live command requires both explicit flags, constructs the selected provider, and opens an interactive session; start work with `/task run <objective>`. Selected sources, the instruction snapshot, objective, opt-in discovery results and eligible checker output may be sent to the provider and may incur costs. Provider credentials must be supplied through its usual environment, not stored in the YAML, source or checker. This host does not configure a custom provider base URL, so `openai-compatible` is rejected rather than silently using an unintended endpoint.
+
+After an approved checker actually executes and fails, the profile can send a bounded tail of that untrusted output to the selected provider for up to three forced continuations. Each feedback-bearing model request is one-shot and is not forwarded to provider retries or fallback. Rejected, unavailable, stale or changed checks and exhausted feedback retries request guidance or stop rather than automatically retrying. Some admission failures, such as a checker changed while awaiting approval, return an error and require the host to inspect and cancel or reconcile the retained task. A subsequent edit and a fresh checker invocation still require approval. This profile omits cumulative task count/time budgets; host ceilings and separate context, output, per-command and checkpoint limits still apply.
+
+The model can directly read and request edits only for explicitly selected files; optional discovery is the separate broader read-only grant above. Every edit, creation and fixed host-only checker invocation require human approval; a modified approval still passes current policy and binding checks. Each explicit task captures a bounded local Git-status baseline and selected-file observations before starting, then reports observed changes, actual mutation receipts and command exit counts. Up to 32 existing status entries and 128 selected paths are displayed with bounded names; their local paths may be sensitive. Baseline contents are not sent to the provider. Git status is limited to 1 MiB and excludes submodules; at most 128 selected files of at most 1 MiB each are compared, and a total observation timeout or unavailable Git is reported rather than treated as clean. Status codes do not prove identical index contents, and these observations cannot conclusively separate all user, checker and agent changes. Interrupted or unacknowledged work is not reported as cleaned up.\n\nOn Unix, ordinary permission bits are preserved, but source files with special permission bits are rejected and ownership, ACLs and extended attributes are not guaranteed to survive atomic replacement. The checker receives the canonical workspace followed by all selected source and new-file paths, starts without inherited environment variables, and must return zero only after its independent acceptance has actually passed. An unchanged checker is required before each invocation; its executable must be outside the workspace and no larger than 8 MiB. The example cannot prove that the checker's tests are independent, that its dependencies cannot be modified, or that it safely executes changed code.\n\nThe default CLI does not install a host revision source and cannot certify freshness against arbitrary external changes during or after a check. `--assume-exclusive-workspace` opts into a live revision for managed selected-file operations only when the caller actually prevents all other writes to the workspace and keeps every checker input, executable and dependency immutable throughout the session. The checker must not modify any validation input; the host does not enforce or detect violations of these conditions. The framework `WorkspaceGuard` marks its revision unavailable during mutation and after uncertain effects, and cannot be shared between separately built runtimes. A tool rejection that changed nothing, such as a missing `overwrite` flag or a non-matching edit, keeps the revision and the session usable, but an uncertain effect leaves the guard unavailable until the host reconciles the workspace and starts a new session. Revision sampling is not an external transaction or filesystem lock. An embedding host may instead install an actually synchronized `HostRevisionSource` through `extensions_with_target`.\n\nFor a task where the agent chooses its own files, root mode loads `workspace-root.yaml` instead of selecting sources. Choose an absolute `WORKSPACE`, an absolute executable `CHECKER` outside it, and repeat `--protect RELATIVE_PATH` for every existing file or directory the checker relies on, such as acceptance tests and manifests; at least one is required. The agent can list, search and read anything under the root, change existing files with exact `file_edit` replacements, and create new files with `file_write`, including missing parent directories. `file_write` never replaces an existing file, so concurrent user changes in a file are kept. Every change requires approval by default, and a write to a protected input is denied before approval. If the agent attempts such a write, a later failed check asks for human guidance instead of sending its output back automatically. All file tools run through the framework `WorkspaceGuard`, which keeps targets inside the root, rejects symlinked components and tracks the files the agent created. The checker receives only the canonical workspace. `--auto-instructions`, `--file`, `--new-file` and `--allow-discovery` are not available in this mode; an explicit instruction file may be appended.
+
+```sh
+cargo run --manifest-path examples/Cargo.toml -p example-code-agent --bin code-agent-setup --offline -- check-root "$WORKSPACE" "$CHECKER" openai gpt-5.4-mini --protect "$PROTECTED"
+cargo run --manifest-path examples/Cargo.toml -p example-code-agent --bin code-agent-setup --offline -- run-root --trust-checker --share-workspace "$WORKSPACE" "$CHECKER" openai gpt-5.4-mini --protect "$PROTECTED"
+```
+
+`check-root` validates the configuration without constructing a provider or running the checker. `run-root` requires both flags because any file name, search match or file content under the root may be sent to the provider. `--assume-exclusive-workspace`, `--max-output-tokens N` and `--checker-timeout-ms N` behave as in the selected-file mode. Protecting checker inputs prevents the agent from weakening its own acceptance through these tools; it does not make the checker independent, isolate the process or stop other writers. The task report additionally lists the paths that carry actual mutation receipts.
+
+The user must supply a trusted checker and any required process/filesystem/network isolation, and prevent concurrent untrusted path replacement. **Neither approval, an allowlist, `--trust-checker` nor the exclusive-workspace assumption is a sandbox.** Do not run untrusted projects or code without a suitably isolated host. There is no hard monetary ceiling or declared-write containment guarantee in this example.
 
 ### `rust/basic-api/`
 
@@ -698,6 +810,11 @@ Custom LLM provider examples - from implementing `LLMProvider` from scratch to m
 | `custom-provider` | Implement `LLMProvider` from scratch with an offline echo/rule-based provider - no API key needed |
 | `openai-compatible` | HTTP adapter for any OpenAI-compatible server (LM Studio, Ollama, vLLM, LocalAI, TGI) |
 | `multi-provider` | Multi-provider routing with `MultiLLMRouter` - expensive model for users, cheap model for internal tasks |
+| `task-events` | Development-only offline task lifecycle events, retained question and explicit resume; no API key or tools |
+| `automatic-tasks` | Development-only YAML state/skill automatic task entry, safe events and explicit host resume through the same controller; offline with no tools or API key |
+| `task-domain-host` | Offline embedded support round trip with actual ticket evidence and the same runtime-only domain installation as eval |
+| `task-domain-evals` | Explicit Rust validator/progress/tool integration for the same development EvalRunner; isolated business state and default-redacted reports, no provider keys |
+
 
 Note: For a zero-code YAML alternative, see `yaml/basic/openai_compatible.yaml` which uses the built-in `provider: openai-compatible` with `base_url` - no custom Rust code needed.
 
@@ -708,6 +825,10 @@ cd examples/rust/custom-llm
 
 # No API key needed - runs entirely offline
 cargo run --bin custom-provider
+
+# Development-only task API: offline, finite and no external effects
+cargo run --bin task-events
+cargo run --bin automatic-tasks
 
 # Requires a running OpenAI-compatible server
 LOCAL_LLM_BASE_URL=http://localhost:1234/v1 cargo run --bin openai-compatible

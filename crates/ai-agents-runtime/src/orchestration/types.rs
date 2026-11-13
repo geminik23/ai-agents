@@ -19,7 +19,7 @@ pub struct PipelineResult {
 }
 
 /// Output from a single pipeline stage.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StageOutput {
     pub agent_id: String,
     pub output: String,
@@ -76,7 +76,7 @@ pub struct ConcurrentResult {
 }
 
 /// Result from a single agent in a concurrent execution.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentResult {
     pub agent_index: usize,
     pub agent_id: String,

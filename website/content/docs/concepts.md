@@ -14,6 +14,14 @@ The ai-agents framework connects YAML agent definitions to a Rust runtime. This 
 
 ---
 
+## Development task execution and events
+
+The development Rust task runner supervises objectives using the existing runtime, shared resource ledger and eligible completion evidence. It is not a separate coding-agent engine: tools, todos and local files are optional. Its explicit event streams describe execution, validation, progress, human decisions and acknowledged results through that same controller. A turn response is not task completion, a pending event is not approval authority, and dropping a stream is not cleanup acknowledgement. Default-safe display events are separate from exact host results and recovery data. Development YAML state and selected-skill declarations can now promote an ordinary input into that same controller. State scope takes precedence before skill dispatch; work already inside a task inherits its actual owner, ledger and completion contract. State exit is not success and script exhaustion is not completion. Development task commands, the plain REPL and task-aware TUI consume the same controller through a foreground host session. The TUI separates screen visibility, operation ownership and request identity; typed task evaluation consumes the same controller and exact observations, including independent child decisions while an ordinary parent is pending. See [development task evaluation](@/docs/evaluation.md#development-task-evaluation-foundation) for fixture, report and lifetime boundaries. See the [development task CLI](@/docs/cli.md#development-task-cli) for supported commands and process-lifetime limits. See [task event streams](@/docs/rust-api.md#task-event-streams-development-only) for the development-only lifetime and privacy contract.
+
+Automatic entry begins when a configured state handles input or a semantic router selects an autonomous skill, not when the agent is constructed or a state is merely restored. Prepared input, clarification context, selected definitions and completed effects are retained. Embedded hosts keep the controller alive, read exact pending data through trusted APIs and explicitly resume or stop the same run. In ordinary compositions, a paused automatic child is awaited in the original caller rather than aggregated as a successful response; this does not serialize that ordinary call stack for restart. See [automatic state and skill tasks](@/docs/rust-api.md#automatic-state-and-skill-tasks-development-only).
+
+Follow [the task hosting and evaluation walkthrough](@/docs/task-autonomy.md) to connect a real domain integration to both an application and its eval suite. It distinguishes workflow movement, model claims, actual effects, eligible evidence and acknowledged task completion.
+
 ## Architecture
 
 
@@ -21,7 +29,7 @@ The dependency layers flow in one direction:
 
 1. **Core** (`ai-agents-core`) - shared dependency-light types, error types, and trait definitions used across the workspace.
 2. **Feature crates** - each layer builds on core: `ai-agents-llm`, `ai-agents-memory`, `ai-agents-tools`, `ai-agents-state`, `ai-agents-skills`, `ai-agents-context`, `ai-agents-process`, `ai-agents-reasoning`, `ai-agents-recovery`, `ai-agents-hitl`, `ai-agents-hooks`, `ai-agents-disambiguation`, `ai-agents-storage`, `ai-agents-template`, `ai-agents-persona`, `ai-agents-facts`, `ai-agents-relationships`, `ai-agents-observability`, and `ai-agents-eval`.
-3. **Runtime** (`ai-agents-runtime`) - wires every feature crate together into a running agent loop. Also contains the dynamic agent spawner module.
+3. **Runtime** (`ai-agents-runtime`) - wires execution feature crates into the agent loop and task controller, and owns dynamic spawning. Evaluation is a consumer of runtime, not a reverse runtime dependency.
 4. **Facade** (`ai-agents`) - provides a reviewed, curated user-facing surface for normal embedding and host integration.
 5. **CLI** (`ai-agents-cli`) - a binary crate providing the `ai-agents-cli` command.
 
@@ -51,7 +59,7 @@ layers:
     - ai-agents-facts
     - ai-agents-relationships
     - ai-agents-observability
-    - ai-agents-eval
+  evaluation: ai-agents-eval   # consumes the runtime; it does not own another task executor
   core: ai-agents-core         # shared traits and types
 ```
 
@@ -321,7 +329,7 @@ process:
 
 Memory controls what the agent remembers across turns. **In-memory** mode keeps a rolling window of recent messages - simple and fast. **Compacting** mode adds auto-summarization: when recent messages reach a threshold, an eligible older prefix is compressed while the requested recent tail stays verbatim. If `max_recent_messages` would leave no useful batch at the threshold, the protected tail is clamped so compression still makes configured batch progress. Compression and other memory mutations are serialized, and snapshots preserve summary accounting.
 
-Token budgeting makes sure memory fits within LLM context limits. You set a total token budget and allocate integer token counts to summaries, recent messages, facts, and relationships. If the budget overflows, the framework either truncates the oldest content or re-summarizes, depending on your chosen strategy.
+Token budgeting allocates estimated token counts to summaries, recent messages, facts, and relationships. Depending on the selected strategy, overflow may truncate older content, re-summarize, or fail. In the development tree, active native batches and older incomplete signed exchanges are protected instead of being silently evicted. Compacted incomplete observations survive later summary merges and allocation as advisory, untrusted data; they do not prove that an external effect did or did not happen. These protections can exceed a soft allocation, and a request that cannot fit the runtime's final estimated hard limit fails. General conversational summaries remain lossy.
 
 Memory is stored in-process during a session. For persistence across sessions, pair memory with a storage backend. File and Redis implement snapshot save/load/list/delete only. SQLite also implements generic session metadata, filtering, expiry cleanup, actor facts, actor relationships, and atomic actor-data deletion. Unsupported operations return a typed capability error rather than an empty result or successful no-op. Redis has backend-native key TTL, but that does not provide the generic metadata or expiry-cleanup capabilities.
 
@@ -351,7 +359,7 @@ memory:
 
 Context provides dynamic data that gets injected into the agent's system prompt at render time. The system prompt is a Jinja2 template, and context values are its variables.
 
-Sources include: **runtime** (passed in by the caller), **builtin** (datetime, session info, agent metadata), **env**, **file**, optional feature-gated **HTTP** JSON sources, and **callback** providers registered by the host. `per_turn` sources resolve during initial setup and again in the first turn's refresh, then once before every later turn. `once` and `per_session` currently resolve during first runtime initialization; `reset()` preserves context, and restoring a session does not automatically invoke a per-session refresh. A fresh runtime can initialize over restored non-runtime values. An already initialized runtime preserves restored `once` and `per_session` values, while the next turn refreshes `per_turn` values. Use explicit refresh or runtime reconstruction when the host needs a new context session boundary.
+Sources include: **runtime** (passed in by the caller), **builtin** (datetime, session info, agent metadata), **env**, **file**, optional feature-gated **HTTP** JSON sources, and **callback** providers registered by the host. Development-only **instructions** sources use a separate host binding and supported work-request preparation rather than the ordinary context refresh lifecycle. `per_turn` sources resolve during initial setup and again in the first turn's refresh, then once before every later turn. `once` and `per_session` currently resolve during first runtime initialization; `reset()` preserves context, and restoring a session does not automatically invoke a per-session refresh. A fresh runtime can initialize over restored non-runtime values. An already initialized runtime preserves restored `once` and `per_session` values, while the next turn refreshes `per_turn` values. Use explicit refresh or runtime reconstruction when the host needs a new context session boundary.
 
 Context values are available in the system prompt template, in state prompts, and in process pipeline stages. The state machine can also write to context via `on_enter` actions and `extract` blocks. For `type: runtime`, `required: true` checks that the top-level key exists at the start of each turn; a configured `default` counts as present. The example below therefore remains runnable without host injection. Omit `default` to reject a missing key, but use host validation if nested fields or fresh per-turn values must be guaranteed.
 
@@ -405,8 +413,7 @@ llm:
 
 For thinking models, prefer native thinking (`llm.reasoning: true`) over `mode: cot`. A future version will wire `mode: cot` to native thinking when the model supports it, with prompt injection as fallback.
 
-When reasoning is active (cot, react, plan_and_execute, or auto), the iteration loop is capped at the lower of the agent-level `max_iterations` and `reasoning.max_iterations`.
-This keeps the reasoning-specific cap as a tighter limit inside the agent's overall safety cap.
+For ordinary chat, active reasoning uses the lower of agent-level `max_iterations` and `reasoning.max_iterations`, including their existing defaults. Source-aware autonomous task loops apply only limits explicitly declared for the relevant root or replacement reasoning configuration; omitted defaults do not become hidden task caps. A typed specification whose source presence was lost remains conservative unless the host explicitly supplies a task iteration policy. Planning, reflection, context and other structural limits remain separate.
 
 For `plan_and_execute` mode, a plan-level reflection loop retries failed plans.
 When `planning.reflection.enabled` is true and a step fails, the runtime checks `on_step_failure` to decide whether to replan, abort, or skip.

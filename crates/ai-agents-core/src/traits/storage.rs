@@ -86,6 +86,7 @@ pub enum StorageCapability {
     ActorFacts,
     ActorRelationships,
     ActorDataDeletion,
+    TaskRuns,
 }
 
 impl std::fmt::Display for StorageCapability {
@@ -98,6 +99,7 @@ impl std::fmt::Display for StorageCapability {
             Self::ActorFacts => f.write_str("actor facts"),
             Self::ActorRelationships => f.write_str("actor relationships"),
             Self::ActorDataDeletion => f.write_str("atomic actor data deletion"),
+            Self::TaskRuns => f.write_str("conditional task run persistence"),
         }
     }
 }
@@ -108,6 +110,13 @@ impl std::fmt::Display for StorageCapability {
 /// Implement this for custom persistence (e.g., PostgreSQL, DynamoDB).
 #[async_trait]
 pub trait AgentStorage: Send + Sync {
+    /// Certifies caller-owned storage operations and enumerates captured model handles for managed task participation.
+    /// A returned error may represent a partial commit; no detached work or automatic effect replay is certified by this declaration.
+    /// None leaves ordinary storage usable but rejects managed actor maintenance; provider-free conforming stores return an empty list.
+    fn task_providers(&self) -> Option<Vec<std::sync::Arc<dyn super::llm::LLMProvider>>> {
+        None
+    }
+
     /// Return whether this backend implements a storage feature.
     fn supports(&self, capability: StorageCapability) -> bool {
         capability == StorageCapability::Snapshot
@@ -121,6 +130,55 @@ pub trait AgentStorage: Send + Sync {
     async fn delete(&self, session_id: &str) -> Result<()>;
     /// List all stored session IDs.
     async fn list_sessions(&self) -> Result<Vec<String>>;
+
+    /// Creates a task identity once; deleted identities cannot be recreated.
+    async fn create_task_run(&self, _snapshot: &crate::autonomy::TaskRunSnapshot) -> Result<()> {
+        Err(AgentError::UnsupportedStorageCapability(
+            StorageCapability::TaskRuns,
+        ))
+    }
+
+    /// Loads exact recovery data; hosts must authorize access separately from namespace scoping.
+    async fn load_task_run(
+        &self,
+        _key: &crate::autonomy::TaskRunKey,
+    ) -> Result<Option<crate::autonomy::TaskRunSnapshot>> {
+        Err(AgentError::UnsupportedStorageCapability(
+            StorageCapability::TaskRuns,
+        ))
+    }
+
+    /// Lists metadata without exposing sensitive recovery payloads.
+    async fn list_task_runs(
+        &self,
+        _filter: &crate::autonomy::TaskRunFilter,
+    ) -> Result<Vec<crate::autonomy::TaskRunSummary>> {
+        Err(AgentError::UnsupportedStorageCapability(
+            StorageCapability::TaskRuns,
+        ))
+    }
+
+    /// Atomically compares revision and ownership before claim, checkpoint, release or cancellation.
+    async fn mutate_task_run(
+        &self,
+        _key: &crate::autonomy::TaskRunKey,
+        _mutation: &crate::autonomy::TaskRunMutation,
+    ) -> Result<crate::autonomy::TaskRunSnapshot> {
+        Err(AgentError::UnsupportedStorageCapability(
+            StorageCapability::TaskRuns,
+        ))
+    }
+
+    /// Deletes only unowned data at the expected revision and retains an identity tombstone.
+    async fn delete_task_run(
+        &self,
+        _key: &crate::autonomy::TaskRunKey,
+        _expected_revision: u64,
+    ) -> Result<()> {
+        Err(AgentError::UnsupportedStorageCapability(
+            StorageCapability::TaskRuns,
+        ))
+    }
 
     // --- Session metadata ---
 
@@ -245,6 +303,11 @@ pub struct NoopStorage;
 
 #[async_trait]
 impl AgentStorage for NoopStorage {
+    /// Unsupported operations have no provider work; capability checks still reject actual persistence requirements.
+    fn task_providers(&self) -> Option<Vec<std::sync::Arc<dyn super::llm::LLMProvider>>> {
+        Some(vec![])
+    }
+
     fn supports(&self, _capability: StorageCapability) -> bool {
         false
     }

@@ -1,0 +1,37 @@
+name: Validation After Real Mutation
+agent: ../../../yaml/autonomy/code_fix.yaml
+# Flow: first candidate + passing checks -> real read/edit -> fresh command/diagnostics -> completion.
+# All files are attempt-local and both validation hosts are fixtures; no cargo process is executed.
+# The final eligible check identity must follow the actual mutation generation, not just a textual success claim.
+settings: {timeout_per_turn_ms: 10000, retries: 0}
+fixtures:
+  files: {code.rs: "return 1\n"}
+  workspace_policy:
+    read_tools: [file_read, file_edit, diagnostics]
+    write_tools: [file_edit]
+  llm:
+    mode: mock
+    responses:
+      - Initial candidate.
+      - '{"tool":"file_read","arguments":{"path":"{{ eval.workspace }}/code.rs"}}'
+      - '{"tool":"file_edit","arguments":{"path":"{{ eval.workspace }}/code.rs","old_text":"return 1","new_text":"return 2","dry_run":false}}'
+      - verified change
+  commands:
+    available: true
+    entries:
+      - argv: [cargo, test]
+        response: {success: true, exit_code: 0, termination: exited, stdout: fixture success, stderr: '', combined_output: fixture success, truncated: false, timed_out: false, cwd: '{{ eval.workspace }}', argv_redacted: [cargo, test]}
+  diagnostics: {available: true, items: []}
+scenarios:
+  - id: mutation-requires-a-later-eligible-validation
+    steps:
+      - !task
+        operation: {action: run, objective: Repair and verify the isolated source., profile: freshness}
+        assert:
+          all:
+            - task: {status: completed, counters: {path: turns, eq: 2}, checks: [{id: tests, outcome: pass}, {id: diagnostics, outcome: pass}], event_result_parity: true}
+            - tool_called: {id: command, source_in: [task], count: 2, executed: true, success: true}
+            - tool_called: {id: diagnostics, source_in: [task], count: 2, executed: true, success: true}
+            - tool_called: {id: file_edit, count: 1}
+            - tool_called: {id: file_edit, executed: true, success: true, args_executed: {path: dry_run, eq: false}}
+            - response_contains: verified change

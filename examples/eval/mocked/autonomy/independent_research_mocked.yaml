@@ -1,0 +1,32 @@
+name: Independent Child Foreground Decisions
+agent: ../../../yaml/autonomy/independent_research.yaml
+# Both children have independent task allowances, but the scenario's provider budget is shared across aliases.
+# Flow: parent pending -> exact child questions -> concurrent typed replies -> original parent aggregate.
+# Responses are fixture data, never a pattern-matched approval or a claim of factual research quality.
+settings: {timeout_per_turn_ms: 10000, retries: 0}
+fixtures:
+  llm:
+    mode: mock
+    responses_by_alias:
+      first: [draft, verified-first]
+      second: [draft, verified-second]
+scenarios:
+  - id: independent-questions-do-not-replace-the-parent-result
+    budget: {max_llm_calls: 4}
+    # Agent names select actual session participants; order here does not prescribe child scheduling.
+    interactions:
+      - agent: IndependentB
+        pending_kind: user_question
+        operation: {action: resume, response: {kind: answer, value: Continue the finding.}}
+        assert: {task: {status: completed, same_run: true, counters: {path: llm_attempts, eq: 2}, event_result_parity: true}}
+      - agent: IndependentA
+        pending_kind: user_question
+        operation: {action: resume, response: {kind: answer, value: Continue the finding.}}
+        assert: {task: {status: completed, same_run: true, counters: {path: llm_attempts, eq: 2}, event_result_parity: true}}
+    turns:
+      - input: Research both findings.
+        assert:
+          all:
+            - response_contains: verified-first
+            - response_contains: verified-second
+            - orchestration: {type: concurrent, agents_include: [first, second]}

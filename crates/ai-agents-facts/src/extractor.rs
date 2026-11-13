@@ -16,6 +16,13 @@ use crate::dedup::deduplicate_exact;
 /// Extracts facts from conversation messages using an LLM.
 #[async_trait]
 pub trait FactExtractor: Send + Sync {
+    /// Certifies that all work stays in the caller's task scope and returns every captured provider handle for capability validation.
+    /// None rejects managed participation; deterministic implementations may return an empty list.
+    /// Certified extractors compute fact proposals without hidden mutations or detached effects; the runtime owns subsequent publication.
+    fn task_providers(&self) -> Option<Vec<Arc<dyn LLMProvider>>> {
+        None
+    }
+
     /// Extract facts from recent messages, given existing facts for deduplication.
     async fn extract(
         &self,
@@ -225,6 +232,11 @@ impl LLMFactExtractor {
 
 #[async_trait]
 impl FactExtractor for LLMFactExtractor {
+    /// Frozen managed handles preserve per-request admission without replacing the extractor's implementation.
+    fn task_providers(&self) -> Option<Vec<Arc<dyn LLMProvider>>> {
+        Some(vec![self.llm.clone()])
+    }
+
     async fn extract(
         &self,
         messages: &[ChatMessage],
@@ -239,6 +251,7 @@ impl FactExtractor for LLMFactExtractor {
         let prompt = self.build_prompt(messages, existing_facts, categories);
 
         let extraction_messages = vec![ChatMessage {
+            provenance: None,
             role: Role::User,
             content: prompt,
             name: None,

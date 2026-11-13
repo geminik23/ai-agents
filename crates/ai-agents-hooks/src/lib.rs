@@ -10,20 +10,6 @@ use ai_agents_llm::{ChatMessage, LLMResponse};
 use ai_agents_memory::{MemoryBudgetEvent, MemoryCompressEvent, MemoryEvictEvent};
 use ai_agents_tools::ToolResult;
 
-fn preview_text(text: &str, max_chars: usize) -> String {
-    if max_chars == 0 {
-        return String::new();
-    }
-
-    let mut chars = text.chars();
-    let preview: String = chars.by_ref().take(max_chars).collect();
-    if chars.next().is_some() {
-        format!("{}...", preview)
-    } else {
-        text.to_string()
-    }
-}
-
 /// Observes agent behavior and shared tool-executor request lifecycles.
 ///
 /// Tool lifecycle hooks describe logical executor requests, not individual retry invocations. A request can finalize without a start callback or without invoking the tool implementation, while an error propagated before record construction may have no completion callback. A fallback starts only after the failed original request releases its resources and completes its own lifecycle. Whether `Tool::execute` was invoked is authoritative only in [`ToolExecutionRecord::executed`].
@@ -31,6 +17,13 @@ fn preview_text(text: &str, max_chars: usize) -> String {
 /// `RuntimeAgent` invokes turn hooks while retaining root-turn ownership. A direct nested chat or stream call into the same runtime returns an `AgentError` instead of waiting on the non-reentrant gate. Nested calls into another runtime are allowed until a runtime gate identity repeats in the task-local call chain.
 #[async_trait]
 pub trait AgentHooks: Send + Sync {
+    /// Certifies caller-owned callbacks that preserve task admission and route managed effects through existing execution boundaries.
+    /// Return every captured provider handle, or an empty list for conforming callbacks with no direct model work; None rejects task participation.
+    /// Certification is not an execution grant or a sandbox for arbitrary hidden I/O and detached work.
+    fn task_providers(&self) -> Option<Vec<Arc<dyn ai_agents_core::LLMProvider>>> {
+        None
+    }
+
     async fn on_message_received(&self, _message: &str) {}
 
     async fn on_llm_start(&self, _messages: &[ChatMessage]) {}
@@ -160,7 +153,12 @@ pub trait AgentHooks: Send + Sync {
 pub struct NoopHooks;
 
 #[async_trait]
-impl AgentHooks for NoopHooks {}
+impl AgentHooks for NoopHooks {
+    /// No-op hooks perform no provider calls or external effects.
+    fn task_providers(&self) -> Option<Vec<Arc<dyn ai_agents_core::LLMProvider>>> {
+        Some(vec![])
+    }
+}
 
 pub struct LoggingHooks {
     prefix: String,
@@ -188,9 +186,17 @@ impl Default for LoggingHooks {
 
 #[async_trait]
 impl AgentHooks for LoggingHooks {
+    /// Logging stays synchronous within the caller and introduces no provider invocation.
+    fn task_providers(&self) -> Option<Vec<Arc<dyn ai_agents_core::LLMProvider>>> {
+        Some(vec![])
+    }
+
     async fn on_message_received(&self, message: &str) {
-        let preview = preview_text(message, 100);
-        info!("{} Message received: {}", self.prefix, preview);
+        info!(
+            "{} Message received ({} characters)",
+            self.prefix,
+            message.chars().count()
+        );
     }
 
     async fn on_llm_start(&self, messages: &[ChatMessage]) {
@@ -208,8 +214,8 @@ impl AgentHooks for LoggingHooks {
         );
     }
 
-    async fn on_tool_start(&self, tool: &str, args: &Value) {
-        debug!("{} Tool {} starting with args: {}", self.prefix, tool, args);
+    async fn on_tool_start(&self, tool: &str, _args: &Value) {
+        debug!("{} Tool {} starting", self.prefix, tool);
     }
 
     async fn on_tool_complete(&self, tool: &str, result: &ToolResult, duration_ms: u64) {
@@ -219,10 +225,7 @@ impl AgentHooks for LoggingHooks {
                 self.prefix, tool, duration_ms
             );
         } else {
-            warn!(
-                "{} Tool {} failed in {}ms: {}",
-                self.prefix, tool, duration_ms, result.output
-            );
+            warn!("{} Tool {} failed in {}ms", self.prefix, tool, duration_ms);
         }
     }
 
@@ -234,19 +237,24 @@ impl AgentHooks for LoggingHooks {
     }
 
     async fn on_error(&self, err: &AgentError) {
-        error!("{} Error: {}", self.prefix, err);
+        if matches!(err, AgentError::Tool(_) | AgentError::Skill(_)) {
+            error!("{} Tool or skill error (details omitted)", self.prefix);
+        } else {
+            error!("{} Error: {}", self.prefix, err);
+        }
     }
 
     async fn on_response(&self, response: &AgentResponse) {
-        let preview = preview_text(&response.content, 100);
-        debug!("{} Response: {}", self.prefix, preview);
+        debug!(
+            "{} Response received ({} characters)",
+            self.prefix,
+            response.content.chars().count()
+        );
     }
 
+    // Approval bodies belong to the exact local reviewer, not the default tracing sink.
     async fn on_approval_requested(&self, request: &ApprovalRequest) {
-        info!(
-            "{} Approval requested [{}]: {}",
-            self.prefix, request.id, request.message
-        );
+        info!("{} Approval requested [{}]", self.prefix, request.id);
     }
 
     async fn on_approval_result(&self, request_id: &str, result: &ApprovalResult) {
@@ -254,11 +262,8 @@ impl AgentHooks for LoggingHooks {
             ApprovalResult::Approved => {
                 info!("{} Approval [{}]: approved", self.prefix, request_id);
             }
-            ApprovalResult::Rejected { reason } => {
-                warn!(
-                    "{} Approval [{}]: rejected ({:?})",
-                    self.prefix, request_id, reason
-                );
+            ApprovalResult::Rejected { .. } => {
+                warn!("{} Approval [{}]: rejected", self.prefix, request_id);
             }
             ApprovalResult::Modified { .. } => {
                 info!(
@@ -319,10 +324,12 @@ impl AgentHooks for LoggingHooks {
     }
 
     async fn on_group_chat_round(&self, round: u32, speaker: &str, content: &str) {
-        let preview = preview_text(content, 80);
         debug!(
-            "{} Group chat round {}: {} said: {}",
-            self.prefix, round, speaker, preview
+            "{} Group chat round {}: {} responded ({} characters)",
+            self.prefix,
+            round,
+            speaker,
+            content.chars().count()
         );
     }
 
@@ -464,6 +471,15 @@ impl Default for CompositeHooks {
 
 #[async_trait]
 impl AgentHooks for CompositeHooks {
+    /// A composite cannot hide an unsupported member or replace the member's captured implementation handles.
+    fn task_providers(&self) -> Option<Vec<Arc<dyn ai_agents_core::LLMProvider>>> {
+        let mut providers = vec![];
+        for hook in &self.hooks {
+            providers.extend(hook.task_providers()?);
+        }
+        Some(providers)
+    }
+
     async fn on_message_received(&self, message: &str) {
         for hook in &self.hooks {
             hook.on_message_received(message).await;
@@ -828,12 +844,11 @@ mod tests {
         hooks.on_llm_start(&[ChatMessage::user("hello")]).await;
     }
 
-    #[test]
-    fn test_preview_text_handles_unicode_boundaries() {
-        let text = "제 이름은 Jay이고 가족관계 관련해서 계약서 내용을 확인하고 싶어서";
-        let preview = preview_text(text, 34);
-        assert!(preview.ends_with("..."));
-        assert!(preview.starts_with("제 이름은 Jay"));
+    #[tokio::test]
+    async fn test_logging_hooks_handles_unicode_without_preview() {
+        let hooks = LoggingHooks::new();
+        hooks.on_message_received("한글🙂").await;
+        hooks.on_response(&AgentResponse::new("한글🙂")).await;
     }
 
     #[tokio::test]

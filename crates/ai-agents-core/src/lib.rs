@@ -1,15 +1,17 @@
 //! Core types and traits for AI Agents framework
 
+pub mod autonomy;
 pub mod dot_path;
 pub mod error;
 pub mod message;
 pub mod native_history;
+pub mod strict_yaml;
 pub mod traits;
 pub mod types;
 
 pub use dot_path::{get_dot_path, get_dot_path_from_map, set_dot_path};
 pub use error::{AgentError, Result};
-pub use message::{ChatMessage, Role};
+pub use message::{ChatMessage, MessageProvenance, Role};
 pub use native_history::{
     MAX_NATIVE_PROVIDER_STATE_BYTES, NATIVE_PROVIDER_STATE_METADATA_KEY,
     NATIVE_PROVIDER_STATE_VERSION, NATIVE_TOOL_CALL_MARKER_KEY, NATIVE_TOOL_RESULT_MARKER_KEY,
@@ -21,7 +23,7 @@ pub use native_history::{
     set_response_provider_state, take_response_provider_state,
 };
 pub use traits::llm::{LLMCapability, LLMError, LLMProvider, TaskContext, ToolSelection};
-pub use traits::memory::{Memory, MemorySnapshot};
+pub use traits::memory::{IncompleteNativeExchange, Memory, MemorySnapshot};
 pub use traits::storage::{
     AgentSnapshot, AgentStorage, NoopStorage, SpawnedAgentEntry, StorageCapability,
 };

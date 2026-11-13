@@ -79,7 +79,7 @@ async fn main() -> Result<()> {
     //    The framework calls provider.get() on every turn, so the system prompt
     //    always shows up-to-date usage statistics.
     let usage_provider = Arc::new(UsageStatsProvider::new());
-    agent.register_context_provider("get_usage_stats", usage_provider);
+    agent.register_context_provider("get_usage_stats", usage_provider)?;
 
     // 4. Run the interactive REPL.
     //    Context is now fully injected — the agent knows the user's name,

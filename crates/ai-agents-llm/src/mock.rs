@@ -345,6 +345,34 @@ impl LLMProvider for MockLLMProvider {
         Ok(Box::new(stream::iter(chunks)))
     }
 
+    fn priced_capability_identity(&self) -> Option<String> {
+        Some("builtin.mock.free.v1".into())
+    }
+
+    // No external request or billable service is performed by any mock request class.
+    fn request_cost_bound(
+        &self,
+        request: &ai_agents_core::autonomy::ProviderRequest<'_>,
+    ) -> Result<Option<ai_agents_core::autonomy::ProviderCostBound>, LLMError> {
+        Ok(Some(ai_agents_core::autonomy::ProviderCostBound {
+            provider_identity: "builtin.mock.v1".into(),
+            pricing_identity: "builtin.mock.free.v1".into(),
+            request_id: request.request_id.into(),
+            max_micro_usd: 0,
+        }))
+    }
+
+    fn settle_request_cost(
+        &self,
+        bound: &ai_agents_core::autonomy::ProviderCostBound,
+        _: &LLMResponse,
+    ) -> Result<Option<ai_agents_core::autonomy::ProviderCostSettlement>, LLMError> {
+        Ok(Some(ai_agents_core::autonomy::ProviderCostSettlement {
+            bound: bound.clone(),
+            charged_micro_usd: 0,
+        }))
+    }
+
     fn provider_name(&self) -> &str {
         "mock"
     }

@@ -13,6 +13,221 @@ use ai_agents::tools::{
 };
 use ai_agents::{NativeCallBinding, NativeProviderState, NativeProviderTarget};
 
+#[test]
+fn development_automatic_task_hosting_surface_compiles() {
+    fn configure(
+        config: ai_agents::AutonomyConfig,
+        store: Arc<dyn ai_agents::TaskRunStore>,
+    ) -> ai_agents::AgentBuilder {
+        ai_agents::AgentBuilder::new()
+            .autonomy(config)
+            .automatic_task_options(ai_agents::AutomaticTaskOptions {
+                ceilings: ai_agents::AutonomyHostCeilings::default(),
+                store: Some(store),
+                config_identity: Some("prepared-host.v1".into()),
+                restore_host: None,
+            })
+    }
+    async fn prepare(builder: ai_agents::AgentBuilder) -> ai_agents::Result<RuntimeAgent> {
+        builder
+            .task_interaction_delivery(false)
+            .build_task_host()
+            .await
+    }
+    fn control(agent: &RuntimeAgent) {
+        let _configured: ai_agents::Result<Arc<ai_agents::autonomy::AutonomyRunner>> =
+            agent.task_runner();
+        let _explicit = agent.run_task("objective", Some("research"));
+        let _resume = agent.resume_task(
+            "retained",
+            1,
+            ai_agents::autonomy::TaskResumeInput::Continue,
+        );
+        let _cancel = agent.cancel_task("retained", 1);
+        let _display = agent.task_display("retained");
+        let _prompt = agent.task_interaction("retained", 1);
+        let _typed_operation = agent.task_operation(ai_agents::TaskStreamOperation::Stop {
+            run_id: "retained".into(),
+            revision: 1,
+            reason: "host stop".into(),
+        });
+        let _exact: Option<ai_agents::TaskRunResult> = agent.automatic_task_result();
+        let _runner: Option<Arc<ai_agents::autonomy::AutonomyRunner>> =
+            agent.automatic_task_runner();
+        let _operation = agent.automatic_task_operation(ai_agents::TaskStreamOperation::Resume {
+            run_id: "retained".into(),
+            revision: 1,
+            input: ai_agents::autonomy::TaskResumeInput::Continue,
+        });
+    }
+    fn eval_types() {
+        let _: ai_agents::eval::assertion::Assertion = Default::default();
+        let _: ai_agents::eval::TaskAssertion = Default::default();
+        let _: Option<ai_agents::eval::TaskStep> = None;
+        let _: Option<ai_agents::eval::TaskReport> = None;
+        let _: Option<ai_agents::eval::interactions::TaskInteraction> = None;
+        let _: Option<ai_agents::eval::interactions::TaskInteractionResult> = None;
+    }
+    fn store_only(store: &dyn ai_agents::TaskRunStore) {
+        eval_types();
+        let _display = ai_agents::TaskRunDisplay::read(store, "retained");
+        let _cancel = ai_agents::CancellationOutcome::request(store, "retained", 1);
+    }
+    async fn foreground_scope(
+        spec: &AgentSpec,
+        builder: ai_agents::AgentBuilder,
+    ) -> ai_agents::Result<()> {
+        let scope = ai_agents::TaskHostScope::from_spec(spec, std::path::Path::new("."), None)?;
+        let _options = scope.task_options();
+        let inspection_scope = scope.clone();
+        let _store = inspection_scope.open_store();
+        let agent = builder.task_host_scope(scope)?.build_task_host().await?;
+        let session = ai_agents::TaskHostSession::new(true);
+        let _result = session.scope(agent.run_task("objective", None));
+        let _changed = session.changed();
+        for run in session.runs() {
+            let _: ai_agents::TaskRunKey = run.key.clone();
+            let _admitted = run.execution_admitted();
+            let _running_cancel = run.runner.request_running_cancel("run");
+            let _revision = run.published_revision();
+            let _cleanup = run.runner.input_unavailable_paused("run", 1);
+            let _local_details = run.runner.task_host_details("run");
+            let _typed: Option<ai_agents::TaskHostDetails> = None;
+            let _inspection = run.runner.task_inspection("run", 1);
+            let _typed_inspection: Option<ai_agents::TaskRunInspection> = None;
+            let _lexical = session.scope_runner(run.runner.clone(), async {});
+            let _observe = ai_agents::TaskHostSession::observe_result;
+            let _record_eligibility = ai_agents::autonomy::tool_record_eligible;
+        }
+        let _protected = session.has_protected_work();
+        session.close_input();
+        Ok(())
+    }
+    fn display_types(view: ai_agents::TaskRunDisplay, outcome: ai_agents::CancellationOutcome) {
+        let _ = (
+            view.summary,
+            outcome.disposition,
+            ai_agents::MAX_TASK_DISPLAY_BYTES,
+        );
+    }
+    fn prompt_type(prompt: ai_agents::TaskHostPrompt, interaction: ai_agents::TaskHostInteraction) {
+        let _ = (prompt, interaction.revision);
+    }
+    fn task_event(event: AgentStreamEvent) -> Option<ai_agents::TaskRunEvent> {
+        match event {
+            AgentStreamEvent::Task(event) => Some(event),
+            _ => None,
+        }
+    }
+    let _surface = (
+        configure,
+        prepare,
+        foreground_scope,
+        control,
+        store_only,
+        display_types,
+        prompt_type,
+        task_event,
+    );
+}
+
+#[test]
+fn development_standalone_and_provenance_migration_surface_compiles() {
+    use ai_agents::autonomy::{AutonomyConfig, AutonomyHostCeilings, AutonomyRunner, TaskRunStore};
+    fn build(
+        agent: Arc<RuntimeAgent>,
+        config: AutonomyConfig,
+        store: Arc<dyn TaskRunStore>,
+    ) -> ai_agents::error::Result<()> {
+        let runner = AutonomyRunner::try_new(
+            agent.clone(),
+            config,
+            AutonomyHostCeilings::default(),
+            store,
+            "prepared-host-binding".into(),
+        )?;
+        let _run = runner.run("objective", None);
+        let _events: ai_agents::TaskRunStream<'_> = runner.run_stream("objective", None)?;
+        let _runtime_events = agent.run_task_stream(&runner, "objective", None)?;
+        let _controlled = agent.task_operation_stream(
+            &runner,
+            ai_agents::TaskStreamOperation::Resume {
+                run_id: "retained-run".into(),
+                revision: 1,
+                input: ai_agents::autonomy::TaskResumeInput::Continue,
+            },
+            ai_agents::TaskStreamConfig { capacity: 1 },
+        )?;
+        let _store: Arc<dyn TaskRunStore> = runner.task_store().clone();
+        let _cancel = runner.request_cancel("retained-run");
+        let _resume = runner.resume(
+            "retained-run",
+            1,
+            ai_agents::autonomy::TaskResumeInput::Approval {
+                request_id: "acknowledged-request".into(),
+                result: ai_agents::hitl::ApprovalResult::Approved,
+            },
+        );
+        let _answer = runner.resume(
+            "retained-run",
+            1,
+            ai_agents::autonomy::TaskResumeInput::UserAnswer {
+                request_id: "acknowledged-question".into(),
+                answer: r#"{"answered":true,"selected":["yes"]}"#.parse().unwrap(),
+            },
+        );
+        let _timeout = runner.resume(
+            "retained-run",
+            1,
+            ai_agents::autonomy::TaskResumeInput::QuestionTimeout {
+                request_id: "expired-question".into(),
+            },
+        );
+        let _recovery = runner.acknowledge_recovery_release("retained-run", 1);
+        let _close = runner.cancel_paused("retained-run", 1);
+        agent.clear_actor_id()?;
+        let _removed = agent.remove_context("obsolete")?;
+        Ok(())
+    }
+    let _surface = build;
+    let message = ai_agents::ChatMessage {
+        provenance: None,
+        role: ai_agents::Role::User,
+        content: "legacy literal".into(),
+        name: None,
+        timestamp: None,
+    };
+    assert!(message.provenance.is_none());
+    let source = ai_agents::MessageProvenance {
+        run_id: "run".into(),
+    };
+    assert_eq!(source.run_id, "run");
+    let bound = ai_agents::autonomy::ProviderCostBound {
+        provider_identity: "host-provider/config-v1".into(),
+        pricing_identity: "declared-schedule-v1".into(),
+        request_id: "exact-request".into(),
+        max_micro_usd: 500_000,
+    };
+    let settlement = ai_agents::autonomy::ProviderCostSettlement {
+        bound: bound.clone(),
+        charged_micro_usd: 200_000,
+    };
+    ai_agents::autonomy::validate_cost_settlement(&bound, &settlement).unwrap();
+    let footprint = ai_agents::autonomy::ToolWriteFootprint::empty("host-read-only/v1");
+    assert!(footprint.targets.is_empty());
+    fn quote(provider: &dyn ai_agents::LLMProvider, messages: &[ai_agents::ChatMessage]) {
+        let request = ai_agents::autonomy::ProviderRequest {
+            request_id: "request",
+            messages,
+            config: None,
+            tools: None,
+            streaming: false,
+        };
+        let _bound = provider.request_cost_bound(&request);
+    }
+    let _surface = quote;
+}
+
 fn configure_host_integrations(
     agent: &RuntimeAgent,
     question_handler: Arc<dyn QuestionHandler>,
@@ -28,6 +243,195 @@ fn configure_host_integrations(
 
 fn supports_snapshots(storage: &dyn AgentStorage) -> bool {
     storage.supports(StorageCapability::Snapshot)
+}
+
+#[test]
+fn task_tool_control_transfer_and_effect_state_surface_compiles() {
+    fn invoke(tool: &dyn ai_agents::Tool, context: ai_agents::tools::ToolExecutionContext) {
+        let _supported = tool.supports_task_messages();
+        drop(tool.execute_task(Default::default(), context));
+    }
+    fn effect(state: ai_agents::autonomy::TaskEffectState) -> &'static str {
+        use ai_agents::autonomy::TaskEffectState;
+        match state {
+            TaskEffectState::Reserved => "reserved",
+            TaskEffectState::Dispatched => "dispatched",
+            TaskEffectState::Suspended => "suspended",
+            TaskEffectState::Completed => "completed",
+            TaskEffectState::Uncertain => "uncertain",
+        }
+    }
+    let _surface = invoke;
+    assert_eq!(
+        effect(ai_agents::autonomy::TaskEffectState::Suspended),
+        "suspended"
+    );
+}
+
+#[test]
+fn autonomy_config_migration_exposes_typed_fields_without_enabling_chat() {
+    use ai_agents::{
+        AutonomyConfig, AutonomyOverride, AutonomyProfile, SkillDefinition, StateDefinition,
+    };
+
+    let spec = AgentSpec {
+        autonomy: AutonomyConfig {
+            defaults: AutonomyProfile {
+                enabled: Some(false),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        ..AgentSpec::default()
+    };
+    let state = StateDefinition {
+        autonomy: Some(AutonomyOverride::default()),
+        ..Default::default()
+    };
+    let skill = SkillDefinition {
+        autonomy: Some(AutonomyOverride::default()),
+        id: "review".into(),
+        description: "Review the result".into(),
+        trigger: "When requested".into(),
+        steps: vec![],
+        reasoning: None,
+        reflection: None,
+        disambiguation: None,
+    };
+    spec.validate().unwrap();
+    assert!(!spec.autonomy.defaults.enabled.unwrap());
+    assert!(state.autonomy.is_some() && skill.autonomy.is_some());
+}
+
+#[test]
+fn autonomy_storage_api_is_additive_and_separates_results_from_envelopes() {
+    use ai_agents::autonomy::*;
+    use ai_agents::persistence::{AgentSnapshot, InMemoryTaskStorage};
+    use ai_agents::{TaskRun, TaskRunStore};
+
+    let snapshot = AgentSnapshot::new("host-agent".into());
+    let now = snapshot.timestamp;
+    let profile = resolve_profile(
+        &AutonomyConfig::default(),
+        AutonomyScope::Task,
+        None,
+        None,
+        None,
+        None,
+        &AutonomyHostCeilings::default(),
+    )
+    .unwrap();
+    let payload = TaskCheckpointPayload::new(
+        "objective".into(),
+        "prepared-config-v1".into(),
+        &profile,
+        TaskRuntimeCheckpoint::between_turns(snapshot).unwrap(),
+    );
+    let envelope = payload
+        .bind(TaskRunSnapshot {
+            schema_version: TASK_RUN_SCHEMA_VERSION,
+            key: TaskRunKey {
+                agent_id: "host-agent".into(),
+                run_id: "run".into(),
+            },
+            actor_id: None,
+            revision: 0,
+            status: TaskRunStatus::Paused,
+            owner_token: None,
+            cancel_requested: false,
+            created_at: now,
+            updated_at: now,
+            payload: Default::default(),
+        })
+        .unwrap();
+    let store = ScopedTaskRunStore::new(
+        Arc::new(InMemoryTaskStorage::default()),
+        "host-agent".into(),
+        None,
+        "prepared-config-v1".into(),
+    )
+    .unwrap();
+    drop(store.create(&envelope));
+    drop(store.load("run"));
+    assert_eq!(
+        TaskRun::from_checkpoint(&envelope, "prepared-config-v1")
+            .unwrap()
+            .objective,
+        "objective"
+    );
+    assert!(!NoopStorage.supports(StorageCapability::TaskRuns));
+    drop(NoopStorage.load_task_run(&envelope.key));
+}
+
+#[test]
+fn autonomy_evaluation_migration_exposes_bounded_host_primitives() {
+    use ai_agents::autonomy::{
+        AutonomyExtensions, ValidationCapabilities, ValidationCheck, ValidationConfig,
+        ValidationSchedule,
+    };
+    use ai_agents::{AutonomyProfile, CompletionGateEvaluator, GateOutcome};
+    let check = ValidationCheck {
+        id: "quality".into(),
+        adapter: "builtin.evidence".into(),
+        contract_version: Some(1),
+        required: Some(true),
+        schedule: Some(ValidationSchedule::Completion),
+        timeout_seconds: None,
+        max_evaluation_rounds: Some(2),
+        max_observations_per_round: Some(1),
+        config: Some(
+            "{\"assertion\":{\"path\":\"ready\",\"exists\":true}}"
+                .parse()
+                .unwrap(),
+        ),
+    };
+    let profile = AutonomyProfile {
+        validation: Some(ValidationConfig {
+            checks: Some(vec![check]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let bound = AutonomyExtensions::builtins()
+        .freeze()
+        .bind(&profile, &ValidationCapabilities::default())
+        .unwrap();
+    assert_eq!(bound.checks.len(), 1);
+    assert_eq!(GateOutcome::Unknown.negate(), GateOutcome::Unknown);
+    assert!(CompletionGateEvaluator::default().redact);
+}
+
+#[test]
+fn artifact_validator_projection_and_configuration_are_available_through_facade() {
+    use ai_agents::autonomy::*;
+    fn project(
+        adapter: &dyn AutonomyValidator,
+        result: &ValidationResult,
+    ) -> ai_agents::error::Result<Vec<ArtifactObservation>> {
+        adapter.artifacts(result)
+    }
+    let _projection = project;
+    let extensions = AutonomyExtensions::builtins();
+    let profile = AutonomyProfile {
+        validation: Some(
+            serde_yaml::from_str(
+                "checks: [{id: report, adapter: builtin.artifact, config: {path: report.json}}]",
+            )
+            .unwrap(),
+        ),
+        ..Default::default()
+    };
+    let bound = extensions
+        .freeze()
+        .bind(
+            &profile,
+            &ValidationCapabilities {
+                tools: std::collections::BTreeSet::from(["file_info".into()]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(bound.checks[0].check.adapter, "builtin.artifact");
 }
 
 #[test]

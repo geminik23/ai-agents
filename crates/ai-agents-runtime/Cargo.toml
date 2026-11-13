@@ -48,6 +48,7 @@ uuid = { workspace = true }
 parking_lot = { workspace = true }
 minijinja = { workspace = true }
 rand = { workspace = true }
+sha2 = { workspace = true }
 
 [features]
 default = []

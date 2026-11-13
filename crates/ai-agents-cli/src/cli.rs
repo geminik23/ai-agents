@@ -18,6 +18,8 @@ pub struct Cli {
 pub enum Command {
     /// Run an agent YAML file interactively
     Run(RunArgs),
+    /// Run and manage development task-controller work (not production restart hosting)
+    Task(TaskArgs),
     /// Evaluate an agent YAML against declarative scenarios
     Eval(EvalArgs),
     /// Validate an agent YAML file without starting the REPL
@@ -76,6 +78,68 @@ pub struct RunArgs {
     /// Color theme (dark, one-dark, catppuccin-mocha, dracula, tokyo-night, vscode-dark, nord, gruvbox-dark, light, one-half-light, github-light)
     #[arg(long)]
     pub theme: Option<String>,
+}
+
+#[derive(Debug, Clone, Parser)]
+pub struct TaskArgs {
+    #[command(subcommand)]
+    pub command: TaskCommand,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum TaskCommand {
+    /// Run an objective through the configured shared controller
+    Run(TaskRunArgs),
+    /// Request new-process resume; the default host rejects unsupported reconstruction
+    Resume(TaskRevisionArgs),
+    /// Record a cancellation request, not remote cleanup acknowledgement
+    Cancel(TaskRevisionArgs),
+    /// List task metadata without constructing providers or consuming pending decisions
+    List(TaskAgentArgs),
+    /// Show a bounded default-redacted task snapshot
+    Show(TaskIdArgs),
+}
+
+#[derive(Debug, Clone, Parser)]
+pub struct TaskAgentArgs {
+    pub agent: PathBuf,
+    #[arg(long, value_name = "ID")]
+    pub actor: Option<String>,
+    /// Emit safe JSON output; exact interactive prompts remain on stderr
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Clone, Parser)]
+pub struct TaskRunArgs {
+    #[command(flatten)]
+    pub host: TaskAgentArgs,
+    pub objective: String,
+    #[arg(long)]
+    pub profile: Option<String>,
+    /// Do not service stdin prompts; unavailable policies still permit normal completion
+    #[arg(long)]
+    pub non_interactive: bool,
+    #[arg(long = "context", value_name = "KEY=VALUE")]
+    pub contexts: Vec<String>,
+    #[arg(long)]
+    pub context_file: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Parser)]
+pub struct TaskIdArgs {
+    #[command(flatten)]
+    pub host: TaskAgentArgs,
+    pub run_id: String,
+}
+
+#[derive(Debug, Clone, Parser)]
+pub struct TaskRevisionArgs {
+    #[command(flatten)]
+    pub target: TaskIdArgs,
+    /// Exact observed revision; required for cancellation, never auto-refreshed
+    #[arg(long)]
+    pub revision: Option<u64>,
 }
 
 #[derive(Debug, Clone, Parser)]

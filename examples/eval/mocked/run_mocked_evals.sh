@@ -95,6 +95,16 @@ passed=0
 failed=0
 failed_names=""
 
+# A fixed, repository-owned host supplies Rust domain adapters to the same EvalRunner.
+# This marker never selects an arbitrary executable or creates tool/approval authority.
+run_suite() {
+  if grep -Fqx '# Eval host: task-domain-evals' "$1"; then
+    cargo run -q --manifest-path examples/Cargo.toml -p example-custom-llm --bin task-domain-evals -- "$1" "$2"
+  else
+    cargo run -q -p ai-agents-cli -- eval --scenarios "$1" --output "$2"
+  fi
+}
+
 for suite in "$suite_dir"/*/*_mocked.yaml; do
   if [ ! -f "$suite" ]; then
     continue
@@ -123,9 +133,7 @@ for suite in "$suite_dir"/*/*_mocked.yaml; do
   output="$output_root/$category/$name"
   echo "==> $display_name"
 
-  if cargo run -q -p ai-agents-cli -- eval \
-    --scenarios "$suite" \
-    --output "$output"; then
+  if run_suite "$suite" "$output"; then
     passed=$((passed + 1))
   else
     failed=$((failed + 1))

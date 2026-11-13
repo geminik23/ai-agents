@@ -3,7 +3,7 @@ use ai_agents_llm::LLMProvider;
 use ai_agents_observability::{ObservationPurpose, with_observation_purpose};
 use ai_agents_state::DelegateContextMode;
 
-/// Prepare the input for a delegated agent based on the context mode.
+/// Prepares delegate input without exempting borrowed summarizer calls from the coordinating task ledger.
 pub async fn prepare_delegate_input(
     input: &str,
     mode: &DelegateContextMode,
@@ -53,7 +53,7 @@ pub async fn prepare_delegate_input(
                 ];
                 match with_observation_purpose(
                     ObservationPurpose::Summarization,
-                    llm.complete(&summary_messages, None),
+                    ai_agents_llm::managed_completion(llm, &summary_messages, None),
                 )
                 .await
                 {

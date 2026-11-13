@@ -7,7 +7,9 @@ use serde::{Deserialize, Serialize};
 pub enum AgentStreamEvent {
     /// Provisional content, tool, state, or error information emitted during execution.
     Chunk(StreamChunk),
-    /// Authoritative response emitted after successful root-turn finalization.
+    /// Bounded default-redacted task lifecycle output from an automatically promoted state or skill, not provider token deltas.
+    Task(crate::autonomy::TaskRunEvent),
+    /// Authoritative dispatch response; task status metadata distinguishes a completed objective from a retained pause or incomplete run.
     Final(AgentResponse),
 }
 

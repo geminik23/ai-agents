@@ -16,7 +16,9 @@ use ai_agents_core::{
 
 use crate::generate_schema;
 use crate::security::path::PathPolicyResolver;
-use crate::types::{FileVersionEvidence, FileVersionStore, file_version_evidence};
+use crate::types::{
+    FileVersionEvidence, FileVersionStore, file_version_evidence, truncate_head_tail,
+};
 
 const DEFAULT_MAX_OUTPUT_CHARS: usize = 20_000;
 const DEFAULT_MAX_REPLACEMENTS: usize = 20;
@@ -146,7 +148,7 @@ struct PatchInput {
     allow_delete: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct MutationOutput {
     path: Option<String>,
     dry_run: bool,
@@ -167,6 +169,7 @@ struct MutationOutput {
 
 #[derive(Debug, Default)]
 struct MutationPolicySnapshot {
+    read_paths: Vec<String>,
     write_paths: Vec<String>,
     allowed_paths: Vec<String>,
     blocked_paths: Vec<String>,
@@ -185,6 +188,7 @@ impl MutationPolicySnapshot {
             .unwrap_or("dry_run_only")
             .to_string();
         let mut snapshot = Self {
+            read_paths: strings_at(value, "read_paths"),
             write_paths: strings_at(value, "write_paths"),
             allowed_paths: strings_at(value, "allowed_paths"),
             blocked_paths: strings_at(value, "blocked_paths"),
@@ -195,6 +199,7 @@ impl MutationPolicySnapshot {
             allow_without_confirmation: bool_at(value, "allow_without_confirmation"),
         };
         if let Some(paths) = value.get("paths") {
+            snapshot.read_paths.extend(strings_at(paths, "allow"));
             snapshot.write_paths.extend(strings_at(paths, "allow"));
             snapshot.blocked_paths.extend(strings_at(paths, "deny"));
         }
@@ -212,6 +217,23 @@ impl MutationPolicySnapshot {
 
 #[async_trait]
 impl Tool for FileWriteTool {
+    fn declared_write_footprint(
+        &self,
+        args: &Value,
+        _ctx: &ToolExecutionContext,
+        max_targets: usize,
+    ) -> ai_agents_core::Result<Option<ai_agents_core::autonomy::ToolWriteFootprint>> {
+        let input: FileWriteInput = serde_json::from_value(args.clone())?;
+        footprint_single(
+            self.id(),
+            Path::new(&input.path),
+            input.dry_run,
+            false,
+            input.create_parent_dirs,
+            max_targets,
+        )
+        .map(Some)
+    }
     fn id(&self) -> &str {
         "file_write"
     }
@@ -267,19 +289,12 @@ impl Tool for FileWriteTool {
         if exists && !policy.overwrite_existing && !input.dry_run {
             return ToolResult::error("overwrite_existing policy is false for this target");
         }
-        if let Some(parent) = path.parent()
-            && !parent.exists()
-        {
-            if !(input.create_parent_dirs && policy.create_parent_dirs) {
-                return ToolResult::error(
-                    "parent directory does not exist or create_parent_dirs is not allowed",
-                );
-            }
-            if !input.dry_run
-                && let Err(error) = fs::create_dir_all(parent)
-            {
-                return ToolResult::error(format!("Create parent directory error: {}", error));
-            }
+        // Every check that can reject the call runs before the first filesystem change, so these plain errors prove no effect.
+        let missing_parent = path.parent().filter(|parent| !parent.exists());
+        if missing_parent.is_some() && !(input.create_parent_dirs && policy.create_parent_dirs) {
+            return ToolResult::error(
+                "parent directory does not exist or create_parent_dirs is not allowed",
+            );
         }
         if exists
             && !input.dry_run
@@ -314,8 +329,26 @@ impl Tool for FileWriteTool {
         let version = if input.dry_run {
             None
         } else {
-            if let Err(error) = atomic_write(&path, input.content.as_bytes()) {
-                return ToolResult::error(format!("Write error: {}", error));
+            let parents = match missing_parent {
+                Some(parent) => match CreatedParents::create(parent) {
+                    Ok(parents) => parents,
+                    Err(failure) => return failure.into_result(),
+                },
+                None => CreatedParents::none(),
+            };
+            let written = if exists {
+                atomic_write(&path, input.content.as_bytes())
+            } else {
+                atomic_create(&path, input.content.as_bytes())
+            };
+            if let Err(error) = written {
+                // A published file or leftover temporary file keeps this call's parents in place and stays uncertain.
+                let message = format!("Write error: {}", error);
+                return if error.uncertain {
+                    EffectFailure::new(message, true).into_result()
+                } else {
+                    parents.fail(message, false).into_result()
+                };
             }
             match file_version_evidence(&path, input.content.as_bytes()) {
                 Ok(version) => {
@@ -325,7 +358,7 @@ impl Tool for FileWriteTool {
                 Err(_) => None,
             }
         };
-        json_result(&MutationOutput {
+        let result = json_result(&MutationOutput {
             path: Some(input.path.clone()),
             dry_run: input.dry_run,
             mutation_performed: !input.dry_run,
@@ -345,12 +378,30 @@ impl Tool for FileWriteTool {
             changed_paths: vec![input.path],
             version,
             near_matches: Vec::new(),
-        })
+        });
+        settle_performed_effect(result, !input.dry_run)
     }
 }
 
 #[async_trait]
 impl Tool for FileEditTool {
+    fn declared_write_footprint(
+        &self,
+        args: &Value,
+        _ctx: &ToolExecutionContext,
+        max_targets: usize,
+    ) -> ai_agents_core::Result<Option<ai_agents_core::autonomy::ToolWriteFootprint>> {
+        let input: FileEditInput = serde_json::from_value(args.clone())?;
+        footprint_single(
+            self.id(),
+            Path::new(&input.path),
+            input.dry_run,
+            false,
+            false,
+            max_targets,
+        )
+        .map(Some)
+    }
     fn id(&self) -> &str {
         "file_edit"
     }
@@ -406,8 +457,10 @@ impl Tool for FileEditTool {
             Ok(content) => content,
             Err(error) => return ToolResult::error(format!("Read error: {}", error)),
         };
-        let matches: Vec<_> = original.match_indices(&input.old_text).collect();
-        if matches.is_empty() {
+        let show_file_context = edit_context_is_readable(&path, &policy);
+        let mut matches = original.match_indices(&input.old_text);
+        let first_match = matches.next();
+        if first_match.is_none() {
             let output = MutationOutput {
                 path: Some(input.path),
                 dry_run: input.dry_run,
@@ -420,26 +473,46 @@ impl Tool for FileEditTool {
                 overwritten: false,
                 truncated: false,
                 approval_required: false,
-                diff_summary: "old_text was not found".to_string(),
+                diff_summary: "old_text was not found; re-read the file and use exact text"
+                    .to_string(),
                 changed_paths: Vec::new(),
                 version: None,
-                near_matches: near_matches(&original, &input.old_text),
-            };
-            return match serde_json::to_string(&output) {
-                Ok(json) => ToolResult {
-                    success: false,
-                    output: json,
-                    metadata: None,
+                near_matches: if show_file_context {
+                    near_matches(&original, &input.old_text)
+                } else {
+                    Vec::new()
                 },
-                Err(error) => ToolResult::error(format!("Serialization error: {}", error)),
             };
+            return file_edit_result(output, false, ctx.limits.max_output_chars);
         }
-        if matches.len() > 1 && !input.replace_all {
-            return ToolResult::error(
-                "old_text appears multiple times; set replace_all to true to replace all occurrences",
-            );
+        if !input.replace_all
+            && let Some(second) = matches.next()
+        {
+            let locations = if show_file_context {
+                let offsets = [
+                    first_match.map(|(offset, _)| offset),
+                    Some(second.0),
+                    matches.next().map(|(offset, _)| offset),
+                ];
+                let lines: Vec<_> = offsets
+                    .into_iter()
+                    .flatten()
+                    .map(|offset| {
+                        original[..offset]
+                            .bytes()
+                            .filter(|byte| *byte == b'\n')
+                            .count()
+                            + 1
+                    })
+                    .collect();
+                format!(" at lines {lines:?}")
+            } else {
+                String::new()
+            };
+            return ToolResult::error(format!(
+                "old_text appears multiple times{locations}; re-read the file or set replace_all to true to replace all occurrences"
+            ));
         }
-        let replacements = if input.replace_all { matches.len() } else { 1 };
         let max_replacements = input
             .max_replacements
             .unwrap_or(DEFAULT_MAX_REPLACEMENTS)
@@ -448,6 +521,12 @@ impl Tool for FileEditTool {
                     .max_replacements
                     .unwrap_or(DEFAULT_MAX_REPLACEMENTS),
             );
+        // Stop after one more than the permitted count instead of retaining every match in a large file.
+        let replacements = if input.replace_all {
+            1 + matches.take(max_replacements).count()
+        } else {
+            1
+        };
         if replacements > max_replacements {
             return ToolResult::error("replacement count exceeds configured max_replacements");
         }
@@ -465,12 +544,37 @@ impl Tool for FileEditTool {
         if exceeds(ctx.limits.max_changed_lines, changed_lines) {
             return ToolResult::error("edit exceeds configured max_changed_lines");
         }
-        let diff_summary = preview_diff(&original, &edited, DEFAULT_MAX_OUTPUT_CHARS);
+        // A completed write needs room for an explicit effect receipt; never mutate when the configured output cannot carry it.
+        let minimum_receipt = serde_json::json!({"mutation_performed": true, "truncated": true})
+            .to_string()
+            .chars()
+            .count();
+        if !input.dry_run
+            && ctx
+                .limits
+                .max_output_chars
+                .is_some_and(|limit| limit < minimum_receipt)
+        {
+            return ToolResult::error("edit not applied: output limit cannot report the effect");
+        }
+        let (diff_summary, diff_truncated) = if show_file_context {
+            preview_diff(
+                &original,
+                &edited,
+                &input.old_text,
+                &input.new_text,
+                replacements,
+                DEFAULT_MAX_OUTPUT_CHARS,
+            )
+        } else {
+            preview_requested_edit(&input.old_text, &input.new_text, replacements)
+        };
         let version = if input.dry_run {
             None
         } else {
             if let Err(error) = atomic_write(&path, edited.as_bytes()) {
-                return ToolResult::error(format!("Write error: {}", error));
+                return EffectFailure::new(format!("Write error: {}", error), error.uncertain)
+                    .into_result();
             }
             match file_version_evidence(&path, edited.as_bytes()) {
                 Ok(version) => {
@@ -480,28 +584,60 @@ impl Tool for FileEditTool {
                 Err(_) => None,
             }
         };
-        json_result(&MutationOutput {
-            path: Some(input.path.clone()),
-            dry_run: input.dry_run,
-            mutation_performed: !input.dry_run,
-            changed_files: 1,
-            changed_lines,
-            replacements,
-            bytes_written: if input.dry_run { 0 } else { edited.len() },
-            created: false,
-            overwritten: !input.dry_run,
-            truncated: diff_summary.chars().count() >= DEFAULT_MAX_OUTPUT_CHARS,
-            approval_required: !input.dry_run && policy.approval_required(),
-            diff_summary,
-            changed_paths: vec![input.path],
-            version,
-            near_matches: Vec::new(),
-        })
+        let result = file_edit_result(
+            MutationOutput {
+                path: Some(input.path.clone()),
+                dry_run: input.dry_run,
+                mutation_performed: !input.dry_run,
+                changed_files: 1,
+                changed_lines,
+                replacements,
+                bytes_written: if input.dry_run { 0 } else { edited.len() },
+                created: false,
+                overwritten: !input.dry_run,
+                truncated: diff_truncated,
+                approval_required: !input.dry_run && policy.approval_required(),
+                diff_summary,
+                changed_paths: vec![input.path],
+                version,
+                near_matches: Vec::new(),
+            },
+            true,
+            ctx.limits.max_output_chars,
+        );
+        settle_performed_effect(result, !input.dry_run)
     }
 }
 
 #[async_trait]
 impl Tool for PatchTool {
+    fn declared_write_footprint(
+        &self,
+        args: &Value,
+        ctx: &ToolExecutionContext,
+        max_targets: usize,
+    ) -> ai_agents_core::Result<Option<ai_agents_core::autonomy::ToolWriteFootprint>> {
+        let input: PatchInput = serde_json::from_value(args.clone())?;
+        if input.dry_run {
+            return Ok(Some(ai_agents_core::autonomy::ToolWriteFootprint::empty(
+                "builtin.patch.v1",
+            )));
+        }
+        let files = parse_unified_diff(&input.patch).map_err(ai_agents_core::AgentError::Tool)?;
+        let base = PathBuf::from(input.base_path.unwrap_or_else(|| ".".into()));
+        let mut targets = std::collections::BTreeSet::new();
+        for file in files {
+            let path = base.join(strip_patch_prefix(file.target_path()));
+            add_footprint_entry(&path, &mut targets, max_targets)?;
+            if MutationPolicySnapshot::from_context(&ctx.policy_snapshot).create_parent_dirs {
+                add_footprint_parents(&path, &mut targets, max_targets)?;
+            }
+        }
+        Ok(Some(ai_agents_core::autonomy::ToolWriteFootprint {
+            binding_identity: "builtin.patch.v1".into(),
+            targets: targets.into_iter().collect(),
+        }))
+    }
     fn id(&self) -> &str {
         "patch"
     }
@@ -639,6 +775,11 @@ impl Tool for PatchTool {
                     Ok(snapshot) => snapshot,
                     Err(error) => return ToolResult::error(format!("Read error: {}", error)),
                 };
+                if !input.dry_run
+                    && let Err(error) = validate_replacement_permissions(&snapshot.permissions)
+                {
+                    return ToolResult::error(format!("Patch preflight error: {}", error));
+                }
                 let content = match String::from_utf8(snapshot.bytes.clone()) {
                     Ok(content) => content,
                     Err(error) => {
@@ -668,8 +809,8 @@ impl Tool for PatchTool {
             }
         }
         if !input.dry_run {
-            if let Err(error) = apply_patch_transaction(&outputs) {
-                return ToolResult::error(error);
+            if let Err(failure) = apply_patch_transaction(&outputs) {
+                return failure.into_result();
             }
             for output in &outputs {
                 if let Some((path, content)) = output.written_file()
@@ -680,7 +821,8 @@ impl Tool for PatchTool {
             }
         }
         let diff_summary = summarize_patch(&files, DEFAULT_MAX_OUTPUT_CHARS);
-        json_result(&MutationOutput {
+        let performed = !input.dry_run && !files.is_empty();
+        let result = json_result(&MutationOutput {
             path: Some(base_path.to_string_lossy().to_string()),
             dry_run: input.dry_run,
             mutation_performed: !input.dry_run && !files.is_empty(),
@@ -703,7 +845,8 @@ impl Tool for PatchTool {
             changed_paths,
             version: None,
             near_matches: Vec::new(),
-        })
+        });
+        settle_performed_effect(result, performed)
     }
 }
 
@@ -796,23 +939,26 @@ enum PatchRollback {
     RemoveCreated {
         path: PathBuf,
         written: Vec<u8>,
+        written_metadata: fs::Metadata,
     },
 }
 
-fn apply_patch_transaction(outputs: &[PatchApply]) -> Result<(), String> {
+// Each failure reports whether anything from this call could remain after rollback.
+fn apply_patch_transaction(outputs: &[PatchApply]) -> Result<(), EffectFailure> {
     let mut rollbacks = Vec::new();
     let mut created_directories = Vec::new();
     for output in outputs {
         match output {
             PatchApply::Delete { path, expected } => {
                 if let Err(error) = verify_present_snapshot(path, expected, "pre-apply") {
-                    return fail_patch_transaction(error, &rollbacks, &created_directories);
+                    return fail_patch_transaction(error, &rollbacks, &created_directories, false);
                 }
                 if let Err(error) = fs::remove_file(path) {
                     return fail_patch_transaction(
                         format!("Patch delete error: {}", error),
                         &rollbacks,
                         &created_directories,
+                        false,
                     );
                 }
                 rollbacks.push(PatchRollback::RestoreDelete {
@@ -831,6 +977,7 @@ fn apply_patch_transaction(outputs: &[PatchApply]) -> Result<(), String> {
                     let missing = missing_directories(parent);
                     if let Err(error) = fs::create_dir_all(parent) {
                         let cleanup_error = cleanup_created_directories(&missing).err();
+                        let residual = cleanup_error.is_some();
                         let error = match cleanup_error {
                             Some(cleanup_error) => format!(
                                 "Create parent directory error: {}; partial directory creation may remain: {}",
@@ -838,20 +985,29 @@ fn apply_patch_transaction(outputs: &[PatchApply]) -> Result<(), String> {
                             ),
                             None => format!("Create parent directory error: {}", error),
                         };
-                        return fail_patch_transaction(error, &rollbacks, &created_directories);
+                        return fail_patch_transaction(
+                            error,
+                            &rollbacks,
+                            &created_directories,
+                            residual,
+                        );
                     }
                     created_directories.extend(missing);
                 }
                 if let Err(error) = verify_expected_state(path, expected, "pre-apply") {
-                    return fail_patch_transaction(error, &rollbacks, &created_directories);
+                    return fail_patch_transaction(error, &rollbacks, &created_directories, false);
                 }
-                if let Err(error) = atomic_write(path, content.as_bytes()) {
-                    return fail_patch_transaction(
-                        format!("Patch write error: {}", error),
-                        &rollbacks,
-                        &created_directories,
-                    );
-                }
+                let written_metadata = match atomic_write(path, content.as_bytes()) {
+                    Ok(metadata) => metadata,
+                    Err(error) => {
+                        return fail_patch_transaction(
+                            format!("Patch write error: {}", error),
+                            &rollbacks,
+                            &created_directories,
+                            error.uncertain,
+                        );
+                    }
+                };
                 let written = content.as_bytes().to_vec();
                 match expected {
                     ExpectedPathState::Present(original) => {
@@ -868,6 +1024,7 @@ fn apply_patch_transaction(outputs: &[PatchApply]) -> Result<(), String> {
                                 format!("Patch permission restore error: {}", error),
                                 &rollbacks,
                                 &created_directories,
+                                false,
                             );
                         }
                         rollbacks.push(rollback);
@@ -876,6 +1033,7 @@ fn apply_patch_transaction(outputs: &[PatchApply]) -> Result<(), String> {
                         rollbacks.push(PatchRollback::RemoveCreated {
                             path: path.clone(),
                             written,
+                            written_metadata,
                         });
                     }
                 }
@@ -885,16 +1043,36 @@ fn apply_patch_transaction(outputs: &[PatchApply]) -> Result<(), String> {
     Ok(())
 }
 
+// Removing only this call's empty directories undoes them, but a restored file has a new identity and other metadata, so it stays uncertain.
 fn fail_patch_transaction(
     error: String,
     rollbacks: &[PatchRollback],
     created_directories: &[PathBuf],
-) -> Result<(), String> {
+    residual: bool,
+) -> Result<(), EffectFailure> {
     match rollback_patch(rollbacks, created_directories) {
-        Ok(()) => Err(format!("{}; no patch changes were retained", error)),
-        Err(rollback_error) => Err(format!(
-            "{}; partial patch application may remain because rollback failed: {}",
-            error, rollback_error
+        Ok(()) if rollbacks.is_empty() && created_directories.is_empty() => {
+            Err(EffectFailure::new(
+                format!(
+                    "{}; no target changes required rollback; any reported temporary artifacts may remain",
+                    error
+                ),
+                residual,
+            ))
+        }
+        Ok(()) => Err(EffectFailure::new(
+            format!(
+                "{}; patch rollback restored file contents and permissions where applicable; other metadata may have changed",
+                error
+            ),
+            residual || !rollbacks.is_empty(),
+        )),
+        Err(rollback_error) => Err(EffectFailure::new(
+            format!(
+                "{}; partial patch application may remain because rollback failed: {}",
+                error, rollback_error
+            ),
+            true,
         )),
     }
 }
@@ -921,17 +1099,26 @@ fn rollback_patch(
             PatchRollback::RestoreDelete { path, original } => {
                 verify_absent(path, "rollback").and_then(|_| restore_file_snapshot(path, original))
             }
-            PatchRollback::RemoveCreated { path, written } => {
-                verify_present_content(path, written, "rollback").and_then(|_| {
-                    fs::remove_file(path).map_err(|error| {
-                        format!(
-                            "Patch rollback remove error for {}: {}",
-                            path.display(),
-                            error
-                        )
-                    })
+            PatchRollback::RemoveCreated {
+                path,
+                written,
+                written_metadata,
+            } => verify_present_content_and_permissions(
+                path,
+                written,
+                &written_metadata.permissions(),
+                "rollback",
+            )
+            .and_then(|_| verify_created_identity(path, written_metadata))
+            .and_then(|_| {
+                fs::remove_file(path).map_err(|error| {
+                    format!(
+                        "Patch rollback remove error for {}: {}",
+                        path.display(),
+                        error
+                    )
                 })
-            }
+            }),
         };
         if let Err(error) = result {
             errors.push(error);
@@ -944,6 +1131,33 @@ fn rollback_patch(
         Ok(())
     } else {
         Err(errors.join("; "))
+    }
+}
+
+// Check created-file identity where available before rollback removes the path.
+fn verify_created_identity(path: &Path, expected: &fs::Metadata) -> Result<(), String> {
+    let current = fs::symlink_metadata(path).map_err(|error| {
+        format!(
+            "Patch rollback conflict for {}: created file metadata is unavailable: {}",
+            path.display(),
+            error
+        )
+    })?;
+    let same = current.file_type().is_file();
+    #[cfg(unix)]
+    let same = {
+        use std::os::unix::fs::MetadataExt;
+        same && current.dev() == expected.dev() && current.ino() == expected.ino()
+    };
+    #[cfg(not(unix))]
+    let _ = expected;
+    if same {
+        Ok(())
+    } else {
+        Err(format!(
+            "Patch rollback conflict for {}: created file was replaced",
+            path.display()
+        ))
     }
 }
 
@@ -967,14 +1181,19 @@ fn verify_expected_state(
 }
 
 fn verify_absent(path: &Path, stage: &str) -> Result<(), String> {
-    if path.exists() {
-        Err(format!(
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Ok(_) => Err(format!(
             "Patch {} conflict for {}: expected path to be absent",
             stage,
             path.display()
-        ))
-    } else {
-        Ok(())
+        )),
+        Err(error) => Err(format!(
+            "Patch {} conflict for {}: absence could not be verified: {}",
+            stage,
+            path.display(),
+            error
+        )),
     }
 }
 
@@ -1048,20 +1267,15 @@ fn verify_present_content_and_permissions(
 }
 
 fn restore_file_snapshot(path: &Path, snapshot: &FileSnapshot) -> Result<(), String> {
-    atomic_write(path, &snapshot.bytes).map_err(|error| {
-        format!(
-            "Patch rollback restore error for {}: {}",
-            path.display(),
-            error
-        )
-    })?;
-    fs::set_permissions(path, snapshot.permissions.clone()).map_err(|error| {
-        format!(
-            "Patch rollback permission restore error for {}: {}",
-            path.display(),
-            error
-        )
-    })
+    atomic_write_with_permissions(path, &snapshot.bytes, Some(&snapshot.permissions))
+        .map(|_| ())
+        .map_err(|error| {
+            format!(
+                "Patch rollback restore error for {}: {}",
+                path.display(),
+                error
+            )
+        })
 }
 
 fn permissions_match(left: &fs::Permissions, right: &fs::Permissions) -> bool {
@@ -1097,7 +1311,7 @@ fn cleanup_created_directories(paths: &[PathBuf]) -> Result<(), String> {
             && error.kind() != std::io::ErrorKind::NotFound
         {
             errors.push(format!(
-                "Patch rollback directory cleanup conflict for {}: {}",
+                "Created directory cleanup conflict for {}: {}",
                 path.display(),
                 error
             ));
@@ -1205,6 +1419,21 @@ fn ensure_write_allowed(
     Ok(())
 }
 
+// File-edit context is model-visible data; a write-only grant must not become authority to read neighboring file content.
+fn edit_context_is_readable(path: &Path, policy: &MutationPolicySnapshot) -> bool {
+    let Ok(resolver) = mutation_path_resolver() else {
+        return false;
+    };
+    for root in policy.read_paths.iter().chain(policy.allowed_paths.iter()) {
+        match resolver.is_allowed(path, Path::new(root)) {
+            Ok(true) => return true,
+            Ok(false) => {}
+            Err(_) => return false,
+        }
+    }
+    false
+}
+
 fn ensure_not_write_root(path: &Path, policy: &MutationPolicySnapshot) -> Result<(), String> {
     let resolver = mutation_path_resolver()?;
     for root in policy.write_paths.iter().chain(policy.allowed_paths.iter()) {
@@ -1240,19 +1469,271 @@ fn enforce_read_before_write(
     }
 }
 
-fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+// Special bits cannot be restored safely when replacement may change the owning user or group.
+fn validate_replacement_permissions(permissions: &fs::Permissions) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if permissions.mode() & 0o7000 != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "atomic replacement of files with special permission bits is unsupported",
+            ));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = permissions;
+    Ok(())
+}
+
+// Existing-file replacements start private even when the process umask permits broader access.
+fn create_atomic_temp(parent: &Path, restricted: bool) -> std::io::Result<(fs::File, PathBuf)> {
     let temp = parent.join(format!(".{}.tmp", Uuid::new_v4()));
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(if restricted { 0o600 } else { 0o666 });
+    }
+    #[cfg(not(unix))]
+    let _ = restricted;
+    Ok((options.open(&temp)?, temp))
+}
+
+// A published destination or a failed temporary cleanup must remain distinct from a known no-effect failure.
+#[derive(Debug)]
+struct AtomicFileError {
+    error: std::io::Error,
+    uncertain: bool,
+}
+
+// Publish a complete new file without replacing an entry created after the caller's existence check.
+// Filesystems that cannot link the temporary file fail closed instead of falling back to replacement.
+fn atomic_create(path: &Path, bytes: &[u8]) -> Result<fs::Metadata, AtomicFileError> {
+    atomic_create_with_cleanup(path, bytes, |temp| fs::remove_file(temp))
+}
+
+// Injecting cleanup also makes the post-publication failure boundary testable without changing filesystem permissions.
+fn atomic_create_with_cleanup(
+    path: &Path,
+    bytes: &[u8],
+    cleanup: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> Result<fs::Metadata, AtomicFileError> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let (mut file, temp) = create_atomic_temp(parent, false).map_err(|error| AtomicFileError {
+        error,
+        uncertain: false,
+    })?;
     let result = (|| {
-        let mut file = fs::File::create(&temp)?;
         file.write_all(bytes)?;
         file.sync_all()?;
-        fs::rename(&temp, path)
+        let metadata = file.metadata()?;
+        drop(file);
+        fs::hard_link(&temp, path)?;
+        Ok(metadata)
     })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temp);
+    match result {
+        Ok(metadata) => match cleanup(&temp) {
+            Ok(()) => Ok(metadata),
+            Err(error) => Err(AtomicFileError {
+                error: std::io::Error::new(
+                    error.kind(),
+                    format!(
+                        "destination was created but temporary-file cleanup failed for {:?}: {error}",
+                        temp
+                    ),
+                ),
+                uncertain: true,
+            }),
+        },
+        Err(error) => match cleanup(&temp) {
+            Ok(()) => Err(AtomicFileError {
+                error,
+                uncertain: false,
+            }),
+            Err(cleanup) if cleanup.kind() == std::io::ErrorKind::NotFound => {
+                Err(AtomicFileError {
+                    error,
+                    uncertain: false,
+                })
+            }
+            Err(cleanup) => Err(AtomicFileError {
+                error: std::io::Error::new(
+                    error.kind(),
+                    format!(
+                        "{error}; temporary-file cleanup failed for {:?}: {cleanup}",
+                        temp
+                    ),
+                ),
+                uncertain: true,
+            }),
+        },
     }
-    result
+}
+
+impl AtomicFileError {
+    // Failures before the temporary file exists cannot leave anything behind.
+    fn settled(error: std::io::Error) -> Self {
+        Self {
+            error,
+            uncertain: false,
+        }
+    }
+}
+
+impl std::fmt::Display for AtomicFileError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(formatter)
+    }
+}
+
+// Preserve ordinary Unix mode bits without exposing an initially broader temporary file.
+fn atomic_write(path: &Path, bytes: &[u8]) -> Result<fs::Metadata, AtomicFileError> {
+    #[cfg(unix)]
+    let original = match fs::metadata(path) {
+        Ok(metadata) => Some(metadata.permissions()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(AtomicFileError::settled(error)),
+    };
+    #[cfg(not(unix))]
+    let original: Option<fs::Permissions> = None;
+    atomic_write_with_permissions(path, bytes, original.as_ref())
+}
+
+// A deleted-file rollback supplies its saved permissions before any original bytes are written.
+fn atomic_write_with_permissions(
+    path: &Path,
+    bytes: &[u8],
+    permissions: Option<&fs::Permissions>,
+) -> Result<fs::Metadata, AtomicFileError> {
+    atomic_write_with_cleanup(path, bytes, permissions, |temp| fs::remove_file(temp))
+}
+
+// The rename is the only commit point; before it, the destination is untouched and only a failed temporary cleanup can leave residue.
+// Injecting cleanup makes that residue boundary testable without changing filesystem permissions.
+fn atomic_write_with_cleanup(
+    path: &Path,
+    bytes: &[u8],
+    permissions: Option<&fs::Permissions>,
+    cleanup: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> Result<fs::Metadata, AtomicFileError> {
+    if let Some(permissions) = permissions {
+        validate_replacement_permissions(permissions).map_err(AtomicFileError::settled)?;
+    }
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let (mut file, temp) =
+        create_atomic_temp(parent, permissions.is_some()).map_err(AtomicFileError::settled)?;
+    let result = (|| {
+        if let Some(permissions) = permissions {
+            file.set_permissions(permissions.clone())?;
+        }
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        let metadata = file.metadata()?;
+        drop(file);
+        fs::rename(&temp, path)?;
+        Ok(metadata)
+    })();
+    match result {
+        Ok(metadata) => Ok(metadata),
+        Err(error) => Err(cleanup_failed_atomic_temp(&temp, error, cleanup)),
+    }
+}
+
+// Keep failed cleanup visible because an uncommitted temporary file can still contain data.
+fn cleanup_failed_atomic_temp(
+    temp: &Path,
+    error: std::io::Error,
+    cleanup: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> AtomicFileError {
+    match cleanup(temp) {
+        Ok(()) => AtomicFileError::settled(error),
+        Err(cleanup) if cleanup.kind() == std::io::ErrorKind::NotFound => {
+            AtomicFileError::settled(error)
+        }
+        Err(cleanup) => AtomicFileError {
+            error: std::io::Error::new(
+                error.kind(),
+                format!(
+                    "{}; failed to remove temporary file {}: {}; partial data may remain",
+                    error,
+                    temp.display(),
+                    cleanup
+                ),
+            ),
+            uncertain: true,
+        },
+    }
+}
+
+/// A failure after a filesystem change may have started.
+/// `residual` is false only when the tool proved that no change from this call remains.
+#[derive(Debug)]
+struct EffectFailure {
+    message: String,
+    residual: bool,
+}
+
+impl EffectFailure {
+    fn new(message: impl Into<String>, residual: bool) -> Self {
+        Self {
+            message: message.into(),
+            residual,
+        }
+    }
+
+    // Plain errors tell the shared executor that nothing remains to settle, so any possible residue must be reported as uncertain.
+    fn into_result(self) -> ToolResult {
+        if self.residual {
+            ToolResult::error_with_uncertain_effect(self.message)
+        } else {
+            ToolResult::error(self.message)
+        }
+    }
+}
+
+// A failed result produced after a performed mutation must not read as a harmless failure.
+fn settle_performed_effect(result: ToolResult, performed: bool) -> ToolResult {
+    if performed && !result.success && !result.has_uncertain_effect() {
+        ToolResult::error_with_uncertain_effect(result.output)
+    } else {
+        result
+    }
+}
+
+/// Parent directories created by one call, so a later failure can remove exactly those empty directories.
+struct CreatedParents {
+    directories: Vec<PathBuf>,
+}
+
+impl CreatedParents {
+    // Create missing parents only after all no-effect validation passed; a partial creation is cleaned before reporting failure.
+    fn create(parent: &Path) -> Result<Self, EffectFailure> {
+        let directories = missing_directories(parent);
+        if let Err(error) = fs::create_dir_all(parent) {
+            let created = Self { directories };
+            return Err(created.fail(format!("Create parent directory error: {}", error), false));
+        }
+        Ok(Self { directories })
+    }
+
+    fn none() -> Self {
+        Self {
+            directories: Vec::new(),
+        }
+    }
+
+    // Remove this call's empty parents; a directory that cannot be removed remains residue of the failed call.
+    fn fail(self, message: String, residual: bool) -> EffectFailure {
+        match cleanup_created_directories(&self.directories) {
+            Ok(()) => EffectFailure::new(message, residual),
+            Err(cleanup) => EffectFailure::new(
+                format!("{message}; created parent directories may remain: {cleanup}"),
+                true,
+            ),
+        }
+    }
 }
 
 fn validate_safe_target(path: &Path) -> Result<(), String> {
@@ -1281,45 +1762,296 @@ fn changed_line_count(before: &str, after: &str) -> usize {
         + before_lines.len().abs_diff(after_lines.len())
 }
 
-fn preview_diff(before: &str, after: &str, max_chars: usize) -> String {
-    let before_lines: Vec<_> = before.lines().collect();
-    let after_lines: Vec<_> = after.lines().collect();
+// A write grant permits reporting requested text, not disclosing unrelated file content or line locations.
+fn preview_requested_edit(old_text: &str, new_text: &str, replacements: usize) -> (String, bool) {
     let mut output = String::new();
-    for (index, (left, right)) in before_lines.iter().zip(after_lines.iter()).enumerate() {
-        if left != right {
-            output.push_str(&format!(
-                "-{}:{}\n+{}:{}\n",
-                index + 1,
-                left,
-                index + 1,
-                right
-            ));
-        }
-        if output.chars().count() >= max_chars {
-            return output.chars().take(max_chars).collect();
-        }
-    }
-    if before_lines.len() != after_lines.len() {
-        output.push_str(&format!(
-            "line count changed from {} to {}\n",
-            before_lines.len(),
-            after_lines.len()
-        ));
-    }
-    output.chars().take(max_chars).collect()
+    let mut used = 0;
+    let header = format!(
+        "{replacements} exact replacement(s); file context requires an explicit read path.\nRequested old text: "
+    );
+    let complete = [
+        header.as_str(),
+        old_text,
+        "\nRequested new text: ",
+        new_text,
+    ]
+    .into_iter()
+    .all(|part| append_bounded(&mut output, &mut used, DEFAULT_MAX_OUTPUT_CHARS, part));
+    finish_diff_preview(output, !complete, DEFAULT_MAX_OUTPUT_CHARS)
 }
 
-fn near_matches(content: &str, needle: &str) -> Vec<String> {
-    let prefix: String = needle.chars().take(16).collect();
-    if prefix.is_empty() {
-        return Vec::new();
+// Show the actual changed lines within exact replacement windows; display must not change admission's line accounting.
+fn preview_diff(
+    before: &str,
+    after: &str,
+    old_text: &str,
+    new_text: &str,
+    replacements: usize,
+    max_chars: usize,
+) -> (String, bool) {
+    const MAX_DIFF_LINES: usize = 1_000;
+    const MAX_DIFF_CELLS: usize = 250_000;
+    let mut windows: Vec<(usize, usize, usize, usize)> = Vec::new();
+    let mut old_cursor = 0;
+    let mut new_cursor = 0;
+    for (old_start, _) in before.match_indices(old_text).take(replacements) {
+        let new_start = new_cursor + (old_start - old_cursor);
+        let old_end = old_start + old_text.len();
+        let new_end = new_start + new_text.len();
+        let old_boundary = old_end > 0 && before.as_bytes()[old_end - 1] == b'\n';
+        let new_boundary = new_end > 0 && after.as_bytes()[new_end - 1] == b'\n';
+        // Joining or splitting lines changes the following line even if the replacement ends at a newline.
+        let old_window_end = if old_boundary && !new_boundary {
+            next_line_end(before, old_end)
+        } else {
+            line_end(before, old_end)
+        };
+        let new_window_end = if new_boundary && !old_boundary {
+            next_line_end(after, new_end)
+        } else {
+            line_end(after, new_end)
+        };
+        let window = (
+            line_start(before, old_start),
+            old_window_end,
+            line_start(after, new_start),
+            new_window_end,
+        );
+        if let Some(last) = windows.last_mut()
+            && window.0 <= last.1
+            && window.2 <= last.3
+        {
+            last.1 = last.1.max(window.1);
+            last.3 = last.3.max(window.3);
+        } else {
+            windows.push(window);
+        }
+        old_cursor = old_end;
+        new_cursor = new_end;
     }
-    content
-        .lines()
-        .filter(|line| line.contains(&prefix))
-        .take(3)
-        .map(str::to_string)
-        .collect()
+
+    let mut output = String::new();
+    let mut used = 0;
+    let mut truncated = false;
+    for (old_start, old_end, new_start, new_end) in windows {
+        let old_lines: Vec<_> = before[old_start..old_end]
+            .split_inclusive('\n')
+            .take(MAX_DIFF_LINES + 1)
+            .collect();
+        let new_lines: Vec<_> = after[new_start..new_end]
+            .split_inclusive('\n')
+            .take(MAX_DIFF_LINES + 1)
+            .collect();
+        let columns = new_lines.len() + 1;
+        let cells = (old_lines.len() + 1).saturating_mul(columns);
+        if old_lines.len() > MAX_DIFF_LINES
+            || new_lines.len() > MAX_DIFF_LINES
+            || cells > MAX_DIFF_CELLS
+        {
+            append_bounded(
+                &mut output,
+                &mut used,
+                max_chars,
+                "Detailed diff omitted because the changed region exceeds preview limits. Re-read the file or use git_diff.\n",
+            );
+            truncated = true;
+            break;
+        }
+        let mut common = vec![0u32; cells];
+        for old_index in (0..old_lines.len()).rev() {
+            for new_index in (0..new_lines.len()).rev() {
+                let index = old_index * columns + new_index;
+                common[index] = if old_lines[old_index] == new_lines[new_index] {
+                    common[(old_index + 1) * columns + new_index + 1] + 1
+                } else {
+                    common[(old_index + 1) * columns + new_index]
+                        .max(common[old_index * columns + new_index + 1])
+                };
+            }
+        }
+        let old_number = before[..old_start]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count()
+            + 1;
+        let new_number = after[..new_start]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count()
+            + 1;
+        let (mut old_index, mut new_index) = (0, 0);
+        while old_index < old_lines.len() || new_index < new_lines.len() {
+            if old_index < old_lines.len()
+                && new_index < new_lines.len()
+                && old_lines[old_index] == new_lines[new_index]
+            {
+                old_index += 1;
+                new_index += 1;
+                continue;
+            }
+            let remove = new_index == new_lines.len()
+                || (old_index < old_lines.len()
+                    && common[(old_index + 1) * columns + new_index]
+                        >= common[old_index * columns + new_index + 1]);
+            let complete = if remove {
+                let complete = append_diff_line(
+                    &mut output,
+                    &mut used,
+                    max_chars,
+                    '-',
+                    old_number + old_index,
+                    old_lines[old_index],
+                );
+                old_index += 1;
+                complete
+            } else {
+                let complete = append_diff_line(
+                    &mut output,
+                    &mut used,
+                    max_chars,
+                    '+',
+                    new_number + new_index,
+                    new_lines[new_index],
+                );
+                new_index += 1;
+                complete
+            };
+            if !complete {
+                truncated = true;
+                break;
+            }
+        }
+        if truncated {
+            break;
+        }
+    }
+    finish_diff_preview(output, truncated, max_chars)
+}
+
+// A preview limit is explicit evidence of incomplete display, not proof that a write was reverted.
+fn finish_diff_preview(mut output: String, truncated: bool, max_chars: usize) -> (String, bool) {
+    if truncated {
+        const MARKER: &str = "\n...[diff truncated]...\n";
+        let marker_len = MARKER.chars().count();
+        if marker_len <= max_chars {
+            output = output.chars().take(max_chars - marker_len).collect();
+            output.push_str(MARKER);
+        }
+    }
+    (output, truncated)
+}
+
+fn line_start(text: &str, offset: usize) -> usize {
+    text[..offset].rfind('\n').map_or(0, |index| index + 1)
+}
+
+fn line_end(text: &str, offset: usize) -> usize {
+    if offset > 0 && text.as_bytes()[offset - 1] == b'\n' {
+        offset
+    } else {
+        next_line_end(text, offset)
+    }
+}
+
+fn next_line_end(text: &str, offset: usize) -> usize {
+    text[offset..]
+        .find('\n')
+        .map_or(text.len(), |index| offset + index + 1)
+}
+
+fn append_bounded(output: &mut String, used: &mut usize, limit: usize, text: &str) -> bool {
+    for character in text.chars() {
+        if *used == limit {
+            return false;
+        }
+        output.push(character);
+        *used += 1;
+    }
+    true
+}
+
+fn append_diff_line(
+    output: &mut String,
+    used: &mut usize,
+    limit: usize,
+    sign: char,
+    line_number: usize,
+    line: &str,
+) -> bool {
+    let (content, ending) = if let Some(content) = line.strip_suffix("\r\n") {
+        (content, " [CRLF]\n")
+    } else if let Some(content) = line.strip_suffix('\n') {
+        (content, "\n")
+    } else {
+        (line, " [no newline]\n")
+    };
+    let prefix = format!("{sign}{line_number}:\"");
+    if !append_bounded(output, used, limit, &prefix) {
+        return false;
+    }
+    for character in content.chars() {
+        let escaped = match character {
+            '"' => Some("\\\"".to_string()),
+            '\\' => Some("\\\\".to_string()),
+            '\t' => Some("\\t".to_string()),
+            '\r' => Some("\\r".to_string()),
+            value if value.is_control() => Some(format!("\\u{:04x}", value as u32)),
+            _ => None,
+        };
+        let mut buffer = [0u8; 4];
+        let text = escaped
+            .as_deref()
+            .unwrap_or_else(|| character.encode_utf8(&mut buffer));
+        if !append_bounded(output, used, limit, text) {
+            return false;
+        }
+    }
+    append_bounded(output, used, limit, "\"") && append_bounded(output, used, limit, ending)
+}
+
+// Candidate context comes only from the already authorized target and is advisory, never a fuzzy write target.
+fn near_matches(content: &str, needle: &str) -> Vec<String> {
+    const MAX_SEARCH_LINES: usize = 5_000;
+    const MAX_MATCH_LINE_CHARS: usize = 256;
+    const MAX_CONTEXT_CHARS: usize = 80;
+    let mut anchors = Vec::new();
+    for line in needle.lines().take(8) {
+        let chars: Vec<_> = line.trim().chars().take(128).collect();
+        if chars.len() < 3 {
+            continue;
+        }
+        let width = (chars.len() / 2).clamp(3, 16).min(chars.len());
+        anchors.push(chars[..width].iter().collect::<String>());
+        anchors.push(chars[chars.len() - width..].iter().collect::<String>());
+    }
+    let snippet = |line: &str, offset: usize| {
+        let prefix_chars = line[..offset].chars().count();
+        let skip = prefix_chars.saturating_sub(30);
+        let mut characters = line.chars().skip(skip);
+        let mut text: String = characters.by_ref().take(MAX_CONTEXT_CHARS).collect();
+        if skip > 0 {
+            text.insert_str(0, "...");
+        }
+        if characters.next().is_some() {
+            text.push_str("...");
+        }
+        text
+    };
+    let mut matches = Vec::new();
+    for (index, line) in content.lines().take(MAX_SEARCH_LINES).enumerate() {
+        let bounded_line: String = line.chars().take(MAX_MATCH_LINE_CHARS).collect();
+        if let Some(offset) = anchors
+            .iter()
+            .filter_map(|anchor| bounded_line.find(anchor))
+            .min()
+        {
+            matches.push(format!("line {}: {}", index + 1, snippet(line, offset)));
+            if matches.len() == 3 {
+                break;
+            }
+        }
+    }
+    matches
 }
 
 fn parse_unified_diff(input: &str) -> Result<Vec<PatchFile>, String> {
@@ -1514,6 +2246,216 @@ fn exceeds(limit: Option<usize>, value: usize) -> bool {
     limit.is_some_and(|limit| value > limit)
 }
 
+// Bound the complete serialized edit result so the shared executor can retain its reason and advisory context when the fixed fields fit.
+fn file_edit_result(mut output: MutationOutput, success: bool, limit: Option<usize>) -> ToolResult {
+    let original_hints = output.near_matches.clone();
+    let json = match serialize_bounded_file_edit(&mut output, success, limit) {
+        Ok(json) => json,
+        Err(error) => return ToolResult::error(format!("Serialization error: {}", error)),
+    };
+    if let Some(limit) = limit {
+        let projected = match file_edit_model_output_len(&json, success) {
+            Ok(projected) => projected,
+            Err(error) => return ToolResult::error(format!("Serialization error: {}", error)),
+        };
+        if projected > limit {
+            if !success {
+                match compact_file_edit_failure(&output, &original_hints, limit) {
+                    Ok(Some(compact)) => {
+                        return ToolResult {
+                            success: false,
+                            output: compact,
+                            metadata: None,
+                        };
+                    }
+                    Ok(None) => {
+                        for reason in [
+                            "file edit failed; re-read the file (output limit)",
+                            "edit failed; re-read",
+                            "edit failed",
+                        ] {
+                            if file_edit_model_output_len(reason, false)
+                                .is_ok_and(|length| length <= limit)
+                            {
+                                return ToolResult::error(reason);
+                            }
+                        }
+                        let marker = "{\"truncated\":true}";
+                        if marker.chars().count() <= limit {
+                            return ToolResult::error(marker);
+                        }
+                        return ToolResult::error(
+                            "file edit failed; output limit prevents details",
+                        );
+                    }
+                    Err(error) => {
+                        return ToolResult::error(format!("Serialization error: {}", error));
+                    }
+                }
+            }
+            let minimal = serde_json::json!({
+                "dry_run": output.dry_run,
+                "mutation_performed": output.mutation_performed,
+                "truncated": true
+            })
+            .to_string();
+            if minimal.chars().count() <= limit {
+                return ToolResult::ok(minimal);
+            }
+            let effect_only = serde_json::json!({
+                "mutation_performed": output.mutation_performed,
+                "truncated": true
+            })
+            .to_string();
+            if effect_only.chars().count() <= limit {
+                return ToolResult::ok(effect_only);
+            }
+        }
+    }
+    ToolResult {
+        success,
+        output: json,
+        metadata: None,
+    }
+}
+
+// A partial failure envelope preserves the reason and authorized hints without pretending omitted effect fields are complete.
+fn compact_file_edit_failure(
+    output: &MutationOutput,
+    hints: &[String],
+    limit: usize,
+) -> Result<Option<String>, serde_json::Error> {
+    let mut compact = serde_json::json!({
+        "mutation_performed": false,
+        "truncated": true,
+        "diff_summary": output.diff_summary,
+        "near_matches": []
+    });
+    let mut best = serde_json::to_string(&compact)?;
+    if file_edit_model_output_len(&best, false)? > limit {
+        return Ok(None);
+    }
+    let max = hints
+        .iter()
+        .map(|hint| hint.chars().count())
+        .max()
+        .unwrap_or(0);
+    let mut low = 0;
+    let mut high = max.saturating_add(1);
+    while low < high {
+        let middle = low + (high - low) / 2;
+        compact["near_matches"] = Value::Array(
+            hints
+                .iter()
+                .map(|hint| hint.chars().take(middle).collect::<String>())
+                .filter(|hint| !hint.is_empty())
+                .map(Value::String)
+                .collect(),
+        );
+        let candidate = serde_json::to_string(&compact)?;
+        if file_edit_model_output_len(&candidate, false)? <= limit {
+            best = candidate;
+            low = middle + 1;
+        } else {
+            high = middle;
+        }
+    }
+    Ok(Some(best))
+}
+
+// Reserve the existing runtime error wrapper as well as its escaped reason within the model-facing limit.
+fn file_edit_model_output_len(output: &str, success: bool) -> Result<usize, serde_json::Error> {
+    if success {
+        return Ok(output.chars().count());
+    }
+    let wrapper = serde_json::json!({
+        "success": false,
+        "error": {
+            "kind": "tool_error",
+            "reason": output,
+            "retryable": false,
+            "requires_user_action": false
+        }
+    });
+    Ok("Error: Tool error: ".len() + serde_json::to_string(&wrapper)?.chars().count())
+}
+
+// Preserve failure reasons and stable effect fields; only display text and nearby hints may be shortened.
+fn serialize_bounded_file_edit(
+    output: &mut MutationOutput,
+    success: bool,
+    limit: Option<usize>,
+) -> Result<String, serde_json::Error> {
+    let full = serde_json::to_string(output)?;
+    let Some(limit) = limit else {
+        return Ok(full);
+    };
+    if file_edit_model_output_len(&full, success)? <= limit {
+        return Ok(full);
+    }
+    let producer_truncated = output.truncated;
+    if output.near_matches.is_empty() && (!success || output.diff_summary.is_empty()) {
+        return Ok(full);
+    }
+    output.truncated = true;
+    let diff = std::mem::take(&mut output.diff_summary);
+    let hints = std::mem::take(&mut output.near_matches);
+    if !success {
+        output.diff_summary = diff.clone();
+    }
+    let mut best = serde_json::to_string(output)?;
+    if file_edit_model_output_len(&best, success)? > limit {
+        return Ok(best);
+    }
+    let max = hints
+        .iter()
+        .map(|hint| hint.chars().count())
+        .chain(success.then(|| diff.chars().count()))
+        .max()
+        .unwrap_or(0);
+    let mut low = 0;
+    let mut high = max.saturating_add(1);
+    while low < high {
+        let middle = low + (high - low) / 2;
+        if success {
+            output.diff_summary = truncate_head_tail(&diff, middle).0;
+        }
+        output.near_matches = hints
+            .iter()
+            .map(|hint| hint.chars().take(middle).collect::<String>())
+            .filter(|hint| !hint.is_empty())
+            .collect();
+        let candidate = serde_json::to_string(output)?;
+        if file_edit_model_output_len(&candidate, success)? <= limit {
+            best = candidate;
+            low = middle + 1;
+        } else {
+            high = middle;
+        }
+    }
+    if !producer_truncated {
+        let original: Value = serde_json::from_str(&full)?;
+        let candidate: Value = serde_json::from_str(&best)?;
+        if original["diff_summary"] == candidate["diff_summary"]
+            && original["near_matches"] == candidate["near_matches"]
+        {
+            let mut reduced: MutationOutput = serde_json::from_str(&best)?;
+            if success && !reduced.diff_summary.is_empty() {
+                let length = reduced.diff_summary.chars().count();
+                reduced.diff_summary = truncate_head_tail(&reduced.diff_summary, length - 1).0;
+            } else if let Some(hint) = reduced.near_matches.last_mut() {
+                let length = hint.chars().count();
+                *hint = hint.chars().take(length.saturating_sub(1)).collect();
+                reduced.near_matches.retain(|hint| !hint.is_empty());
+            } else {
+                return Ok(full);
+            }
+            return serde_json::to_string(&reduced);
+        }
+    }
+    Ok(best)
+}
+
 fn json_result<T: Serialize>(output: &T) -> ToolResult {
     match serde_json::to_string(output) {
         Ok(json) => ToolResult::ok(json),
@@ -1652,6 +2594,24 @@ struct PathMutationOutput {
 
 #[async_trait]
 impl Tool for CopyPathTool {
+    fn declared_write_footprint(
+        &self,
+        args: &Value,
+        _ctx: &ToolExecutionContext,
+        max_targets: usize,
+    ) -> ai_agents_core::Result<Option<ai_agents_core::autonomy::ToolWriteFootprint>> {
+        let input: CopyPathInput = serde_json::from_value(args.clone())?;
+        footprint_transfer(
+            self.id(),
+            Path::new(&input.source_path),
+            Path::new(&input.destination_path),
+            input.dry_run,
+            false,
+            input.create_parent_dirs,
+            max_targets,
+        )
+        .map(Some)
+    }
     fn id(&self) -> &str {
         "copy_path"
     }
@@ -1722,23 +2682,22 @@ impl Tool for CopyPathTool {
         if destination_exists && !policy.overwrite_existing && !input.dry_run {
             return ToolResult::error("overwrite_existing policy is false for this destination");
         }
-        if let Some(parent) = destination.parent()
-            && !parent.exists()
-        {
-            if !(input.create_parent_dirs && policy.create_parent_dirs) {
-                return ToolResult::error(
-                    "destination parent directory does not exist or create_parent_dirs is not allowed",
-                );
-            }
-            if !input.dry_run
-                && let Err(error) = fs::create_dir_all(parent)
-            {
-                return ToolResult::error(format!("Create parent directory error: {}", error));
-            }
+        let missing_parent = destination.parent().filter(|parent| !parent.exists());
+        if missing_parent.is_some() && !(input.create_parent_dirs && policy.create_parent_dirs) {
+            return ToolResult::error(
+                "destination parent directory does not exist or create_parent_dirs is not allowed",
+            );
         }
         let mut cleanup_warning = None;
         let mut retained_backup_path = None;
         if !input.dry_run {
+            let parents = match missing_parent {
+                Some(parent) => match CreatedParents::create(parent) {
+                    Ok(parents) => parents,
+                    Err(failure) => return failure.into_result(),
+                },
+                None => CreatedParents::none(),
+            };
             if destination_exists {
                 match replace_copy_path(&source, &destination) {
                     ReplacementOutcome::Committed {
@@ -1749,13 +2708,19 @@ impl Tool for CopyPathTool {
                         retained_backup_path = backup;
                     }
                     ReplacementOutcome::Unchanged(error) => {
-                        return ToolResult::error(format!("Copy error: {}", error));
+                        return parents
+                            .fail(format!("Copy error: {}", error), false)
+                            .into_result();
+                    }
+                    ReplacementOutcome::Residual(error) => {
+                        return EffectFailure::new(format!("Copy error: {}", error), true)
+                            .into_result();
                     }
                     ReplacementOutcome::RecoveryIncomplete {
                         error,
                         retained_backup_path,
                     } => {
-                        return json_error_result(&PathMutationOutput {
+                        let receipt = json_error_result(&PathMutationOutput {
                             source_path: Some(input.source_path.clone()),
                             destination_path: Some(input.destination_path.clone()),
                             path: None,
@@ -1776,13 +2741,20 @@ impl Tool for CopyPathTool {
                             cleanup_warning: None,
                             retained_backup_path: Some(retained_backup_path),
                         });
+                        return settle_performed_effect(receipt, true);
                     }
                 }
             } else if let Err(error) = copy_path(&source, &destination) {
-                return ToolResult::error(format!("Copy error: {}", error));
+                // A partial copy is not removed because this call cannot prove it owns whatever now occupies the destination.
+                let message = format!("Copy error: {}", error);
+                return if path_entry_exists(&destination) {
+                    EffectFailure::new(message, true).into_result()
+                } else {
+                    parents.fail(message, false).into_result()
+                };
             }
         }
-        json_result(&PathMutationOutput {
+        let result = json_result(&PathMutationOutput {
             source_path: Some(input.source_path.clone()),
             destination_path: Some(input.destination_path.clone()),
             path: None,
@@ -1810,12 +2782,31 @@ impl Tool for CopyPathTool {
             error: None,
             cleanup_warning,
             retained_backup_path,
-        })
+        });
+        settle_performed_effect(result, !input.dry_run)
     }
 }
 
 #[async_trait]
 impl Tool for MovePathTool {
+    fn declared_write_footprint(
+        &self,
+        args: &Value,
+        _ctx: &ToolExecutionContext,
+        max_targets: usize,
+    ) -> ai_agents_core::Result<Option<ai_agents_core::autonomy::ToolWriteFootprint>> {
+        let input: MovePathInput = serde_json::from_value(args.clone())?;
+        footprint_transfer(
+            self.id(),
+            Path::new(&input.source_path),
+            Path::new(&input.destination_path),
+            input.dry_run,
+            true,
+            input.create_parent_dirs,
+            max_targets,
+        )
+        .map(Some)
+    }
     fn id(&self) -> &str {
         "move_path"
     }
@@ -1894,19 +2885,11 @@ impl Tool for MovePathTool {
         if destination_exists && !policy.overwrite_existing && !input.dry_run {
             return ToolResult::error("overwrite_existing policy is false for this destination");
         }
-        if let Some(parent) = destination.parent()
-            && !parent.exists()
-        {
-            if !(input.create_parent_dirs && policy.create_parent_dirs) {
-                return ToolResult::error(
-                    "destination parent directory does not exist or create_parent_dirs is not allowed",
-                );
-            }
-            if !input.dry_run
-                && let Err(error) = fs::create_dir_all(parent)
-            {
-                return ToolResult::error(format!("Create parent directory error: {}", error));
-            }
+        let missing_parent = destination.parent().filter(|parent| !parent.exists());
+        if missing_parent.is_some() && !(input.create_parent_dirs && policy.create_parent_dirs) {
+            return ToolResult::error(
+                "destination parent directory does not exist or create_parent_dirs is not allowed",
+            );
         }
         let recursive = source.is_dir();
         let bytes_affected = path_size(&source).unwrap_or(0);
@@ -1914,6 +2897,13 @@ impl Tool for MovePathTool {
         let mut cleanup_warning = None;
         let mut retained_backup_path = None;
         if !input.dry_run {
+            let parents = match missing_parent {
+                Some(parent) => match CreatedParents::create(parent) {
+                    Ok(parents) => parents,
+                    Err(failure) => return failure.into_result(),
+                },
+                None => CreatedParents::none(),
+            };
             if destination_exists {
                 match replace_moved_path(&source, &destination) {
                     ReplacementOutcome::Committed {
@@ -1924,13 +2914,19 @@ impl Tool for MovePathTool {
                         retained_backup_path = backup;
                     }
                     ReplacementOutcome::Unchanged(error) => {
-                        return ToolResult::error(format!("Move error: {}", error));
+                        return parents
+                            .fail(format!("Move error: {}", error), false)
+                            .into_result();
+                    }
+                    ReplacementOutcome::Residual(error) => {
+                        return EffectFailure::new(format!("Move error: {}", error), true)
+                            .into_result();
                     }
                     ReplacementOutcome::RecoveryIncomplete {
                         error,
                         retained_backup_path,
                     } => {
-                        return json_error_result(&PathMutationOutput {
+                        let receipt = json_error_result(&PathMutationOutput {
                             source_path: Some(input.source_path.clone()),
                             destination_path: Some(input.destination_path.clone()),
                             path: None,
@@ -1951,13 +2947,17 @@ impl Tool for MovePathTool {
                             cleanup_warning: None,
                             retained_backup_path: Some(retained_backup_path),
                         });
+                        return settle_performed_effect(receipt, true);
                     }
                 }
             } else if let Err(error) = fs::rename(&source, &destination) {
-                return ToolResult::error(format!("Move error: {}", error));
+                // A failed rename leaves source and destination untouched, so only created parents need cleanup.
+                return parents
+                    .fail(format!("Move error: {}", error), false)
+                    .into_result();
             }
         }
-        json_result(&PathMutationOutput {
+        let result = json_result(&PathMutationOutput {
             source_path: Some(input.source_path.clone()),
             destination_path: Some(input.destination_path.clone()),
             path: None,
@@ -1985,12 +2985,30 @@ impl Tool for MovePathTool {
             error: None,
             cleanup_warning,
             retained_backup_path,
-        })
+        });
+        settle_performed_effect(result, !input.dry_run)
     }
 }
 
 #[async_trait]
 impl Tool for DeletePathTool {
+    fn declared_write_footprint(
+        &self,
+        args: &Value,
+        _ctx: &ToolExecutionContext,
+        max_targets: usize,
+    ) -> ai_agents_core::Result<Option<ai_agents_core::autonomy::ToolWriteFootprint>> {
+        let input: DeletePathInput = serde_json::from_value(args.clone())?;
+        footprint_single(
+            self.id(),
+            Path::new(&input.path),
+            input.dry_run,
+            true,
+            false,
+            max_targets,
+        )
+        .map(Some)
+    }
     fn id(&self) -> &str {
         "delete_path"
     }
@@ -2054,10 +3072,12 @@ impl Tool for DeletePathTool {
                 fs::remove_file(&path)
             };
             if let Err(error) = result {
-                return ToolResult::error(format!("Delete error: {}", error));
+                // A failed file unlink changes nothing, but a recursive removal may stop after deleting part of the tree.
+                return EffectFailure::new(format!("Delete error: {}", error), recursive)
+                    .into_result();
             }
         }
-        json_result(&PathMutationOutput {
+        let result = json_result(&PathMutationOutput {
             source_path: None,
             destination_path: None,
             path: Some(input.path.clone()),
@@ -2085,7 +3105,8 @@ impl Tool for DeletePathTool {
             error: None,
             cleanup_warning: None,
             retained_backup_path: None,
-        })
+        });
+        settle_performed_effect(result, !input.dry_run)
     }
 }
 
@@ -2204,29 +3225,50 @@ enum ReplacementOutcome {
         retained_backup_path: Option<String>,
     },
     Unchanged(String),
+    /// The destination is unchanged, but a staged sibling from this call could not be removed.
+    Residual(String),
     RecoveryIncomplete {
         error: String,
         retained_backup_path: String,
     },
 }
 
+// A staged copy that cannot be removed turns an otherwise unchanged replacement into residue of this call.
 fn replace_copy_path(source: &Path, destination: &Path) -> ReplacementOutcome {
+    replace_copy_path_with(source, destination, remove_path)
+}
+
+// Injecting staged cleanup makes the residue boundary testable without changing filesystem permissions.
+fn replace_copy_path_with(
+    source: &Path,
+    destination: &Path,
+    remove_staged: impl Fn(&Path) -> std::io::Result<()>,
+) -> ReplacementOutcome {
     let staged = unique_sibling_path(destination, "copy");
-    if let Err(error) = copy_path(source, &staged) {
-        if path_entry_exists(&staged) {
-            let _ = remove_path(&staged);
+    let discard_staged = |error: String| -> ReplacementOutcome {
+        match path_entry_exists(&staged).then(|| remove_staged(&staged)) {
+            Some(Err(cleanup)) => ReplacementOutcome::Residual(format!(
+                "{}; staged copy cleanup failed for {}: {}",
+                error,
+                staged.display(),
+                cleanup
+            )),
+            _ => ReplacementOutcome::Unchanged(error),
         }
-        return ReplacementOutcome::Unchanged(error.to_string());
+    };
+    if let Err(error) = copy_path(source, &staged) {
+        return discard_staged(error.to_string());
     }
-    let outcome = replace_existing_path(&staged, destination);
-    if matches!(
-        outcome,
-        ReplacementOutcome::Unchanged(_) | ReplacementOutcome::RecoveryIncomplete { .. }
-    ) && path_entry_exists(&staged)
-    {
-        let _ = remove_path(&staged);
+    match replace_existing_path(&staged, destination) {
+        ReplacementOutcome::Unchanged(error) => discard_staged(error),
+        outcome @ ReplacementOutcome::RecoveryIncomplete { .. } => {
+            if path_entry_exists(&staged) {
+                let _ = remove_staged(&staged);
+            }
+            outcome
+        }
+        outcome => outcome,
     }
-    outcome
 }
 
 fn replace_moved_path(source: &Path, destination: &Path) -> ReplacementOutcome {
@@ -2346,6 +3388,165 @@ fn path_item_count(path: &Path) -> std::io::Result<usize> {
     }
 }
 
+/// Entry mutations resolve the parent but never follow the leaf; two links to one referent remain distinct targets.
+pub(super) fn add_footprint_entry(
+    path: &Path,
+    targets: &mut std::collections::BTreeSet<String>,
+    limit: usize,
+) -> ai_agents_core::Result<()> {
+    let resolved = footprint_entry_path(path)?;
+    add_footprint_identity(&resolved, targets, limit)
+}
+
+// Parent resolution is shared with policy, while the leaf remains an operation-owned entry.
+fn footprint_entry_path(path: &Path) -> ai_agents_core::Result<PathBuf> {
+    validate_safe_target(path).map_err(ai_agents_core::AgentError::Tool)?;
+    let name = path.file_name().ok_or_else(|| {
+        ai_agents_core::AgentError::Tool("footprint cannot mutate a filesystem root".into())
+    })?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let resolver = mutation_path_resolver().map_err(ai_agents_core::AgentError::Tool)?;
+    let resolved = resolver
+        .resolve_path(parent)
+        .map_err(|error| ai_agents_core::AgentError::Tool(error.to_string()))?
+        .join(name);
+    Ok(resolved)
+}
+
+// Projected replacement descendants must not resolve through the old tree's symlinks.
+fn add_footprint_identity(
+    resolved: &Path,
+    targets: &mut std::collections::BTreeSet<String>,
+    limit: usize,
+) -> ai_agents_core::Result<()> {
+    targets.insert(serde_json::to_string(resolved)?);
+    if targets.len() > limit {
+        return Err(ai_agents_core::AgentError::Tool(
+            "declared footprint exceeds target bound".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Missing parent creations are logical writes even when the leaf operation later fails.
+pub(super) fn add_footprint_parents(
+    path: &Path,
+    targets: &mut std::collections::BTreeSet<String>,
+    limit: usize,
+) -> ai_agents_core::Result<()> {
+    let mut parent = path.parent();
+    while let Some(path) = parent {
+        if path.as_os_str().is_empty() {
+            break;
+        }
+        match fs::symlink_metadata(path) {
+            Ok(_) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                add_footprint_entry(path, targets, limit)?
+            }
+            Err(error) => return Err(ai_agents_core::AgentError::Tool(error.to_string())),
+        }
+        parent = path.parent();
+    }
+    Ok(())
+}
+
+/// Bounded traversal does not follow symbolic links and includes directory entries and overwritten descendants.
+fn add_footprint_tree(
+    path: &Path,
+    mapped: &Path,
+    targets: &mut std::collections::BTreeSet<String>,
+    limit: usize,
+) -> ai_agents_core::Result<()> {
+    let mut stack = vec![(path.to_path_buf(), footprint_entry_path(mapped)?)];
+    while let Some((path, mapped)) = stack.pop() {
+        add_footprint_identity(&mapped, targets, limit)?;
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(ai_agents_core::AgentError::Tool(error.to_string())),
+        };
+        if metadata.is_dir() && !metadata.file_type().is_symlink() {
+            for child in fs::read_dir(path)
+                .map_err(|error| ai_agents_core::AgentError::Tool(error.to_string()))?
+            {
+                let child =
+                    child.map_err(|error| ai_agents_core::AgentError::Tool(error.to_string()))?;
+                // Bound queued enumeration as well as the final union so one directory cannot hide unbounded allocation.
+                if stack.len() >= limit {
+                    return Err(ai_agents_core::AgentError::Tool(
+                        "recursive footprint exceeds target bound".into(),
+                    ));
+                }
+                stack.push((child.path(), mapped.join(child.file_name())));
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn footprint_single(
+    id: &str,
+    path: &Path,
+    preview: bool,
+    recursive: bool,
+    parents: bool,
+    limit: usize,
+) -> ai_agents_core::Result<ai_agents_core::autonomy::ToolWriteFootprint> {
+    let binding_identity = format!("builtin.{id}.v1");
+    if preview {
+        return Ok(ai_agents_core::autonomy::ToolWriteFootprint::empty(
+            binding_identity,
+        ));
+    }
+    let mut targets = std::collections::BTreeSet::new();
+    if recursive {
+        add_footprint_tree(path, path, &mut targets, limit)?;
+    } else {
+        add_footprint_entry(path, &mut targets, limit)?;
+    }
+    if parents {
+        add_footprint_parents(path, &mut targets, limit)?;
+    }
+    Ok(ai_agents_core::autonomy::ToolWriteFootprint {
+        binding_identity,
+        targets: targets.into_iter().collect(),
+    })
+}
+
+fn footprint_transfer(
+    id: &str,
+    source: &Path,
+    destination: &Path,
+    preview: bool,
+    moving: bool,
+    parents: bool,
+    limit: usize,
+) -> ai_agents_core::Result<ai_agents_core::autonomy::ToolWriteFootprint> {
+    let binding_identity = format!("builtin.{id}.v1");
+    if preview {
+        return Ok(ai_agents_core::autonomy::ToolWriteFootprint::empty(
+            binding_identity,
+        ));
+    }
+    let mut targets = std::collections::BTreeSet::new();
+    add_footprint_tree(destination, destination, &mut targets, limit)?;
+    add_footprint_tree(source, destination, &mut targets, limit)?;
+    if moving {
+        add_footprint_tree(source, source, &mut targets, limit)?;
+    }
+    if parents {
+        add_footprint_parents(destination, &mut targets, limit)?;
+    }
+    Ok(ai_agents_core::autonomy::ToolWriteFootprint {
+        binding_identity,
+        targets: targets.into_iter().collect(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2354,6 +3555,7 @@ mod tests {
     fn mutation_context(tool_id: &str, root: &Path) -> ToolExecutionContext {
         let mut context = ToolExecutionContext::test(tool_id);
         context.policy_snapshot = serde_json::json!({
+            "read_paths": [root.to_string_lossy()],
             "write_paths": [root.to_string_lossy()],
             "overwrite_existing": true,
             "create_parent_dirs": true,
@@ -2364,6 +3566,168 @@ mod tests {
 
     fn result_json(result: &ToolResult) -> Value {
         serde_json::from_str(&result.output).unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_temp_creation_is_private_under_permissive_umask() {
+        use std::os::unix::fs::PermissionsExt;
+
+        const CHILD: &str = "AI_AGENTS_ATOMIC_TEMP_UMASK_TEST";
+        if std::env::var_os(CHILD).is_some() {
+            let dir = tempdir().unwrap();
+            fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
+            let (private, private_path) = create_atomic_temp(dir.path(), true).unwrap();
+            assert_eq!(private.metadata().unwrap().permissions().mode() & 0o077, 0);
+            assert_eq!(fs::metadata(private_path).unwrap().len(), 0);
+            let (new_file, _) = create_atomic_temp(dir.path(), false).unwrap();
+            let ordinary = fs::File::create(dir.path().join("ordinary.txt")).unwrap();
+            assert_eq!(
+                new_file.metadata().unwrap().permissions().mode() & 0o777,
+                ordinary.metadata().unwrap().permissions().mode() & 0o777
+            );
+            return;
+        }
+        let output = std::process::Command::new("/bin/sh")
+            .args([
+                "-c",
+                "umask 000; exec \"$1\" --exact builtin::fs_mutation::tests::atomic_temp_creation_is_private_under_permissive_umask --nocapture",
+                "sh",
+            ])
+            .arg(std::env::current_exe().unwrap())
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn file_edit_preserves_existing_executable_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("script.sh");
+        fs::write(&path, "old\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        let result = FileEditTool::new()
+            .execute(
+                serde_json::json!({
+                    "path": path.to_string_lossy(),
+                    "old_text": "old",
+                    "new_text": "new",
+                    "dry_run": false
+                }),
+                mutation_context("file_edit", dir.path()),
+            )
+            .await;
+        assert!(result.success, "{}", result.output);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "new\n");
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn file_edit_refuses_existing_special_mode_without_mutation() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("special.txt");
+        fs::write(&path, "old\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o1700)).unwrap();
+        let result = FileEditTool::new()
+            .execute(
+                serde_json::json!({
+                    "path": path.to_string_lossy(),
+                    "old_text": "old",
+                    "new_text": "new",
+                    "dry_run": false
+                }),
+                mutation_context("file_edit", dir.path()),
+            )
+            .await;
+        assert!(!result.success);
+        assert!(result.output.contains("special permission bits"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "old\n");
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o7777,
+            0o1700
+        );
+    }
+
+    #[test]
+    fn atomic_create_never_replaces_an_entry_created_before_publication() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("new.txt");
+        fs::write(&path, "user content").unwrap();
+        let error = atomic_create(&path, b"agent content").unwrap_err();
+        assert_eq!(error.error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert!(!error.uncertain);
+        assert_eq!(fs::read(&path).unwrap(), b"user content");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn atomic_create_reports_uncertainty_when_cleanup_fails_after_publication() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("new.txt");
+        let error = atomic_create_with_cleanup(&path, b"published content", |_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "fixture cleanup failure",
+            ))
+        })
+        .unwrap_err();
+        assert!(error.uncertain);
+        assert!(error.error.to_string().contains("destination was created"));
+        assert_eq!(fs::read(&path).unwrap(), b"published content");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn atomic_create_publishes_complete_content_and_cleans_temporary_entry() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("new.txt");
+        atomic_create(&path, b"complete content").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"complete content");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn file_write_preserves_existing_private_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("private.txt");
+        fs::write(&path, "old\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let result = FileWriteTool::new()
+            .execute(
+                serde_json::json!({
+                    "path": path.to_string_lossy(),
+                    "content": "new\n",
+                    "overwrite": true,
+                    "dry_run": false
+                }),
+                mutation_context("file_write", dir.path()),
+            )
+            .await;
+        assert!(result.success, "{}", result.output);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "new\n");
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     #[tokio::test]
@@ -2405,7 +3769,548 @@ mod tests {
             .await;
         assert!(!result.success);
         let output: Value = serde_json::from_str(&result.output).unwrap();
-        assert_eq!(output["diff_summary"], "old_text was not found");
+        assert!(
+            output["diff_summary"]
+                .as_str()
+                .unwrap()
+                .contains("old_text was not found")
+        );
+        assert!(output["diff_summary"].as_str().unwrap().contains("re-read"));
+    }
+
+    #[tokio::test]
+    async fn output_and_edit_regression_missing_text_has_bounded_context_without_mutation() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.txt");
+        let before = "before\nStatus: draft\nafter\n";
+        fs::write(&path, before).unwrap();
+        let result = FileEditTool::new()
+            .execute(
+                serde_json::json!({
+                    "path": path.to_string_lossy(),
+                    "old_text": "Status: ready",
+                    "new_text": "Status: reviewed",
+                    "dry_run": false
+                }),
+                mutation_context("file_edit", dir.path()),
+            )
+            .await;
+        assert!(!result.success);
+        assert_eq!(fs::read_to_string(&path).unwrap(), before);
+        let output = result_json(&result);
+        let hints = output["near_matches"].as_array().unwrap();
+        assert!(!hints.is_empty());
+        let hints = hints
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(hints.contains("Status: draft"));
+        assert!(hints.contains('2'));
+        assert!(hints.chars().count() <= 1_000);
+    }
+
+    #[tokio::test]
+    async fn output_and_edit_regression_diff_reports_insert_delete_and_end_of_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.txt");
+        let tool = FileEditTool::new();
+        for (before, old, new, expected, unexpected) in [
+            (
+                "one\nkeep\nlast\n",
+                "one\n",
+                "one\ninserted\n",
+                "+2:\"inserted\"",
+                "-2:\"keep\"",
+            ),
+            (
+                "one\nremove\nkeep\n",
+                "remove\n",
+                "",
+                "-2:\"remove\"",
+                "+2:\"keep\"",
+            ),
+            (
+                "keep\n",
+                "keep\n",
+                "keep\nlast\n",
+                "+2:\"last\"",
+                "-1:\"keep\"",
+            ),
+        ] {
+            fs::write(&path, before).unwrap();
+            let result = tool
+                .execute(
+                    serde_json::json!({
+                        "path": path.to_string_lossy(),
+                        "old_text": old,
+                        "new_text": new,
+                        "dry_run": true
+                    }),
+                    mutation_context("file_edit", dir.path()),
+                )
+                .await;
+            assert!(result.success, "{}", result.output);
+            let output = result_json(&result);
+            let diff = output["diff_summary"].as_str().unwrap();
+            assert!(diff.contains(expected), "{diff:?}");
+            assert!(!diff.contains(unexpected), "{diff:?}");
+            assert_eq!(fs::read_to_string(&path).unwrap(), before);
+        }
+    }
+
+    #[tokio::test]
+    async fn output_and_edit_regression_edit_results_fit_the_effective_output_limit() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("bounded.txt");
+        let before = (0..6)
+            .map(|i| format!("Status: draft {i} {}\n", "\\\"".repeat(80)))
+            .collect::<String>();
+        fs::write(&path, &before).unwrap();
+        let mut context = mutation_context("file_edit", dir.path());
+        context.limits.max_output_chars = Some(512);
+        let result = FileEditTool::new()
+            .execute(
+                serde_json::json!({
+                    "path": path.to_string_lossy(),
+                    "old_text": "Status: ready",
+                    "new_text": "Status: reviewed",
+                    "dry_run": true
+                }),
+                context,
+            )
+            .await;
+        assert!(!result.success);
+        assert!(result.output.chars().count() <= 512);
+        let model_error = serde_json::json!({
+            "success": false,
+            "error": {
+                "kind": "tool_error",
+                "reason": result.output,
+                "retryable": false,
+                "requires_user_action": false
+            }
+        })
+        .to_string();
+        assert!("Error: Tool error: ".len() + model_error.chars().count() <= 512);
+        let output = result_json(&result);
+        assert_eq!(output["truncated"], true);
+        assert!(output["diff_summary"].as_str().unwrap().contains("re-read"));
+        assert!(
+            output["near_matches"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|hint| {
+                    hint.as_str()
+                        .is_some_and(|hint| hint.contains("Status: draft"))
+                })
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn output_and_edit_regression_one_character_over_limit_remains_valid_json() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("edit.txt");
+        fs::write(&path, "a\n").unwrap();
+        let tool = FileEditTool::new();
+        let args = serde_json::json!({"path":path.to_string_lossy(),"old_text":"a","new_text":"b","dry_run":true});
+        let original = tool
+            .execute(args.clone(), mutation_context("file_edit", dir.path()))
+            .await;
+        assert!(original.success);
+        let cap = original.output.chars().count() - 1;
+        let mut context = mutation_context("file_edit", dir.path());
+        context.limits.max_output_chars = Some(cap);
+        let bounded = tool.execute(args, context).await;
+        assert!(bounded.success);
+        assert!(bounded.output.chars().count() <= cap);
+        let output = result_json(&bounded);
+        assert_eq!(output["mutation_performed"], false);
+        assert_eq!(output["truncated"], true);
+        assert_ne!(
+            output["diff_summary"],
+            result_json(&original)["diff_summary"]
+        );
+    }
+
+    #[tokio::test]
+    async fn output_and_edit_regression_small_limit_reports_actual_write() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("edit.txt");
+        fs::write(&path, "before\n").unwrap();
+        let mut context = mutation_context("file_edit", dir.path());
+        context.limits.max_output_chars = Some(48);
+        let result = FileEditTool::new()
+            .execute(
+                serde_json::json!({"path":path.to_string_lossy(),"old_text":"before","new_text":"after","dry_run":false}),
+                context,
+            )
+            .await;
+        assert!(result.success);
+        assert!(result.output.chars().count() <= 48);
+        let output = result_json(&result);
+        assert_eq!(output["mutation_performed"], true);
+        assert_eq!(output["truncated"], true);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "after\n");
+    }
+
+    #[tokio::test]
+    async fn output_and_edit_regression_small_error_limit_bounds_model_payload() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("edit.txt");
+        fs::write(&path, "a\n").unwrap();
+        let mut context = mutation_context("file_edit", dir.path());
+        context.policy_snapshot["read_paths"] = serde_json::json!([]);
+        context.limits.max_output_chars = Some(180);
+        let result = FileEditTool::new()
+            .execute(
+                serde_json::json!({"path":path.to_string_lossy(),"old_text":"absent","new_text":"x","dry_run":true}),
+                context,
+            )
+            .await;
+        assert!(!result.success);
+        let model_error = serde_json::json!({
+            "success": false,
+            "error": {"kind":"tool_error","reason":result.output,"retryable":false,"requires_user_action":false}
+        })
+        .to_string();
+        assert!("Error: Tool error: ".len() + model_error.chars().count() <= 180);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "a\n");
+    }
+
+    #[tokio::test]
+    async fn output_and_edit_regression_diff_preserves_crlf_and_repeated_edits() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("unicode.txt");
+        let before = "\u{feff}첫줄\r\n항목=old\r\n중간\r\n항목=old";
+        fs::write(&path, before).unwrap();
+        let result = FileEditTool::new()
+            .execute(
+                serde_json::json!({
+                    "path": path.to_string_lossy(),
+                    "old_text": "항목=old",
+                    "new_text": "항목=new",
+                    "replace_all": true,
+                    "dry_run": false
+                }),
+                mutation_context("file_edit", dir.path()),
+            )
+            .await;
+        assert!(result.success, "{}", result.output);
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            before.replace("항목=old", "항목=new")
+        );
+        let output = result_json(&result);
+        let diff = output["diff_summary"].as_str().unwrap();
+        assert!(diff.contains("-2:\"항목=old\" [CRLF]"));
+        assert!(diff.contains("+2:\"항목=new\" [CRLF]"));
+        assert!(diff.contains("-4:\"항목=old\" [no newline]"));
+        assert!(diff.contains("+4:\"항목=new\" [no newline]"));
+        assert!(!diff.contains("중간"));
+        assert_eq!(output["replacements"], 2);
+    }
+
+    #[tokio::test]
+    async fn output_and_edit_regression_write_only_does_not_disclose_file_context() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("private.txt");
+        let before = "Status: private-fixture-value\n";
+        fs::write(&path, before).unwrap();
+        let mut context = ToolExecutionContext::test("file_edit");
+        context.policy_snapshot = serde_json::json!({
+            "write_paths": [dir.path().to_string_lossy()],
+            "allow_without_confirmation": true
+        });
+        let tool = FileEditTool::new();
+        let missing = tool
+            .execute(
+                serde_json::json!({"path": path.to_string_lossy(), "old_text": "Status: ready", "new_text": "Status: done", "dry_run": true}),
+                context.clone(),
+            )
+            .await;
+        assert!(!missing.success);
+        assert!(!missing.output.contains("private-fixture-value"));
+        assert!(
+            result_json(&missing)["near_matches"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        let preview = tool
+            .execute(
+                serde_json::json!({"path": path.to_string_lossy(), "old_text": "Status", "new_text": "State", "dry_run": true}),
+                context,
+            )
+            .await;
+        assert!(preview.success);
+        assert!(!preview.output.contains("private-fixture-value"));
+        assert!(preview.output.contains("Requested old text"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn output_and_edit_regression_diff_handles_joined_split_and_unchanged_lines() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("lines.txt");
+        let tool = FileEditTool::new();
+        for (before, old, new, expected, unexpected) in [
+            (
+                "a\nb",
+                "\n",
+                "",
+                vec!["-1:\"a\"", "-2:\"b\"", "+1:\"ab\""],
+                vec![],
+            ),
+            (
+                "ab",
+                "a",
+                "a\n",
+                vec!["-1:\"ab\"", "+1:\"a\"", "+2:\"b\""],
+                vec![],
+            ),
+            (
+                "a\nkeep\nb\n",
+                "a\nkeep\nb\n",
+                "x\nkeep\ny\n",
+                vec!["-1:\"a\"", "-3:\"b\"", "+1:\"x\"", "+3:\"y\""],
+                vec!["-2:\"keep\"", "+2:\"keep\""],
+            ),
+        ] {
+            fs::write(&path, before).unwrap();
+            let result = tool
+                .execute(
+                    serde_json::json!({"path": path.to_string_lossy(), "old_text": old, "new_text": new, "dry_run": true}),
+                    mutation_context("file_edit", dir.path()),
+                )
+                .await;
+            assert!(result.success, "{}", result.output);
+            let output = result_json(&result);
+            let diff = output["diff_summary"].as_str().unwrap();
+            for expected in expected {
+                assert!(diff.contains(expected), "missing {expected:?}: {diff:?}");
+            }
+            for unexpected in unexpected {
+                assert!(
+                    !diff.contains(unexpected),
+                    "unexpected {unexpected:?}: {diff:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn output_and_edit_regression_diff_preserves_all_unchanged_lines() {
+        fn lines(text: &str) -> Vec<&str> {
+            text.split_inclusive('\n').collect()
+        }
+        for before in ["a\nb", "a\nb\n", "ab\nc", "a\n\nb", "a\r\nb", "ab", ""] {
+            let mut ranges = Vec::new();
+            for start in 0..before.len() {
+                for end in start + 1..=before.len() {
+                    let old = &before[start..end];
+                    if before.match_indices(old).count() == 1 {
+                        ranges.push(old);
+                    }
+                }
+            }
+            if before.is_empty() {
+                ranges.push("");
+            }
+            for old in ranges {
+                for new in ["", "x", "\n", "x\n", "\nx"] {
+                    if old == new {
+                        continue;
+                    }
+                    let after = before.replacen(old, new, 1);
+                    let (diff, truncated) = preview_diff(before, &after, old, new, 1, 20_000);
+                    assert!(!truncated);
+                    assert!(
+                        !diff.is_empty(),
+                        "before={before:?}, old={old:?}, new={new:?}"
+                    );
+                    let original = lines(before);
+                    let edited = lines(&after);
+                    let mut removed = HashSet::new();
+                    let mut added = HashSet::new();
+                    for row in diff.lines() {
+                        let sign = row.chars().next().unwrap();
+                        let (number, encoded) = row[1..].split_once(':').unwrap();
+                        let number: usize = number.parse().unwrap();
+                        let (encoded, ending) =
+                            if let Some(encoded) = encoded.strip_suffix(" [CRLF]") {
+                                (encoded, "\r\n")
+                            } else if let Some(encoded) = encoded.strip_suffix(" [no newline]") {
+                                (encoded, "")
+                            } else {
+                                (encoded, "\n")
+                            };
+                        let decoded: String = serde_json::from_str(encoded).unwrap();
+                        let rendered = format!("{decoded}{ending}");
+                        match sign {
+                            '-' => {
+                                assert!(removed.insert(number));
+                                assert_eq!(original[number - 1], rendered);
+                            }
+                            '+' => {
+                                assert!(added.insert(number));
+                                assert_eq!(edited[number - 1], rendered);
+                            }
+                            _ => panic!("invalid diff line: {row}"),
+                        }
+                    }
+                    let kept_old: Vec<_> = original
+                        .iter()
+                        .enumerate()
+                        .filter(|(index, _)| !removed.contains(&(index + 1)))
+                        .map(|(_, line)| *line)
+                        .collect();
+                    let kept_new: Vec<_> = edited
+                        .iter()
+                        .enumerate()
+                        .filter(|(index, _)| !added.contains(&(index + 1)))
+                        .map(|(_, line)| *line)
+                        .collect();
+                    assert_eq!(
+                        kept_old, kept_new,
+                        "before={before:?}, old={old:?}, new={new:?}, diff={diff:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn output_and_edit_regression_diff_distinguishes_literal_line_ending_markers() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("markers.txt");
+        fs::write(&path, "a [CRLF]\n").unwrap();
+        let result = FileEditTool::new()
+            .execute(
+                serde_json::json!({"path": path.to_string_lossy(), "old_text": " [CRLF]\n", "new_text": "\r\n", "dry_run": true}),
+                mutation_context("file_edit", dir.path()),
+            )
+            .await;
+        assert!(result.success, "{}", result.output);
+        let output = result_json(&result);
+        let diff = output["diff_summary"].as_str().unwrap();
+        assert!(diff.contains("-1:\"a [CRLF]\""), "{diff}");
+        assert!(diff.contains("+1:\"a\" [CRLF]"), "{diff}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn output_and_edit_regression_unresolvable_read_root_fails_closed() {
+        use std::os::unix::fs::symlink;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("private.txt");
+        fs::write(&path, "Status: private-fixture-value\n").unwrap();
+        let dangling = dir.path().join("dangling");
+        symlink(dir.path().join("missing"), &dangling).unwrap();
+        let mut context = mutation_context("file_edit", dir.path());
+        context.policy_snapshot["read_paths"] =
+            serde_json::json!([dangling.to_string_lossy(), dir.path().to_string_lossy()]);
+        let result = FileEditTool::new()
+            .execute(
+                serde_json::json!({"path": path.to_string_lossy(), "old_text": "Status: ready", "new_text": "Status: done", "dry_run": true}),
+                context,
+            )
+            .await;
+        assert!(!result.success);
+        assert!(!result.output.contains("private-fixture-value"));
+        assert!(
+            result_json(&result)["near_matches"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn output_and_edit_regression_fixed_fields_do_not_falsely_claim_preview_truncation() {
+        let mut output = MutationOutput {
+            path: Some("a".repeat(200)),
+            dry_run: true,
+            mutation_performed: false,
+            changed_files: 0,
+            changed_lines: 0,
+            replacements: 0,
+            bytes_written: 0,
+            created: false,
+            overwritten: false,
+            truncated: false,
+            approval_required: false,
+            diff_summary: "old_text was not found; re-read the file and use exact text".into(),
+            changed_paths: Vec::new(),
+            version: None,
+            near_matches: Vec::new(),
+        };
+        let full = serde_json::to_string(&output).unwrap();
+        let cap = full.chars().count() - 1;
+        let result = serialize_bounded_file_edit(&mut output, false, Some(cap)).unwrap();
+        assert_eq!(result, full);
+        assert!(!output.truncated);
+    }
+
+    #[tokio::test]
+    async fn output_and_edit_regression_empty_text_keeps_replacement_limit() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("large.txt");
+        let before = "한".repeat(50_000);
+        fs::write(&path, &before).unwrap();
+        let result = FileEditTool::new()
+            .execute(
+                serde_json::json!({"path":path.to_string_lossy(),"old_text":"","new_text":"x","replace_all":true,"max_replacements":3,"dry_run":false}),
+                mutation_context("file_edit", dir.path()),
+            )
+            .await;
+        assert!(!result.success);
+        assert!(result.output.contains("max_replacements"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn output_and_edit_regression_large_diff_is_explicitly_incomplete() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("large.txt");
+        let before = (0..501).map(|n| format!("old-{n}\n")).collect::<String>();
+        let after = (0..501).map(|n| format!("new-{n}\n")).collect::<String>();
+        fs::write(&path, &before).unwrap();
+        let result = FileEditTool::new()
+            .execute(
+                serde_json::json!({"path": path.to_string_lossy(), "old_text": before, "new_text": after, "dry_run": true}),
+                mutation_context("file_edit", dir.path()),
+            )
+            .await;
+        assert!(result.success, "{}", result.output);
+        let output = result_json(&result);
+        assert_eq!(output["truncated"], true);
+        assert!(output["diff_summary"].as_str().unwrap().contains("omitted"));
+    }
+
+    #[tokio::test]
+    async fn output_and_edit_regression_stale_read_cannot_mutate_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("stale.txt");
+        let before = "status=old\n";
+        fs::write(&path, before).unwrap();
+        let versions = FileVersionStore::default();
+        versions.record(file_version_evidence(&path, before.as_bytes()).unwrap());
+        let changed = "external change\nstatus=old\n";
+        fs::write(&path, changed).unwrap();
+        let mut context = mutation_context("file_edit", dir.path());
+        context.policy_snapshot["require_read_before_write"] = Value::Bool(true);
+        let result = FileEditTool::with_version_store(versions)
+            .execute(
+                serde_json::json!({"path": path.to_string_lossy(), "old_text": "status=old", "new_text": "status=new", "dry_run": false}),
+                context,
+            )
+            .await;
+        assert!(!result.success);
+        assert!(result.output.contains("must not change before write"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), changed);
     }
 
     #[tokio::test]
@@ -2864,7 +4769,13 @@ mod tests {
             },
         ];
         let error = apply_patch_transaction(&outputs).unwrap_err();
-        assert!(error.contains("no patch changes were retained"));
+        assert!(
+            error
+                .message
+                .contains("patch rollback restored file contents and permissions")
+        );
+        assert!(error.message.contains("other metadata may have changed"));
+        assert!(error.residual, "a restored file is a new identity");
         assert_eq!(fs::read_to_string(&first).unwrap(), "old\n");
         #[cfg(unix)]
         {
@@ -2875,6 +4786,348 @@ mod tests {
             );
         }
         assert!(!invalid_parent.join("child.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn patch_delete_rollback_restores_private_bytes_and_reports_metadata_limits() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("private.txt");
+        let link = dir.path().join("link.txt");
+        let invalid_parent = dir.path().join("blocker");
+        fs::write(&path, "private data\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::hard_link(&path, &link).unwrap();
+        fs::write(&invalid_parent, "blocker\n").unwrap();
+        let outputs = vec![
+            PatchApply::Delete {
+                path: path.clone(),
+                expected: read_file_snapshot(&path).unwrap(),
+            },
+            PatchApply::Write {
+                path: invalid_parent.join("child"),
+                content: "new\n".into(),
+                expected: ExpectedPathState::Absent,
+            },
+        ];
+        let error = apply_patch_transaction(&outputs).unwrap_err();
+        assert!(
+            error
+                .message
+                .contains("patch rollback restored file contents and permissions")
+        );
+        assert!(error.message.contains("other metadata may have changed"));
+        assert!(error.residual, "a restored file is a new identity");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "private data\n");
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(fs::read_to_string(&link).unwrap(), "private data\n");
+        assert_ne!(
+            fs::metadata(&path).unwrap().ino(),
+            fs::metadata(&link).unwrap().ino()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn patch_created_file_rollback_preserves_external_permission_changes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("created.txt");
+        fs::write(&path, "created\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let written_metadata = fs::metadata(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+        let error = rollback_patch(
+            &[PatchRollback::RemoveCreated {
+                path: path.clone(),
+                written: b"created\n".to_vec(),
+                written_metadata,
+            }],
+            &[],
+        )
+        .unwrap_err();
+        assert!(error.contains("permissions changed"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "created\n");
+        assert_eq!(
+            fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn patch_created_file_rollback_preserves_same_content_replacement() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("created.txt");
+        let replacement = dir.path().join("replacement.txt");
+        fs::write(&path, "created\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let written_metadata = fs::metadata(&path).unwrap();
+        fs::write(&replacement, "created\n").unwrap();
+        fs::set_permissions(&replacement, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::rename(&replacement, &path).unwrap();
+        let error = rollback_patch(
+            &[PatchRollback::RemoveCreated {
+                path: path.clone(),
+                written: b"created\n".to_vec(),
+                written_metadata,
+            }],
+            &[],
+        )
+        .unwrap_err();
+        assert!(error.contains("created file was replaced"));
+        assert_eq!(fs::read_to_string(path).unwrap(), "created\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn patch_delete_rollback_preserves_a_dangling_symlink() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("target.txt");
+        fs::write(&path, "original\n").unwrap();
+        let original = read_file_snapshot(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink("missing-target", &path).unwrap();
+        let error = rollback_patch(
+            &[PatchRollback::RestoreDelete {
+                path: path.clone(),
+                original,
+            }],
+            &[],
+        )
+        .unwrap_err();
+        assert!(error.contains("rollback conflict"));
+        assert!(
+            fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[test]
+    fn atomic_temp_cleanup_failure_is_reported() {
+        let dir = tempdir().unwrap();
+        let original = std::io::Error::other("write failed");
+        let error = cleanup_failed_atomic_temp(dir.path(), original, |temp| fs::remove_file(temp));
+        assert!(error.to_string().contains("write failed"));
+        assert!(error.to_string().contains("partial data may remain"));
+        assert!(error.uncertain);
+        assert!(dir.path().is_dir());
+    }
+
+    #[test]
+    fn atomic_replacement_is_uncertain_only_when_its_temporary_file_may_remain() {
+        let dir = tempdir().unwrap();
+        // Renaming a file over a directory fails after the temporary file was written.
+        let blocker = dir.path().join("blocker");
+        fs::create_dir(&blocker).unwrap();
+        let cleaned =
+            atomic_write_with_cleanup(&blocker, b"agent", None, |temp| fs::remove_file(temp))
+                .unwrap_err();
+        assert!(!cleaned.uncertain);
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+
+        let leaked = atomic_write_with_cleanup(&blocker, b"agent", None, |_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "fixture cleanup failure",
+            ))
+        })
+        .unwrap_err();
+        assert!(leaked.uncertain);
+        assert!(leaked.to_string().contains("partial data may remain"));
+        assert!(blocker.is_dir());
+    }
+
+    #[tokio::test]
+    async fn file_write_rejects_limits_before_creating_parent_directories() {
+        let dir = tempdir().unwrap();
+        let parent = dir.path().join("new").join("nested");
+        let mut ctx = mutation_context("file_write", dir.path());
+        ctx.limits.max_changed_lines = Some(1);
+        let result = FileWriteTool::new()
+            .execute(
+                serde_json::json!({
+                    "path": parent.join("file.txt").to_string_lossy(),
+                    "content": "one\ntwo\nthree\n",
+                    "create_parent_dirs": true
+                }),
+                ctx,
+            )
+            .await;
+        assert!(!result.success);
+        assert!(
+            result.output.contains("changed-line cap"),
+            "{}",
+            result.output
+        );
+        assert!(!result.has_uncertain_effect());
+        assert!(!dir.path().join("new").exists());
+    }
+
+    #[test]
+    fn created_parents_are_removed_or_reported_as_residue() {
+        let dir = tempdir().unwrap();
+        let parent = dir.path().join("a").join("b");
+        let failure = CreatedParents::create(&parent)
+            .unwrap()
+            .fail("write failed".into(), false);
+        assert!(!failure.residual);
+        assert!(!dir.path().join("a").exists());
+
+        let parents = CreatedParents::create(&parent).unwrap();
+        fs::write(parent.join("external.txt"), "user").unwrap();
+        let failure = parents.fail("write failed".into(), false);
+        assert!(failure.residual);
+        assert!(
+            failure
+                .message
+                .contains("created parent directories may remain")
+        );
+        assert!(failure.into_result().has_uncertain_effect());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_copy_that_cannot_be_removed_is_residue() {
+        let dir = tempdir().unwrap();
+        // The copy creates the staged directory and then fails on the unsupported link.
+        let source = dir.path().join("source");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("file.txt"), "data").unwrap();
+        std::os::unix::fs::symlink(source.join("file.txt"), source.join("link")).unwrap();
+        let destination = dir.path().join("destination");
+        fs::write(&destination, "user").unwrap();
+
+        let outcome = replace_copy_path_with(&source, &destination, |_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "fixture cleanup failure",
+            ))
+        });
+        assert!(
+            matches!(outcome, ReplacementOutcome::Residual(ref error) if error.contains("staged copy cleanup failed"))
+        );
+        assert_eq!(fs::read_to_string(&destination).unwrap(), "user");
+
+        for entry in fs::read_dir(dir.path()).unwrap() {
+            let path = entry.unwrap().path();
+            if path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .contains(".copy.")
+            {
+                fs::remove_dir_all(path).unwrap();
+            }
+        }
+        let outcome = replace_copy_path(&source, &destination);
+        assert!(matches!(outcome, ReplacementOutcome::Unchanged(_)));
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn recursive_delete_failure_is_uncertain() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let tree = dir.path().join("tree");
+        let locked = tree.join("locked");
+        fs::create_dir_all(&locked).unwrap();
+        fs::write(tree.join("first.txt"), "data").unwrap();
+        fs::write(locked.join("kept.txt"), "data").unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o555)).unwrap();
+        // A privileged user ignores directory permissions, so the partial failure cannot be produced.
+        let privileged = fs::write(locked.join("probe"), "x").is_ok();
+        if !privileged {
+            let result = DeletePathTool
+                .execute(
+                    serde_json::json!({"path": tree.to_string_lossy(), "recursive": true}),
+                    mutation_context("delete_path", dir.path()),
+                )
+                .await;
+            assert!(!result.success);
+            assert!(result.has_uncertain_effect(), "{}", result.output);
+        }
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let file = dir.path().join("missing-parent").join("file.txt");
+        let result = DeletePathTool
+            .execute(
+                serde_json::json!({"path": file.to_string_lossy()}),
+                mutation_context("delete_path", dir.path()),
+            )
+            .await;
+        assert!(!result.success);
+        assert!(!result.has_uncertain_effect());
+    }
+
+    #[test]
+    fn patch_delete_rollback_does_not_overwrite_an_external_replacement() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("target.txt");
+        fs::write(&path, "original\n").unwrap();
+        let original = read_file_snapshot(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+        fs::write(&path, "external\n").unwrap();
+        let error = rollback_patch(
+            &[PatchRollback::RestoreDelete {
+                path: path.clone(),
+                original,
+            }],
+            &[],
+        )
+        .unwrap_err();
+        assert!(error.contains("rollback conflict"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "external\n");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn patch_special_mode_delete_is_rejected_before_earlier_writes() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let dir = tempdir().unwrap();
+        let first = dir.path().join("first.txt");
+        let special = dir.path().join("special.txt");
+        fs::write(&first, "old\n").unwrap();
+        fs::write(&special, "protected\n").unwrap();
+        fs::set_permissions(&special, fs::Permissions::from_mode(0o1700)).unwrap();
+        let inode = fs::metadata(&first).unwrap().ino();
+        let patch = concat!(
+            "--- a/first.txt\n+++ b/first.txt\n@@ -1,1 +1,1 @@\n-old\n+new\n",
+            "--- a/special.txt\n+++ /dev/null\n@@ -1,1 +0,0 @@\n-protected\n"
+        );
+        let result = PatchTool::new()
+            .execute(
+                serde_json::json!({
+                    "base_path": dir.path().to_string_lossy(),
+                    "patch": patch,
+                    "allow_delete": true,
+                    "dry_run": false
+                }),
+                mutation_context("patch", dir.path()),
+            )
+            .await;
+        assert!(!result.success);
+        assert!(result.output.contains("special permission bits"));
+        assert_eq!(fs::read_to_string(&first).unwrap(), "old\n");
+        assert_eq!(fs::metadata(&first).unwrap().ino(), inode);
+        assert_eq!(fs::read_to_string(&special).unwrap(), "protected\n");
+        assert_eq!(
+            fs::metadata(&special).unwrap().permissions().mode() & 0o7777,
+            0o1700
+        );
     }
 
     #[test]
@@ -2890,7 +5143,8 @@ mod tests {
         };
         fs::write(&existing, "external\n").unwrap();
         let error = apply_patch_transaction(&[existing_output]).unwrap_err();
-        assert!(error.contains("pre-apply conflict"));
+        assert!(error.message.contains("pre-apply conflict"));
+        assert!(!error.residual);
         assert_eq!(fs::read_to_string(&existing).unwrap(), "external\n");
 
         let created_output = PatchApply::Write {
@@ -2900,7 +5154,8 @@ mod tests {
         };
         fs::write(&created, "external\n").unwrap();
         let error = apply_patch_transaction(&[created_output]).unwrap_err();
-        assert!(error.contains("pre-apply conflict"));
+        assert!(error.message.contains("pre-apply conflict"));
+        assert!(!error.residual);
         assert_eq!(fs::read_to_string(&created).unwrap(), "external\n");
     }
 

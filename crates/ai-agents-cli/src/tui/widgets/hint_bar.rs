@@ -14,9 +14,9 @@ pub struct HintBarState {
 
 pub fn render_hint_bar(area: Rect, buf: &mut Buffer, state: &HintBarState, theme: &Theme) {
     let hints = if state.is_command_mode {
-        " /help  /quit  /state  /memory  /context  Esc cancel"
+        " /task run OBJECTIVE | F10 tasks | Ctrl+P pending | Esc hides"
     } else if state.panels_enabled {
-        " Enter send  Ctrl+C quit  Ctrl+L clear  Ctrl+T theme  F1-F9 panels  / commands"
+        " Enter send | Ctrl+C shutdown | F10 tasks | Ctrl+P pending | / commands"
     } else {
         " Enter send  Ctrl+C quit  Ctrl+L clear  / commands"
     };

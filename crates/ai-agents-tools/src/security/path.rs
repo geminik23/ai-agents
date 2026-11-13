@@ -183,7 +183,7 @@ fn resolve_with_missing_suffix(path: &Path) -> Result<PathBuf, PathResolutionErr
     }
 }
 
-fn normalize_lexically(path: &Path) -> PathBuf {
+pub(crate) fn normalize_lexically(path: &Path) -> PathBuf {
     let mut normalized = PathBuf::new();
     for component in path.components() {
         match component {

@@ -31,6 +31,14 @@ pub struct EvalMetrics {
     pub by_assertion: HashMap<String, AssertionMetrics>,
     /// Scenario counts grouped by failure category.
     pub by_failure_category: HashMap<String, usize>,
+    /// Distinct observed runs across attempts; resume snapshots are not counted as new runs.
+    #[serde(default)]
+    pub observed_task_runs: usize,
+    /// Latest observed status, not a claim about later cleanup or an unseen final revision.
+    #[serde(default)]
+    pub observed_task_statuses: HashMap<String, usize>,
+    #[serde(default)]
+    pub observed_task_llm_attempts: u64,
 }
 
 /// Pass, fail, and skip counts for one grouping key.
@@ -61,6 +69,7 @@ pub fn compute_metrics(results: &[ScenarioResult]) -> EvalMetrics {
     let total = results.len();
     let passed = results.iter().filter(|r| r.status.is_passed()).count();
     let mut latencies = Vec::new();
+    let mut task_runs = HashMap::new();
     let mut metrics = EvalMetrics {
         pass_rate: if total == 0 {
             0.0
@@ -94,6 +103,32 @@ pub fn compute_metrics(results: &[ScenarioResult]) -> EvalMetrics {
         for attempt in &result.attempts {
             for turn in &attempt.turns {
                 latencies.push(turn.latency_ms);
+                for task in turn.task.iter().chain(
+                    turn.interactions
+                        .iter()
+                        .filter_map(|interaction| interaction.task.as_ref()),
+                ) {
+                    observe_run(
+                        &mut task_runs,
+                        crate::interactions::run_hash(&task.display.summary.key),
+                        task.display.summary.revision,
+                        task.display.summary.status,
+                        task.display.counters.llm_attempts,
+                    );
+                }
+                for outcome in turn
+                    .interactions
+                    .iter()
+                    .filter_map(|interaction| interaction.outcome.as_ref())
+                {
+                    observe_run(
+                        &mut task_runs,
+                        outcome.run_hash.clone(),
+                        outcome.revision,
+                        outcome.status,
+                        outcome.counters.llm_attempts,
+                    );
+                }
                 for assertion in &turn.assertion_results {
                     let entry = metrics
                         .by_assertion
@@ -110,6 +145,15 @@ pub fn compute_metrics(results: &[ScenarioResult]) -> EvalMetrics {
         }
     }
 
+    metrics.observed_task_runs = task_runs.len();
+    for (_, status, attempts) in task_runs.into_values() {
+        let status = serde_json::to_value(status).expect("serializable task status");
+        *metrics
+            .observed_task_statuses
+            .entry(status.as_str().unwrap().into())
+            .or_default() += 1;
+        metrics.observed_task_llm_attempts += attempts;
+    }
     metrics.total_turns = latencies.len();
     if !latencies.is_empty() {
         latencies.sort_unstable();
@@ -120,6 +164,20 @@ pub fn compute_metrics(results: &[ScenarioResult]) -> EvalMetrics {
     }
 
     metrics
+}
+
+// A control ACK remains measurable even if later safe-display collection fails; never count cumulative revisions twice.
+fn observe_run(
+    runs: &mut HashMap<String, (u64, ai_agents_runtime::autonomy::TaskRunStatus, u64)>,
+    key: String,
+    revision: u64,
+    status: ai_agents_runtime::autonomy::TaskRunStatus,
+    attempts: u64,
+) {
+    let previous = runs.entry(key).or_insert((revision, status, attempts));
+    if previous.0 < revision {
+        *previous = (revision, status, attempts);
+    }
 }
 
 fn update_count(metrics: &mut CountMetrics, status: &ScenarioStatus) {
@@ -168,6 +226,8 @@ mod tests {
             attempts: vec![AttemptResult {
                 attempt: 0,
                 turns: vec![TurnResult {
+                    interactions: Vec::new(),
+                    task: None,
                     index: 0,
                     input: RedactedString::redacted("[redacted]"),
                     response: RedactedString::redacted("[redacted]"),
@@ -176,6 +236,7 @@ mod tests {
                     state: None,
                     metadata: None,
                     evidence: crate::evidence::TurnEvidence {
+                        task: None,
                         response_metadata: None,
                         state: None,
                         state_history: Vec::new(),

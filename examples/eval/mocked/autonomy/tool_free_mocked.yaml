@@ -1,0 +1,20 @@
+name: Tool Free Iterative Task
+agent: ../../../yaml/autonomy/tool_free_analysis.yaml
+settings: {timeout_per_turn_ms: 10000, retries: 0}
+fixtures:
+  llm:
+    mode: mock
+    responses_by_alias:
+      main: [Initial analysis., Revised analysis with the requested criteria.]
+      judge: ['{"overall_score":0.2}', '{"overall_score":0.9}']
+scenarios:
+  - id: main-and-judge-share-the-same-task
+    steps:
+      - !task
+        operation: {action: run, objective: Improve the analysis.}
+        assert:
+          all:
+            - task: {status: completed, counters: {path: llm_attempts, eq: 4}, checks: [{id: quality, outcome: pass}], event_result_parity: true}
+            - response_contains: Revised analysis
+            - tool_not_called: todo
+            - tool_not_called: command

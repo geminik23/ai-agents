@@ -66,6 +66,20 @@ struct HttpOutput {
 
 #[async_trait]
 impl Tool for HttpTool {
+    // Only local-write-free reads have a footprint; an arbitrary remote mutation is not a proven bounded write set.
+    fn declared_write_footprint(
+        &self,
+        args: &Value,
+        _: &ToolExecutionContext,
+        _: usize,
+    ) -> ai_agents_core::Result<Option<ai_agents_core::autonomy::ToolWriteFootprint>> {
+        let input: HttpInput = serde_json::from_value(args.clone())?;
+        Ok(
+            matches!(input.method.to_ascii_uppercase().as_str(), "GET" | "HEAD").then(|| {
+                ai_agents_core::autonomy::ToolWriteFootprint::empty("builtin.http.read.v1")
+            }),
+        )
+    }
     fn id(&self) -> &str {
         "http"
     }

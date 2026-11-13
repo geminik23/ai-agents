@@ -1,13 +1,13 @@
+#[cfg(test)]
 use std::io::{self, Write};
 
 use ai_agents::memory::{estimate_message_tokens, estimate_tokens};
-use ai_agents::{Agent, AgentResponse, AgentStreamEvent, RuntimeAgent, StreamChunk};
+use ai_agents::{AgentResponse, RuntimeAgent, TaskRunResult};
+use async_trait::async_trait;
 use serde_json;
 
-use crate::stream_reconcile::{FinalContent, reconcile_final_content, unseen_unique_tool_names};
-use crate::stream_terminal::{
-    INCOMPLETE_STREAM_ERROR, StreamDriveControl, StreamDriveOutcome, drive_agent_stream,
-};
+#[cfg(test)]
+use crate::stream_terminal::{INCOMPLETE_STREAM_ERROR, StreamDriveOutcome};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReplMode {
@@ -29,6 +29,18 @@ pub enum CommandResult {
 }
 
 type CommandHandler = Box<dyn Fn(&str, &RuntimeAgent) -> CommandResult + Send + Sync>;
+
+/// An optional host observer for explicit foreground tasks; it does not authorize or finalize work.
+/// The preparation runs before each new task, while the result is the latest acknowledged root result when available.
+/// A missing result means the foreground operation failed or lost its acknowledgement, not that cleanup succeeded.
+#[async_trait]
+pub trait CliTaskObserver: Send + Sync {
+    /// Prepare per-task host observations before a new explicit task begins.
+    async fn before_task(&self) -> Result<(), String>;
+
+    /// Report the foreground outcome without changing its status or consuming retained decisions.
+    async fn after_task(&self, result: Option<&TaskRunResult>) -> Option<String>;
+}
 
 pub(crate) fn parse_relationship_perspective(
     value: &str,
@@ -64,10 +76,12 @@ fn preview_text(text: &str, max_chars: usize) -> String {
     }
 }
 
+#[cfg(test)]
 fn write_stream_error(output: &mut impl Write, message: &str) -> io::Result<()> {
     writeln!(output, "\n[Stream Error: {}]\n", message)
 }
 
+#[cfg(test)]
 fn report_stream_outcome(output: &mut impl Write, outcome: StreamDriveOutcome) -> io::Result<()> {
     if outcome == StreamDriveOutcome::IncompleteEof {
         write_stream_error(output, INCOMPLETE_STREAM_ERROR)?;
@@ -108,9 +122,10 @@ enum CommandAction {
 }
 
 pub struct CliRepl {
-    agent: RuntimeAgent,
+    agent: std::sync::Arc<RuntimeAgent>,
     config: CliReplConfig,
     command_handler: Option<CommandHandler>,
+    task_observer: Option<std::sync::Arc<dyn CliTaskObserver>>,
 }
 
 // Manual Debug impl because CommandHandler (a boxed closure) doesn't implement Debug.
@@ -134,9 +149,10 @@ impl std::fmt::Debug for CliRepl {
 impl CliRepl {
     pub fn new(agent: RuntimeAgent) -> Self {
         Self {
-            agent,
+            agent: std::sync::Arc::new(agent),
             config: CliReplConfig::default(),
             command_handler: None,
+            task_observer: None,
         }
     }
 
@@ -195,7 +211,24 @@ impl CliRepl {
         self
     }
 
+    /// Install a host observer for explicit task commands without affecting ordinary chat or other frontends.
+    pub fn task_observer(mut self, observer: std::sync::Arc<dyn CliTaskObserver>) -> Self {
+        self.task_observer = Some(observer);
+        self
+    }
+
     pub async fn run(self) -> ai_agents::Result<()> {
+        let io = crate::session::FrontendSession::terminal(false, true);
+        self.agent.set_question_handler(Some(io.bridge()));
+        self.run_with_io(io)
+            .await
+            .map_err(|error| ai_agents::error::AgentError::Other(error.to_string()))
+    }
+
+    pub(crate) async fn run_with_io(
+        self,
+        mut io: crate::session::FrontendSession,
+    ) -> anyhow::Result<()> {
         if let Some(ref welcome) = self.config.welcome {
             println!("{}", welcome);
             println!();
@@ -222,8 +255,7 @@ impl CliRepl {
         }
         println!();
 
-        let stdin = io::stdin();
-        let mut stdout = io::stdout();
+        // The foreground adapter and ordinary callbacks share exactly one bounded input reader.
 
         loop {
             let prompt_str = match self.config.prompt {
@@ -234,13 +266,11 @@ impl CliRepl {
                 }
             };
 
-            print!("{}", prompt_str);
-            stdout.flush().ok();
-
-            let mut input = String::new();
-            if stdin.read_line(&mut input).is_err() {
+            io.write(prompt_str).await?;
+            io.finish().await?;
+            let Some(input) = io.next_line().await? else {
                 break;
-            }
+            };
             let input = input.trim();
             if input.is_empty() {
                 continue;
@@ -253,6 +283,92 @@ impl CliRepl {
                 continue;
             }
 
+            // Task commands retain the same runtime; they are not routed back into model input.
+            if let Some(rest) = input.strip_prefix("/task run ") {
+                let (profile, objective) = if let Some(rest) = rest.strip_prefix("--profile ") {
+                    let (profile, objective) = rest.split_once(' ').ok_or_else(|| {
+                        anyhow::anyhow!("expected /task run --profile ID OBJECTIVE")
+                    })?;
+                    (Some(profile.to_string()), objective)
+                } else {
+                    (None, rest)
+                };
+                if let Some(observer) = &self.task_observer {
+                    match io.observe(observer.before_task()).await {
+                        Some(Ok(())) => {}
+                        Some(Err(error)) => {
+                            eprintln!("Task preparation failed: {error}");
+                            continue;
+                        }
+                        None => break,
+                    }
+                }
+                let (tx, rx) = tokio::sync::mpsc::channel(32);
+                let result = io
+                    .drive(
+                        crate::session::task_work(
+                            self.agent.clone(),
+                            ai_agents::TaskStreamOperation::Run {
+                                objective: objective.into(),
+                                profile,
+                            },
+                            tx,
+                            false,
+                        ),
+                        rx,
+                    )
+                    .await;
+                let result = match result {
+                    Ok(result) => result,
+                    Err(error) => {
+                        if let Some(observer) = &self.task_observer
+                            && let Some(Some(report)) = io.observe(observer.after_task(None)).await
+                            && !io.output_suppressed()
+                        {
+                            let _ = io.write(report).await;
+                        }
+                        if !error.is::<crate::session::ProtectedSession>() && !io.output_closed() {
+                            eprintln!("[Error] {error}");
+                            continue;
+                        }
+                        return Err(error);
+                    }
+                };
+                if result.quit && io.output_suppressed() {
+                    eprintln!(
+                        "Foreground shutdown returned; stdout delivery suppressed. Protected effects are not rollback."
+                    );
+                    break;
+                }
+                if let crate::session::OperationResult::Task(initial) = result.primary {
+                    let done = result
+                        .results
+                        .get(&initial.run.key.run_id)
+                        .unwrap_or(&initial);
+                    io.write(format!(
+                        "Task {} revision {}: {:?}\n",
+                        done.run.key.run_id, done.run.revision, done.run.status
+                    ))
+                    .await?;
+                    if let Some(response) = &done.final_response {
+                        io.write(self.response_text(response)).await?;
+                    }
+                    if let Some(observer) = &self.task_observer
+                        && let Some(Some(report)) =
+                            io.observe(observer.after_task(Some(done))).await
+                    {
+                        io.write(report).await?;
+                    }
+                } else if let Some(observer) = &self.task_observer
+                    && let Some(Some(report)) = io.observe(observer.after_task(None)).await
+                {
+                    io.write(report).await?;
+                }
+                if result.quit {
+                    break;
+                }
+                continue;
+            }
             // 2. Try built-in commands
             match self.handle_command(input).await {
                 Some(CommandAction::Quit) => {
@@ -265,22 +381,112 @@ impl CliRepl {
 
             // 3. Normal chat / streaming
             let start = std::time::Instant::now();
+            let facts_before = self.agent.actor_facts().len();
 
-            match self.config.mode {
-                ReplMode::Chat => self.handle_chat(input).await,
-                ReplMode::Streaming => self.handle_streaming(input).await,
+            let (tx, rx) = tokio::sync::mpsc::channel(32);
+            let result = io
+                .drive(
+                    crate::session::chat_work(
+                        self.agent.clone(),
+                        input.into(),
+                        self.config.clone(),
+                        tx,
+                    ),
+                    rx,
+                )
+                .await;
+            let result = match result {
+                Ok(result) => result,
+                Err(error)
+                    if !error.is::<crate::session::ProtectedSession>() && !io.output_closed() =>
+                {
+                    eprintln!("[Error] {error}");
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            if result.quit && io.output_suppressed() {
+                eprintln!(
+                    "Foreground shutdown returned; stdout delivery suppressed. Protected effects are not rollback."
+                );
+                break;
+            }
+            if let crate::session::OperationResult::Chat(response) = result.primary {
+                let task_id = response
+                    .metadata
+                    .as_ref()
+                    .and_then(|m| m.get("task_run"))
+                    .and_then(|m| m.get("run_id"))
+                    .and_then(|v| v.as_str());
+                if let Some(task) = task_id.and_then(|id| result.results.get(id)) {
+                    io.write(format!(
+                        "\nTask {} revision {}: {:?}\n",
+                        task.run.key.run_id, task.run.revision, task.run.status
+                    ))
+                    .await?;
+                    if let Some(response) = &task.final_response {
+                        io.write(self.response_text(response)).await?;
+                    }
+                } else if self.config.mode != ReplMode::Streaming {
+                    io.write(self.response_text(&response)).await?;
+                } else {
+                    io.write("\n").await?;
+                }
+            }
+            let facts_after = self.agent.actor_facts().len();
+            if facts_after > facts_before {
+                io.write(format!(
+                    "[facts] {} new fact(s) extracted ({} total). Use /facts to inspect.\n",
+                    facts_after - facts_before,
+                    facts_after
+                ))
+                .await?;
+            }
+            if result.quit {
+                break;
             }
 
             if self.config.show_timing {
                 let elapsed = start.elapsed();
-                println!("  ({:.1}s)", elapsed.as_secs_f64());
+                io.write(format!("  ({:.1}s)\n", elapsed.as_secs_f64()))
+                    .await?;
             }
         }
 
+        if !io.output_suppressed() {
+            io.finish().await?;
+        }
         Ok(())
     }
 
     async fn handle_command(&self, input: &str) -> Option<CommandAction> {
+        if input == "/task list" || input.starts_with("/task show ") {
+            let inspected = async {
+                let runner = self.agent.task_runner()?;
+                if input == "/task list" {
+                    for row in runner.task_store().list().await? {
+                        println!("{} {} {:?}", row.key.run_id, row.revision, row.status);
+                    }
+                } else {
+                    let view = runner
+                        .task_display(input.trim_start_matches("/task show ").trim())
+                        .await?;
+                    println!("{}", serde_json::to_string_pretty(&view)?);
+                }
+                Ok::<_, ai_agents::error::AgentError>(())
+            }
+            .await;
+            if let Err(error) = inspected {
+                eprintln!("Task inspection failed: {error}");
+            }
+            return Some(CommandAction::Continue);
+        }
+        if input.starts_with("/task ") {
+            eprintln!(
+                "Task controls resume/cancel/stop/objective/limits apply to the exact run/revision while its foreground session is retained. Use /task run, /task list or /task show RUN."
+            );
+            return Some(CommandAction::Continue);
+        }
         if !self.config.builtin_commands {
             return match input.to_lowercase().as_str() {
                 "/quit" | "/exit" => Some(CommandAction::Quit),
@@ -392,6 +598,12 @@ impl CliRepl {
 
     fn print_help(&self) {
         println!("Commands:");
+        println!("  /task run [--profile ID] OBJECTIVE  Run an explicit task on this same host");
+        println!("  /task list | /task show RUN         Inspect retained task metadata");
+        println!("  During work: /task resume RUN REV REQUEST ANSWER, /task cancel RUN REV");
+        println!(
+            "  During pauses: /task stop RUN REV, /task objective RUN REV TEXT, /task limits RUN REV JSON"
+        );
         println!("  /help, ?             Show this help message");
         println!("  /quit, /exit         Exit the REPL");
         println!("  /reset               Clear memory and reset state");
@@ -488,8 +700,9 @@ impl CliRepl {
                     }
                 };
                 match self.agent.remove_context(key) {
-                    Some(_) => println!("  Removed: {}", key),
-                    None => println!("  Key not found: {}", key),
+                    Ok(Some(_)) => println!("  Removed: {}", key),
+                    Ok(None) => println!("  Key not found: {}", key),
+                    Err(error) => eprintln!("  Context removal failed: {}", error),
                 }
             }
             Some(other) => {
@@ -1295,130 +1508,17 @@ impl CliRepl {
         println!("---------------------\n");
     }
 
-    async fn handle_chat(&self, input: &str) {
-        let facts_before = self.agent.actor_facts().len();
-        match self.agent.chat(input).await {
-            Ok(response) => {
-                self.print_response(&response);
-                let facts_after = self.agent.actor_facts().len();
-                if facts_after > facts_before {
-                    let new_count = facts_after - facts_before;
-                    println!(
-                        "  [facts] {} new fact(s) extracted ({} total). Use /facts to inspect.\n",
-                        new_count, facts_after
-                    );
-                }
-            }
-            Err(e) => eprintln!("\n[Error] {}\n", e),
-        }
-    }
-
-    fn print_response(&self, response: &AgentResponse) {
-        println!("\nAgent: {}\n", response.content);
+    fn response_text(&self, response: &AgentResponse) -> String {
+        let mut text = format!("\nAgent: {}\n", response.content);
 
         if self.config.show_tool_calls
             && let Some(ref calls) = response.tool_calls
             && !calls.is_empty()
         {
             let names: Vec<&str> = calls.iter().map(|t| t.name.as_str()).collect();
-            println!("  Tools used: {}", names.join(", "));
+            text.push_str(&format!("  Tools used: {}\n", names.join(", ")));
         }
-    }
-
-    async fn handle_streaming(&self, input: &str) {
-        match self.agent.chat_stream_events(input).await {
-            Ok(stream) => {
-                print!("\nAgent: ");
-                io::stdout().flush().ok();
-
-                let mut streamed_content = String::new();
-                let mut observed_tool_names = Vec::new();
-                let mut stderr = io::stderr();
-
-                let outcome = drive_agent_stream(stream, |event| {
-                    match event {
-                        AgentStreamEvent::Chunk(chunk) => match chunk {
-                            StreamChunk::Content { text } => {
-                                streamed_content.push_str(&text);
-                                print!("{}", text);
-                                io::stdout().flush().ok();
-                            }
-                            StreamChunk::ToolCallStart { name, .. } => {
-                                if !observed_tool_names.contains(&name) {
-                                    observed_tool_names.push(name.clone());
-                                }
-                                if self.config.show_tool_calls {
-                                    print!("\n  [Tool: {}...", name);
-                                    io::stdout().flush().ok();
-                                }
-                            }
-                            StreamChunk::ToolResult {
-                                output, success, ..
-                            } => {
-                                if self.config.show_tool_calls {
-                                    if success {
-                                        print!(" ✓]");
-                                    } else {
-                                        print!(" ✗ {}]", output);
-                                    }
-                                    io::stdout().flush().ok();
-                                }
-                            }
-                            StreamChunk::ToolCallEnd { .. } => {}
-                            StreamChunk::ToolCallDelta { .. } => {}
-                            StreamChunk::StateTransition { from, to } => {
-                                if self.config.show_state_transitions {
-                                    let from_str = from.as_deref().unwrap_or("—");
-                                    print!("\n  [State: {} → {}]", from_str, to);
-                                    io::stdout().flush().ok();
-                                }
-                            }
-                            StreamChunk::Done {} => {
-                                // Final owns successful completion for the event API.
-                            }
-                            StreamChunk::Error { message } => {
-                                write_stream_error(&mut stderr, &message).ok();
-                            }
-                        },
-                        AgentStreamEvent::Final(response) => {
-                            match reconcile_final_content(&streamed_content, &response.content) {
-                                FinalContent::Unchanged => println!("\n"),
-                                FinalContent::Suffix(suffix) => {
-                                    print!("{}", suffix);
-                                    println!("\n");
-                                }
-                                FinalContent::Authoritative(content) => {
-                                    println!("\n\nAgent (authoritative final): {}\n", content);
-                                }
-                            }
-
-                            if self.config.show_tool_calls {
-                                let final_tool_names = unseen_unique_tool_names(
-                                    response
-                                        .tool_calls
-                                        .as_ref()
-                                        .into_iter()
-                                        .flatten()
-                                        .map(|call| call.name.clone()),
-                                    &observed_tool_names,
-                                );
-                                if !final_tool_names.is_empty() {
-                                    println!("  Tools used: {}", final_tool_names.join(", "));
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                    StreamDriveControl::Continue
-                })
-                .await;
-
-                report_stream_outcome(&mut stderr, outcome).ok();
-            }
-            Err(e) => {
-                eprintln!("\n[Error] {}\n", e);
-            }
-        }
+        text
     }
 }
 
@@ -1461,6 +1561,132 @@ fn parse_save_load_args(input: &str) -> Option<(SaveScope, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct TaskObserver {
+        starts: std::sync::atomic::AtomicUsize,
+        results: std::sync::Mutex<Vec<(String, ai_agents::TaskRunStatus)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl CliTaskObserver for TaskObserver {
+        async fn before_task(&self) -> Result<(), String> {
+            self.starts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn after_task(&self, result: Option<&TaskRunResult>) -> Option<String> {
+            let run = &result.expect("acknowledged task result").run;
+            self.results
+                .lock()
+                .unwrap()
+                .push((run.key.run_id.clone(), run.status));
+            Some("observer report\n".into())
+        }
+    }
+
+    struct TaskProvider;
+
+    #[async_trait::async_trait]
+    impl ai_agents::llm::LLMProvider for TaskProvider {
+        async fn complete(
+            &self,
+            _: &[ai_agents::llm::ChatMessage],
+            _: Option<&ai_agents::llm::LLMConfig>,
+        ) -> Result<ai_agents::llm::LLMResponse, ai_agents::llm::LLMError> {
+            Ok(ai_agents::llm::LLMResponse::new(
+                "done",
+                ai_agents::llm::FinishReason::Stop,
+            ))
+        }
+
+        async fn complete_stream(
+            &self,
+            _: &[ai_agents::llm::ChatMessage],
+            _: Option<&ai_agents::llm::LLMConfig>,
+        ) -> Result<
+            Box<
+                dyn futures::Stream<
+                        Item = Result<ai_agents::llm::LLMChunk, ai_agents::llm::LLMError>,
+                    > + Unpin
+                    + Send,
+            >,
+            ai_agents::llm::LLMError,
+        > {
+            Err(ai_agents::llm::LLMError::Config("unexpected stream".into()))
+        }
+
+        fn provider_name(&self) -> &str {
+            "task-observer-test"
+        }
+        fn supports(&self, _: ai_agents::llm::LLMFeature) -> bool {
+            false
+        }
+    }
+
+    #[tokio::test]
+    async fn task_observer_sees_each_explicit_foreground_task_once() {
+        use crate::session::{FrontendSession, Input, Output};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use std::time::Duration;
+        let (io, input, mut output) = FrontendSession::embedded();
+        let agent = ai_agents::AgentBuilder::from_yaml("name: ObserverTest\nsystem_prompt: Answer.\ntools: []\nautonomy:\n  enabled: true\n  completion: {response_not_empty: true}\n")
+            .unwrap().llm(Arc::new(TaskProvider)).build_task_host().await.unwrap();
+        let observer = Arc::new(TaskObserver {
+            starts: AtomicUsize::new(0),
+            results: std::sync::Mutex::new(Vec::new()),
+        });
+        let driver = CliRepl::new(agent)
+            .task_observer(observer.clone())
+            .run_with_io(io);
+        let (text_tx, mut texts) = tokio::sync::mpsc::unbounded_channel();
+        let collector = tokio::spawn(async move {
+            while let Some(output) = output.recv().await {
+                match output {
+                    Output::Flush(ack) => {
+                        let _ = ack.send(());
+                    }
+                    Output::Text(text) => {
+                        let _ = text_tx.send(text);
+                    }
+                    _ => {}
+                }
+            }
+        });
+        let user = async {
+            for objective in ["first", "second"] {
+                input
+                    .send(Input::Line(format!("/task run {objective}")))
+                    .await
+                    .unwrap();
+                while let Some(text) = texts.recv().await {
+                    if text.contains("observer report") {
+                        break;
+                    }
+                }
+            }
+            input.send(Input::Line("/quit".into())).await.unwrap();
+        };
+        tokio::time::timeout(Duration::from_secs(40), async {
+            let (result, ()) = tokio::join!(driver, user);
+            result.unwrap();
+        })
+        .await
+        .expect("foreground tasks timed out");
+        collector.await.unwrap();
+        assert_eq!(observer.starts.load(Ordering::SeqCst), 2);
+        let results = observer.results.lock().unwrap();
+        assert_eq!(results.len(), 2);
+        assert_ne!(results[0].0, results[1].0);
+        assert!(
+            results
+                .iter()
+                .all(|(_, status)| *status == ai_agents::TaskRunStatus::Completed)
+        );
+    }
 
     #[test]
     fn terminal_error_is_not_followed_by_incomplete_eof_output() {

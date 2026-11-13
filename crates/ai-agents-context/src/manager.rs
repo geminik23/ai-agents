@@ -118,6 +118,9 @@ impl ContextManager {
 
     pub async fn refresh_per_session(&self) -> Result<()> {
         for (key, source) in &self.schema {
+            if matches!(source, ContextSource::Instructions { .. }) {
+                continue;
+            }
             match source.refresh_policy() {
                 RefreshPolicy::PerSession | RefreshPolicy::Once => {
                     if let Some(value) = self.resolve_source(key, source).await? {
@@ -132,6 +135,9 @@ impl ContextManager {
 
     pub async fn initialize(&self) -> Result<()> {
         for (key, source) in &self.schema {
+            if matches!(source, ContextSource::Instructions { .. }) {
+                continue;
+            }
             if let ContextSource::Runtime { default, .. } = source {
                 if let Some(default_value) = default
                     && !self.values.read().contains_key(key)
@@ -143,6 +149,117 @@ impl ContextManager {
             } else if let Some(value) = self.resolve_source(key, source).await? {
                 self.values.write().insert(key.clone(), value);
             }
+        }
+        Ok(())
+    }
+
+    /// Resolves a complete, bounded instruction projection without storing it in ordinary context.
+    /// A configured source requires a live host provider; serialized names alone cannot read files.
+    pub async fn instruction_snapshot(&self) -> Result<Option<String>> {
+        self.instruction_snapshot_for_task(false).await
+    }
+
+    /// Requires explicit effect-free, cancellation-safe provider participation for autonomous task work.
+    pub async fn instruction_snapshot_for_task(&self, task: bool) -> Result<Option<String>> {
+        if !self.has_instruction_sources() {
+            return Ok(None);
+        }
+        tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            self.resolve_instruction_snapshot(task),
+        )
+        .await
+        .map_err(|_| {
+            AgentError::InstructionUnavailable("instruction preparation timed out".into())
+        })?
+    }
+
+    // Builds one complete replacement and never publishes a partial result when any source fails.
+    async fn resolve_instruction_snapshot(&self, task: bool) -> Result<Option<String>> {
+        const MAX_SOURCES: usize = 32;
+        const MAX_BYTES: usize = 256 * 1024;
+        let mut sources: Vec<_> = self
+            .schema
+            .iter()
+            .filter_map(|(key, source)| match source {
+                ContextSource::Instructions { name } => Some((key, name)),
+                _ => None,
+            })
+            .collect();
+        if sources.len() > MAX_SOURCES {
+            return Err(AgentError::InstructionUnavailable(
+                "too many instruction sources".into(),
+            ));
+        }
+        sources.sort_by(|a, b| a.0.cmp(b.0));
+        let mut snapshot = String::new();
+        for (key, name) in sources {
+            let provider = self.providers.read().get(name).cloned().ok_or_else(|| {
+                AgentError::InstructionUnavailable(
+                    "host instruction provider is not installed".into(),
+                )
+            })?;
+            if task && !provider.task_instruction_safe() {
+                return Err(AgentError::InstructionUnavailable(
+                    "instruction provider lacks task-safe participation".into(),
+                ));
+            }
+            // Instruction authority comes from the installed host binding, not mutable model context.
+            let value = provider.get(key, &Value::Null).await.map_err(|_| {
+                AgentError::InstructionUnavailable("host instruction provider failed".into())
+            })?;
+            let content = value.as_str().ok_or_else(|| {
+                AgentError::InstructionUnavailable(
+                    "instruction provider must return a string".into(),
+                )
+            })?;
+            if snapshot
+                .len()
+                .saturating_add(content.len())
+                .saturating_add(1)
+                > MAX_BYTES
+            {
+                return Err(AgentError::InstructionUnavailable(
+                    "instruction snapshot exceeds the byte limit".into(),
+                ));
+            }
+            if !snapshot.is_empty() && !content.is_empty() {
+                snapshot.push('\n');
+            }
+            snapshot.push_str(content);
+        }
+        Ok(self.has_instruction_sources().then_some(snapshot))
+    }
+
+    /// Reports whether the configured agent requires host-bound instruction preparation.
+    pub fn has_instruction_sources(&self) -> bool {
+        self.schema
+            .values()
+            .any(|source| matches!(source, ContextSource::Instructions { .. }))
+    }
+
+    /// Returns deterministic source declarations for restoration binding without exposing instruction text.
+    pub fn instruction_source_bindings(&self) -> std::collections::BTreeMap<String, String> {
+        self.schema
+            .iter()
+            .filter_map(|(key, source)| match source {
+                ContextSource::Instructions { name } => Some((key.clone(), name.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Refuses task reconstruction without live, explicitly task-safe instruction providers.
+    pub fn validate_task_instruction_bindings(&self) -> Result<()> {
+        let providers = self.providers.read();
+        if self.instruction_source_bindings().values().any(|name| {
+            providers
+                .get(name)
+                .is_none_or(|provider| !provider.task_instruction_safe())
+        }) {
+            return Err(AgentError::InstructionUnavailable(
+                "task-safe host instruction provider is not installed".into(),
+            ));
         }
         Ok(())
     }
@@ -258,6 +375,10 @@ impl ContextManager {
 
             ContextSource::Env { name } => Ok(std::env::var(name).ok().map(Value::String)),
 
+            ContextSource::Instructions { .. } => Err(AgentError::Config(
+                "instruction sources are prepared only for supported model requests".into(),
+            )),
+
             ContextSource::Callback { name, .. } => {
                 // Clone the provider to avoid holding the lock across await
                 let provider = {
@@ -283,6 +404,37 @@ impl ContextManager {
 mod tests {
     use super::super::source::BuiltinSource;
     use super::*;
+
+    struct InstructionFixture;
+
+    #[async_trait::async_trait]
+    impl ContextProvider for InstructionFixture {
+        async fn get(&self, _: &str, context: &Value) -> Result<Value> {
+            assert!(context.is_null());
+            Ok(json!("advisory instruction"))
+        }
+    }
+
+    #[tokio::test]
+    async fn instructions_require_live_provider_and_do_not_enter_context_snapshot() {
+        let schema = HashMap::from([(
+            "rules".into(),
+            ContextSource::Instructions {
+                name: "host".into(),
+            },
+        )]);
+        let manager = ContextManager::new(schema, "test".into(), "1".into());
+        manager.initialize().await.unwrap();
+        manager.refresh_per_session().await.unwrap();
+        assert!(manager.instruction_snapshot().await.is_err());
+        manager.register_provider("host", Arc::new(InstructionFixture));
+        assert_eq!(
+            manager.instruction_snapshot().await.unwrap().as_deref(),
+            Some("advisory instruction")
+        );
+        assert!(!manager.snapshot().contains_key("rules"));
+        assert!(manager.refresh("rules").await.is_err());
+    }
 
     #[test]
     fn test_set_and_get() {

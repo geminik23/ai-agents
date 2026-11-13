@@ -1,7 +1,7 @@
 use ai_agents_skills::SkillDefinition;
 
 /// Skill selected by a speculative routing branch before execution commits.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SkillCandidate {
     pub skill_id: String,
     pub skill: SkillDefinition,

@@ -4,12 +4,16 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::Digest;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
+
+#[cfg(test)]
+#[path = "process_lifetime_tests.rs"]
+mod process_lifetime_tests;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -310,6 +314,15 @@ pub struct QuestionResponse {
 /// Host bridge for asking preference or clarification questions.
 #[async_trait]
 pub trait QuestionHandler: Send + Sync {
+    /// Bounds all logical writes made while serving this exact question; unsupported is not inferred from UI labels.
+    fn declared_write_footprint(
+        &self,
+        _request: &QuestionRequest,
+        _ctx: &ai_agents_core::ToolExecutionContext,
+        _max_targets: usize,
+    ) -> ai_agents_core::Result<Option<ai_agents_core::autonomy::ToolWriteFootprint>> {
+        Ok(None)
+    }
     /// Ask a structured question and return a bounded answer.
     async fn ask_question(&self, request: QuestionRequest) -> QuestionResponse;
 }
@@ -369,7 +382,7 @@ pub struct DiagnosticsResponse {
     /// Diagnostics matching the request.
     #[serde(default)]
     pub diagnostics: Vec<DiagnosticItem>,
-    /// Optional message for unavailable or partial results.
+    /// Optional message for unavailable or partial results; providers must set this when matching diagnostics were omitted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
 }
@@ -377,12 +390,21 @@ pub struct DiagnosticsResponse {
 /// Provider hook for compiler, linter, or editor diagnostics.
 #[async_trait]
 pub trait DiagnosticsProvider: Send + Sync {
+    /// Declares implementation-owned logical writes; diagnostic collection is not assumed side-effect-free.
+    fn declared_write_footprint(
+        &self,
+        _request: &DiagnosticsRequest,
+        _ctx: &ai_agents_core::ToolExecutionContext,
+        _max_targets: usize,
+    ) -> ai_agents_core::Result<Option<ai_agents_core::autonomy::ToolWriteFootprint>> {
+        Ok(None)
+    }
     /// Return whether this provider can serve diagnostics now.
     fn is_available(&self) -> bool {
         true
     }
 
-    /// Return diagnostics for the supplied request.
+    /// Return diagnostics for the supplied request, marking omitted matching items as partial through `message`.
     async fn diagnostics(&self, request: DiagnosticsRequest) -> DiagnosticsResponse;
 }
 
@@ -392,6 +414,16 @@ pub struct UnavailableDiagnosticsProvider;
 
 #[async_trait]
 impl DiagnosticsProvider for UnavailableDiagnosticsProvider {
+    fn declared_write_footprint(
+        &self,
+        _: &DiagnosticsRequest,
+        _: &ai_agents_core::ToolExecutionContext,
+        _: usize,
+    ) -> ai_agents_core::Result<Option<ai_agents_core::autonomy::ToolWriteFootprint>> {
+        Ok(Some(ai_agents_core::autonomy::ToolWriteFootprint::empty(
+            "host.unavailable.diagnostics.v1",
+        )))
+    }
     fn is_available(&self) -> bool {
         false
     }
@@ -432,10 +464,22 @@ impl StaticDiagnosticsProvider {
 
 #[async_trait]
 impl DiagnosticsProvider for StaticDiagnosticsProvider {
+    fn declared_write_footprint(
+        &self,
+        _: &DiagnosticsRequest,
+        _: &ai_agents_core::ToolExecutionContext,
+        _: usize,
+    ) -> ai_agents_core::Result<Option<ai_agents_core::autonomy::ToolWriteFootprint>> {
+        Ok(Some(ai_agents_core::autonomy::ToolWriteFootprint::empty(
+            "host.static.diagnostics.v1",
+        )))
+    }
     fn is_available(&self) -> bool {
         self.available
     }
 
+    // Fixtures use component-wise lexical paths without filesystem I/O; an empty or dot scope includes every known diagnostic.
+    // Apply limits after filtering and retain a partial signal even when the returned prefix fits the tool's own limit.
     async fn diagnostics(&self, request: DiagnosticsRequest) -> DiagnosticsResponse {
         if !self.available {
             return DiagnosticsResponse {
@@ -452,7 +496,7 @@ impl DiagnosticsProvider for StaticDiagnosticsProvider {
                 request
                     .path
                     .as_ref()
-                    .is_none_or(|path| item.path.starts_with(path))
+                    .is_none_or(|path| diagnostic_path_matches(&item.path, path))
             })
             .filter(|item| {
                 request
@@ -463,6 +507,9 @@ impl DiagnosticsProvider for StaticDiagnosticsProvider {
             .cloned()
             .collect();
 
+        let partial = request
+            .max_results
+            .is_some_and(|limit| diagnostics.len() > limit);
         if let Some(max_results) = request.max_results {
             diagnostics.truncate(max_results);
         }
@@ -470,9 +517,20 @@ impl DiagnosticsProvider for StaticDiagnosticsProvider {
         DiagnosticsResponse {
             available: true,
             diagnostics,
-            message: None,
+            message: partial.then(|| "diagnostics result limit omitted matching items".into()),
         }
     }
+}
+
+// Match complete lexical path components so src never includes src2; relative dot components do not require a real workspace.
+fn diagnostic_path_matches(path: &str, scope: &str) -> bool {
+    let meaningful =
+        |component: &std::path::Component<'_>| *component != std::path::Component::CurDir;
+    let mut path = Path::new(path).components().filter(meaningful);
+    Path::new(scope)
+        .components()
+        .filter(meaningful)
+        .all(|component| path.next() == Some(component))
 }
 
 /// Shared slot used by `diagnostics` to find the active provider.
@@ -550,6 +608,15 @@ pub struct WebSearchResponse {
 /// Host bridge for provider-neutral public web search.
 #[async_trait]
 pub trait WebSearchProvider: Send + Sync {
+    /// Covers host-local logical writes, not the search service's invoice or unrelated remote storage.
+    fn declared_write_footprint(
+        &self,
+        _request: &WebSearchRequest,
+        _ctx: &ai_agents_core::ToolExecutionContext,
+        _max_targets: usize,
+    ) -> ai_agents_core::Result<Option<ai_agents_core::autonomy::ToolWriteFootprint>> {
+        Ok(None)
+    }
     /// Return whether this provider can serve search requests now.
     fn is_available(&self) -> bool {
         true
@@ -565,6 +632,16 @@ pub struct UnavailableWebSearchProvider;
 
 #[async_trait]
 impl WebSearchProvider for UnavailableWebSearchProvider {
+    fn declared_write_footprint(
+        &self,
+        _: &WebSearchRequest,
+        _: &ai_agents_core::ToolExecutionContext,
+        _: usize,
+    ) -> ai_agents_core::Result<Option<ai_agents_core::autonomy::ToolWriteFootprint>> {
+        Ok(Some(ai_agents_core::autonomy::ToolWriteFootprint::empty(
+            "host.unavailable.search.v1",
+        )))
+    }
     fn is_available(&self) -> bool {
         false
     }
@@ -609,6 +686,16 @@ impl StaticWebSearchProvider {
 
 #[async_trait]
 impl WebSearchProvider for StaticWebSearchProvider {
+    fn declared_write_footprint(
+        &self,
+        _: &WebSearchRequest,
+        _: &ai_agents_core::ToolExecutionContext,
+        _: usize,
+    ) -> ai_agents_core::Result<Option<ai_agents_core::autonomy::ToolWriteFootprint>> {
+        Ok(Some(ai_agents_core::autonomy::ToolWriteFootprint::empty(
+            "host.static.search.v1",
+        )))
+    }
     fn is_available(&self) -> bool {
         self.available
     }
@@ -690,9 +777,35 @@ pub struct CommandRequest {
     pub reason: Option<String>,
 }
 
+/// Runner-reported foreground execution state, separate from exit success and output completeness.
+/// Reports are trusted host data, not execution authority, rollback receipts or proof that arbitrary descendants stopped.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum CommandExecutionState {
+    /// Legacy hosts retain normal exited-result compatibility; interrupted or ambiguous results remain uncertain.
+    #[default]
+    Unspecified,
+    /// The runner established that command work did not start; the enclosing tool attempt was still invoked and charged.
+    NotStarted,
+    /// The host established completion of its supported foreground work and owned resources, not rollback.
+    Finished,
+    /// Work may have started and effects or required cleanup remain unconfirmed.
+    Uncertain,
+}
+
+impl CommandExecutionState {
+    fn is_unspecified(&self) -> bool {
+        *self == Self::Unspecified
+    }
+}
+
 /// Result returned by a host command runner.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
 pub struct CommandResponse {
+    /// Explicit host execution/cleanup report; missing legacy data cannot certify an interrupted command's settlement.
+    #[serde(default, skip_serializing_if = "CommandExecutionState::is_unspecified")]
+    pub execution_state: CommandExecutionState,
     /// Whether the process completed with exit code 0.
     pub success: bool,
     /// Process exit code when available.
@@ -700,13 +813,13 @@ pub struct CommandResponse {
     pub exit_code: Option<i32>,
     /// Termination reason: exited, timeout, cancelled, unavailable, or error.
     pub termination: String,
-    /// Captured stdout after truncation.
+    /// Captured stdout, preserving bounded beginning and ending text when truncated.
     #[serde(default)]
     pub stdout: String,
-    /// Captured stderr after truncation.
+    /// Captured stderr, preserving bounded beginning and ending text when truncated.
     #[serde(default)]
     pub stderr: String,
-    /// Captured stdout and stderr after truncation.
+    /// Captured stdout followed by stderr, not their chronological interleaving.
     #[serde(default)]
     pub combined_output: String,
     /// True when output was truncated.
@@ -726,6 +839,16 @@ pub struct CommandResponse {
 /// Host bridge for controlled command execution.
 #[async_trait]
 pub trait CommandRunner: Send + Sync {
+    /// Trusted hosts may declare an enforced complete logical footprint for the actual policy-normalized request.
+    /// Process runners remain unsupported by default; a command name or argv allowlist is not write containment.
+    fn declared_write_footprint(
+        &self,
+        _request: &CommandRequest,
+        _ctx: &ai_agents_core::ToolExecutionContext,
+        _max_targets: usize,
+    ) -> ai_agents_core::Result<Option<ai_agents_core::autonomy::ToolWriteFootprint>> {
+        Ok(None)
+    }
     /// Return whether this runner can execute commands now.
     fn is_available(&self) -> bool {
         true
@@ -745,6 +868,16 @@ pub struct UnavailableCommandRunner;
 
 #[async_trait]
 impl CommandRunner for UnavailableCommandRunner {
+    fn declared_write_footprint(
+        &self,
+        _: &CommandRequest,
+        _: &ai_agents_core::ToolExecutionContext,
+        _: usize,
+    ) -> ai_agents_core::Result<Option<ai_agents_core::autonomy::ToolWriteFootprint>> {
+        Ok(Some(ai_agents_core::autonomy::ToolWriteFootprint::empty(
+            "host.unavailable.command.v1",
+        )))
+    }
     fn is_available(&self) -> bool {
         false
     }
@@ -757,6 +890,7 @@ impl CommandRunner for UnavailableCommandRunner {
         CommandResponse {
             success: false,
             termination: "unavailable".to_string(),
+            execution_state: CommandExecutionState::NotStarted,
             cwd: request.cwd,
             argv_redacted: redact_argv(&request.argv),
             ..CommandResponse::default()
@@ -794,6 +928,16 @@ impl StaticCommandRunner {
 
 #[async_trait]
 impl CommandRunner for StaticCommandRunner {
+    fn declared_write_footprint(
+        &self,
+        _: &CommandRequest,
+        _: &ai_agents_core::ToolExecutionContext,
+        _: usize,
+    ) -> ai_agents_core::Result<Option<ai_agents_core::autonomy::ToolWriteFootprint>> {
+        Ok(Some(ai_agents_core::autonomy::ToolWriteFootprint::empty(
+            "host.static.command.v1",
+        )))
+    }
     fn is_available(&self) -> bool {
         self.available
     }
@@ -807,6 +951,7 @@ impl CommandRunner for StaticCommandRunner {
             return CommandResponse {
                 success: false,
                 termination: "unavailable".to_string(),
+                execution_state: CommandExecutionState::NotStarted,
                 cwd: request.cwd,
                 argv_redacted: redact_argv(&request.argv),
                 ..CommandResponse::default()
@@ -819,6 +964,7 @@ impl CommandRunner for StaticCommandRunner {
                 success: false,
                 exit_code: Some(127),
                 termination: "not_found".to_string(),
+                execution_state: CommandExecutionState::NotStarted,
                 stderr: "mock command not found".to_string(),
                 combined_output: "mock command not found".to_string(),
                 cwd: request.cwd,
@@ -834,6 +980,8 @@ pub struct ProcessCommandRunner;
 
 #[async_trait]
 impl CommandRunner for ProcessCommandRunner {
+    // Own wait and pipe futures together under one original work deadline; dropping closes readers without detaching tasks.
+    // Timeout cleanup can reap the direct child but cannot certify descendant effects, so it narrows settlement to uncertain.
     async fn run_command(
         &self,
         request: CommandRequest,
@@ -843,6 +991,7 @@ impl CommandRunner for ProcessCommandRunner {
             return CommandResponse {
                 success: false,
                 termination: "error".to_string(),
+                execution_state: CommandExecutionState::NotStarted,
                 stderr: "argv must not be empty".to_string(),
                 combined_output: "argv must not be empty".to_string(),
                 cwd: request.cwd,
@@ -878,6 +1027,7 @@ impl CommandRunner for ProcessCommandRunner {
                 return CommandResponse {
                     success: false,
                     termination: "error".to_string(),
+                    execution_state: CommandExecutionState::NotStarted,
                     stderr: error.to_string(),
                     combined_output: error.to_string(),
                     cwd: request.cwd,
@@ -886,46 +1036,41 @@ impl CommandRunner for ProcessCommandRunner {
                 };
             }
         };
-        let output_byte_cap = max_output_chars.saturating_mul(4).max(1);
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
-        let stdout_task = tokio::spawn(read_pipe_bounded(stdout, output_byte_cap));
-        let stderr_task = tokio::spawn(read_pipe_bounded(stderr, output_byte_cap));
-        let status = tokio::time::timeout(Duration::from_millis(timeout_ms), child.wait()).await;
-        match status {
-            Ok(Ok(status)) => {
-                let (stdout, stdout_truncated) = stdout_task.await.unwrap_or_default();
-                let (stderr, stderr_truncated) = stderr_task.await.unwrap_or_default();
-                command_output_response(
-                    status,
-                    stdout,
-                    stderr,
-                    stdout_truncated || stderr_truncated,
-                    request,
-                    max_output_chars,
-                )
+        let result = tokio::time::timeout(
+            Duration::from_millis(timeout_ms),
+            collect_process_output(child.wait(), stdout, stderr, max_output_chars),
+        )
+        .await;
+        match result {
+            Ok(Ok((status, stdout, stderr))) => {
+                command_output_response(status, stdout, stderr, request, max_output_chars)
             }
-            Ok(Err(error)) => CommandResponse {
-                success: false,
-                termination: "error".to_string(),
-                stderr: error.to_string(),
-                combined_output: error.to_string(),
-                cwd: request.cwd,
-                argv_redacted: redact_argv(&request.argv),
-                ..CommandResponse::default()
-            },
-            Err(_) => {
-                let _ = child.kill().await;
-                let _ = child.wait().await;
-                stdout_task.abort();
-                stderr_task.abort();
-                let message = "command timed out; process cleanup requested".to_string();
+            interrupted => {
+                let timed_out = interrupted.is_err();
+                let cause = match interrupted {
+                    Ok(Err(error)) => format!("command wait failed: {error}"),
+                    _ => "command timed out".into(),
+                };
+                // This is cleanup of admitted work, not a renewed execution deadline or permission to retry.
+                // Outer executor cancellation/drop can interrupt this await and retains its own original custody.
+                let cleanup = match child.kill().await {
+                    Ok(()) => "direct child reaped",
+                    Err(_) => match child.try_wait() {
+                        Ok(Some(_)) => "direct child already reaped",
+                        _ => "direct child cleanup unconfirmed",
+                    },
+                };
+                let message = format!("{cause}; {cleanup}; descendant effects remain unconfirmed");
                 CommandResponse {
+                    execution_state: CommandExecutionState::Uncertain,
                     success: false,
-                    termination: "timeout".to_string(),
+                    termination: if timed_out { "timeout" } else { "error" }.into(),
                     stderr: message.clone(),
                     combined_output: message,
-                    timed_out: true,
+                    truncated: true,
+                    timed_out,
                     cwd: request.cwd,
                     argv_redacted: redact_argv(&request.argv),
                     ..CommandResponse::default()
@@ -938,74 +1083,223 @@ impl CommandRunner for ProcessCommandRunner {
 /// Shared slot used by `command` to find the active host runner.
 pub type CommandRunnerSlot = Arc<RwLock<Arc<dyn CommandRunner>>>;
 
-async fn read_pipe_bounded<R>(pipe: Option<R>, max_bytes: usize) -> (Vec<u8>, bool)
+// The wait and both readers are owned by this future, so wait failure or cancellation closes the read ends synchronously.
+// Reader I/O failures stay partial captures rather than aborting otherwise running work or implying uncertain effects.
+async fn collect_process_output<W, O, E>(
+    wait: W,
+    stdout: Option<O>,
+    stderr: Option<E>,
+    limit: usize,
+) -> std::io::Result<(
+    std::process::ExitStatus,
+    BoundedProcessOutput,
+    BoundedProcessOutput,
+)>
+where
+    W: std::future::Future<Output = std::io::Result<std::process::ExitStatus>>,
+    O: tokio::io::AsyncRead + Unpin,
+    E: tokio::io::AsyncRead + Unpin,
+{
+    tokio::try_join!(
+        wait,
+        async { Ok(read_pipe_bounded(stdout, limit).await) },
+        async { Ok(read_pipe_bounded(stderr, limit).await) },
+    )
+}
+
+// Retain both ends while draining the entire pipe; the configured character bound does not grow with process output.
+struct BoundedProcessOutput {
+    head: String,
+    tail: VecDeque<char>,
+    count: usize,
+    limit: usize,
+    read_failed: bool,
+}
+
+impl BoundedProcessOutput {
+    fn new(limit: usize) -> Self {
+        Self {
+            head: String::new(),
+            tail: VecDeque::new(),
+            count: 0,
+            limit,
+            read_failed: false,
+        }
+    }
+
+    fn push(&mut self, character: char) {
+        if self.count < self.limit {
+            self.head.push(character);
+        }
+        if self.limit > 0 {
+            if self.tail.len() == self.limit {
+                self.tail.pop_front();
+            }
+            self.tail.push_back(character);
+        }
+        self.count = self.count.saturating_add(1);
+    }
+
+    fn tail_string(&self) -> String {
+        self.tail.iter().collect()
+    }
+
+    fn render(&self) -> (String, bool) {
+        render_head_tail(&self.head, &self.tail_string(), self.count, self.limit)
+    }
+}
+
+const OUTPUT_TRUNCATION_MARKER: &str = "\n...[truncated]...\n";
+
+// Preserve the original string when it fits and reserve space for the marker within the same character limit.
+fn render_head_tail(head: &str, tail: &str, count: usize, max_chars: usize) -> (String, bool) {
+    if count <= max_chars {
+        return (head.to_string(), false);
+    }
+    let marker_chars = OUTPUT_TRUNCATION_MARKER.chars().count();
+    const MIN_ERROR_TAIL_CHARS: usize = 32;
+    if max_chars <= marker_chars + MIN_ERROR_TAIL_CHARS {
+        let mut suffix: Vec<_> = tail.chars().rev().take(max_chars).collect();
+        suffix.reverse();
+        return (suffix.into_iter().collect(), true);
+    }
+    let available = max_chars - marker_chars;
+    let tail_count = available.div_ceil(2).max(MIN_ERROR_TAIL_CHARS);
+    let head_count = available - tail_count;
+    let mut suffix: Vec<_> = tail.chars().rev().take(tail_count).collect();
+    suffix.reverse();
+    let mut output: String = head.chars().take(head_count).collect();
+    output.push_str(OUTPUT_TRUNCATION_MARKER);
+    output.extend(suffix);
+    (output, true)
+}
+
+// Serialized envelopes carry their own truncation flag, so shortening them needs no additional marker or non-monotonic escape cost.
+pub(crate) fn truncate_head_tail(value: &str, max_chars: usize) -> (String, bool) {
+    if value.chars().count() <= max_chars {
+        return (value.to_string(), false);
+    }
+    let head_count = max_chars / 2;
+    let tail_count = max_chars - head_count;
+    let mut suffix: Vec<_> = value.chars().rev().take(tail_count).collect();
+    suffix.reverse();
+    let mut output: String = value.chars().take(head_count).collect();
+    output.extend(suffix);
+    (output, true)
+}
+
+// Decode incrementally so a UTF-8 character split across reads is not replaced merely because it crossed a pipe boundary.
+fn decode_process_output(output: &mut BoundedProcessOutput, pending: &mut Vec<u8>, finished: bool) {
+    let mut consumed = 0;
+    while consumed < pending.len() {
+        match std::str::from_utf8(&pending[consumed..]) {
+            Ok(text) => {
+                for character in text.chars() {
+                    output.push(character);
+                }
+                consumed = pending.len();
+            }
+            Err(error) => {
+                let valid_end = consumed + error.valid_up_to();
+                let valid = std::str::from_utf8(&pending[consumed..valid_end])
+                    .expect("UTF-8 decoder returned an invalid prefix");
+                for character in valid.chars() {
+                    output.push(character);
+                }
+                consumed = valid_end;
+                match error.error_len() {
+                    Some(length) => {
+                        output.push('\u{fffd}');
+                        consumed += length;
+                    }
+                    None => break,
+                }
+            }
+        }
+    }
+    pending.drain(..consumed);
+    if finished {
+        for character in String::from_utf8_lossy(pending).chars() {
+            output.push(character);
+        }
+        pending.clear();
+    }
+}
+
+async fn read_pipe_bounded<R>(pipe: Option<R>, max_chars: usize) -> BoundedProcessOutput
 where
     R: tokio::io::AsyncRead + Unpin,
 {
+    let mut output = BoundedProcessOutput::new(max_chars);
     let Some(mut pipe) = pipe else {
-        return (Vec::new(), false);
+        return output;
     };
-    let mut output = Vec::new();
-    let mut truncated = false;
-    let mut buffer = vec![0u8; 8192];
+    let mut pending = Vec::new();
+    let mut buffer = [0u8; 8192];
     loop {
         let read = match pipe.read(&mut buffer).await {
             Ok(0) => break,
             Ok(read) => read,
-            Err(_) => break,
+            Err(_) => {
+                output.read_failed = true;
+                break;
+            }
         };
-        let remaining = max_bytes.saturating_sub(output.len());
-        if remaining > 0 {
-            output.extend_from_slice(&buffer[..read.min(remaining)]);
-        }
-        if read > remaining {
-            truncated = true;
-        }
+        pending.extend_from_slice(&buffer[..read]);
+        decode_process_output(&mut output, &mut pending, false);
     }
-    (output, truncated)
+    decode_process_output(&mut output, &mut pending, true);
+    output
 }
 
 fn command_output_response(
     status: std::process::ExitStatus,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
-    pre_truncated: bool,
+    stdout: BoundedProcessOutput,
+    stderr: BoundedProcessOutput,
     request: CommandRequest,
     max_output_chars: usize,
 ) -> CommandResponse {
-    let stdout = String::from_utf8_lossy(&stdout).to_string();
-    let stderr = String::from_utf8_lossy(&stderr).to_string();
-    let combined = if stderr.is_empty() {
-        stdout.clone()
-    } else if stdout.is_empty() {
-        stderr.clone()
+    let separator = if stdout.count > 0 && stderr.count > 0 {
+        "\n"
     } else {
-        format!("{}\n{}", stdout, stderr)
+        ""
     };
-    let (stdout, stdout_truncated) = truncate_chars(stdout, max_output_chars);
-    let (stderr, stderr_truncated) = truncate_chars(stderr, max_output_chars);
-    let (combined_output, combined_truncated) = truncate_chars(combined, max_output_chars);
+    // Combined output preserves the existing stdout-then-stderr order, not the time order of pipe writes.
+    let combined_head = format!("{}{}{}", stdout.head, separator, stderr.head);
+    let combined_tail = format!(
+        "{}{}{}",
+        stdout.tail_string(),
+        separator,
+        stderr.tail_string()
+    );
+    let combined_count = stdout
+        .count
+        .saturating_add(stderr.count)
+        .saturating_add(separator.len());
+    let (combined_output, combined_truncated) = render_head_tail(
+        &combined_head,
+        &combined_tail,
+        combined_count,
+        max_output_chars,
+    );
+    let (stdout_text, stdout_truncated) = stdout.render();
+    let (stderr_text, stderr_truncated) = stderr.render();
     CommandResponse {
+        execution_state: CommandExecutionState::Finished,
         success: status.success(),
         exit_code: status.code(),
         termination: "exited".to_string(),
-        stdout,
-        stderr,
+        stdout: stdout_text,
+        stderr: stderr_text,
         combined_output,
-        truncated: pre_truncated || stdout_truncated || stderr_truncated || combined_truncated,
+        truncated: stdout.read_failed
+            || stderr.read_failed
+            || stdout_truncated
+            || stderr_truncated
+            || combined_truncated,
         timed_out: false,
         cwd: request.cwd,
         argv_redacted: redact_argv(&request.argv),
-    }
-}
-
-fn truncate_chars(value: String, max_chars: usize) -> (String, bool) {
-    let mut chars = value.chars();
-    let truncated: String = chars.by_ref().take(max_chars).collect();
-    if chars.next().is_some() {
-        (truncated, true)
-    } else {
-        (value, false)
     }
 }
 
@@ -1058,21 +1352,89 @@ pub struct TodoItem {
     pub status: TodoStatus,
 }
 
-/// Session-local todo storage shared by the registry and runtime accessor.
+/// Identifies the sole run owner of a canonical todo list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TodoRunBinding {
+    #[serde(default)]
+    pub objective_revision: u64,
+    pub agent_id: String,
+    pub run_id: String,
+    pub token: String,
+}
+
+#[derive(Default)]
+struct TodoStoreState {
+    items: Vec<TodoItem>,
+    binding: Option<TodoRunBinding>,
+    max_open: Option<u32>,
+}
+
+/// Session-local storage shared by the tool and runtime, optionally bound to one task run.
 #[derive(Clone, Default)]
 pub struct TodoStore {
-    inner: Arc<RwLock<Vec<TodoItem>>>,
+    inner: Arc<RwLock<TodoStoreState>>,
+}
+
+tokio::task_local! { static TASK_TODO_AUTHORITY: (TodoStore, TodoRunBinding); }
+
+/// Installs the coordinating canonical store without replacing a child's prepared tool handle.
+pub async fn scope_task_todos<F: std::future::Future>(
+    store: TodoStore,
+    binding: TodoRunBinding,
+    future: F,
+) -> F::Output {
+    TASK_TODO_AUTHORITY.scope((store, binding), future).await
+}
+
+/// A stale scoped binding fails closed instead of falling back to a participant's session-local list.
+pub fn current_task_todo_store() -> ai_agents_core::Result<Option<TodoStore>> {
+    TASK_TODO_AUTHORITY
+        .try_with(|(store, binding)| {
+            if store.list_for_run(binding).is_some() {
+                Ok(Some(store.clone()))
+            } else {
+                Err(ai_agents_core::autonomy::TaskRunStorageError::Conflict.into())
+            }
+        })
+        .unwrap_or(Ok(None))
 }
 
 impl TodoStore {
     /// Return a snapshot of all todo items.
     pub fn list(&self) -> Vec<TodoItem> {
-        self.inner.read().clone()
+        self.inner.read().items.clone()
     }
 
     /// Replace the full todo list.
     pub fn set(&self, items: Vec<TodoItem>) {
-        *self.inner.write() = items;
+        let _ = self.try_set(items);
+    }
+
+    /// Applies the run's open-item bound atomically without replacing the sole canonical list on rejection.
+    pub fn try_set(&self, items: Vec<TodoItem>) -> bool {
+        let mut state = self.inner.write();
+        if state
+            .max_open
+            .is_some_and(|limit| open_todos(&items) > limit as usize)
+        {
+            return false;
+        }
+        state.items = items;
+        true
+    }
+
+    /// Installs a bound only for the current run owner; ordinary session todo behavior is unchanged.
+    pub fn set_run_open_limit(&self, binding: &TodoRunBinding, limit: Option<u32>) -> bool {
+        let mut state = self.inner.write();
+        if state.binding.as_ref() != Some(binding)
+            || limit == Some(0)
+            || limit.is_some_and(|limit| open_todos(&state.items) > limit as usize)
+        {
+            return false;
+        }
+        state.max_open = limit;
+        true
     }
 
     /// Update one item by ID and return whether it existed.
@@ -1083,10 +1445,26 @@ impl TodoStore {
         active_form: Option<String>,
         status: Option<TodoStatus>,
     ) -> bool {
-        let mut items = self.inner.write();
-        let Some(item) = items.iter_mut().find(|item| item.id == id) else {
+        let mut state = self.inner.write();
+        let Some(index) = state.items.iter().position(|item| item.id == id) else {
             return false;
         };
+        let was_open = matches!(
+            state.items[index].status,
+            TodoStatus::Pending | TodoStatus::InProgress
+        );
+        let becomes_open = status
+            .as_ref()
+            .is_some_and(|status| matches!(status, TodoStatus::Pending | TodoStatus::InProgress));
+        if !was_open
+            && becomes_open
+            && state
+                .max_open
+                .is_some_and(|limit| open_todos(&state.items) >= limit as usize)
+        {
+            return false;
+        }
+        let item = &mut state.items[index];
         if let Some(content) = content {
             item.content = content;
         }
@@ -1101,8 +1479,67 @@ impl TodoStore {
 
     /// Remove every todo item.
     pub fn clear(&self) {
-        self.inner.write().clear();
+        self.inner.write().items.clear();
     }
+
+    /// Confirms a host alias observes the same canonical authority rather than an unrelated JSON-returning tool.
+    pub fn shares_store(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    /// Binds a new run atomically and discards only the prior unbound session list.
+    pub fn bind_run(&self, binding: TodoRunBinding, items: Vec<TodoItem>) -> bool {
+        let mut state = self.inner.write();
+        if state.binding.is_some() {
+            return false;
+        }
+        state.binding = Some(binding);
+        state.items = items;
+        true
+    }
+
+    /// Replaces one objective binding and its list under the same lock without exposing an unbound interval.
+    /// The caller must retain the old list for audit and acknowledge the matching durable handoff before execution.
+    pub fn rebind_run(&self, previous: &TodoRunBinding, next: TodoRunBinding) -> bool {
+        let mut state = self.inner.write();
+        if state.binding.as_ref() != Some(previous)
+            || next.agent_id != previous.agent_id
+            || next.run_id != previous.run_id
+            || previous.objective_revision.checked_add(1) != Some(next.objective_revision)
+            || next.token.is_empty()
+            || next.token == previous.token
+        {
+            return false;
+        }
+        state.binding = Some(next);
+        state.items.clear();
+        true
+    }
+
+    /// Returns one authoritative list only when the run binding still matches.
+    pub fn list_for_run(&self, binding: &TodoRunBinding) -> Option<Vec<TodoItem>> {
+        let state = self.inner.read();
+        (state.binding.as_ref() == Some(binding)).then(|| state.items.clone())
+    }
+
+    /// Releases a matching run; a stale adapter cannot detach a newer owner.
+    pub fn release_run(&self, binding: &TodoRunBinding) -> bool {
+        let mut state = self.inner.write();
+        if state.binding.as_ref() != Some(binding) {
+            return false;
+        }
+        state.binding = None;
+        state.max_open = None;
+        true
+    }
+}
+
+// Completed and cancelled items are visible history, not open work.
+fn open_todos(items: &[TodoItem]) -> usize {
+    items
+        .iter()
+        .filter(|item| matches!(item.status, TodoStatus::Pending | TodoStatus::InProgress))
+        .count()
 }
 
 fn default_true() -> bool {
@@ -1112,6 +1549,138 @@ fn default_true() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "subprocess helper"]
+    fn output_and_edit_regression_process_output_helper() {
+        if std::env::var("AI_AGENTS_PROCESS_OUTPUT_HELPER").as_deref() != Ok("1") {
+            return;
+        }
+        use std::io::Write;
+        let mut stdout = std::io::stdout().lock();
+        let mut stderr = std::io::stderr().lock();
+        write!(stdout, "START-OUT {} END-OUT", "가".repeat(4_000)).unwrap();
+        write!(stderr, "START-ERR {} 끝-오류", "z".repeat(12_000)).unwrap();
+        stdout.flush().unwrap();
+        stderr.flush().unwrap();
+        // Exit the helper before the test harness appends its own summary to stdout.
+        let code = if std::env::var("AI_AGENTS_PROCESS_OUTPUT_FAIL").as_deref() == Ok("1") {
+            1
+        } else {
+            0
+        };
+        std::process::exit(code);
+    }
+
+    #[tokio::test]
+    async fn output_and_edit_regression_process_runner_keeps_head_and_error_tail() {
+        let executable = std::env::current_exe().unwrap();
+        let request = CommandRequest {
+            argv: vec![
+                executable.to_string_lossy().into_owned(),
+                "types::tests::output_and_edit_regression_process_output_helper".to_string(),
+                "--exact".to_string(),
+                "--ignored".to_string(),
+                "--nocapture".to_string(),
+            ],
+            env: HashMap::from([
+                ("AI_AGENTS_PROCESS_OUTPUT_HELPER".into(), "1".into()),
+                ("AI_AGENTS_PROCESS_OUTPUT_FAIL".into(), "1".into()),
+            ]),
+            timeout_ms: Some(5_000),
+            max_output_chars: Some(160),
+            ..CommandRequest::default()
+        };
+        let response = ProcessCommandRunner
+            .run_command(
+                request,
+                ai_agents_core::ToolExecutionContext::test("command"),
+            )
+            .await;
+
+        assert_eq!(response.termination, "exited");
+        assert_eq!(response.exit_code, Some(1));
+        assert!(!response.success);
+        assert!(response.truncated);
+        assert!(response.stdout.contains("START-OUT"));
+        assert!(response.stdout.contains("END-OUT"));
+        assert!(response.stderr.contains("START-ERR"));
+        assert!(response.stderr.contains("끝-오류"));
+        assert!(response.combined_output.contains("끝-오류"));
+        for value in [
+            &response.stdout,
+            &response.stderr,
+            &response.combined_output,
+        ] {
+            assert!(value.chars().count() <= 160);
+            assert!(!value.contains('\u{fffd}'));
+        }
+    }
+
+    #[test]
+    fn output_and_edit_regression_small_cap_keeps_the_final_error() {
+        let text = format!("{}FINAL-ERROR", "x".repeat(100));
+        let (output, truncated) = render_head_tail(&text, &text, text.chars().count(), 20);
+        assert!(truncated);
+        assert!(output.contains("FINAL-ERROR"));
+        assert!(output.chars().count() <= 20);
+    }
+
+    #[tokio::test]
+    async fn output_and_edit_regression_split_utf8_and_tiny_output_limits() {
+        use tokio::io::AsyncWriteExt;
+        let text = "A가🦀BéZ";
+        for limit in [0, 1, 5, 6, 20] {
+            let (reader, mut writer) = tokio::io::duplex(1);
+            let bytes = text.as_bytes().to_vec();
+            let sending = tokio::spawn(async move {
+                for byte in bytes {
+                    writer.write_all(&[byte]).await.unwrap();
+                }
+            });
+            let captured = read_pipe_bounded(Some(reader), limit).await;
+            sending.await.unwrap();
+            let (output, truncated) = captured.render();
+            assert_eq!(truncated, text.chars().count() > limit);
+            assert!(output.chars().count() <= limit);
+            assert!(!output.contains('\u{fffd}'));
+            if text.chars().count() <= limit {
+                assert_eq!(output, text);
+            } else if limit > 0 {
+                assert!(output.ends_with('Z'));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn output_and_edit_regression_invalid_utf8_and_zero_limit_still_drain() {
+        use tokio::io::AsyncWriteExt;
+        let bytes = vec![b'a', 0xff, 0xf0, 0x9f];
+        let (reader, mut writer) = tokio::io::duplex(1);
+        let sent = bytes.clone();
+        let sending = tokio::spawn(async move {
+            for byte in sent {
+                writer.write_all(&[byte]).await.unwrap();
+            }
+        });
+        let captured = read_pipe_bounded(Some(reader), 20).await;
+        sending.await.unwrap();
+        assert_eq!(captured.render().0, String::from_utf8_lossy(&bytes));
+        assert!(!captured.render().1);
+
+        let (reader, mut writer) = tokio::io::duplex(1);
+        let sending = tokio::spawn(async move {
+            writer.write_all(&vec![b'x'; 10_000]).await.unwrap();
+        });
+        let captured =
+            tokio::time::timeout(Duration::from_secs(5), read_pipe_bounded(Some(reader), 0))
+                .await
+                .expect("the complete pipe must be drained");
+        sending.await.unwrap();
+        let (output, truncated) = captured.render();
+        assert!(output.is_empty());
+        assert!(truncated);
+    }
 
     #[test]
     fn process_command_runner_timeout_helper() {
@@ -1168,6 +1737,10 @@ mod tests {
 
         assert_eq!(response.termination, "timeout");
         assert!(response.timed_out);
+        assert!(
+            response.truncated,
+            "timeout abandons any partially captured output"
+        );
         assert!(started_path.exists());
         assert!(!completed_path.exists());
         tokio::time::sleep(Duration::from_secs(2)).await;

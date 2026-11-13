@@ -40,6 +40,9 @@ use crate::{EvalError, Result};
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct FixturesConfig {
+    /// UTF-8 files created only inside a fresh attempt workspace; reset preserves them unless persistence is explicitly deleted.
+    #[serde(default)]
+    pub files: std::collections::BTreeMap<String, String>,
     /// Runtime or fixture context value.
     #[serde(default)]
     pub context: Option<Value>,
@@ -467,6 +470,25 @@ struct MockRoute {
 
 impl FixturesConfig {
     pub(crate) fn validate(&self) -> Result<()> {
+        if self.files.len() > 256
+            || self.files.values().map(String::len).sum::<usize>() > 8 * 1024 * 1024
+        {
+            return Err(EvalError::Config(
+                "fixtures.files exceeds its bounded workspace size".into(),
+            ));
+        }
+        for path in self.files.keys() {
+            if path.is_empty()
+                || path.contains(['\\', ':'])
+                || path
+                    .split('/')
+                    .any(|part| part.is_empty() || matches!(part, "." | ".."))
+            {
+                return Err(EvalError::Config(
+                    "fixtures.files paths must be relative normal components".into(),
+                ));
+            }
+        }
         if let Some(mock_server) = &self.mock_server {
             for (index, route) in mock_server.routes.iter().cloned().enumerate() {
                 serde_json::from_value::<MockRoute>(route).map_err(|error| {
@@ -520,13 +542,24 @@ pub struct AttemptFixtureContext {
 /// Runner-owned attempt context that removes its temporary workspace on drop.
 pub(crate) struct AttemptWorkspace {
     context: AttemptFixtureContext,
+    retained: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl AttemptWorkspace {
     pub(crate) fn create(mock_server: Option<&MockServerHandle>) -> Result<Self> {
         Ok(Self {
             context: AttemptFixtureContext::create(mock_server)?,
+            retained: Default::default(),
         })
+    }
+}
+
+impl AttemptWorkspace {
+    // The attempt holds files until foreground task cleanup is acknowledged, including early-return/drop paths.
+    pub(crate) fn hold_for_tasks(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        self.retained
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.retained.clone()
     }
 }
 
@@ -540,6 +573,12 @@ impl std::ops::Deref for AttemptWorkspace {
 
 impl Drop for AttemptWorkspace {
     fn drop(&mut self) {
+        if self.retained.load(std::sync::atomic::Ordering::Acquire) {
+            tracing::warn!(
+                "eval attempt workspace retained because task cleanup was not acknowledged"
+            );
+            return;
+        }
         if let Err(error) = std::fs::remove_dir_all(&self.context.workspace)
             && error.kind() != std::io::ErrorKind::NotFound
         {
@@ -553,6 +592,67 @@ impl Drop for AttemptWorkspace {
 }
 
 impl AttemptFixtureContext {
+    // Fixture installation happens before runtime construction and never overwrites an existing effect or follows a fixture-created symlink.
+    pub(crate) fn materialize_files(&self, fixtures: &FixturesConfig) -> Result<()> {
+        fixtures.validate()?;
+        for (relative, content) in &fixtures.files {
+            let path = self.workspace.join(relative);
+            let parent = path.parent().expect("relative fixture path");
+            std::fs::create_dir_all(parent)?;
+            if !parent.canonicalize()?.starts_with(&self.workspace) {
+                return Err(EvalError::Config(
+                    "fixture parent escapes its attempt workspace".into(),
+                ));
+            }
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)?;
+            std::io::Write::write_all(&mut file, content.as_bytes())?;
+        }
+        Ok(())
+    }
+
+    // Only generated eval tokens are substituted in typed agent values; field names and all other templates remain unchanged.
+    pub(crate) fn interpolate_config<T: serde::Serialize + serde::de::DeserializeOwned>(
+        &self,
+        config: &T,
+    ) -> Result<T> {
+        fn visit(context: &AttemptFixtureContext, value: &mut Value) -> Result<()> {
+            match value {
+                Value::String(text) => {
+                    if text.contains("{{ mock_server.base_url }}")
+                        && context.mock_server_base_url.is_none()
+                    {
+                        return Err(EvalError::Config(
+                            "mock_server token requires an enabled fixture server".into(),
+                        ));
+                    }
+                    *text = interpolate_fixture_string(
+                        text,
+                        &context.workspace.display().to_string(),
+                        context.mock_server_base_url.as_deref(),
+                    );
+                }
+                Value::Array(values) => {
+                    for value in values {
+                        visit(context, value)?;
+                    }
+                }
+                Value::Object(values) => {
+                    for value in values.values_mut() {
+                        visit(context, value)?;
+                    }
+                }
+                _ => {}
+            }
+            Ok(())
+        }
+        let mut value = serde_json::to_value(config)?;
+        visit(self, &mut value)?;
+        Ok(serde_json::from_value(value)?)
+    }
+
     pub fn create(mock_server: Option<&MockServerHandle>) -> Result<Self> {
         let isolation_id = uuid::Uuid::new_v4().to_string();
         let workspace = std::env::temp_dir().join(format!("ai_agents_eval_{}", isolation_id));
@@ -669,8 +769,8 @@ impl From<&ai_agents_core::ToolCallSource> for ToolExecutionSource {
             ai_agents_core::ToolCallSource::Orchestration => Self::Orchestration,
             ai_agents_core::ToolCallSource::Spawner => Self::Spawner,
             ai_agents_core::ToolCallSource::EvalFixture => Self::Mock,
+            ai_agents_core::ToolCallSource::Task => Self::Task,
             ai_agents_core::ToolCallSource::Fallback { .. }
-            | ai_agents_core::ToolCallSource::Task
             | ai_agents_core::ToolCallSource::Manual => Self::Llm,
         }
     }
@@ -1197,6 +1297,47 @@ impl Tool for RecordingTool {
 
     async fn execute(&self, args: Value, ctx: ToolExecutionContext) -> ToolResult {
         self.inner.execute(args, ctx).await
+    }
+
+    // Recording remains in shared executor hooks; forwarding must not erase the wrapped implementation's task protocol.
+    async fn execute_task(
+        &self,
+        args: Value,
+        ctx: ToolExecutionContext,
+    ) -> ai_agents_core::Result<ToolResult> {
+        self.inner.execute_task(args, ctx).await
+    }
+    fn supports_task_messages(&self) -> bool {
+        self.inner.supports_task_messages()
+    }
+    fn manages_task_todos(&self) -> bool {
+        self.inner.manages_task_todos()
+    }
+    fn task_question(&self, args: &Value) -> ai_agents_core::Result<Option<Value>> {
+        self.inner.task_question(args)
+    }
+    fn task_question_result(
+        &self,
+        args: &Value,
+        answer: &Value,
+    ) -> ai_agents_core::Result<ToolResult> {
+        self.inner.task_question_result(args, answer)
+    }
+    async fn execute_task_question(
+        &self,
+        args: Value,
+        answer: Value,
+        ctx: ToolExecutionContext,
+    ) -> ToolResult {
+        self.inner.execute_task_question(args, answer, ctx).await
+    }
+    fn declared_write_footprint(
+        &self,
+        args: &Value,
+        ctx: &ToolExecutionContext,
+        max_targets: usize,
+    ) -> ai_agents_core::Result<Option<ai_agents_core::autonomy::ToolWriteFootprint>> {
+        self.inner.declared_write_footprint(args, ctx, max_targets)
     }
 }
 
@@ -2015,7 +2156,7 @@ mod tests {
                 },
                 ToolExecutionSource::Llm,
             ),
-            (ToolCallSource::Task, ToolExecutionSource::Llm),
+            (ToolCallSource::Task, ToolExecutionSource::Task),
             (ToolCallSource::Manual, ToolExecutionSource::Llm),
             (ToolCallSource::EvalFixture, ToolExecutionSource::Mock),
         ];
