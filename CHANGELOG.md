@@ -77,6 +77,7 @@
 - Rust configuration compatibility: typed autonomy fields, validation driver bounds and objective-bound todo identities require affected struct literals to be updated; these development additions are not the published stable API
 
 ### Fixed
+- Dependency security: refresh locked OpenSSL, rustls, and webpki versions to address TLS advisories
 - Command lifetimes: keep output readers under the original work deadline and caller lifetime, with explicit uncertain effects after unconfirmed cleanup
 - Default approval logging: omit approval bodies and rejection reasons while preserving exact local review and trusted execution records
 - Task diagnostics: preserve partial-result and path-filter semantics, reject changed-query or fallback completion proof, and distinguish output limits from malformed host results

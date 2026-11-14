@@ -250,6 +250,65 @@ fn task_store_commands_manage_legacy_finite_namespace() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+// Accepted sockets have platform-dependent modes; request parsing requires bounded blocking reads on every platform.
+// EOF/reset ends only this connection, while timeouts and malformed requests remain visible test failures.
+fn read_fixture_request(socket: &mut std::net::TcpStream) -> std::io::Result<Option<Value>> {
+    use std::io::{Error, ErrorKind};
+
+    socket.set_nonblocking(false)?;
+    socket.set_read_timeout(Some(Duration::from_secs(5)))?;
+    let mut read_more = |bytes: &mut Vec<u8>| -> std::io::Result<bool> {
+        let mut buffer = [0; 4096];
+        loop {
+            match socket.read(&mut buffer) {
+                Ok(0) => return Ok(false),
+                Ok(n) => {
+                    bytes.extend_from_slice(&buffer[..n]);
+                    return Ok(true);
+                }
+                Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted
+                    ) =>
+                {
+                    return Ok(false);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    };
+    let mut bytes = Vec::new();
+    let end = loop {
+        if !read_more(&mut bytes)? {
+            return Ok(None);
+        }
+        if let Some(i) = bytes.windows(4).position(|v| v == b"\r\n\r\n") {
+            break i + 4;
+        }
+    };
+    let len = std::str::from_utf8(&bytes[..end])
+        .map_err(|error| Error::new(ErrorKind::InvalidData, error))?
+        .lines()
+        .find_map(|line| {
+            line.split_once(':')
+                .filter(|(key, _)| key.eq_ignore_ascii_case("content-length"))
+                .map(|(_, value)| value.trim().parse::<usize>())
+        })
+        .transpose()
+        .map_err(|error| Error::new(ErrorKind::InvalidData, error))?
+        .unwrap_or(0);
+    while bytes.len() - end < len {
+        if !read_more(&mut bytes)? {
+            return Ok(None);
+        }
+    }
+    serde_json::from_slice(&bytes[end..end + len])
+        .map(Some)
+        .map_err(|error| Error::new(ErrorKind::InvalidData, error))
+}
+
 static NEXT: AtomicUsize = AtomicUsize::new(0);
 struct Fixture {
     dir: PathBuf,
@@ -282,44 +341,19 @@ impl Fixture {
             while !stopped.load(Ordering::Relaxed) {
                 let (mut socket, _) = match listener.accept() {
                     Ok(v) => v,
-                    Err(_) => {
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(2));
                         continue;
                     }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(error) => panic!("fixture accept failed: {error}"),
                 };
-                socket
-                    .set_read_timeout(Some(Duration::from_secs(5)))
-                    .unwrap();
-                let mut bytes = vec![];
-                let end = loop {
-                    let mut buf = [0; 4096];
-                    let n = socket.read(&mut buf).unwrap();
-                    if n == 0 {
-                        return;
-                    }
-                    bytes.extend_from_slice(&buf[..n]);
-                    if let Some(i) = bytes.windows(4).position(|v| v == b"\r\n\r\n") {
-                        break i + 4;
-                    }
+                let Some(body) =
+                    read_fixture_request(&mut socket).expect("fixture request read failed")
+                else {
+                    // A client may disconnect before sending a request; it does not stop the listener or consume a reply.
+                    continue;
                 };
-                let len = std::str::from_utf8(&bytes[..end])
-                    .unwrap()
-                    .lines()
-                    .find_map(|line| {
-                        line.split_once(':')
-                            .filter(|(k, _)| k.eq_ignore_ascii_case("content-length"))
-                            .map(|(_, v)| v.trim().parse::<usize>().unwrap())
-                    })
-                    .unwrap_or(0);
-                while bytes.len() < end + len {
-                    let mut buf = [0; 4096];
-                    let n = socket.read(&mut buf).unwrap();
-                    if n == 0 {
-                        return;
-                    }
-                    bytes.extend_from_slice(&buf[..n]);
-                }
-                let body: Value = serde_json::from_slice(&bytes[end..end + len]).unwrap();
                 let index = count.fetch_add(1, Ordering::SeqCst);
                 let reply = replies.get(index).cloned().unwrap_or_else(|| "done".into());
                 while held.load(Ordering::Acquire) && !stopped.load(Ordering::Acquire) {
@@ -523,12 +557,121 @@ impl Fixture {
 impl Drop for Fixture {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        if let Some(worker) = self.worker.take() {
-            worker.join().unwrap();
-        }
+        let worker_result = self.worker.take().map(|worker| worker.join());
         let _ = std::fs::remove_dir_all(&self.dir);
+        if let Some(Err(error)) = worker_result {
+            // Keep worker failures fatal, but preserve the primary failure when the test is already unwinding.
+            if thread::panicking() {
+                eprintln!("fixture worker also failed during test cleanup");
+            } else {
+                std::panic::resume_unwind(error);
+            }
+        }
     }
 }
+#[test]
+fn fixture_request_waits_for_fragmented_data_on_a_nonblocking_socket() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (mut socket, _) = listener.accept().unwrap();
+    // Reproduce the accepted-socket mode independently of the host operating system.
+    socket.set_nonblocking(true).unwrap();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    let worker = thread::spawn(move || {
+        ready_tx.send(()).unwrap();
+        result_tx.send(read_fixture_request(&mut socket)).unwrap();
+    });
+    ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(matches!(
+        result_rx.recv_timeout(Duration::from_millis(25)),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+    ));
+    client.write_all(b"POST / HTTP/1.1\r\nContent-Len").unwrap();
+    assert!(matches!(
+        result_rx.recv_timeout(Duration::from_millis(25)),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+    ));
+    client.write_all(b"gth: 2\r\n\r\n{").unwrap();
+    assert!(matches!(
+        result_rx.recv_timeout(Duration::from_millis(25)),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+    ));
+    client.write_all(b"}").unwrap();
+    assert_eq!(
+        result_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap(),
+        Some(json!({}))
+    );
+    worker.join().unwrap();
+}
+
+#[test]
+fn fixture_incomplete_connection_does_not_stop_server_or_consume_reply() {
+    let fixture = Fixture::new(&["first-reply"]);
+    let address = fixture
+        .url
+        .trim_start_matches("http://")
+        .trim_end_matches("/v1/");
+    let mut abandoned = std::net::TcpStream::connect(address).unwrap();
+    abandoned
+        .write_all(b"POST / HTTP/1.1\r\nContent-Length: 2\r\n\r\n{")
+        .unwrap();
+    drop(abandoned);
+
+    let mut client = std::net::TcpStream::connect(address).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    client
+        .write_all(b"POST / HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}")
+        .unwrap();
+    let mut response = String::new();
+    client.read_to_string(&mut response).unwrap();
+    assert!(response.contains("first-reply"), "{response}");
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn fixture_worker_failure_is_reported_without_replacing_primary_panic() {
+    for primary_panic in [false, true] {
+        let fixture = Fixture::new(&[]);
+        let address = fixture
+            .url
+            .trim_start_matches("http://")
+            .trim_end_matches("/v1/");
+        let mut client = std::net::TcpStream::connect(address).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        client
+            .write_all(b"POST / HTTP/1.1\r\nContent-Length: 2\r\n\r\nxx")
+            .unwrap();
+        // EOF acknowledges the worker has failed and closed this connection before testing cleanup.
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).unwrap();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _fixture = fixture;
+            if primary_panic {
+                panic!("primary fixture test failure");
+            }
+        }));
+        let error = result.expect_err("worker failure must not be swallowed");
+        let message = error
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| error.downcast_ref::<&str>().copied())
+            .unwrap();
+        if primary_panic {
+            assert_eq!(message, "primary fixture test failure");
+        } else {
+            assert!(message.contains("fixture request read failed"), "{message}");
+        }
+    }
+}
+
 const TASK: &str = "tools: []\nautonomy:\n  enabled: true\n  mode: until_complete\n  max_turns: 4\n  max_llm_calls: 4\n  completion: {response_contains: done}\n";
 fn assert_exit(output: &Output, code: i32) {
     assert_eq!(
