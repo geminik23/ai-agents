@@ -4,7 +4,7 @@
 
 use ai_agents::autonomy::{
     AutonomyConfig, AutonomyHostCeilings, AutonomyRunner, ScopedTaskRunStore, TaskResumeInput,
-    TaskRunStatus,
+    TaskRunStatus, parse_task_overrides,
 };
 use ai_agents::llm::{
     ChatMessage, FinishReason, LLMChunk, LLMConfig, LLMError, LLMFeature, LLMProvider, LLMResponse,
@@ -79,7 +79,10 @@ async fn main() -> Result<()> {
         store,
         "offline-task.v1".into(),
     )?;
-    let mut events = agent.run_task_stream(&runner, "Prepare a report", None)?;
+    // Invocation settings survive the question without changing the host namespace or later run defaults.
+    let overrides = parse_task_overrides("max_llm_calls: 2")?;
+    let mut events =
+        agent.run_task_stream_with_overrides(&runner, "Prepare a report", None, &overrides)?;
     while let Some(event) = events.next_event().await {
         println!("{}", serde_json::to_string(&event)?);
     }
@@ -101,5 +104,6 @@ async fn main() -> Result<()> {
     let done = resumed.take_result().expect("drained operation result")?;
     assert_eq!(done.run.status, TaskRunStatus::Completed);
     assert_eq!(done.run.counters.llm_attempts, 2);
+    assert_eq!(done.run.limits.max_llm_calls, Some(2));
     Ok(())
 }

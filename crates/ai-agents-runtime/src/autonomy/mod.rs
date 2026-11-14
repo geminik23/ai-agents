@@ -102,6 +102,8 @@ mod controller_failure_tests;
 #[cfg(test)]
 mod controller_tests;
 #[cfg(test)]
+mod override_tests;
+#[cfg(test)]
 mod restoration_failure_tests;
 #[cfg(test)]
 mod restoration_test_support;
@@ -197,5 +199,8 @@ pub use store::{ScopedTaskRunStore, TaskRunStore};
 pub use todo::RunTodoAdapter;
 
 pub use ai_agents_core::autonomy::*;
-pub use config::{AutonomyHostCeilings, AutonomyScope, EffectiveAutonomyProfile, resolve_profile};
+pub use config::{
+    AutonomyHostCeilings, AutonomyScope, EffectiveAutonomyProfile, parse_task_overrides,
+    resolve_profile,
+};
 pub(crate) use config::{has_enabled_declaration, validate_agent_config, validate_loaded_skills};

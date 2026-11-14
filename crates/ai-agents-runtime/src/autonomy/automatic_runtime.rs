@@ -214,6 +214,18 @@ impl RuntimeAgent {
         self.task_runner()?.run(objective, profile).await
     }
 
+    /// Starts explicit work with run-local settings through the configured host without changing later automatic declarations.
+    pub async fn run_task_with_overrides(
+        &self,
+        objective: &str,
+        profile: Option<&str>,
+        overrides: &ai_agents_core::autonomy::AutonomyProfile,
+    ) -> Result<TaskRunResult> {
+        self.task_runner()?
+            .run_with_overrides(objective, profile, overrides)
+            .await
+    }
+
     /// Resumes only the exact acknowledged revision on the retained runner; the trusted host authenticates the response caller.
     /// Turn-local actor context may have ended, so control must retain the admitted store scope rather than reconstruct it from session defaults.
     pub async fn resume_task(
@@ -263,7 +275,10 @@ impl RuntimeAgent {
     pub async fn task_operation(&self, operation: TaskStreamOperation) -> Result<TaskRunResult> {
         let runner = if matches!(
             &operation,
-            TaskStreamOperation::Run { .. } | TaskStreamOperation::Skill { .. }
+            TaskStreamOperation::Run { .. }
+                | TaskStreamOperation::Skill { .. }
+                | TaskStreamOperation::RunWithOverrides { .. }
+                | TaskStreamOperation::SkillWithOverrides { .. }
         ) {
             self.task_runner()?
         } else {

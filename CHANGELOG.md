@@ -3,6 +3,7 @@
 ## Unreleased
 
 ### Added
+- Task invocation settings: development Rust and CLI callers can override one task or skill profile while preserving required reviews, host ceilings and settings across retained or explicitly prepared continuation
 - Workspace file protection: development Rust hosts can confine built-in file tools to one workspace root or selected entries, track created files and expose a cooperative mutation revision without adding write authority
 - Scoped instructions: opt-in host-bound workspace rules refresh for supported model work without widening tool authority
 - Code agent example: run the scripted sample or connect selected workspace files, or a whole workspace root with protected checker inputs, and a provider to an approved host-owned checker

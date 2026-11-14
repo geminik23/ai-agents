@@ -810,7 +810,7 @@ Custom LLM provider examples - from implementing `LLMProvider` from scratch to m
 | `custom-provider` | Implement `LLMProvider` from scratch with an offline echo/rule-based provider - no API key needed |
 | `openai-compatible` | HTTP adapter for any OpenAI-compatible server (LM Studio, Ollama, vLLM, LocalAI, TGI) |
 | `multi-provider` | Multi-provider routing with `MultiLLMRouter` - expensive model for users, cheap model for internal tasks |
-| `task-events` | Development-only offline task lifecycle events, retained question and explicit resume; no API key or tools |
+| `task-events` | Development-only offline task events with run-local settings, a retained question and explicit resume; no API key or tools |
 | `automatic-tasks` | Development-only YAML state/skill automatic task entry, safe events and explicit host resume through the same controller; offline with no tools or API key |
 | `task-domain-host` | Offline embedded support round trip with actual ticket evidence and the same runtime-only domain installation as eval |
 | `task-domain-evals` | Explicit Rust validator/progress/tool integration for the same development EvalRunner; isolated business state and default-redacted reports, no provider keys |

@@ -794,6 +794,16 @@ fn task_subprocess_objective_revision_requires_explicit_continue_and_preserves_u
 
 #[test]
 fn task_subprocess_remote_cancel_is_a_request_until_original_operation_settles() {
+    remote_cancel_case(false);
+}
+
+#[test]
+fn task_overrides_remote_cancel_without_original_file_preserves_settlement() {
+    remote_cancel_case(true);
+}
+
+// The live owner settles the original operation; journal management must not reread invocation input or create providers.
+fn remote_cancel_case(with_overrides: bool) {
     let f = Fixture::new(&["done"]);
     f.gate.store(true, Ordering::Release);
     let db = f.dir.join("tasks.sqlite");
@@ -801,56 +811,67 @@ fn task_subprocess_remote_cancel_is_a_request_until_original_operation_settles()
         "{TASK}storage: {{type: sqlite, path: '{}' }}\n",
         db.display()
     ));
+    let overlay = f.dir.join("invocation.yaml");
+    let mut args = vec![
+        "task",
+        "run",
+        agent.to_str().unwrap(),
+        "operations",
+        "--json",
+    ];
+    if with_overrides {
+        std::fs::write(&overlay, "max_llm_calls: 1\n").unwrap();
+        args.extend(["--overrides", overlay.to_str().unwrap()]);
+    }
     let mut requested = false;
-    let out = f.interact(
-        &[
-            "task",
-            "run",
-            agent.to_str().unwrap(),
-            "operations",
-            "--json",
-        ],
-        |text, _| {
-            if !requested && f.calls.load(Ordering::SeqCst) > 0 {
-                let id = text
-                    .lines()
-                    .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-                    .find_map(|v| v["run_id"].as_str().map(str::to_owned));
-                if let Some(id) = id {
-                    let view = f.run(
-                        &["task", "show", agent.to_str().unwrap(), &id, "--json"],
-                        "",
-                    );
-                    assert_exit(&view, 0);
-                    let view: Value = serde_json::from_slice(&view.stdout).unwrap();
-                    let rev = view["summary"]["revision"].as_u64().unwrap().to_string();
-                    let receipt = f.run(
-                        &[
-                            "task",
-                            "cancel",
-                            agent.to_str().unwrap(),
-                            &id,
-                            "--revision",
-                            &rev,
-                            "--json",
-                        ],
-                        "",
-                    );
-                    assert_exit(&receipt, 0);
-                    let receipt: Value = serde_json::from_slice(&receipt.stdout).unwrap();
-                    assert_eq!(receipt["disposition"], "requested");
-                    assert_eq!(receipt["locally_retained"], Value::Null);
-                    requested = true;
-                    f.gate.store(false, Ordering::Release);
+    let out = f.interact(&args, |text, _| {
+        if !requested && f.calls.load(Ordering::SeqCst) > 0 {
+            let id = text
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .find_map(|v| v["run_id"].as_str().map(str::to_owned));
+            if let Some(id) = id {
+                if with_overrides {
+                    std::fs::remove_file(&overlay).unwrap();
                 }
+                let view = f.run(
+                    &["task", "show", agent.to_str().unwrap(), &id, "--json"],
+                    "",
+                );
+                assert_exit(&view, 0);
+                let view: Value = serde_json::from_slice(&view.stdout).unwrap();
+                let rev = view["summary"]["revision"].as_u64().unwrap().to_string();
+                let receipt = f.run(
+                    &[
+                        "task",
+                        "cancel",
+                        agent.to_str().unwrap(),
+                        &id,
+                        "--revision",
+                        &rev,
+                        "--json",
+                    ],
+                    "",
+                );
+                assert_exit(&receipt, 0);
+                let receipt: Value = serde_json::from_slice(&receipt.stdout).unwrap();
+                assert_eq!(receipt["disposition"], "requested");
+                assert_eq!(receipt["locally_retained"], Value::Null);
+                requested = true;
+                f.gate.store(false, Ordering::Release);
             }
-            None
-        },
-    );
+        }
+        None
+    });
     assert_exit(&out, 1);
     assert!(requested);
     assert_eq!(f.calls.load(Ordering::SeqCst), 1);
-    assert!(!String::from_utf8_lossy(&out.stdout).contains("\"status\":\"completed\""));
+    let final_result = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|value| value["type"] == "result")
+        .expect("the original foreground operation must acknowledge a final result");
+    assert_eq!(final_result["status"], "cancelled");
 }
 
 #[cfg(unix)]
@@ -1413,4 +1434,138 @@ fn repl_subprocess_eof_and_ordinary_chat_are_not_a_busy_loop() {
     assert_exit(&out, 0);
     assert!(String::from_utf8_lossy(&out.stdout).contains("ordinary answer"));
     assert_eq!(f.calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn task_overrides_preflight_rejects_before_provider_and_storage() {
+    let f = Fixture::new(&[]);
+    let db = f.dir.join("override-must-not-create.sqlite");
+    let agent = f.agent(&format!(
+        "{TASK}\nstorage: {{type: sqlite, path: '{}' }}\n",
+        db.display()
+    ));
+    let path = f.dir.join("override.yaml");
+    for yaml in [
+        "persistence: {enabled: true}",
+        "objective: one\nobjective_template: two",
+        "max_llm_calls: 0",
+        "completion: {check: nonexistent}",
+        "unknown: true",
+    ] {
+        std::fs::write(&path, yaml).unwrap();
+        let output = f.run(
+            &[
+                "task",
+                "run",
+                agent.to_str().unwrap(),
+                "work",
+                "--overrides",
+                path.to_str().unwrap(),
+                "--non-interactive",
+            ],
+            "",
+        );
+        assert_exit(&output, 2);
+        assert!(!db.exists(), "{yaml}");
+        assert_eq!(f.calls.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[test]
+fn task_overrides_use_one_namespace_and_management_needs_no_overlay_file() {
+    let f = Fixture::new(&["accepted-one", "accepted-two", "done"]);
+    let db = f.dir.join("override-journal.sqlite");
+    let agent = f.agent(&format!(
+        "{TASK}\nstorage: {{type: sqlite, path: '{}' }}\n",
+        db.display()
+    ));
+    let path = f.dir.join("override.yaml");
+    for answer in ["accepted-one", "accepted-two"] {
+        std::fs::write(
+            &path,
+            format!("completion: {{response_contains: {answer}}}\nmax_llm_calls: 1\n"),
+        )
+        .unwrap();
+        let output = f.run(
+            &[
+                "task",
+                "run",
+                agent.to_str().unwrap(),
+                "work",
+                "--overrides",
+                path.to_str().unwrap(),
+                "--non-interactive",
+                "--json",
+            ],
+            "",
+        );
+        assert_exit(&output, 0);
+    }
+    std::fs::remove_file(path).unwrap();
+    assert_exit(
+        &f.run(
+            &[
+                "task",
+                "run",
+                agent.to_str().unwrap(),
+                "work",
+                "--non-interactive",
+            ],
+            "",
+        ),
+        0,
+    );
+    let list = f.run(&["task", "list", agent.to_str().unwrap(), "--json"], "");
+    assert_exit(&list, 0);
+    let rows: Value = serde_json::from_slice(&list.stdout).unwrap();
+    assert_eq!(rows.as_array().unwrap().len(), 3);
+    for row in rows.as_array().unwrap() {
+        let id = row["key"]["run_id"].as_str().unwrap();
+        assert_exit(
+            &f.run(&["task", "show", agent.to_str().unwrap(), id, "--json"], ""),
+            0,
+        );
+    }
+    assert_eq!(f.calls.load(Ordering::SeqCst), 3);
+}
+
+#[test]
+fn task_overrides_preflight_precedes_provider_credentials() {
+    let f = Fixture::new(&[]);
+    let db = f.dir.join("no-preparation.sqlite");
+    let agent = f.agent(&format!(
+        "{TASK}\nstorage: {{type: sqlite, path: '{}' }}\n",
+        db.display()
+    ));
+    let yaml = std::fs::read_to_string(&agent)
+        .unwrap()
+        .replace("provider: openai-compatible", "provider: openai")
+        .replace("TASK_FIXTURE_TOKEN", "TASK_OVERRIDE_MISSING_KEY");
+    std::fs::write(&agent, yaml).unwrap();
+    let path = f.dir.join("override.yaml");
+    std::fs::write(&path, "persistence: {enabled: true}").unwrap();
+    let command = || {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_ai-agents-cli"));
+        cmd.args([
+            "task",
+            "run",
+            agent.to_str().unwrap(),
+            "work",
+            "--non-interactive",
+        ])
+        .env_remove("OPENAI_API_KEY")
+        .env_remove("TASK_OVERRIDE_MISSING_KEY");
+        cmd
+    };
+    let rejected = command()
+        .args(["--overrides", path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert_exit(&rejected, 2);
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("durable task execution requires"));
+    let normal = command().output().unwrap();
+    assert_exit(&normal, 2);
+    assert!(String::from_utf8_lossy(&normal.stderr).contains("API key not found"));
+    assert!(!db.exists());
+    assert_eq!(f.calls.load(Ordering::SeqCst), 0);
 }

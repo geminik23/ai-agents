@@ -1465,6 +1465,19 @@ async fn restore_oversized_preparation_preserves_usable_live_pause() {
 #[cfg(feature = "sqlite")]
 #[tokio::test]
 async fn restore_process_parent_reopens_sqlite_without_retained_objects() {
+    restore_process_case(false).await;
+}
+
+// Invocation settings must cross an actual process boundary without becoming namespace or provider authority.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn overrides_restore_process_preserves_settings_and_completed_effects() {
+    restore_process_case(true).await;
+}
+
+// The same producer and consumer fixtures cover legacy input and the additive run payload independently.
+#[cfg(feature = "sqlite")]
+async fn restore_process_case(overrides: bool) {
     let directory = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../temp/restoration-tests")
         .join(uuid::Uuid::new_v4().to_string());
@@ -1479,6 +1492,10 @@ async fn restore_process_parent_reopens_sqlite_without_retained_objects() {
             ])
             .env("AI_AGENTS_RESTORE_PHASE", phase)
             .env("AI_AGENTS_RESTORE_DIRECTORY", &directory)
+            .env(
+                "AI_AGENTS_RESTORE_OVERRIDES",
+                if overrides { "yes" } else { "no" },
+            )
             .kill_on_drop(true);
         let output = tokio::time::timeout(std::time::Duration::from_secs(120), command.output())
             .await
@@ -1528,6 +1545,8 @@ async fn restore_process_worker() {
         )
         .unwrap(),
     );
+    let overrides = (std::env::var("AI_AGENTS_RESTORE_OVERRIDES").as_deref() == Ok("yes"))
+        .then(|| parse_task_overrides("max_llm_calls: 2\nmax_turns: 3").unwrap());
     if phase == "producer" {
         let root = host.runtime(host.root.clone());
         let runner = AutonomyRunner::try_new(
@@ -1538,7 +1557,13 @@ async fn restore_process_worker() {
             "restore.v1".into(),
         )
         .unwrap();
-        let paused = runner.run("verify durable effect", None).await.unwrap();
+        let paused = match &overrides {
+            Some(overrides) => runner
+                .run_with_overrides("verify durable effect", None, overrides)
+                .await
+                .unwrap(),
+            None => runner.run("verify durable effect", None).await.unwrap(),
+        };
         assert_eq!(paused.run.status, TaskRunStatus::Paused);
         assert_eq!(host.effects.load(Ordering::SeqCst), 1);
         let prepared = runner
@@ -1576,6 +1601,21 @@ async fn restore_process_worker() {
         let done = answer(&runner, &reviewed.run).await.unwrap();
         assert_eq!(done.run.status, TaskRunStatus::Completed);
         assert_eq!(done.run.counters.llm_attempts, 2);
+        assert_eq!(
+            done.run.limits.max_llm_calls,
+            Some(if overrides.is_some() { 2 } else { 12 })
+        );
+        let payload: TaskCheckpointPayload = serde_json::from_value(
+            store
+                .load(&done.run.key.run_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .payload,
+        )
+        .unwrap();
+        assert_eq!(payload.invocation_overrides.as_deref(), overrides.as_ref());
+        assert_eq!(payload.config_identity, "restore.v1");
         assert_eq!(host.calls.load(Ordering::SeqCst), 1);
         assert_eq!(host.effects.load(Ordering::SeqCst), 0);
         assert_eq!(
@@ -1893,4 +1933,72 @@ async fn restore_paused_new_runtime_requires_fresh_review_and_preserves_complete
         assert_eq!(host.calls.load(Ordering::SeqCst), before + 1);
         assert_eq!(host.effects.load(Ordering::SeqCst), 1);
     }
+}
+
+// A stored override is re-resolved against the actual host before claim; disagreement cannot dispatch or consume the saved question.
+#[tokio::test]
+async fn overrides_restore_rejects_changed_configuration_before_claim() {
+    let host = host();
+    let root = host.runtime(host.root.clone());
+    let store = super::continuation_test_support::store(root.info().id, "restore.v1", false).await;
+    let runner = AutonomyRunner::try_new(
+        root.clone(),
+        config(),
+        Default::default(),
+        store.clone(),
+        "restore.v1".into(),
+    )
+    .unwrap();
+    let overlay = parse_task_overrides("max_llm_calls: 2").unwrap();
+    let paused = runner
+        .run_with_overrides("work", None, &overlay)
+        .await
+        .unwrap();
+    let prepared = runner
+        .checkpoint_for_restore(&paused.run.key.run_id, paused.run.revision, host.as_ref())
+        .await
+        .unwrap();
+    let before = host.calls.load(Ordering::SeqCst);
+    drop(runner);
+    drop(root);
+    let mut changed = config();
+    changed.defaults.max_tool_calls = Some(ai_agents_core::autonomy::AutonomyLimit::Finite(10));
+    let request = TaskRestoreRequest {
+        run_id: prepared.run.key.run_id.clone(),
+        expected_revision: prepared.run.revision,
+        config_identity: "restore.v1".into(),
+        config: changed,
+        ceilings: Default::default(),
+    };
+    assert!(
+        AutonomyRunner::restore_paused(request, store.clone(), host.clone())
+            .await
+            .is_err()
+    );
+    assert_eq!(host.calls.load(Ordering::SeqCst), before);
+    assert_eq!(
+        store
+            .load(&prepared.run.key.run_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .revision,
+        prepared.run.revision
+    );
+    let request = TaskRestoreRequest {
+        run_id: prepared.run.key.run_id.clone(),
+        expected_revision: prepared.run.revision,
+        config_identity: "restore.v1".into(),
+        config: config(),
+        ceilings: Default::default(),
+    };
+    let (runner, restored) = AutonomyRunner::restore_paused(request, store, host.clone())
+        .await
+        .unwrap();
+    let reviewed = approve(&runner, &restored.run).await;
+    let done = answer(&runner, &reviewed.run).await.unwrap();
+    assert_eq!(done.run.status, TaskRunStatus::Completed);
+    assert_eq!(done.run.limits.max_llm_calls, Some(2));
+    assert_eq!(done.run.counters.llm_attempts, 2);
+    assert_eq!(host.effects.load(Ordering::SeqCst), 1);
 }

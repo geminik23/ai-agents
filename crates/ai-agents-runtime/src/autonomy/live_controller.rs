@@ -14,7 +14,23 @@ impl AutonomyRunner {
         selected: Option<&str>,
     ) -> Result<TaskRunResult> {
         let skill = self.agent.admit_autonomy_skill(skill_id)?;
-        let result = Box::pin(self.run_entry(objective, selected, Some(skill), None)).await?;
+        let result = Box::pin(self.run_entry(objective, selected, Some(skill), None, None)).await?;
+        self.persist_returned_pause(result).await
+    }
+
+    /// Starts a selected skill with run-local overrides while retaining its actual loaded implementation binding.
+    /// Nested skills continue under their existing owner rather than starting another invocation.
+    pub async fn run_skill_with_overrides(
+        &self,
+        objective: &str,
+        skill_id: &str,
+        selected: Option<&str>,
+        overrides: &AutonomyProfile,
+    ) -> Result<TaskRunResult> {
+        let skill = self.agent.admit_autonomy_skill(skill_id)?;
+        let result =
+            Box::pin(self.run_entry(objective, selected, Some(skill), None, Some(overrides)))
+                .await?;
         self.persist_returned_pause(result).await
     }
 
@@ -28,7 +44,7 @@ impl AutonomyRunner {
         let skill = entry.binding.skill.clone();
         let input = entry.binding.prepared.content.clone();
         let mut cleanup = OwnedTurnCleanup::new(owner.clone());
-        let result = Box::pin(self.run_entry(&input, None, skill, Some(entry))).await;
+        let result = Box::pin(self.run_entry(&input, None, skill, Some(entry), None)).await;
         if result.is_err()
             && self
                 .active
@@ -51,7 +67,8 @@ impl AutonomyRunner {
         self
     }
 
-    /// Re-resolves the original entry scope against its actual live definition, never against a serialized skill ID alone.
+    /// Re-resolves the original entry scope and invocation settings against the actual live definition.
+    /// Stored overrides cannot replace a skill binding, current host review requirement or authenticated limit revision.
     pub(super) fn retained_profile(
         &self,
         payload: &TaskCheckpointPayload,
@@ -94,7 +111,7 @@ impl AutonomyRunner {
             },
             payload.profile.as_deref(),
             skill.as_ref().and_then(|skill| skill.autonomy.as_ref()),
-            None,
+            payload.invocation_overrides.as_deref(),
             Some(&payload.objective),
             &self.host,
         )

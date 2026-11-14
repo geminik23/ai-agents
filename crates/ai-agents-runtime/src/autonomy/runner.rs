@@ -1643,17 +1643,32 @@ impl AutonomyRunner {
     /// Revision sources are sampled state, not providers or execution permits, and are rechecked at continuation/publication boundaries.
     /// Opted-in persistence prepares the acknowledged safe pause before returning it; failed preparation never reports a durable restart point.
     pub async fn run(&self, objective: &str, selected: Option<&str>) -> Result<TaskRunResult> {
-        let result = Box::pin(self.run_entry(objective, selected, None, None)).await?;
+        let result = Box::pin(self.run_entry(objective, selected, None, None, None)).await?;
+        self.persist_returned_pause(result).await
+    }
+
+    /// Starts an explicit task with immutable invocation settings, preserving the configured runner and journal namespace.
+    /// Overrides cannot waive required reviews and are retained with this run through pauses and prepared reconstruction.
+    pub async fn run_with_overrides(
+        &self,
+        objective: &str,
+        selected: Option<&str>,
+        overrides: &AutonomyProfile,
+    ) -> Result<TaskRunResult> {
+        let result =
+            Box::pin(self.run_entry(objective, selected, None, None, Some(overrides))).await?;
         self.persist_returned_pause(result).await
     }
 
     /// Executes one admitted entry under the same controller; automatic routing never creates another run here.
+    /// The invocation DTO is captured only for this run and never changes defaults for later or nested work.
     async fn run_entry(
         &self,
         objective: &str,
         selected: Option<&str>,
         skill: Option<ai_agents_skills::SkillDefinition>,
         automatic: Option<Box<super::automatic::AutomaticEntry>>,
+        overrides: Option<&AutonomyProfile>,
     ) -> Result<TaskRunResult> {
         let binding = automatic.as_ref().map(|entry| &entry.binding);
         let profile = resolve_profile(
@@ -1670,7 +1685,7 @@ impl AutonomyRunner {
             binding
                 .map(|binding| &binding.settings)
                 .or_else(|| skill.as_ref().and_then(|skill| skill.autonomy.as_ref())),
-            None,
+            overrides,
             Some(objective),
             &self.host,
         )?;
@@ -1801,6 +1816,7 @@ impl AutonomyRunner {
                 &profile,
                 TaskRuntimeCheckpoint::between_turns(self.agent.save_state().await?)?,
             );
+            payload.invocation_overrides = overrides.cloned().map(Box::new);
             if let Some(binding) = &activation {
                 payload.adapters.push(TaskAdapterCheckpoint {
                     id: "runtime.activation".into(),

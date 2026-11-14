@@ -30,7 +30,7 @@ agent.yaml
 
 ## Development task evaluation foundation
 
-The development checkout supports typed task operations through the same configured runtime/controller used by explicit tasks and automatic state/skill entry. This is not part of the published 1.1.1 contract, and complete task-evaluation acceptance and documentation closure remain unfinished. Task evaluation is not a second executor and does not decide completion from response wording or UI strings.
+The development checkout supports typed task operations through the same configured runtime/controller used by explicit tasks and automatic state/skill entry. This is not part of the published 1.1.1 contract, and supports typed operations, exact retained controls, shared domain host integration and bounded redacted reports for the documented development paths. Task evaluation is not a second executor and does not decide completion from response wording or UI strings.
 
 Run the current no-key task suites from the repository root:
 

@@ -27,6 +27,8 @@ Rust providers / tools / domain bindings / ceilings
         assertions and safe reports
 ```
 
+Explicit task/skill invocations can supply a partial profile through Rust `*_with_overrides` methods or CLI `task run --overrides FILE`. It follows named/scoped settings, preserves required reviews and host ceilings, and remains bound to the same run through continuation and supported reconstruction. See [invocation settings](@/docs/rust-api.md#invocation-settings-development-only) and [CLI usage](@/docs/cli.md#development-task-cli).
+
 ## 1. Choose the smallest appropriate profile
 
 Start from the source definitions in `examples/yaml/autonomy/`:

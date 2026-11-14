@@ -92,6 +92,17 @@ pub struct TaskRunEvent {
 /// Explicit operations share existing runner APIs, including paused controls that do not execute another model turn.
 #[derive(Debug)]
 pub enum TaskStreamOperation {
+    RunWithOverrides {
+        objective: String,
+        profile: Option<String>,
+        overrides: Box<ai_agents_core::autonomy::AutonomyProfile>,
+    },
+    SkillWithOverrides {
+        objective: String,
+        skill_id: String,
+        profile: Option<String>,
+        overrides: Box<ai_agents_core::autonomy::AutonomyProfile>,
+    },
     Run {
         objective: String,
         profile: Option<String>,
@@ -549,6 +560,23 @@ impl AutonomyRunner {
             Default::default(),
         )
     }
+    /// Streams explicit work with immutable run-local settings through the same admission and settlement boundaries.
+    pub fn run_stream_with_overrides<'a>(
+        &'a self,
+        objective: &str,
+        selected: Option<&str>,
+        overrides: &ai_agents_core::autonomy::AutonomyProfile,
+    ) -> Result<TaskRunStream<'a>> {
+        self.stream_operation(
+            TaskStreamOperation::RunWithOverrides {
+                objective: objective.into(),
+                profile: selected.map(str::to_owned),
+                overrides: Box::new(overrides.clone()),
+            },
+            Default::default(),
+        )
+    }
+
     /// Streams one retained response under its exact revision and original execution authority.
     pub fn resume_stream(
         &self,
@@ -575,11 +603,35 @@ impl AutonomyRunner {
             &operation,
             TaskStreamOperation::Run { .. }
                 | TaskStreamOperation::Skill { .. }
+                | TaskStreamOperation::RunWithOverrides { .. }
+                | TaskStreamOperation::SkillWithOverrides { .. }
                 | TaskStreamOperation::Resume { .. }
         );
         self.stream_work(
             async move {
                 match operation {
+                    TaskStreamOperation::RunWithOverrides {
+                        objective,
+                        profile,
+                        overrides,
+                    } => {
+                        self.run_with_overrides(&objective, profile.as_deref(), &overrides)
+                            .await
+                    }
+                    TaskStreamOperation::SkillWithOverrides {
+                        objective,
+                        skill_id,
+                        profile,
+                        overrides,
+                    } => {
+                        self.run_skill_with_overrides(
+                            &objective,
+                            &skill_id,
+                            profile.as_deref(),
+                            &overrides,
+                        )
+                        .await
+                    }
                     TaskStreamOperation::Run { objective, profile } => {
                         self.run(&objective, profile.as_deref()).await
                     }
@@ -758,6 +810,25 @@ impl crate::RuntimeAgent {
             ));
         }
         runner.stream_operation(operation, config)
+    }
+
+    /// Streams a run-local override through the supplied runner after checking actual runtime identity.
+    pub fn run_task_stream_with_overrides<'a>(
+        &'a self,
+        runner: &'a AutonomyRunner,
+        objective: &str,
+        profile: Option<&str>,
+        overrides: &ai_agents_core::autonomy::AutonomyProfile,
+    ) -> Result<TaskRunStream<'a>> {
+        self.task_operation_stream(
+            runner,
+            TaskStreamOperation::RunWithOverrides {
+                objective: objective.into(),
+                profile: profile.map(str::to_owned),
+                overrides: Box::new(overrides.clone()),
+            },
+            Default::default(),
+        )
     }
 
     /// Streams an explicit objective through the supplied runner and the same live runtime ownership boundary.

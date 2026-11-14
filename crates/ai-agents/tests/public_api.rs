@@ -146,6 +146,13 @@ fn development_standalone_and_provenance_migration_surface_compiles() {
             store,
             "prepared-host-binding".into(),
         )?;
+        let overrides = ai_agents::autonomy::parse_task_overrides("max_llm_calls: 2")?;
+        let _run_overrides = runner.run_with_overrides("objective", None, &overrides);
+        let _skill_overrides =
+            runner.run_skill_with_overrides("objective", "skill", None, &overrides);
+        let _host_overrides = agent.run_task_with_overrides("objective", None, &overrides);
+        let _override_stream =
+            agent.run_task_stream_with_overrides(&runner, "objective", None, &overrides)?;
         let _run = runner.run("objective", None);
         let _events: ai_agents::TaskRunStream<'_> = runner.run_stream("objective", None)?;
         let _runtime_events = agent.run_task_stream(&runner, "objective", None)?;
