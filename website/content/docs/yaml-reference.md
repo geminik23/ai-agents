@@ -3081,6 +3081,8 @@ parallel_tools:
 
 MCP tools are declared inline in the `tools` list (not as a separate top-level block). See the [Tools section](#mcp-tool) for the full syntax.
 
+In the development checkout, HTTP-based MCP connections limit non-streaming JSON response bodies to 16 MiB and HTTP error bodies to 64 KiB. Responses exceeding these limits fail the transport call; the client does not return a truncated tool result. HTTPS uses native TLS with certificate verification enabled.
+
 ### Quick Reference
 
 ```yaml
