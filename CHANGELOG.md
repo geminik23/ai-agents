@@ -3,6 +3,7 @@
 ## Unreleased
 
 ### Added
+- Task invocation settings: development Rust and CLI callers can override one task or skill profile while preserving required reviews, host ceilings and settings across retained or explicitly prepared continuation
 - Workspace file protection: development Rust hosts can confine built-in file tools to one workspace root or selected entries, track created files and expose a cooperative mutation revision without adding write authority
 - Scoped instructions: opt-in host-bound workspace rules refresh for supported model work without widening tool authority
 - Code agent example: run the scripted sample or connect selected workspace files, or a whole workspace root with protected checker inputs, and a provider to an approved host-owned checker
@@ -76,6 +77,8 @@
 - Rust configuration compatibility: typed autonomy fields, validation driver bounds and objective-bound todo identities require affected struct literals to be updated; these development additions are not the published stable API
 
 ### Fixed
+- MCP transport security: bound HTTP JSON and error response buffering and enable certificate-verified HTTPS through native TLS
+- Dependency security: refresh locked OpenSSL, rustls, and webpki versions to address TLS advisories
 - Command lifetimes: keep output readers under the original work deadline and caller lifetime, with explicit uncertain effects after unconfirmed cleanup
 - Default approval logging: omit approval bodies and rejection reasons while preserving exact local review and trusted execution records
 - Task diagnostics: preserve partial-result and path-filter semantics, reject changed-query or fallback completion proof, and distinguish output limits from malformed host results

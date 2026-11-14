@@ -852,7 +852,8 @@ fn validate_skill(config: &AutonomyConfig, skill: &SkillDefinition) -> Result<()
     Ok(())
 }
 
-// Resolves selection before merging, including explicit per-run and scoped profile references.
+// Resolves selection before merging and validates partial invocation input before replacement can hide raw errors.
+// Required reviews from the selected and scoped host declaration cannot be waived by this invocation.
 fn resolve_raw(
     config: &AutonomyConfig,
     selected: Option<&str>,
@@ -873,9 +874,41 @@ fn resolve_raw(
         merge_profile(&mut raw, &scoped.settings)?;
     }
     if let Some(per_run) = per_run {
+        // Validate the supplied partial DTO before merging can erase a contradictory objective form.
+        validate_raw(per_run)?;
+        let required = raw.supervision.clone().unwrap_or_default();
         merge_profile(&mut raw, per_run)?;
+        let effective = raw.supervision.as_ref().cloned().unwrap_or_default();
+        for (before, after) in [
+            (required.stage_changes, effective.stage_changes),
+            (required.plan_changes, effective.plan_changes),
+        ] {
+            if before == Some(ai_agents_core::autonomy::ReviewPolicy::RequireApproval)
+                && after != before
+            {
+                return Err(AgentError::InvalidSpec(
+                    "task overrides cannot waive a required stage or plan review".into(),
+                ));
+            }
+        }
     }
     Ok(raw)
+}
+
+/// Parses a partial invocation profile through the same structural YAML boundary as agent declarations.
+/// This checks raw input only; inherited references, scope and live bindings are checked at admission.
+pub fn parse_task_overrides(yaml: &str) -> Result<AutonomyProfile> {
+    let value: serde_yaml::Value = serde_yaml::from_str(yaml)?;
+    let paths = ai_agents_core::strict_yaml::unsupported_yaml_keys(&value);
+    if !paths.is_empty() {
+        return Err(AgentError::InvalidSpec(format!(
+            "Unsupported task override YAML keys: {}",
+            paths.join(", ")
+        )));
+    }
+    let profile: AutonomyProfile = serde_yaml::from_value(value)?;
+    validate_raw(&profile)?;
+    Ok(profile)
 }
 
 /// Merges a chosen profile, scoped settings and invocation overrides before applying defaults and host ceilings.

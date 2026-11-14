@@ -12,7 +12,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub const TASK_PAYLOAD_VERSION: u32 = 2;
+pub const TASK_PAYLOAD_VERSION: u32 = 3;
 pub const MAX_TASK_CHECKPOINT_RECORDS: usize = 4096;
 
 /// Exact persisted native-history identity, separate from display and actor-memory projections.
@@ -583,6 +583,9 @@ pub struct TaskCheckpointPayload {
     pub profile: Option<String>,
     pub config_identity: String,
     pub settings: AutonomyProfile,
+    /// Original explicit invocation input, separate from host identity and later authenticated objective/limit revisions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invocation_overrides: Option<Box<AutonomyProfile>>,
     pub limits: TaskRunLimits,
     pub stage: Option<String>,
     pub stage_attempt: Option<String>,
@@ -619,6 +622,7 @@ impl TaskCheckpointPayload {
             profile: profile.profile.clone(),
             config_identity,
             settings: profile.settings.clone(),
+            invocation_overrides: None,
             limits: TaskRunLimits::from_profile(profile),
             stage: None,
             stage_attempt: None,
@@ -655,7 +659,14 @@ impl TaskCheckpointPayload {
         config_identity: &str,
     ) -> Result<()> {
         let invalid = || AgentError::from(TaskRunStorageError::InvalidCheckpoint);
-        if !matches!(self.version, 1 | TASK_PAYLOAD_VERSION)
+        // Legacy payloads never carried an invocation overlay; automatic scopes cannot acquire one through storage.
+        if (self.invocation_overrides.is_some()
+            && (self.version < 3
+                || self
+                    .adapters
+                    .iter()
+                    .any(|adapter| adapter.id == "runtime.activation")))
+            || !matches!(self.version, 1 | 2 | TASK_PAYLOAD_VERSION)
             || self.objective.trim().is_empty()
             || self.config_identity.is_empty()
             || self.config_identity != config_identity

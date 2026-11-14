@@ -79,12 +79,17 @@ These commands describe the development tree, not the published 1.1.1 CLI. They 
 ```sh
 cargo run -p ai-agents-cli -- task run agent.yaml "Research the requested topic"
 cargo run -p ai-agents-cli -- task run agent.yaml "Research the requested topic" --profile research
+cargo run -p ai-agents-cli -- task run agent.yaml "Research the requested topic" --profile research --overrides task-overrides.yaml
 cargo run -p ai-agents-cli -- task run agent.yaml "Produce a report" --non-interactive --json
 cargo run -p ai-agents-cli -- task list agent.yaml --json
 cargo run -p ai-agents-cli -- task show agent.yaml RUN_ID --json
 cargo run -p ai-agents-cli -- task cancel agent.yaml RUN_ID --revision REVISION --json
 cargo run -p ai-agents-cli -- task resume agent.yaml RUN_ID
 ```
+
+`--overrides FILE` loads a strict partial autonomy profile once for this invocation. For example, a file containing `max_llm_calls: 12` inherits the selected profile's other settings. Raw conflicts, invalid resolved declarations and persistence unsupported by the default CLI reject before provider, storage or MCP preparation. The same typed input reaches execution, where actual bindings and host limits are checked again. An invocation cannot waive an inherited required stage/plan review. This option belongs to the command-line `task run`; the REPL/TUI task command retains its existing syntax.
+
+Run-specific settings remain in the task payload. `list/show/cancel` use the original agent declaration and actor namespace without the override file or provider credentials. Original invocation settings survive supported retained/explicit-host reconstruction; changing the file does not change a paused run. See [Rust invocation settings](@/docs/rust-api.md#invocation-settings-development-only) for payload compatibility and the separate authenticated host controls.
 
 `task run` uses the same YAML/base-directory, providers, tools, MCP, spawner, context and actor preparation as ordinary execution. Add `--context KEY=VALUE` repeatedly, `--context-file PATH`, or `--actor ID` as needed. `--profile ID` selects an existing profile rather than granting capabilities or enabling a disabled one. `--non-interactive` exposes no stdin response endpoint; it does not reject tool-free or no-storage tasks that can complete normally.
 

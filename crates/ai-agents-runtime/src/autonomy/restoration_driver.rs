@@ -4,6 +4,7 @@ use super::*;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
+// Re-resolve the original invocation overlay without using it as host identity or reconstruction authority.
 // Stored limits cannot exceed the current authenticated host even when raw profile settings still compare equal.
 pub(super) fn current_host_compatible(
     request: &TaskRestoreRequest,
@@ -33,7 +34,7 @@ pub(super) fn current_host_compatible(
             .as_ref()
             .map(|binding| &binding.settings)
             .or_else(|| skill.as_ref().and_then(|skill| skill.autonomy.as_ref())),
-        None,
+        payload.invocation_overrides.as_deref(),
         Some(&payload.objective),
         &request.ceilings,
     )?;

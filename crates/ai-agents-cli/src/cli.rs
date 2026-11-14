@@ -112,6 +112,9 @@ pub struct TaskAgentArgs {
 
 #[derive(Debug, Clone, Parser)]
 pub struct TaskRunArgs {
+    /// Strict YAML partial autonomy profile for this invocation only
+    #[arg(long, value_name = "FILE")]
+    pub overrides: Option<PathBuf>,
     #[command(flatten)]
     pub host: TaskAgentArgs,
     pub objective: String,

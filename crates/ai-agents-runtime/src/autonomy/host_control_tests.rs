@@ -8,10 +8,10 @@ use ai_agents_hitl::ApprovalResult;
 use serde_json::json;
 use std::sync::{Arc, atomic::Ordering};
 
-/// Plan review retains one actual planner result and its run-wide intervention accounting.
+/// Plan review retains one actual planner result and its run-wide intervention accounting, including invocation-added review and objective supersession.
 #[tokio::test]
 async fn host_control_plan_review_and_supersession_preserve_planner_and_intervention_counts() {
-    for revise in [false, true] {
+    for (revise, override_review) in [(false, false), (true, false), (false, true), (true, true)] {
         let plan = r#"{"steps":[{"id":"one","description":"Revise plan","action_type":"think","action_target":"reason","dependencies":[]}]}"#;
         let provider = RecordingProvider::new(&["working", plan, "done"]);
         let agent = Arc::new(
@@ -23,10 +23,12 @@ async fn host_control_plan_review_and_supersession_preserve_planner_and_interven
         );
         let store = support::store(agent.info().id, "plan.v1", false).await;
         let mut config = super::runner_tests::config(8);
-        config.defaults.supervision = Some(SupervisionConfig {
-            stage_changes: None,
-            plan_changes: Some(ReviewPolicy::RequireApproval),
-        });
+        if !override_review {
+            config.defaults.supervision = Some(SupervisionConfig {
+                stage_changes: None,
+                plan_changes: Some(ReviewPolicy::RequireApproval),
+            });
+        }
         config.defaults.progress = Some(serde_yaml::from_str("stagnation: {max_cycles_without_progress: 1, action: replan, max_replans: 1, on_exhausted: stop}").unwrap());
         let runner = AutonomyRunner::try_new(
             agent,
@@ -36,7 +38,15 @@ async fn host_control_plan_review_and_supersession_preserve_planner_and_interven
             "plan.v1".into(),
         )
         .unwrap();
-        let first = runner.run("objective", None).await.unwrap();
+        let overrides = parse_task_overrides("objective: configured\nmax_llm_calls: 3\nsupervision: {plan_changes: require_approval}").unwrap();
+        let first = if override_review {
+            runner
+                .run_with_overrides("objective", None, &overrides)
+                .await
+                .unwrap()
+        } else {
+            runner.run("objective", None).await.unwrap()
+        };
         assert_eq!(
             first.run.status,
             TaskRunStatus::Paused,
@@ -84,6 +94,12 @@ async fn host_control_plan_review_and_supersession_preserve_planner_and_interven
         );
         assert_eq!(done.run.progress.replans, 1);
         assert_eq!(provider.calls.load(Ordering::SeqCst), 3);
+        if override_review {
+            let saved = payload(&store, &done.run).await;
+            assert_eq!(saved.invocation_overrides.as_deref(), Some(&overrides));
+            assert_eq!(done.run.objective, if revise { "new" } else { "objective" });
+            assert_eq!(done.run.limits.max_llm_calls, Some(3));
+        }
     }
 }
 

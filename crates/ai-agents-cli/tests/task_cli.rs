@@ -250,6 +250,65 @@ fn task_store_commands_manage_legacy_finite_namespace() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+// Accepted sockets have platform-dependent modes; request parsing requires bounded blocking reads on every platform.
+// EOF/reset ends only this connection, while timeouts and malformed requests remain visible test failures.
+fn read_fixture_request(socket: &mut std::net::TcpStream) -> std::io::Result<Option<Value>> {
+    use std::io::{Error, ErrorKind};
+
+    socket.set_nonblocking(false)?;
+    socket.set_read_timeout(Some(Duration::from_secs(5)))?;
+    let mut read_more = |bytes: &mut Vec<u8>| -> std::io::Result<bool> {
+        let mut buffer = [0; 4096];
+        loop {
+            match socket.read(&mut buffer) {
+                Ok(0) => return Ok(false),
+                Ok(n) => {
+                    bytes.extend_from_slice(&buffer[..n]);
+                    return Ok(true);
+                }
+                Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted
+                    ) =>
+                {
+                    return Ok(false);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    };
+    let mut bytes = Vec::new();
+    let end = loop {
+        if !read_more(&mut bytes)? {
+            return Ok(None);
+        }
+        if let Some(i) = bytes.windows(4).position(|v| v == b"\r\n\r\n") {
+            break i + 4;
+        }
+    };
+    let len = std::str::from_utf8(&bytes[..end])
+        .map_err(|error| Error::new(ErrorKind::InvalidData, error))?
+        .lines()
+        .find_map(|line| {
+            line.split_once(':')
+                .filter(|(key, _)| key.eq_ignore_ascii_case("content-length"))
+                .map(|(_, value)| value.trim().parse::<usize>())
+        })
+        .transpose()
+        .map_err(|error| Error::new(ErrorKind::InvalidData, error))?
+        .unwrap_or(0);
+    while bytes.len() - end < len {
+        if !read_more(&mut bytes)? {
+            return Ok(None);
+        }
+    }
+    serde_json::from_slice(&bytes[end..end + len])
+        .map(Some)
+        .map_err(|error| Error::new(ErrorKind::InvalidData, error))
+}
+
 static NEXT: AtomicUsize = AtomicUsize::new(0);
 struct Fixture {
     dir: PathBuf,
@@ -282,44 +341,19 @@ impl Fixture {
             while !stopped.load(Ordering::Relaxed) {
                 let (mut socket, _) = match listener.accept() {
                     Ok(v) => v,
-                    Err(_) => {
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(2));
                         continue;
                     }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(error) => panic!("fixture accept failed: {error}"),
                 };
-                socket
-                    .set_read_timeout(Some(Duration::from_secs(5)))
-                    .unwrap();
-                let mut bytes = vec![];
-                let end = loop {
-                    let mut buf = [0; 4096];
-                    let n = socket.read(&mut buf).unwrap();
-                    if n == 0 {
-                        return;
-                    }
-                    bytes.extend_from_slice(&buf[..n]);
-                    if let Some(i) = bytes.windows(4).position(|v| v == b"\r\n\r\n") {
-                        break i + 4;
-                    }
+                let Some(body) =
+                    read_fixture_request(&mut socket).expect("fixture request read failed")
+                else {
+                    // A client may disconnect before sending a request; it does not stop the listener or consume a reply.
+                    continue;
                 };
-                let len = std::str::from_utf8(&bytes[..end])
-                    .unwrap()
-                    .lines()
-                    .find_map(|line| {
-                        line.split_once(':')
-                            .filter(|(k, _)| k.eq_ignore_ascii_case("content-length"))
-                            .map(|(_, v)| v.trim().parse::<usize>().unwrap())
-                    })
-                    .unwrap_or(0);
-                while bytes.len() < end + len {
-                    let mut buf = [0; 4096];
-                    let n = socket.read(&mut buf).unwrap();
-                    if n == 0 {
-                        return;
-                    }
-                    bytes.extend_from_slice(&buf[..n]);
-                }
-                let body: Value = serde_json::from_slice(&bytes[end..end + len]).unwrap();
                 let index = count.fetch_add(1, Ordering::SeqCst);
                 let reply = replies.get(index).cloned().unwrap_or_else(|| "done".into());
                 while held.load(Ordering::Acquire) && !stopped.load(Ordering::Acquire) {
@@ -523,12 +557,121 @@ impl Fixture {
 impl Drop for Fixture {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        if let Some(worker) = self.worker.take() {
-            worker.join().unwrap();
-        }
+        let worker_result = self.worker.take().map(|worker| worker.join());
         let _ = std::fs::remove_dir_all(&self.dir);
+        if let Some(Err(error)) = worker_result {
+            // Keep worker failures fatal, but preserve the primary failure when the test is already unwinding.
+            if thread::panicking() {
+                eprintln!("fixture worker also failed during test cleanup");
+            } else {
+                std::panic::resume_unwind(error);
+            }
+        }
     }
 }
+#[test]
+fn fixture_request_waits_for_fragmented_data_on_a_nonblocking_socket() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (mut socket, _) = listener.accept().unwrap();
+    // Reproduce the accepted-socket mode independently of the host operating system.
+    socket.set_nonblocking(true).unwrap();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    let worker = thread::spawn(move || {
+        ready_tx.send(()).unwrap();
+        result_tx.send(read_fixture_request(&mut socket)).unwrap();
+    });
+    ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(matches!(
+        result_rx.recv_timeout(Duration::from_millis(25)),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+    ));
+    client.write_all(b"POST / HTTP/1.1\r\nContent-Len").unwrap();
+    assert!(matches!(
+        result_rx.recv_timeout(Duration::from_millis(25)),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+    ));
+    client.write_all(b"gth: 2\r\n\r\n{").unwrap();
+    assert!(matches!(
+        result_rx.recv_timeout(Duration::from_millis(25)),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+    ));
+    client.write_all(b"}").unwrap();
+    assert_eq!(
+        result_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap(),
+        Some(json!({}))
+    );
+    worker.join().unwrap();
+}
+
+#[test]
+fn fixture_incomplete_connection_does_not_stop_server_or_consume_reply() {
+    let fixture = Fixture::new(&["first-reply"]);
+    let address = fixture
+        .url
+        .trim_start_matches("http://")
+        .trim_end_matches("/v1/");
+    let mut abandoned = std::net::TcpStream::connect(address).unwrap();
+    abandoned
+        .write_all(b"POST / HTTP/1.1\r\nContent-Length: 2\r\n\r\n{")
+        .unwrap();
+    drop(abandoned);
+
+    let mut client = std::net::TcpStream::connect(address).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    client
+        .write_all(b"POST / HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}")
+        .unwrap();
+    let mut response = String::new();
+    client.read_to_string(&mut response).unwrap();
+    assert!(response.contains("first-reply"), "{response}");
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn fixture_worker_failure_is_reported_without_replacing_primary_panic() {
+    for primary_panic in [false, true] {
+        let fixture = Fixture::new(&[]);
+        let address = fixture
+            .url
+            .trim_start_matches("http://")
+            .trim_end_matches("/v1/");
+        let mut client = std::net::TcpStream::connect(address).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        client
+            .write_all(b"POST / HTTP/1.1\r\nContent-Length: 2\r\n\r\nxx")
+            .unwrap();
+        // EOF acknowledges the worker has failed and closed this connection before testing cleanup.
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).unwrap();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _fixture = fixture;
+            if primary_panic {
+                panic!("primary fixture test failure");
+            }
+        }));
+        let error = result.expect_err("worker failure must not be swallowed");
+        let message = error
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| error.downcast_ref::<&str>().copied())
+            .unwrap();
+        if primary_panic {
+            assert_eq!(message, "primary fixture test failure");
+        } else {
+            assert!(message.contains("fixture request read failed"), "{message}");
+        }
+    }
+}
+
 const TASK: &str = "tools: []\nautonomy:\n  enabled: true\n  mode: until_complete\n  max_turns: 4\n  max_llm_calls: 4\n  completion: {response_contains: done}\n";
 fn assert_exit(output: &Output, code: i32) {
     assert_eq!(
@@ -794,6 +937,16 @@ fn task_subprocess_objective_revision_requires_explicit_continue_and_preserves_u
 
 #[test]
 fn task_subprocess_remote_cancel_is_a_request_until_original_operation_settles() {
+    remote_cancel_case(false);
+}
+
+#[test]
+fn task_overrides_remote_cancel_without_original_file_preserves_settlement() {
+    remote_cancel_case(true);
+}
+
+// The live owner settles the original operation; journal management must not reread invocation input or create providers.
+fn remote_cancel_case(with_overrides: bool) {
     let f = Fixture::new(&["done"]);
     f.gate.store(true, Ordering::Release);
     let db = f.dir.join("tasks.sqlite");
@@ -801,56 +954,67 @@ fn task_subprocess_remote_cancel_is_a_request_until_original_operation_settles()
         "{TASK}storage: {{type: sqlite, path: '{}' }}\n",
         db.display()
     ));
+    let overlay = f.dir.join("invocation.yaml");
+    let mut args = vec![
+        "task",
+        "run",
+        agent.to_str().unwrap(),
+        "operations",
+        "--json",
+    ];
+    if with_overrides {
+        std::fs::write(&overlay, "max_llm_calls: 1\n").unwrap();
+        args.extend(["--overrides", overlay.to_str().unwrap()]);
+    }
     let mut requested = false;
-    let out = f.interact(
-        &[
-            "task",
-            "run",
-            agent.to_str().unwrap(),
-            "operations",
-            "--json",
-        ],
-        |text, _| {
-            if !requested && f.calls.load(Ordering::SeqCst) > 0 {
-                let id = text
-                    .lines()
-                    .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-                    .find_map(|v| v["run_id"].as_str().map(str::to_owned));
-                if let Some(id) = id {
-                    let view = f.run(
-                        &["task", "show", agent.to_str().unwrap(), &id, "--json"],
-                        "",
-                    );
-                    assert_exit(&view, 0);
-                    let view: Value = serde_json::from_slice(&view.stdout).unwrap();
-                    let rev = view["summary"]["revision"].as_u64().unwrap().to_string();
-                    let receipt = f.run(
-                        &[
-                            "task",
-                            "cancel",
-                            agent.to_str().unwrap(),
-                            &id,
-                            "--revision",
-                            &rev,
-                            "--json",
-                        ],
-                        "",
-                    );
-                    assert_exit(&receipt, 0);
-                    let receipt: Value = serde_json::from_slice(&receipt.stdout).unwrap();
-                    assert_eq!(receipt["disposition"], "requested");
-                    assert_eq!(receipt["locally_retained"], Value::Null);
-                    requested = true;
-                    f.gate.store(false, Ordering::Release);
+    let out = f.interact(&args, |text, _| {
+        if !requested && f.calls.load(Ordering::SeqCst) > 0 {
+            let id = text
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .find_map(|v| v["run_id"].as_str().map(str::to_owned));
+            if let Some(id) = id {
+                if with_overrides {
+                    std::fs::remove_file(&overlay).unwrap();
                 }
+                let view = f.run(
+                    &["task", "show", agent.to_str().unwrap(), &id, "--json"],
+                    "",
+                );
+                assert_exit(&view, 0);
+                let view: Value = serde_json::from_slice(&view.stdout).unwrap();
+                let rev = view["summary"]["revision"].as_u64().unwrap().to_string();
+                let receipt = f.run(
+                    &[
+                        "task",
+                        "cancel",
+                        agent.to_str().unwrap(),
+                        &id,
+                        "--revision",
+                        &rev,
+                        "--json",
+                    ],
+                    "",
+                );
+                assert_exit(&receipt, 0);
+                let receipt: Value = serde_json::from_slice(&receipt.stdout).unwrap();
+                assert_eq!(receipt["disposition"], "requested");
+                assert_eq!(receipt["locally_retained"], Value::Null);
+                requested = true;
+                f.gate.store(false, Ordering::Release);
             }
-            None
-        },
-    );
+        }
+        None
+    });
     assert_exit(&out, 1);
     assert!(requested);
     assert_eq!(f.calls.load(Ordering::SeqCst), 1);
-    assert!(!String::from_utf8_lossy(&out.stdout).contains("\"status\":\"completed\""));
+    let final_result = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|value| value["type"] == "result")
+        .expect("the original foreground operation must acknowledge a final result");
+    assert_eq!(final_result["status"], "cancelled");
 }
 
 #[cfg(unix)]
@@ -1413,4 +1577,138 @@ fn repl_subprocess_eof_and_ordinary_chat_are_not_a_busy_loop() {
     assert_exit(&out, 0);
     assert!(String::from_utf8_lossy(&out.stdout).contains("ordinary answer"));
     assert_eq!(f.calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn task_overrides_preflight_rejects_before_provider_and_storage() {
+    let f = Fixture::new(&[]);
+    let db = f.dir.join("override-must-not-create.sqlite");
+    let agent = f.agent(&format!(
+        "{TASK}\nstorage: {{type: sqlite, path: '{}' }}\n",
+        db.display()
+    ));
+    let path = f.dir.join("override.yaml");
+    for yaml in [
+        "persistence: {enabled: true}",
+        "objective: one\nobjective_template: two",
+        "max_llm_calls: 0",
+        "completion: {check: nonexistent}",
+        "unknown: true",
+    ] {
+        std::fs::write(&path, yaml).unwrap();
+        let output = f.run(
+            &[
+                "task",
+                "run",
+                agent.to_str().unwrap(),
+                "work",
+                "--overrides",
+                path.to_str().unwrap(),
+                "--non-interactive",
+            ],
+            "",
+        );
+        assert_exit(&output, 2);
+        assert!(!db.exists(), "{yaml}");
+        assert_eq!(f.calls.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[test]
+fn task_overrides_use_one_namespace_and_management_needs_no_overlay_file() {
+    let f = Fixture::new(&["accepted-one", "accepted-two", "done"]);
+    let db = f.dir.join("override-journal.sqlite");
+    let agent = f.agent(&format!(
+        "{TASK}\nstorage: {{type: sqlite, path: '{}' }}\n",
+        db.display()
+    ));
+    let path = f.dir.join("override.yaml");
+    for answer in ["accepted-one", "accepted-two"] {
+        std::fs::write(
+            &path,
+            format!("completion: {{response_contains: {answer}}}\nmax_llm_calls: 1\n"),
+        )
+        .unwrap();
+        let output = f.run(
+            &[
+                "task",
+                "run",
+                agent.to_str().unwrap(),
+                "work",
+                "--overrides",
+                path.to_str().unwrap(),
+                "--non-interactive",
+                "--json",
+            ],
+            "",
+        );
+        assert_exit(&output, 0);
+    }
+    std::fs::remove_file(path).unwrap();
+    assert_exit(
+        &f.run(
+            &[
+                "task",
+                "run",
+                agent.to_str().unwrap(),
+                "work",
+                "--non-interactive",
+            ],
+            "",
+        ),
+        0,
+    );
+    let list = f.run(&["task", "list", agent.to_str().unwrap(), "--json"], "");
+    assert_exit(&list, 0);
+    let rows: Value = serde_json::from_slice(&list.stdout).unwrap();
+    assert_eq!(rows.as_array().unwrap().len(), 3);
+    for row in rows.as_array().unwrap() {
+        let id = row["key"]["run_id"].as_str().unwrap();
+        assert_exit(
+            &f.run(&["task", "show", agent.to_str().unwrap(), id, "--json"], ""),
+            0,
+        );
+    }
+    assert_eq!(f.calls.load(Ordering::SeqCst), 3);
+}
+
+#[test]
+fn task_overrides_preflight_precedes_provider_credentials() {
+    let f = Fixture::new(&[]);
+    let db = f.dir.join("no-preparation.sqlite");
+    let agent = f.agent(&format!(
+        "{TASK}\nstorage: {{type: sqlite, path: '{}' }}\n",
+        db.display()
+    ));
+    let yaml = std::fs::read_to_string(&agent)
+        .unwrap()
+        .replace("provider: openai-compatible", "provider: openai")
+        .replace("TASK_FIXTURE_TOKEN", "TASK_OVERRIDE_MISSING_KEY");
+    std::fs::write(&agent, yaml).unwrap();
+    let path = f.dir.join("override.yaml");
+    std::fs::write(&path, "persistence: {enabled: true}").unwrap();
+    let command = || {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_ai-agents-cli"));
+        cmd.args([
+            "task",
+            "run",
+            agent.to_str().unwrap(),
+            "work",
+            "--non-interactive",
+        ])
+        .env_remove("OPENAI_API_KEY")
+        .env_remove("TASK_OVERRIDE_MISSING_KEY");
+        cmd
+    };
+    let rejected = command()
+        .args(["--overrides", path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert_exit(&rejected, 2);
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("durable task execution requires"));
+    let normal = command().output().unwrap();
+    assert_exit(&normal, 2);
+    assert!(String::from_utf8_lossy(&normal.stderr).contains("API key not found"));
+    assert!(!db.exists());
+    assert_eq!(f.calls.load(Ordering::SeqCst), 0);
 }

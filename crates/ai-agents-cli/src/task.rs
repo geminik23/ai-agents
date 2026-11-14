@@ -104,7 +104,22 @@ async fn run_inner(args: TaskArgs) -> Result<u8> {
                 theme: None,
             };
             let prepared = crate::run::load_prepared_spec(&options.agent_path)?;
-            preflight_run(prepared.spec(), args.profile.as_deref(), &args.objective)?;
+            let overrides = args
+                .overrides
+                .as_ref()
+                .map(|path| {
+                    let yaml = std::fs::read_to_string(path)?;
+                    ai_agents::autonomy::parse_task_overrides(&yaml)
+                        .map(Box::new)
+                        .map_err(anyhow::Error::from)
+                })
+                .transpose()?;
+            preflight_run(
+                prepared.spec(),
+                args.profile.as_deref(),
+                &args.objective,
+                overrides.as_deref(),
+            )?;
             let namespace = scope(&args.host)?;
             let agent = crate::run::build_frontend_agent(
                 &options.agent_path,
@@ -120,9 +135,16 @@ async fn run_inner(args: TaskArgs) -> Result<u8> {
                 .drive(
                     task_work(
                         agent,
-                        TaskStreamOperation::Run {
-                            objective: args.objective,
-                            profile: args.profile,
+                        match overrides {
+                            Some(overrides) => TaskStreamOperation::RunWithOverrides {
+                                objective: args.objective,
+                                profile: args.profile,
+                                overrides,
+                            },
+                            None => TaskStreamOperation::Run {
+                                objective: args.objective,
+                                profile: args.profile,
+                            },
                         },
                         tx,
                         args.host.json,
@@ -222,13 +244,14 @@ pub(crate) fn preflight_run(
     spec: &ai_agents::spec::AgentSpec,
     selected: Option<&str>,
     objective: &str,
+    overrides: Option<&ai_agents::autonomy::AutonomyProfile>,
 ) -> Result<()> {
     let profile = ai_agents::autonomy::resolve_profile(
         &spec.autonomy,
         ai_agents::autonomy::AutonomyScope::Task,
         selected,
         None,
-        None,
+        overrides,
         Some(objective),
         &Default::default(),
     )?;

@@ -63,7 +63,7 @@ rand = "0.8"
 sha2 = "0.10"
 
 reqwest = { version = "0.12", features = ["json", "stream"] }
-rmcp = { version = "1.4", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"] }
+rmcp = { version = "3.9", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest-native-tls"] }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
 redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
 clap = { version = "4.5", features = ["derive"] }
