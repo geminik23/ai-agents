@@ -30,7 +30,7 @@ agent.yaml
 
 ## Development task evaluation foundation
 
-The development checkout supports typed task operations through the same configured runtime/controller used by explicit tasks and automatic state/skill entry. This is not part of the published 1.1.1 contract, and supports typed operations, exact retained controls, shared domain host integration and bounded redacted reports for the documented development paths. Task evaluation is not a second executor and does not decide completion from response wording or UI strings.
+The development checkout supports typed task operations through the same configured runtime/controller used by explicit tasks and automatic state/skill entry. This is not part of the published 1.1.2 contract, and supports typed operations, exact retained controls, shared domain host integration and bounded redacted reports for the documented development paths. Task evaluation is not a second executor and does not decide completion from response wording or UI strings.
 
 Run the current no-key task suites from the repository root:
 
@@ -1201,7 +1201,7 @@ response metadata is omitted from JSON and JSONL
 
 Set `settings.redact_outputs: false` only for trusted local debugging.
 
-The development checkout emits machine-readable `schema_version: 3`; published 1.1.1 reports use schema 1. See the development migration notes above before changing report consumers.
+The development checkout emits machine-readable `schema_version: 3`; published 1.1.2 reports use schema 1. See the development migration notes above before changing report consumers.
 
 ---
 

@@ -99,6 +99,7 @@ impl TaskRunStore for ReceiptStore {
         self.inner.delete(id, revision).await
     }
     // Faults target the selected consumption, provider settlement or final write rather than an incidental nearby checkpoint.
+    // An optional success selector distinguishes a real successful effect from cancellation settlement.
     async fn mutate(&self, id: &str, mutation: &TaskRunMutation) -> Result<TaskRunSnapshot> {
         let selected = if let Some(binding) = &*self.checkpoint.lock() {
             if binding.get("claim") == Some(&serde_json::Value::Bool(true)) {
@@ -170,6 +171,13 @@ impl TaskRunStore for ReceiptStore {
                             TaskEffectState::Completed
                         };
                         reservation.state == expected
+                            && binding.get("success").is_none_or(|expected_success| {
+                                reservation
+                                    .result
+                                    .as_ref()
+                                    .and_then(|result| result.get("success"))
+                                    == Some(expected_success)
+                            })
                             && payload.adapters.iter().any(|adapter| {
                                 adapter.id == format!("invocation:{}", reservation.id)
                                     && adapter.config["tool"] == tool

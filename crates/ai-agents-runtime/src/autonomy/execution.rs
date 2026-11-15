@@ -1062,6 +1062,7 @@ impl RunExecution {
     }
 
     /// Intersects only actual active, wall and inherited composition limits; None never suppresses accounting or a live restriction.
+    /// Local composition time does not replace the coordinating run's independent aggregate clock.
     pub(crate) fn remaining_duration(&self) -> Option<std::time::Duration> {
         let consumed = match self.consumed_active_millis() {
             Ok(consumed) => consumed,
@@ -1079,7 +1080,7 @@ impl RunExecution {
             self.expiry_projection
                 .map(|expiry| expiry.saturating_duration_since(Instant::now())),
             super::composition::current_composition_deadline()
-                .map(|deadline| deadline.saturating_duration_since(Instant::now())),
+                .map(|deadline| deadline.saturating_duration_since(super::invocation_clock::now())),
         ]
         .into_iter()
         .flatten()
@@ -1168,7 +1169,7 @@ impl RunExecution {
             return Err(AgentError::Other(format!("autonomy stopped: {reason}")));
         }
         if super::composition::current_composition_deadline()
-            .is_some_and(|deadline| Instant::now() >= deadline)
+            .is_some_and(|deadline| super::invocation_clock::now() >= deadline)
         {
             self.stop("composition_timeout");
             return Err(AgentError::Other("composition deadline exceeded".into()));
@@ -1401,7 +1402,7 @@ impl ai_agents_core::autonomy::InvocationAdmission for RunExecution {
             self.stop("owner_abandoned");
         }
         if super::composition::current_composition_deadline()
-            .is_some_and(|deadline| Instant::now() >= deadline)
+            .is_some_and(|deadline| super::invocation_clock::now() >= deadline)
         {
             self.stop("composition_timeout");
         } else if self

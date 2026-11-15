@@ -335,6 +335,7 @@ impl RuntimeAgent {
     }
 
     /// Resume checks current scope and policy under fresh locks but never consumes a second invocation or rate slot.
+    /// The saved frame wall deadline uses invocation time while policy and implementation bindings remain live.
     async fn reauthorize_message(
         &self,
         frame: &DelegateFrame,
@@ -409,7 +410,7 @@ impl RuntimeAgent {
                 && state.record.approval.is_none()
             || frame
                 .expires_at
-                .is_some_and(|expiry| chrono::Utc::now() >= expiry)
+                .is_some_and(|expiry| crate::autonomy::invocation_clock::utc_now() >= expiry)
         {
             return Err(AgentError::Tool(
                 "message continuation authorization or deadline changed".into(),
@@ -473,6 +474,7 @@ impl RuntimeAgent {
     /// The settled result returns to captured retry/fallback recovery before the original caller advances.
     /// Both successful delivery and recovery preserve factual settlement while rechecking the original message clock after its ACK.
     /// A failed retry closes only its acknowledged parent batch result and never fabricates non-invocation of the original effect.
+    /// The original message deadline uses the same clock for reauthorization, waiting and post-ACK eligibility.
     pub(super) async fn resume_message_frame(&self, frame: DelegateFrame) -> Result<AgentResponse> {
         let execution = crate::autonomy::current_execution()
             .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
@@ -484,18 +486,18 @@ impl RuntimeAgent {
             .copied()
             .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
         let original_allowance =
-            original_deadline.saturating_duration_since(std::time::Instant::now());
+            original_deadline.saturating_duration_since(crate::autonomy::invocation_clock::now());
         let allowance = execution
             .remaining_duration()
             .map_or(original_allowance, |remaining| {
                 original_allowance.min(remaining)
             });
-        let guards = tokio::time::timeout(
+        let guards = crate::autonomy::invocation_clock::timeout(
             allowance,
             Box::pin(self.reauthorize_message(&frame, &state)),
         )
         .await
-        .unwrap_or_else(|_| {
+        .unwrap_or_else(|| {
             Err(AgentError::Tool(
                 "message continuation deadline expired during authorization".into(),
             ))
@@ -571,7 +573,7 @@ impl RuntimeAgent {
                 != state.state_generation
             || self.runtime_control.emergency_deny.load(Ordering::SeqCst)
             || execution.stop_reason().is_some()
-            || original_deadline <= std::time::Instant::now()
+            || original_deadline <= crate::autonomy::invocation_clock::now()
         {
             Box::pin(execution.suspend_message(&self.info.id, &state.attempt)).await?;
             execution.take_parked_approvals(&self.info.id);
@@ -611,15 +613,13 @@ impl RuntimeAgent {
                 .await
             }),
         );
-        let original_allowance =
-            original_deadline.saturating_duration_since(std::time::Instant::now());
-        let timer = tokio::time::sleep(
-            execution
-                .remaining_duration()
-                .map_or(original_allowance, |remaining| {
-                    original_allowance.min(remaining)
-                }),
-        );
+        let timer_deadline = execution
+            .remaining_duration()
+            .and_then(|remaining| crate::autonomy::invocation_clock::now().checked_add(remaining))
+            .map_or(original_deadline, |deadline| {
+                original_deadline.min(deadline)
+            });
+        let timer = crate::autonomy::invocation_clock::sleep_until(timer_deadline);
         tokio::pin!(timer);
         let mut work = Box::pin(work);
         let mut cancellation = tokio::time::interval(std::time::Duration::from_millis(10));
@@ -691,14 +691,14 @@ impl RuntimeAgent {
         let result_eligible = !tool_result.success
             || (crate::autonomy::invocation::check_dispatched_invocation().is_ok()
                 && !self.runtime_control.emergency_deny.load(Ordering::SeqCst)
-                && std::time::Instant::now() < original_deadline);
+                && crate::autonomy::invocation_clock::now() < original_deadline);
         Box::pin(execution.settle(&state.attempt, serde_json::to_value(&tool_result)?, false))
             .await?;
         guards.effect_custody.store(false, Ordering::SeqCst);
         let eligible = !tool_result.success
             || (crate::autonomy::invocation::check_dispatched_invocation().is_ok()
                 && !self.runtime_control.emergency_deny.load(Ordering::SeqCst)
-                && std::time::Instant::now() < original_deadline
+                && crate::autonomy::invocation_clock::now() < original_deadline
                 && result_eligible);
         if !eligible {
             execution.stop("tool_result_ineligible");

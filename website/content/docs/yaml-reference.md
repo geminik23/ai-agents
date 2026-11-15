@@ -18,7 +18,7 @@ Fixed framework-owned objects reject unknown fields. Misspelled top-level and ne
 
 ## Development-only autonomy configuration
 
-The development tree accepts typed `autonomy` profiles, named validation/progress adapters and enabled automatic state/selected-skill entry. These are not the published 1.1.1 contract. The standard builder installs retained embedded hosting for enabled declarations; development task commands, the plain REPL and task-aware TUI now consume the same controller. Development typed task evaluation supports exact retained controls, shared domain host integration and bounded redacted reports for the documented paths. See [development task evaluation](@/docs/evaluation.md#development-task-evaluation-foundation). Top-level `autonomy` configures defaults/profiles rather than automatically replacing every ordinary chat. See [automatic state and skill tasks](@/docs/rust-api.md#automatic-state-and-skill-tasks-development-only) for host lifetime, exact results and explicit resume.
+The development tree accepts typed `autonomy` profiles, named validation/progress adapters and enabled automatic state/selected-skill entry. These are not the published 1.1.2 contract. The standard builder installs retained embedded hosting for enabled declarations; development task commands, the plain REPL and task-aware TUI now consume the same controller. Development typed task evaluation supports exact retained controls, shared domain host integration and bounded redacted reports for the documented paths. See [development task evaluation](@/docs/evaluation.md#development-task-evaluation-foundation). Top-level `autonomy` configures defaults/profiles rather than automatically replacing every ordinary chat. See [automatic state and skill tasks](@/docs/rust-api.md#automatic-state-and-skill-tasks-development-only) for host lifetime, exact results and explicit resume.
 
 ### Profile fields, defaults and merging
 
@@ -3814,7 +3814,7 @@ Judge fields:
 | File | Purpose |
 |------|---------|
 | `summary.md` | Human-readable pass/fail summary |
-| `summary.json` | Machine-readable result: published 1.1.1 uses `schema_version: 1`; the development checkout uses `schema_version: 3` |
+| `summary.json` | Machine-readable result: published 1.1.2 uses `schema_version: 1`; the development checkout uses `schema_version: 3` |
 | `per_scenario.jsonl` | One scenario result per line |
 | `failures.md` | Failure-focused report |
 | `junit.xml` | Optional CI report when `--junit` is used |
