@@ -6,16 +6,32 @@ description: "Required remediation, verification and review with truthful escala
 # Flow: remediate -> verify health or actual escalation -> required review -> completion.
 # Usage (offline): sh examples/eval/mocked/run_mocked_evals.sh --category autonomy
 # Customize the stage instructions and actual health/escalation adapters first; a claimed incident is not a stored incident.
-system_prompt: Attempt the authorized remediation; if health cannot recover, create an escalation record and explain the remaining outage.
-llm: {provider: openai, model: gpt-5.4-mini}
+system_prompt: |
+  Attempt only the remediation supported by the installed host. This synthetic host has no health-recovery operation.
+  To escalate, call the domain tool with arguments {"op":"incident"}; no value is needed.
+  A proposed incident is not a stored incident. Use the returned incident ID and health in verification and the final review.
+# Output caps apply per response; cumulative task budgets are intentionally omitted.
+llm: {provider: openai, model: gpt-5.4-mini-2026-03-17, max_tokens: 16384, tool_choice: auto}
+# Auto tool choice sends granted tool schemas through supported native providers; omission keeps the legacy prompt path.
 tools: [domain]
 autonomy:
   enabled: true
   execution: {strategy: lifecycle}
-  max_turns: 8  # Work-cycle allowance; resolved default: unlimited.
-  max_llm_calls: 20  # Shared managed-call allowance; resolved default: unlimited.
   # Stages are required by default. Passing an alternative completion gate cannot skip verification or review.
-  lifecycle: [{id: remediate}, {id: verify}, {id: review}]
+  lifecycle:
+    - id: remediate
+      instruction: Create the actual escalation using domain with op incident; preserve the returned ID and health status.
+    - id: verify
+      instruction: Verify the observed incident is open and health is down. Do not claim recovery or repeat a completed incident creation.
+    - id: review
+      instruction: 'Review the escalation. Return only a JSON object with incident_id, status, health, and summary. Copy the actual ID/status/health from the domain result, and explain the remaining outage in the summary string.'
+      # The final report must agree with the actual incident, not merely say that review finished.
+      validation:
+        checks:
+          - id: review_result
+            adapter: host.records
+            config: {domain: operations_review}
+      completion: {validator_passed: review_result}
   validation:
     checks:
       - id: health

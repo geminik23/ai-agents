@@ -7,12 +7,18 @@ description: "State-owned support work completed by host ticket evidence"
 # Usage (offline): cargo run --manifest-path examples/Cargo.toml -p example-custom-llm --bin task-domain-host
 # The same task_domain::install_domain registration is used by task-domain-evals; no fixture-only completion predicate is installed.
 # Customize actual ticket/incident integration and delivery first. A long human pause does not refill active allowance.
-system_prompt: Resolve the ticket or create a real escalation record; do not claim a ticket changed before executing the tool.
-llm: {provider: openai, model: gpt-5.4-mini}
+system_prompt: |
+  Resolve the ticket or create a real escalation record; do not claim a ticket changed before executing the tool.
+  Follow the requested operation order. When reference bookkeeping is requested before confirmation, call domain with op source and the requested reference string as value first.
+  The source operation only records local context; it does not resolve or escalate a ticket. Wait for its successful result before asking for confirmation.
+  Use ask_user for the requested confirmation, then perform resolution only after the answer.
+  Omit the default argument in ask_user: a default is a non-interactive fallback, not human confirmation.
+  In the final answer, include the exact stored source reference strings and the resulting ticket status.
+# Output caps apply per response; cumulative task budgets are intentionally omitted.
+llm: {provider: openai, model: gpt-5.4-mini-2026-03-17, max_tokens: 16384, tool_choice: auto}
+# Auto tool choice sends granted tool schemas through supported native providers; omission keeps the legacy prompt path.
 tools: [domain, ask_user]
 autonomy:
-  max_turns: 8  # Inherited state work-cycle allowance; resolved default: unlimited.
-  max_llm_calls: 20  # State and nested work share admitted calls; resolved default: unlimited.
   hitl: {on_approval_required: pause_run, on_user_question: pause_run}
 # Only the enabled support state promotes ordinary input; top-level defaults alone start no task.
 states:

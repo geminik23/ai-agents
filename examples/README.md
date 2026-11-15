@@ -596,6 +596,7 @@ Development-only task profiles use the existing controller, not a coding-specifi
 
 | File | Description |
 |------|-------------|
+| `research_corpus_task.yaml` | Actual synthetic document retrieval, exact fact/citation checks and a managed grounded-comparison judge; shared Rust application/eval host required |
 | `research_task.yaml` | Named profile with actual source deduplication/citation evidence, semantic quality checks and custom progress; Rust domain host required |
 | `support_resolution.yaml` | Automatic state-owned ticket resolution with an exact retained question; Rust domain host required |
 | `artifact_generation.yaml` | Actual isolated file creation, repair and managed content validation with an explicit one-path host ceiling; Rust domain host required |
@@ -626,6 +627,10 @@ cargo run --manifest-path examples/Cargo.toml -p example-custom-llm --bin task-d
 
 `rust/custom-llm/src/task_domain.rs` is shared by the embedded `task-domain-host` and `task-domain-evals`; customize its real record integration and pure predicates without modifying the controller, core gates or eval helper. Its consumer acceptance is `cargo test --manifest-path examples/Cargo.toml -p example-custom-llm --test task_domain_acceptance`: recorded-source/citation rejection, pre-question state and cumulative usage, required operations stage order, protected budget refusal and actual offline application execution. These isolated records do not certify web-source authenticity, health recovery or live model quality. Follow `website/content/docs/task-autonomy.md` for configuration, typed delivery, evidence interpretation and your own host executable.
 
+
+For intentional provider-backed checks, run `sh examples/eval/live/run_live_example_evals.sh --dry-config-check --category autonomy`, then explicitly choose `--yes-live`. Four suites cover tool-free analysis, synthetic corpus comparison, retained support confirmation and reviewed incident escalation. The domain executable applies detailed in-memory acceptance as well as suite assertions and writes `acceptance.json`; both must pass. Source-ID research remains a separate deterministic contract.
+
+For application use, run `cargo run --manifest-path examples/Cargo.toml -p example-custom-llm --bin task-domain-live -- --agent examples/yaml/autonomy/research_corpus_task.yaml --dry-config-check`. Replace the last flag with `--real-llm` to construct providers. Use `/task run --profile research OBJECTIVE`, `/task run OBJECTIVE` for operations/tool-free, or ordinary input for support. Provider/model settings come from YAML; the executable adds no turn, call, time or price ceiling and preserves omitted task iteration limits. The supplied OpenAI configurations require `OPENAI_API_KEY`. Output caps are 16,384 tokens for main and 8,192 for judge per request, not cumulative task budgets. Use the separate eval suites when a bounded evaluation is needed. It does not authenticate real sources, restore processes or operate a customer system.
 
 The helper's fixed host marker selects that Rust application only where adapters/ceilings are required; it still uses the same `EvalRunner`. Top-level autonomy defaults/profile loading does not turn every ordinary input into a task. Explicit invocations start task profiles, while the state/skill examples declare automatic scoped entry. `{{ eval.workspace }}` in file/command profiles is a generated eval token: replace it with the application's authorized path outside the eval harness. Keep attempt-local file fixtures and command/HTTP/approval fixtures intact. Compile/build-only validation does not prove live model quality or production restart support.
 
@@ -812,8 +817,9 @@ Custom LLM provider examples - from implementing `LLMProvider` from scratch to m
 | `multi-provider` | Multi-provider routing with `MultiLLMRouter` - expensive model for users, cheap model for internal tasks |
 | `task-events` | Development-only offline task events with run-local settings, a retained question and explicit resume; no API key or tools |
 | `automatic-tasks` | Development-only YAML state/skill automatic task entry, safe events and explicit host resume through the same controller; offline with no tools or API key |
+| `task-domain-live` | Explicitly authorized provider-backed task REPL with the same synthetic domain and user-configured limits; provider-free dry checking |
 | `task-domain-host` | Offline embedded support round trip with actual ticket evidence and the same runtime-only domain installation as eval |
-| `task-domain-evals` | Explicit Rust validator/progress/tool integration for the same development EvalRunner; isolated business state and default-redacted reports, no provider keys |
+| `task-domain-evals` | Explicit Rust validator/progress/tool integration for the same development EvalRunner; isolated business state and default-redacted reports; no-key mock default, explicit live and provider-free dry options |
 
 
 Note: For a zero-code YAML alternative, see `yaml/basic/openai_compatible.yaml` which uses the built-in `provider: openai-compatible` with `base_url` - no custom Rust code needed.

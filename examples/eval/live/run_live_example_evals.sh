@@ -49,10 +49,12 @@ list_only="false"
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --dry-config-check)
+      if [ -n "$mode" ]; then echo "error: choose one execution mode" >&2; exit 2; fi
       mode="dry"
       shift
       ;;
     --yes-live)
+      if [ -n "$mode" ]; then echo "error: choose one execution mode" >&2; exit 2; fi
       mode="live"
       shift
       ;;
@@ -152,6 +154,30 @@ for suite in "$suite_dir"/*/*_live.yaml; do
 
   output="$output_root/$category/$name"
   echo "==> $display_name"
+
+  host=$(sed -n 's/^# Eval host: //p' "$suite")
+  if [ -n "$host" ] && [ "$host" != "task-domain-evals" ]; then
+    echo "error: unknown eval host for $display_name" >&2
+    exit 2
+  fi
+  if [ "$host" = "task-domain-evals" ]; then
+    if [ "$mode" = "dry" ]; then
+      if cargo run -q --manifest-path examples/Cargo.toml -p example-custom-llm --bin task-domain-evals -- "$suite" --dry-config-check; then
+        passed=$((passed + 1))
+      else
+        failed=$((failed + 1))
+        failed_names="$failed_names $display_name"
+      fi
+    else
+      if cargo run -q --manifest-path examples/Cargo.toml -p example-custom-llm --bin task-domain-evals -- "$suite" "$output" --real-llm; then
+        passed=$((passed + 1))
+      else
+        failed=$((failed + 1))
+        failed_names="$failed_names $display_name"
+      fi
+    fi
+    continue
+  fi
 
   if [ "$mode" = "dry" ]; then
     if cargo run -q -p ai-agents-cli -- eval \
