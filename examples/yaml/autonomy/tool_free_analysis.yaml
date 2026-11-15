@@ -1,22 +1,21 @@
 name: ToolFreeAnalysis
 version: "1.0.0"
-description: "Tool-free iterative analysis with bounded semantic validation"
+description: "Tool-free iterative analysis with semantic validation"
 
 # No tools, todo store or filesystem are required. Mocked judge scores exercise the protocol, not factual answer quality.
-# Flow: draft -> semantic check -> revise or stop at the original resource limit.
+# Flow: draft -> semantic check -> revise or stop at the configured completion or stagnation policy.
 # Usage (offline): sh examples/eval/mocked/run_mocked_evals.sh --category autonomy
 # Customize criteria/threshold and bounds first. Fixed mocked scores prove the controller protocol, not live answer quality.
 system_prompt: Develop an answer addressing the requested criteria and revise it using validation feedback.
+# Output caps apply per response; cumulative task budgets are intentionally omitted.
 llms:
-  main: {provider: openai, model: gpt-5.4-mini}
-  judge: {provider: openai, model: gpt-5.4-nano}
+  main: {provider: openai, model: gpt-5.4-mini-2026-03-17, max_tokens: 16384}
+  judge: {provider: openai, model: gpt-5.4-mini-2026-03-17, max_tokens: 8192}
 llm: {default: main}
 # Empty grants are intentional: task ownership and progress must not require a coding toolchain.
 tools: []
 autonomy:
   enabled: true
-  max_turns: 4  # Work-cycle allowance; resolved default: unlimited.
-  max_llm_calls: 8  # Includes judge calls, not only main replies; resolved default: unlimited.
   validation:
     checks:
       - id: quality
@@ -31,7 +30,5 @@ autonomy:
     stagnation: {max_cycles_without_progress: 2, action: stop}
   profiles:
     current_progress:
-      # Exactly two main and two judge calls; crossing the current-cycle threshold must not require a fifth call.
-      max_turns: 2
-      max_llm_calls: 4
+      # This profile uses current progress as completion; exact-call budgets belong to its eval suite.
       completion: {progress_path: {path: metrics.signals.quality, gte: 0.8}}

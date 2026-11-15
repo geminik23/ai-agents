@@ -3,6 +3,9 @@
 // Replace Records and its domain predicates for your application; no core gate or executor changes are needed.
 // Each installation creates fresh state. Resume retains that installation; rebuilding intentionally starts a new domain instance.
 
+#[path = "task_corpus.rs"]
+pub mod corpus;
+
 use ai_agents::autonomy::*;
 use ai_agents::tools::{Tool, ToolExecutionContext, ToolResult, ToolSafetyMetadata};
 use ai_agents::{AgentBuilder, AgentError};
@@ -46,11 +49,11 @@ impl Tool for RecordTool {
         "Domain records"
     }
     fn description(&self) -> &str {
-        "Update isolated records; no command, network or filesystem effects."
+        "Update isolated records. source records the string supplied in value; resolve marks the ticket resolved; incident opens an escalation. report sets a JSON report, world sets a numeric level, code sets a source string. No command, network or filesystem effects."
     }
     fn input_schema(&self) -> Value {
         json!({"type":"object","additionalProperties":false,"properties":{
-            "op":{"type":"string","enum":["source","resolve","incident","report","world","code"]},"value":{}},"required":["op"]})
+            "op":{"type":"string","enum":["source","resolve","incident","report","world","code"]},"value":{"description":"Required for source/code: a string; for world: a number; for report: the report object. Omit for resolve/incident."}},"required":["op"]})
     }
     // Admitted bodies change actual host state and revision; a model completion claim changes neither.
     async fn execute(&self, args: Value, _: ToolExecutionContext) -> ToolResult {
@@ -90,7 +93,16 @@ impl AutonomyValidator for RecordValidator {
                 .any(|key| !matches!(key.as_str(), "domain" | "min_unique"))
         }) || !matches!(
             config["domain"].as_str(),
-            Some("research" | "support" | "report" | "operations" | "health" | "world" | "code")
+            Some(
+                "research"
+                    | "support"
+                    | "report"
+                    | "operations"
+                    | "operations_review"
+                    | "health"
+                    | "world"
+                    | "code"
+            )
         ) || config
             .get("min_unique")
             .is_some_and(|value| value.as_u64().is_none_or(|value| value == 0))
@@ -143,6 +155,23 @@ impl AutonomyValidator for RecordValidator {
             "operations" => {
                 data["incident"]["id"].is_string() && data["incident"]["status"] == "open"
             }
+            "operations_review" => input
+                .evidence
+                .current
+                .as_ref()
+                .filter(|current| {
+                    current.complete && current.identity.eligible(input.scope, true, true)
+                })
+                .and_then(|current| serde_json::from_str::<Value>(&current.value.response).ok())
+                .is_some_and(|response| {
+                    data["incident"]["id"].is_string()
+                        && response["incident_id"] == data["incident"]["id"]
+                        && response["status"] == data["incident"]["status"]
+                        && response["health"] == data["health"]
+                        && response["summary"]
+                            .as_str()
+                            .is_some_and(|s| !s.trim().is_empty())
+                }),
             "health" => data["health"] == "up",
             "world" => data["world"].as_i64().is_some_and(|value| value >= 10),
             "code" => data["source"] == "return 2",
@@ -154,7 +183,11 @@ impl AutonomyValidator for RecordValidator {
             } else {
                 GateOutcome::Fail
             },
-            reason: "observed domain predicate".into(),
+            reason: if input.config["domain"] == "operations_review" {
+                "return a JSON object with actual incident_id, status, health and a nonempty summary".into()
+            } else {
+                "observed domain predicate".into()
+            },
             metrics: json!({"unique":unique,"world":data["world"],
                 "artifact":{"path":"report://current","exists":!data["report"].is_null()}}),
             evidence_refs: vec![],
@@ -265,7 +298,7 @@ impl ProgressAdapter for RecordProgress {
 }
 /// Installs actual tools and immutable named adapters without replacing providers, hooks, storage or their admission layers.
 /// This installer owns the named adapter registry; combine additional adapters here before freezing, and set hosting options explicitly in the caller.
-pub fn install_domain(builder: AgentBuilder) -> ai_agents::Result<AgentBuilder> {
+pub fn domain_components() -> ai_agents::Result<(AutonomyExtensions, Vec<Arc<dyn Tool>>)> {
     let records = Records::new();
     let mut extensions = AutonomyExtensions::builtins();
     extensions.register_validator(Arc::new(FileReportValidator(AdapterDescriptor {
@@ -289,10 +322,18 @@ pub fn install_domain(builder: AgentBuilder) -> ai_agents::Result<AgentBuilder> 
         checks: vec!["records".into()],
         ..Default::default()
     })))?;
-    for check in ["records", "health"] {
+    for check in ["records", "health", "review_result"] {
         extensions.register_validation_target(check, "domain-state", records.clone())?;
     }
-    Ok(builder
-        .tool(Arc::new(RecordTool(records)))
-        .autonomy_extensions(extensions))
+    let catalog = corpus::register(&mut extensions)?;
+    Ok((extensions, vec![Arc::new(RecordTool(records)), catalog]))
+}
+
+/// Installs the same domain components used by pure configuration checks, preserving caller-owned execution layers.
+pub fn install_domain(mut builder: AgentBuilder) -> ai_agents::Result<AgentBuilder> {
+    let (extensions, tools) = domain_components()?;
+    for tool in tools {
+        builder = builder.tool(tool);
+    }
+    Ok(builder.autonomy_extensions(extensions))
 }

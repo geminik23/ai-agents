@@ -124,6 +124,14 @@ For stronger consumer acceptance, run `cargo test --manifest-path examples/Cargo
 
 Use `!task` for explicit run/skill/control steps and returned foreground pauses. Use scenario `interactions` when an ordinary parent still awaits independently hosted child decisions. See [typed steps](@/docs/evaluation.md#typed-steps-and-exact-continuation) and [foreground controls](@/docs/evaluation.md#foreground-participant-controls).
 
+### Provider-backed examples
+
+`research_corpus_task.yaml` adds a small synthetic service catalog. The Rust host supplies `research_catalog` and `host.corpus`: actual successful reads establish source evidence, exact facts and citations are checked deterministically, and a managed judge receives the retrieved documents with the comparison. The original source-ID-only research fixture remains available. The operations review validates a final JSON report against the actual incident ID, status and health, so a generic completion message cannot replace the required report.
+
+Use the shared `task-domain-live --agent PATH --dry-config-check` binary to validate declarations and registered adapter configuration without constructing providers. `--real-llm` explicitly starts the provider-backed CLI; it requires credentials and incurs cost. Research uses `/task run --profile research OBJECTIVE`, operations/tool-free use `/task run OBJECTIVE`, and support enters through ordinary state-owned input. The executable honors YAML provider settings and adds no cumulative task ceilings or price schedule. Omitted task-loop limits remain omitted through `PreparedAgentSpec`; explicit user limits remain effective. Main/judge output caps in these examples are 16,384/8,192 tokens per response. Evaluation calls/tokens/cost/time budgets belong to the separate eval suites. This is not a production restart host.
+
+The live helper's `autonomy` category dispatches the four reviewed suites to the fixed domain eval binary. Its real mode requires explicit authorization. Detailed acceptance checks retained support state and ordered operations stages using exact in-memory evidence, while exported `acceptance.json` contains only stable check names and outcomes. Both the standard suite and detailed acceptance must pass. Dry checking validates local declarations, not provider access or executable runtime capabilities. See the [examples catalog](@/examples/_index.md) for commands and limitations.
+
 ## 6. Read results without overclaiming
 
 | Observation | What it proves | What it does not prove |

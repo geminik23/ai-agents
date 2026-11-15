@@ -1,0 +1,43 @@
+# Eval host: task-domain-evals
+name: Live Task - Synthetic corpus comparison
+agent: ../../../../yaml/autonomy/research_corpus_task.yaml
+
+# Intentional paid evaluation with synthetic inputs and no external business services.
+# Flow: declared task -> shared controller and host -> actual evidence -> redacted report.
+# Run with task-domain-evals SUITE OUTPUT --real-llm; --dry-config-check never constructs providers.
+settings:
+  timeout_per_turn_ms: 600000
+  timeout_per_scenario_ms: 600000
+  retries: 0
+  parallel: false
+observability:
+  enabled: true
+  latency: {track_llm: true}
+  cost:
+    enabled: true
+    unknown_price_policy: error
+    pricing:
+      openai/gpt-5.4-mini-2026-03-17: {input_per_1k: 0.00075, output_per_1k: 0.0045}
+  export: {formats: [json], write_report: false}
+fixtures:
+  llm: {mode: real}
+  approvals:
+    default: {outcome: reject, reason: Unexpected approval in synthetic task}
+scenarios:
+  - id: live-research
+    tags: [live, examples, autonomy, fixture, real-llm]
+    language: en
+    budget: {max_llm_calls: 24, max_total_tokens: 200000, max_cost_usd: 0.25}
+    steps:
+      - !task
+        operation:
+          action: run
+          profile: research
+          objective: Compare the synthetic alert services for a monthly budget of 40 USD, at least 300 events/minute and p95 delivery at most 300 ms. Read the sources, return their exact structured facts, compare trade-offs and state uncertainty.
+        assert:
+          all:
+            - task: {status: completed, checks: [{id: corpus, outcome: pass}], event_result_parity: true}
+            - tool_called: {id: research_catalog, count_gte: 2, executed: true, success: true, args_executed: {path: op, eq: read}}
+            - response_contains: alerts-b
+            - tool_not_called: web_fetch
+            - tool_not_called: command

@@ -10,7 +10,7 @@ fixtures:
       - I claim remediation succeeded.
       - '{"tool":"domain","arguments":{"op":"incident"}}'
       - An incident record is open; health remains down.
-      - Reviewed the escalation and remaining outage.
+      - '{"incident_id":"fixture-incident","status":"open","health":"down","summary":"Reviewed escalation and remaining outage."}'
 scenarios:
   - id: verified-escalation-does-not-skip-review
     steps:

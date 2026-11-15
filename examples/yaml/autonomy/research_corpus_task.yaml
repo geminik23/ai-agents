@@ -1,0 +1,47 @@
+name: ResearchCorpusTask
+version: "1.0.0"
+description: "Compare retrieved synthetic documents with verified facts and a managed semantic judge"
+
+# Rust installs research_catalog and host.corpus through the shared application/eval domain host.
+# Flow: list sources -> read documents -> compare exact facts -> managed judge -> complete or revise.
+# Usage: task-domain-live --agent examples/yaml/autonomy/research_corpus_task.yaml --real-llm
+# Then use /task run --profile research followed by the comparison objective.
+# Customize the corpus and question together; the data are invented and prove no real service performance.
+system_prompt: |
+  Compare the synthetic alert services using research_catalog. List the catalog, then read every source you cite.
+  Return only a JSON object with sources, comparison, and uncertainty.
+  sources must be an array of objects. comparison and uncertainty must each be a plain JSON string, not an array or object.
+  Use this shape: {"sources":[{"id":"SOURCE_ID","monthly_usd":0,"events_per_minute":0,"p95_ms":0}],"comparison":"your comparison","uncertainty":"measurement limitations"}.
+  Replace the placeholder and numbers with actual retrieved facts; the example shape is not evidence.
+  Each sources entry must contain id, monthly_usd, events_per_minute, and p95_ms copied exactly from the retrieved document.
+  Cite every successfully read document, without duplicates, and compare at least two sources.
+  Explain the trade-offs and what the synthetic measurements cannot establish.
+# Output caps apply per response; cumulative task budgets are intentionally omitted.
+llms:
+  main: {provider: openai, model: gpt-5.4-mini-2026-03-17, max_tokens: 16384, tool_choice: auto}
+  judge: {provider: openai, model: gpt-5.4-mini-2026-03-17, max_tokens: 8192}
+llm: {default: main}
+# Only this in-memory catalog is granted. The model cannot fetch the web or modify workspace files.
+# Auto tool choice sends granted tool schemas through supported native providers; omission keeps the legacy prompt path.
+tools: [research_catalog]
+autonomy:
+  enabled: true
+  default_profile: research
+  profiles:
+    research:
+      validation:
+        checks:
+          - id: corpus
+            adapter: host.corpus
+            config:
+              llm: judge
+              pass_threshold: 0.8  # Minimum semantic score after factual checks; this host requires an explicit value.
+              question: Compare alert services for a monthly budget of 40 USD, at least 300 events/minute and p95 delivery at most 300 ms. Explain trade-offs and uncertainty.
+      completion: {validator_passed: corpus}
+      progress:
+        adapter: builtin.evidence
+        config:
+          signals:
+            - {id: sources, validator: corpus, path: metrics.unique, comparison: increase}
+            - {id: quality, validator: corpus, path: metrics.score, comparison: increase}
+        stagnation: {max_cycles_without_progress: 3, action: stop}
