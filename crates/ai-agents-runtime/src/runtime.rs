@@ -6784,6 +6784,7 @@ impl RuntimeAgent {
     /// Expiry before invocation settles as non-invocation; returned effects settle factually before continuing restrictions decide result eligibility.
     /// An ineligible acknowledged result cannot retry, fall back or supply completion credit, but its consumption and actual result remain auditable.
     /// A returned uncertainty marker keeps effect custody even when the tool future itself completed.
+    /// Deadline creation, waits and post-ACK checks share one invocation clock without renewing the admitted bound.
     async fn execute_resolved_tool_once(
         &self,
         tool: Arc<dyn ai_agents_core::Tool>,
@@ -6883,7 +6884,7 @@ impl RuntimeAgent {
         let timer_duration = bounds.map_or(timer_duration, |bounds| {
             timer_duration.min(bounds.remaining())
         });
-        let invocation_deadline = std::time::Instant::now()
+        let invocation_deadline = crate::autonomy::invocation_clock::now()
             .checked_add(timer_duration)
             .ok_or_else(|| AgentError::Config("tool deadline overflow".into()))?;
         let deadline_delta = if timer_duration == timeout.timer {
@@ -6893,7 +6894,7 @@ impl RuntimeAgent {
                 .map_err(|_| AgentError::Config("tool deadline overflow".into()))?
         };
         ctx.deadline = Some(
-            chrono::Utc::now()
+            crate::autonomy::invocation_clock::utc_now()
                 .checked_add_signed(deadline_delta)
                 .ok_or_else(|| AgentError::Config("tool deadline overflow".into()))?,
         );
@@ -6957,7 +6958,7 @@ impl RuntimeAgent {
         if let (Some(execution), Some(invocation)) = (&execution, &message_invocation) {
             execution.approval_deadlines.lock().insert(
                 format!("composition:{}", invocation.frame.id),
-                std::time::Instant::now()
+                crate::autonomy::invocation_clock::now()
                     .checked_add(timer_duration)
                     .ok_or_else(|| AgentError::Config("message deadline overflow".into()))?,
             );
@@ -6978,7 +6979,7 @@ impl RuntimeAgent {
                         )
                     })
                     || bounds.is_some_and(|bounds| bounds.remaining().is_zero())
-                    || (managed && std::time::Instant::now() >= invocation_deadline)
+                    || (managed && crate::autonomy::invocation_clock::now() >= invocation_deadline)
                 {
                     return Ok(ToolResult::error(
                         "Validation proof, cancellation or original deadline changed before tool dispatch",
@@ -7012,7 +7013,7 @@ impl RuntimeAgent {
                 }
             },
         ));
-        let timer = tokio::time::sleep_until(invocation_deadline.into());
+        let timer = crate::autonomy::invocation_clock::sleep_until(invocation_deadline);
         tokio::pin!(timer);
         let mut cancel_tick = tokio::time::interval(std::time::Duration::from_millis(50));
 
@@ -7035,7 +7036,7 @@ impl RuntimeAgent {
                     // Preserve the actual returned effect separately from its eligibility; a late ACK cannot renew this invocation.
                     let result_eligible = crate::autonomy::invocation::check_dispatched_invocation().is_ok()
                         && !self.runtime_control.emergency_deny.load(Ordering::SeqCst)
-                        && (!managed || std::time::Instant::now() < invocation_deadline);
+                        && (!managed || crate::autonomy::invocation_clock::now() < invocation_deadline);
                     if let (Some(execution), Some(attempt)) = (&execution, &attempt) {
                         let settlement = if invoked.load(Ordering::SeqCst) { serde_json::to_value(&result)? } else { serde_json::json!({"not_invoked":true}) };
                         Box::pin(execution.settle(attempt, settlement, effect_uncertain)).await?;
@@ -7046,7 +7047,7 @@ impl RuntimeAgent {
                     if !effect_uncertain && let Some(custody) = &effect_custody { custody.store(false, Ordering::SeqCst); }
                     let eligible = !effect_uncertain && crate::autonomy::invocation::check_dispatched_invocation().is_ok()
                         && !self.runtime_control.emergency_deny.load(Ordering::SeqCst)
-                        && (!managed || std::time::Instant::now() < invocation_deadline)
+                        && (!managed || crate::autonomy::invocation_clock::now() < invocation_deadline)
                         && result_eligible;
                     if !eligible && let Some(execution) = &execution {
                         execution.stop("tool_result_ineligible");
@@ -7355,7 +7356,7 @@ impl RuntimeAgent {
         }
         let started_at = crate::autonomy::suspension::executor_progress()
             .and_then(|cursor| cursor.started_at)
-            .unwrap_or_else(chrono::Utc::now);
+            .unwrap_or_else(crate::autonomy::invocation_clock::utc_now);
         let start = Instant::now();
         info!(tool = %request.requested_name, "Executing tool");
 

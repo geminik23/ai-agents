@@ -351,6 +351,7 @@ impl AutonomyRunner {
 
     /// Claims an exact retained composition and resumes its child action before running the parent's saved finalization path.
     /// Only a fully returned, non-pending group can transfer a configured capacity wait to the controller; rejection still settles siblings.
+    /// Message frame expiry shares invocation time; run and human-response clocks retain their separate ownership.
     async fn resume_group(
         &self,
         snapshot: TaskRunSnapshot,
@@ -399,11 +400,11 @@ impl AutonomyRunner {
                     .any(|frame| {
                         frame
                             .expires_at
-                            .is_some_and(|expiry| chrono::Utc::now() >= expiry)
+                            .is_some_and(|expiry| super::invocation_clock::utc_now() >= expiry)
                             || retained
                                 .approval_deadlines
                                 .get(&format!("composition:{}", frame.id))
-                                .is_some_and(|expiry| std::time::Instant::now() >= *expiry)
+                                .is_some_and(|expiry| super::invocation_clock::now() >= *expiry)
                     }),
                 retained.targets.clone(),
             )

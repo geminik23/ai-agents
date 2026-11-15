@@ -29,6 +29,7 @@ pub(crate) mod speculation;
 pub(crate) mod work;
 pub(crate) use work::owned_maintenance;
 pub(crate) mod invocation;
+pub(crate) mod invocation_clock;
 mod memory;
 pub(crate) mod message;
 mod participants;
