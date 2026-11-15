@@ -9,6 +9,9 @@ This page compares the development checkout with published **1.1.2**. The checko
 
 ## Task support boundaries
 
+The 1.2 support contract includes the task APIs and behaviors listed below as supported framework functionality, including configured prepared-pause restart on Linux and macOS. Runtime prerequisites such as durable storage, current authorization and synchronized time are enforced admission requirements. Application-specific tools, validators and service state use supported Rust extension points; the application supplies their implementation and recovery binding.
+
+
 A task continues, pauses or finishes according to configured completion evidence and host decisions. YAML describes common behavior, profiles, stages and policy; Rust integrations supply application services and domain evidence. Research, support, operations, reports, code and tool-free analysis use the same controller. A particular profile does not make tools, filesystem access, todos or SQLite mandatory for every task.
 
 | Development surface | Available behavior | Required host contract or limitation |
@@ -92,4 +95,13 @@ Ordinary chat JSONL input remains supported. Task operations and participant int
 
 The facade retains `default`, `sqlite`, `redis-storage`, `http-context`, `full-storage` and `full`. A workspace build can unify features from other members, including the CLI. Check an embedded consumer with its own selected features rather than inferring its available APIs from a workspace all-features build.
 
-Existing Linux/macOS evidence covers CLI/PTY and MCP integration. Configured restart has Linux process acceptance; native macOS verification of the new clock and recovery path remains separate. Windows CLI stack-overflow investigation and platform CI are deferred; that does not establish failure of every Windows library use. Redis remains an experimental snapshot backend, and SQLite currently has one documented audit exception pending an upstream dependency fix. Neither limitation is resolved by passing compatibility checks.
+| Environment or integration | 1.2 support boundary |
+|---|---|
+| Linux and macOS configured restart | Supported prepared-pause reconstruction with the declared SQLite, clock, binding and review requirements. Linux process/fault acceptance and macOS CI success cover the native execution paths. |
+| Reboot, suspend and clock correction | The same original deadlines and fresh OS evidence are required. Missing evidence or detected discontinuity blocks restoration. These lifecycle transitions have not been exercised in dedicated real-machine experiments. |
+| VM snapshot replay or host migration | No automatic certification of clock or external-state continuity; restoring a copied journal alone grants no execution authority. |
+| Windows CLI and configured restart | Deferred: the CLI stack-overflow investigation remains open and the native restoration clock/lease implementation is unavailable. This does not establish failure of every Windows library API. |
+| Custom domain or opaque service, including MCP state | Supported component-factory integration; the installed host supplies truthful state compatibility and interrupted-preparation evidence. The default CLI cannot infer opaque server state. |
+| Redis | Experimental snapshot storage; no task-run durability capability. |
+
+The SQLite audit exception remains tracked pending an upstream dependency fix. The platform and extension boundaries above do not change the published 1.1.2 contract or complete release preparation.

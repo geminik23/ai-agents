@@ -8,7 +8,7 @@ This page tracks the released stable v1 foundation, hierarchical LLM routing in 
 
 ---
 
-The development task support boundaries and migration from published 1.1.2 are described in [Support and compatibility](@/docs/compatibility.md). This documents available development behavior without assigning its next release version.
+The development task support boundaries and migration from published 1.1.2 are described in [Support and compatibility](@/docs/compatibility.md). The selected development target is 1.2; package version updates and publication remain separate.
 
 ## Status Legend
 
