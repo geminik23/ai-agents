@@ -327,3 +327,5 @@ jobs:
         run: rustup toolchain install ${{ env.RELEASE_RUST }} --profile minimal
       - name: Run default-feature platform tests
         run: cargo +1.97.0 test --workspace --locked
+      - name: Run Rust MCP YAML integration
+        run: cargo +1.97.0 run -p xtask --features mcp-integration --locked -- mcp-integration

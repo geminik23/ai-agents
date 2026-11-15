@@ -34,6 +34,23 @@ fn run_tui_pty(agent: &std::path::Path, initial: &str, expected: &str, answer: &
     );
 }
 
+// The supervisor must outlive the foreground CLI without masking a missing terminal restoration.
+#[cfg(unix)]
+#[test]
+fn tui_pty_harness_preserves_terminal_and_detects_missing_restoration() {
+    let out = Command::new("python3")
+        .args(["-B", "-m", "unittest", "discover", "-s"])
+        .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/tests"))
+        .args(["-p", "test_tui_pty.py", "-v"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "PTY harness regression failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn tui_pty_retained_question_and_terminal_restoration() {

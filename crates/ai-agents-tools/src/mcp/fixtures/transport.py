@@ -3,6 +3,7 @@ import http.server
 import json
 import os
 from pathlib import Path
+import socketserver
 import ssl
 import subprocess
 import sys
@@ -65,6 +66,12 @@ if mode.startswith('stdio'):
             print(json.dumps(response), flush=True)
     (root / 'closed').write_text('stdin-eof')
 else:
+    class LoopbackHTTPServer(http.server.ThreadingHTTPServer):
+        def server_bind(self):
+            # The fixture's numeric endpoint must not depend on the host's reverse DNS configuration.
+            socketserver.TCPServer.server_bind(self)
+            self.server_name, self.server_port = self.server_address[:2]
+
     class Handler(http.server.BaseHTTPRequestHandler):
         protocol_version = 'HTTP/1.1'
 
@@ -105,18 +112,19 @@ else:
             self.end_headers()
             self.wfile.write(body)
 
-    server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+    server = LoopbackHTTPServer(('127.0.0.1', 0), Handler)
+    host, port = server.server_address[:2]
     scheme = 'http'
     if mode == 'https':
         # Ephemeral fixture-only identity; no private key is checked into the repository.
         subprocess.run(['openssl', 'req', '-x509', '-newkey', 'rsa:2048', '-nodes',
                         '-keyout', str(root / 'key.pem'), '-out', str(root / 'cert.pem'),
-                        '-days', '1', '-subj', '/CN=localhost',
-                        '-addext', 'subjectAltName=DNS:localhost'],
+                        '-days', '1', '-subj', f'/CN={host}',
+                        '-addext', f'subjectAltName=IP:{host}'],
                        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.load_cert_chain(root / 'cert.pem', root / 'key.pem')
         server.socket = context.wrap_socket(server.socket, server_side=True)
         scheme = 'https'
-    ready(url=f'{scheme}://localhost:{server.server_port}/mcp')
+    ready(url=f'{scheme}://{host}:{port}/mcp')
     server.serve_forever()
