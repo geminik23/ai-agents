@@ -176,6 +176,22 @@ fn assert_calls(requests: &[Value]) {
     assert_eq!(names, ["echo", "fail"]);
 }
 
+// Loopback fixture startup must remain independent of the runner's hostname resolver.
+#[test]
+fn http_fixture_readiness_does_not_require_dns() {
+    let output = std::process::Command::new("python3")
+        .args(["-B", "-m", "unittest", "discover", "-s"])
+        .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/src/mcp/fixtures"))
+        .args(["-p", "test_transport.py", "-v"])
+        .output()
+        .expect("python3 is required for local MCP transport tests");
+    assert!(
+        output.status.success(),
+        "MCP fixture startup regression failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[tokio::test]
 async fn http_and_sse_discovery_calls_headers_views_and_shutdown() {
     for (mode, headers) in [("http", false), ("http", true), ("sse", false)] {
