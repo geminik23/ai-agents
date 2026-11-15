@@ -728,13 +728,21 @@ pub fn configure_orchestration_tools(
     registry: Arc<AgentRegistry>,
     llm: Arc<LLMRegistry>,
 ) -> Vec<Arc<dyn Tool>> {
+    let route = Arc::new(RouteToAgentTool::new(registry.clone(), llm.clone()));
+    configure_tools_with_route(config, registry, llm, route)
+}
+
+// The configured builder retains the actual route cursor for restoration instead of identifying a tool by its public name.
+pub(crate) fn configure_tools_with_route(
+    config: &crate::spec::OrchestrationToolsConfig,
+    registry: Arc<AgentRegistry>,
+    llm: Arc<LLMRegistry>,
+    route: Arc<RouteToAgentTool>,
+) -> Vec<Arc<dyn Tool>> {
     let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
 
     if config.includes("route_to_agent") {
-        tools.push(Arc::new(RouteToAgentTool::new(
-            Arc::clone(&registry),
-            Arc::clone(&llm),
-        )));
+        tools.push(route);
     }
     if config.includes("pipeline_process") {
         tools.push(Arc::new(PipelineProcessTool::new(Arc::clone(&registry))));

@@ -178,6 +178,10 @@ pub trait TaskRunStore: Send + Sync {
     fn supports_reconstruction(&self) -> bool {
         false
     }
+    /// Describes the actual journal lifetime, not permission to restore a decoded checkpoint.
+    fn supports_process_restart(&self) -> bool {
+        false
+    }
     /// Commits only the framework-prepared restoration successor; arbitrary payload replacement remains unavailable.
     async fn checkpoint_reconstruction(
         &self,
@@ -400,6 +404,10 @@ impl TaskRunStore for ScopedTaskRunStore {
     /// Scoped backends preserve the opaque reconstruction proof and final guard at the existing conditional write boundary.
     fn supports_reconstruction(&self) -> bool {
         true
+    }
+    /// Process-local task stores keep this false even when they implement all conditional reconstruction operations.
+    fn supports_process_restart(&self) -> bool {
+        self.storage.supports(StorageCapability::DurableTaskRuns)
     }
 
     /// Validates the exact claimed predecessor before applying a reconstruction-specific successor and verifying its full receipt.

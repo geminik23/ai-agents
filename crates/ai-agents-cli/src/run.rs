@@ -106,6 +106,15 @@ pub async fn run_agent(options: RunOptions) -> Result<()> {
             options.agent_path.parent().unwrap_or(Path::new(".")),
             options.actor.clone(),
         )?;
+        if let Some(restored) =
+            restore_startup(&options, &prepared, io.bridge(), namespace.clone()).await?
+        {
+            let config = resolve_cli_config(&spec, &metadata);
+            return CliRepl::from_restored(restored)
+                .with_config(config)
+                .run_with_io(io)
+                .await;
+        }
         let agent = build_frontend_agent(
             &options.agent_path,
             prepared.clone(),
@@ -127,6 +136,22 @@ pub async fn run_agent(options: RunOptions) -> Result<()> {
         options.agent_path.parent().unwrap_or(Path::new(".")),
         options.actor.clone(),
     )?;
+    if let Some(restored) =
+        restore_startup(&options, &prepared, io.bridge(), namespace.clone()).await?
+    {
+        let agent = restored.0.runtime().clone();
+        let config = resolve_cli_config(&spec, &metadata);
+        return crate::tui::run_prepared_shared(
+            agent,
+            config,
+            metadata.theme.clone(),
+            io,
+            input,
+            output,
+            Some(restored),
+        )
+        .await;
+    }
     let agent =
         build_frontend_agent(&options.agent_path, prepared, io.bridge(), Some(namespace)).await?;
     prepare_frontend(&agent, &options).await?;
@@ -134,6 +159,55 @@ pub async fn run_agent(options: RunOptions) -> Result<()> {
     crate::tui::run_prepared(agent, config, metadata.theme.clone(), io, input, output)
         .await
         .map_err(|error| anyhow::anyhow!("failed to run TUI session: {error:#}"))
+}
+
+/// Selects persisted startup work before constructing an ordinary runtime or replaying auto-spawn preparation.
+async fn restore_startup(
+    options: &RunOptions,
+    prepared: &ai_agents::spec::PreparedAgentSpec,
+    bridge: Arc<crate::session::InputBridge>,
+    namespace: ai_agents::TaskHostScope,
+) -> Result<Option<crate::session::RestoredTask>> {
+    let startup_requested = root_startup_requested(prepared.spec())?;
+    let Some(timeout) = prepared.spec().autonomy.restoration_timeout_ms else {
+        if startup_requested {
+            anyhow::bail!("resume_on_start requires autonomy.restoration_timeout_ms");
+        }
+        return Ok(None);
+    };
+    if !matches!(
+        prepared.spec().storage,
+        ai_agents::spec::StorageConfig::Sqlite(_)
+    ) {
+        if startup_requested {
+            anyhow::bail!("resume_on_start requires SQLite task storage");
+        }
+        return Ok(None);
+    }
+    let host = configured_restore_host(
+        &options.agent_path,
+        prepared.clone(),
+        bridge,
+        Some(namespace),
+        timeout,
+    )?;
+    let Some(candidate) = host.startup_candidate().await? else {
+        return Ok(None);
+    };
+    if !options.contexts.is_empty() || options.context_file.is_some() {
+        anyhow::bail!(
+            "startup restoration preserves saved context; use an explicit new task for replacement context"
+        );
+    }
+    host.restore(candidate.key.run_id, candidate.revision)
+        .await
+        .map(Some)
+        .map_err(Into::into)
+}
+
+// Ordinary/default-off input does not resolve task-only requirements merely because the CLI can host tasks.
+fn root_startup_requested(spec: &AgentSpec) -> Result<bool> {
+    ai_agents::autonomy::declares_startup_resume(&spec.autonomy).map_err(Into::into)
 }
 
 /// Parse "key=value" where key supports dotted paths and value is auto-typed.
@@ -303,7 +377,9 @@ async fn configured_builder(
 
 /// Prepares the same ordinary storage/context/actor contract before foreground task admission.
 pub(crate) async fn prepare_frontend(agent: &RuntimeAgent, options: &RunOptions) -> Result<()> {
-    agent.set_command_runner(Arc::new(ProcessCommandRunner));
+    if !agent.has_configured_task_restoration() {
+        agent.set_command_runner(Arc::new(ProcessCommandRunner));
+    }
     agent
         .init_storage()
         .await
@@ -318,10 +394,64 @@ pub(crate) async fn build_frontend_agent(
     bridge: Arc<crate::session::InputBridge>,
     scope: Option<ai_agents::TaskHostScope>,
 ) -> Result<RuntimeAgent> {
+    if let Some(timeout) = prepared.spec().autonomy.restoration_timeout_ms {
+        let host = configured_restore_host(path, prepared, bridge, scope, timeout)?;
+        return host.build().await.map_err(Into::into);
+    }
     let builder = configured_builder(path, prepared, Some(bridge.clone()), scope).await?;
     let agent = builder.build_task_host().await?;
     agent.set_question_handler(Some(bridge));
     Ok(agent)
+}
+
+/// Prepares declarative restoration authority and current UI endpoints without constructing providers or consuming a task.
+pub(crate) fn configured_restore_host(
+    path: &Path,
+    prepared: ai_agents::spec::PreparedAgentSpec,
+    bridge: Arc<crate::session::InputBridge>,
+    scope: Option<ai_agents::TaskHostScope>,
+    timeout: std::num::NonZeroU64,
+) -> Result<Arc<ai_agents::autonomy::ConfiguredTaskRestoreHost>> {
+    if prepared.spec().hitl.is_some() {
+        let metadata = prepared
+            .spec()
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("cli"))
+            .and_then(|cli| {
+                serde_json::from_value::<ai_agents::spec::CliMetadata>(cli.clone()).ok()
+            })
+            .and_then(|cli| cli.hitl);
+        bridge.set_show_context(
+            metadata
+                .as_ref()
+                .and_then(|metadata| metadata.show_context)
+                .unwrap_or(true),
+        );
+        bridge.set_auto_approval(
+            match metadata
+                .as_ref()
+                .and_then(|metadata| metadata.style.as_ref())
+            {
+                Some(ai_agents::spec::CliHitlStyle::AutoApprove) => Some(true),
+                Some(ai_agents::spec::CliHitlStyle::AutoReject) => Some(false),
+                _ => None,
+            },
+        );
+    }
+    let actor = scope
+        .as_ref()
+        .and_then(|scope| scope.actor_id())
+        .map(str::to_owned);
+    let host = ai_agents::autonomy::ConfiguredTaskRestoreHost::new(
+        prepared,
+        path.parent().unwrap_or(Path::new(".")).into(),
+        actor,
+        std::time::Duration::from_millis(timeout.get()),
+    )?
+    .approval_handler(bridge.clone())
+    .question_handler(bridge);
+    Ok(Arc::new(host))
 }
 
 pub fn resolve_cli_config(spec: &AgentSpec, metadata: &ResolvedCliMetadata) -> CliReplConfig {

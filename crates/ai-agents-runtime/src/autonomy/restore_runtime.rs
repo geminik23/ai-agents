@@ -57,6 +57,129 @@ impl ai_agents_core::autonomy::TaskFinalAdmission for RestoreRuntimeGuard {
 }
 
 impl RuntimeAgent {
+    // Seals actual first-party construction handles before any task can capture the runtime for restoration.
+    pub(crate) fn with_configured_task_source(
+        mut self,
+        mut source: Box<crate::autonomy::ConfiguredTaskSource>,
+        route: Option<Arc<crate::orchestration::tools::RouteToAgentTool>>,
+    ) -> Result<Self> {
+        if source.process_commands {
+            self.tools
+                .set_command_runner(Arc::new(ai_agents_tools::ProcessCommandRunner));
+        }
+        if let Some(state) = source.state.take() {
+            let reads = self.tools.file_version_store();
+            let mut paths = std::collections::BTreeSet::new();
+            for read in state.file_reads {
+                if !paths.insert(read.path.clone()) {
+                    return Err(AgentError::Config(
+                        "duplicate restored file observation".into(),
+                    ));
+                }
+                reads.record(read);
+            }
+        }
+        let command_slot = self.tools.command_runner_slot();
+        let command = command_slot.read().clone();
+        let diagnostic_slot = self.tools.diagnostics_provider_slot();
+        let diagnostic = diagnostic_slot.read().clone();
+        let search_slot = self.tools.web_search_provider_slot();
+        let search = search_slot.read().clone();
+        let component_binding = source
+            .component_state
+            .as_ref()
+            .map(|state| state.binding())
+            .transpose()?;
+        if let (Some(factory), Some(binding)) = (&source.components, &component_binding) {
+            if factory.identity() != (binding.id.clone(), binding.contract_version) {
+                return Err(AgentError::Config(
+                    "installed component identity differs from factory".into(),
+                ));
+            }
+            factory.validate(&source.prepared, binding)?;
+        }
+        self.configured_task_recipe = Some(Box::new(crate::autonomy::ConfiguredTaskRecipe {
+            source,
+            configuration: self.task_restore_configuration()?,
+            providers: self.llm_registry.clone(),
+            tools_version: self.tools.version(),
+            route,
+            services_match: Box::new(move || {
+                Arc::ptr_eq(&command, &command_slot.read())
+                    && Arc::ptr_eq(&diagnostic, &diagnostic_slot.read())
+                    && Arc::ptr_eq(&search, &search_slot.read())
+            }),
+            component_binding: component_binding.map(|mut binding| {
+                binding.state = Value::Null;
+                binding
+            }),
+        }));
+        Ok(self)
+    }
+
+    // Source recipes remain usable only while their actual configured implementations have not been replaced.
+    pub(crate) fn configured_task_recipe(&self) -> Result<&crate::autonomy::ConfiguredTaskRecipe> {
+        let recipe = self.configured_task_recipe.as_ref().ok_or_else(|| {
+            AgentError::Config("runtime has no first-party construction recipe".into())
+        })?;
+        if self.task_restore_configuration()? != recipe.configuration
+            || self.tools.version() != recipe.tools_version
+            || !self.llm_registry.same_bindings(&recipe.providers)
+            || !(recipe.services_match)()
+        {
+            return Err(AgentError::Config(
+                "configured runtime implementations changed".into(),
+            ));
+        }
+        let current = recipe
+            .source
+            .component_state
+            .as_ref()
+            .map(|state| state.binding())
+            .transpose()?;
+        if current.as_ref().map(|binding| {
+            (
+                &binding.id,
+                binding.contract_version,
+                &binding.configuration,
+            )
+        }) != recipe.component_binding.as_ref().map(|binding| {
+            (
+                &binding.id,
+                binding.contract_version,
+                &binding.configuration,
+            )
+        }) {
+            return Err(AgentError::Config(
+                "component implementation configuration changed".into(),
+            ));
+        }
+        Ok(recipe)
+    }
+
+    // Captured file observations still pass ordinary read-before-write checks against the actual filesystem after restoration.
+    pub(crate) fn configured_task_state(&self) -> Result<crate::autonomy::ConfiguredTaskState> {
+        let recipe = self.configured_task_recipe()?;
+        Ok(crate::autonomy::ConfiguredTaskState {
+            route_position: recipe
+                .route
+                .as_ref()
+                .map(|route| route.round_robin_position()),
+            file_reads: self.tools.file_version_store().snapshot(),
+            components: recipe
+                .source
+                .component_state
+                .as_ref()
+                .map(|state| state.binding())
+                .transpose()?,
+        })
+    }
+
+    /// Reports configured first-party restoration plumbing, not checkpoint readiness or permission to resume a task.
+    pub fn has_configured_task_restoration(&self) -> bool {
+        self.configured_task_recipe.is_some()
+    }
+
     /// Process-local generations are captured only to validate and translate cursor bindings, never copied into new counters.
     pub(crate) fn task_restore_generations(&self) -> TaskRestoreGenerations {
         let safety = self.runtime_safety_snapshot();

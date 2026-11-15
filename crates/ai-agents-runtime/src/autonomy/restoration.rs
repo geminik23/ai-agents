@@ -55,6 +55,11 @@ pub struct TaskRestoreGraph {
 /// Immutable configuration must distinguish different implementations even when their display names match; mutable state may advance only through admitted work.
 #[async_trait]
 pub trait TaskRestoreHost: Send + Sync {
+    /// Checks host-specific persistence prerequisites before task creation or semantic dispatch.
+    /// Existing explicit hosts retain their own lifetime contract; configured production hosts must check actual journal durability and clock availability.
+    fn preflight_persistence(&self, _process_durable: Option<bool>) -> Result<()> {
+        Ok(())
+    }
     /// Stable host contract identity, distinct from the task profile's compatibility identity.
     fn identity(&self) -> (String, u32);
     /// Host-selected maximum active work for each capture/reconstruction/review transaction.
@@ -81,12 +86,48 @@ pub trait TaskRestoreHost: Send + Sync {
     fn capture_graph(&self, root: Arc<RuntimeAgent>) -> Result<TaskRestoreGraph> {
         TaskRestoreGraph::from_root(root)
     }
+    /// Acquires explicit preparation resources before a claim; the returned guard lives through the transaction's final acknowledgement.
+    /// Implementations must bind exclusion to the actual store and run, not a serialized owner's asserted liveness.
+    fn work_lease(
+        &self,
+        _snapshot: &TaskRunSnapshot,
+    ) -> Result<Option<Box<dyn crate::autonomy::TaskRestoreWorkLease>>> {
+        Ok(None)
+    }
+    /// Explicitly prepares configured resources within the already claimed reconstruction transaction and its original budget.
+    /// A returned graph remains unpublished and must pass the same binding checks as pure staging; no semantic work or lifecycle replay is permitted.
+    async fn prepare_graph(
+        &self,
+        _manifest: &TaskRestoreManifest,
+    ) -> Result<Option<TaskRestoreGraph>> {
+        Ok(None)
+    }
+    /// Confirms that this exact acknowledged snapshot is available through the host's surviving restart backend.
+    /// Reconstruction capability alone is insufficient; process-local or unverified stores keep the default refusal.
+    async fn checkpoint_survives_exit(&self, _snapshot: &TaskRunSnapshot) -> Result<bool> {
+        Ok(false)
+    }
     /// Constructs fresh unpublished runtimes and empty registries with the recorded alias relationships and host bindings.
     async fn stage(&self, manifest: &TaskRestoreManifest) -> Result<TaskRestoreGraph>;
     /// The installed host certifies a trustworthy UTC epoch/continuity for stored bounds across processes and returns an error when it cannot.
     /// Sampling an unchecked OS clock alone is not a continuity proof; backward anchors are rejected and original monotonic cuts are preserved.
     /// Returned UTC must share the backend timestamp domain; projecting an independent old epoch cannot certify continuity with later backend writes.
     fn now(&self) -> Result<DateTime<Utc>>;
+
+    /// Supplies measured UTC uncertainty when the host uses an OS-certified clock.
+    /// None preserves an existing host's exact-clock contract; it is not an OS-clock fallback.
+    fn clock_evidence(&self) -> Result<Option<crate::autonomy::TaskUtcEvidence>> {
+        Ok(None)
+    }
+
+    /// Uses the earlier possible UTC for a work-start anchor or a retained monotonic deadline projection.
+    /// Admission uses now instead, so uncertainty cannot extend a bound or undercharge interrupted work.
+    fn capture_now(&self) -> Result<DateTime<Utc>> {
+        match self.clock_evidence()? {
+            Some(evidence) => Ok(evidence.earliest),
+            None => self.now(),
+        }
+    }
 }
 
 /// One authoritative current runtime image, distinct from immutable historical per-operation snapshots.
@@ -180,6 +221,9 @@ pub struct TaskRestoreManifest {
     pub revision: u64,
     pub payload_digest: String,
     pub captured_at: DateTime<Utc>,
+    /// Version three records the OS uncertainty interval separately from exact-clock legacy hosts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clock_evidence: Option<crate::autonomy::TaskUtcEvidence>,
     pub whole_expiry: Option<DateTime<Utc>>,
     pub deadlines: BTreeMap<String, DateTime<Utc>>,
     pub validation_bound: Option<(EvidenceIdentity, DateTime<Utc>)>,
@@ -322,7 +366,7 @@ pub(super) fn validate_startup_candidate(
         return Ok(false);
     };
     let manifest: TaskRestoreManifest = serde_json::from_value(adapter.state.clone())?;
-    if !matches!(manifest.version, 1 | 2)
+    if !matches!(manifest.version, 1..=3)
         || manifest.host != host.identity()
         || !driver::current_host_compatible(request, payload)?
         || !host.compatible_manifest(&manifest)?
@@ -548,7 +592,7 @@ fn capture_message_context(context: &ai_agents_core::ToolExecutionContext) -> Va
 
 // Converts only an actual source monotonic bound, then intersects prior absolute cuts so repeated reconstruction cannot extend it.
 fn capture_deadline(deadline: Instant, host: &dyn TaskRestoreHost) -> Result<DateTime<Utc>> {
-    let now = host.now()?;
+    let now = host.capture_now()?;
     let remaining = chrono::Duration::from_std(deadline.saturating_duration_since(Instant::now()))
         .map_err(|_| AgentError::Config("restore clock projection overflow".into()))?;
     now.checked_add_signed(remaining)
@@ -659,7 +703,7 @@ async fn capture_manifest(
             .and_then(|controller| controller.driver.as_ref())
             .map(|driver| {
                 driver
-                    .reconstruction_expiry(host.now()?)
+                    .reconstruction_expiry(host.capture_now()?)
                     .map(|cut| cut.map(|cut| (driver.identity.clone(), cut)))
             })
             .transpose()?
@@ -961,12 +1005,14 @@ async fn capture_manifest(
         .filter(|(id, _)| tools.contains_key(*id))
         .map(|(id, context)| (id.clone(), capture_message_context(context)))
         .collect();
+    let clock_evidence = host.clock_evidence()?;
     let manifest = TaskRestoreManifest {
-        version: 2,
+        version: if clock_evidence.is_some() { 3 } else { 2 },
         host: host.identity(),
         revision,
         payload_digest: payload_digest(payload)?,
         captured_at,
+        clock_evidence,
         whole_expiry,
         deadlines,
         validation_bound,
@@ -1436,7 +1482,8 @@ impl AutonomyRunner {
         let _gate = self.resume_gate.lock().await;
         let started = Instant::now();
         let budget = host.reconstruction_budget();
-        let started_at = host.now()?;
+        // The earlier start bounds interrupted work conservatively if publication or its acknowledgement is lost.
+        let started_at = host.capture_now()?;
         let snapshot = self
             .store
             .load(run_id)
@@ -1445,6 +1492,7 @@ impl AutonomyRunner {
         let mut payload: TaskCheckpointPayload = serde_json::from_value(snapshot.payload.clone())?;
         payload.validate(&snapshot, &self.config_identity)?;
         safe_pause(&snapshot, &payload, host.now()?, true)?;
+        let _work_lease = host.work_lease(&snapshot)?;
         if snapshot.revision != expected_revision {
             return Err(TaskRunStorageError::Conflict.into());
         }

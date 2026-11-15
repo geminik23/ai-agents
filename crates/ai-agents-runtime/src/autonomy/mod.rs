@@ -1,5 +1,5 @@
 //! Development task controller, scoped entry, foreground hosting and explicit prepared recovery.
-//! Runtime execution is shared across consumers; production restart hosting and arbitrary in-flight restoration are not installed.
+//! Runtime execution is shared across consumers; configured hosts add prepared process restart, not arbitrary in-flight restoration.
 
 #[cfg(test)]
 mod ad_maintenance_fault_tests;
@@ -7,6 +7,23 @@ mod ad_maintenance_fault_tests;
 mod admission_tests;
 mod authority;
 mod host_scope;
+mod restore_clock;
+mod restore_lease;
+pub use restore_clock::{SystemTaskClock, TaskUtcEvidence};
+pub use restore_lease::TaskRestoreWorkLease;
+mod configured_restore;
+#[cfg(all(
+    test,
+    feature = "sqlite",
+    any(target_os = "linux", target_os = "macos")
+))]
+mod configured_restore_tests;
+pub(crate) use configured_restore::{
+    ConfiguredTaskRecipe, ConfiguredTaskSource, ConfiguredTaskState,
+};
+pub use configured_restore::{
+    ConfiguredTaskRestoreHost, TaskRestoreComponentState, TaskRestoreComponents,
+};
 pub(crate) mod host_session;
 #[cfg(test)]
 mod host_session_tests;
@@ -201,7 +218,7 @@ pub use todo::RunTodoAdapter;
 
 pub use ai_agents_core::autonomy::*;
 pub use config::{
-    AutonomyHostCeilings, AutonomyScope, EffectiveAutonomyProfile, parse_task_overrides,
-    resolve_profile,
+    AutonomyHostCeilings, AutonomyScope, EffectiveAutonomyProfile, declares_startup_resume,
+    parse_task_overrides, resolve_profile,
 };
 pub(crate) use config::{has_enabled_declaration, validate_agent_config, validate_loaded_skills};

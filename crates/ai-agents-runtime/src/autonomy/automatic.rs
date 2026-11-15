@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 /// Host-installed storage, ceilings and reconstruction binding for automatic state/skill tasks.
 /// Omission uses a retained volatile backend; durable behavior still requires an explicit reconstruction host.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct AutomaticTaskOptions {
     pub ceilings: AutonomyHostCeilings,
     pub store: Option<Arc<dyn TaskRunStore>>,
@@ -26,6 +26,8 @@ pub(crate) struct AutomaticTaskHost {
     // Prepared session backends can be shared, but task adapters retain independent actor/configuration validation.
     pub(crate) storage: Arc<dyn ai_agents_core::AgentStorage>,
     pub(crate) runner: parking_lot::Mutex<Option<Arc<AutonomyRunner>>>,
+    // A reconstructed runner owns the outer runtime handle; the service must not own it back in a cycle.
+    pub(crate) restored_runner: parking_lot::Mutex<std::sync::Weak<AutonomyRunner>>,
     pub(crate) outcome: parking_lot::Mutex<Arc<AutomaticOutcome>>,
 }
 

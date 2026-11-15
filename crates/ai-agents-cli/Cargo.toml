@@ -31,3 +31,6 @@ crossterm = { workspace = true }
 tui-textarea = { workspace = true }
 dirs = { workspace = true }
 chrono = { workspace = true }
+
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"

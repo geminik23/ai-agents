@@ -87,6 +87,8 @@ pub enum StorageCapability {
     ActorRelationships,
     ActorDataDeletion,
     TaskRuns,
+    /// Conditional task records survive process exit; this does not install reconstruction authority or certify external cleanup.
+    DurableTaskRuns,
 }
 
 impl std::fmt::Display for StorageCapability {
@@ -100,6 +102,7 @@ impl std::fmt::Display for StorageCapability {
             Self::ActorRelationships => f.write_str("actor relationships"),
             Self::ActorDataDeletion => f.write_str("atomic actor data deletion"),
             Self::TaskRuns => f.write_str("conditional task run persistence"),
+            Self::DurableTaskRuns => f.write_str("process-surviving conditional task persistence"),
         }
     }
 }

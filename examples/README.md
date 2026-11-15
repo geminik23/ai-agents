@@ -610,6 +610,7 @@ Development-only task profiles use the existing controller, not a coding-specifi
 | `state_task.yaml` | State-scope exit with an explicit post-exit gate, without unrelated destination work |
 | `approval_task.yaml` | Exact task approval/rejection; its mocked suite replaces approved HTTP output and opens no socket |
 | `controlled_analysis.yaml` | Tool-free objective/limit revisions, explicit Continue, stop/cancel and bounded reviewed replanning |
+| `restartable_analysis.yaml` | Configured SQLite restart with OS time evidence, a separately reviewed clarification and semantic validation; provider credentials required for execution |
 | `unrelated_exit.yaml` | Negative state-scope control: movement into an unrelated destination is incomplete, not success |
 | `independent_research.yaml` | Ordinary parent with two independent state-task questions serviced while its original future is pending |
 | `agents/independent_a.yaml` | First independently hosted researcher; selected through actual session participation, not a label-derived runner |
@@ -626,6 +627,8 @@ cargo run --manifest-path examples/Cargo.toml -p example-custom-llm --bin task-d
 ```
 
 `rust/custom-llm/src/task_domain.rs` is shared by the embedded `task-domain-host` and `task-domain-evals`; customize its real record integration and pure predicates without modifying the controller, core gates or eval helper. Its consumer acceptance is `cargo test --manifest-path examples/Cargo.toml -p example-custom-llm --test task_domain_acceptance`: recorded-source/citation rejection, pre-question state and cumulative usage, required operations stage order, protected budget refusal and actual offline application execution. These isolated records do not certify web-source authenticity, health recovery or live model quality. Follow `website/content/docs/task-autonomy.md` for configuration, typed delivery, evidence interpretation and your own host executable.
+
+Configured restoration of the shared ticket/source/corpus integration is checked offline with `cargo test --manifest-path examples/Cargo.toml -p example-custom-llm --test task_domain_acceptance configured_public_consumer`. This uses the public configured host, real SQLite and fresh component instances; runtime/CLI tests separately cover independent OS processes and interrupted recovery. The `restartable_analysis.yaml` application uses normal provider credentials and is not a mocked-eval suite.
 
 
 For intentional provider-backed checks, run `sh examples/eval/live/run_live_example_evals.sh --dry-config-check --category autonomy`, then explicitly choose `--yes-live`. Four suites cover tool-free analysis, synthetic corpus comparison, retained support confirmation and reviewed incident escalation. The domain executable applies detailed in-memory acceptance as well as suite assertions and writes `acceptance.json`; both must pass. Source-ID research remains a separate deterministic contract.

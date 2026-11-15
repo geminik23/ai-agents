@@ -25,7 +25,9 @@ pub fn preflight_eval(spec: &AgentSpec) -> Result<()> {
 
 fn preflight_with_ceilings(spec: &AgentSpec, ceilings: &AutonomyHostCeilings) -> Result<()> {
     spec.validate()?;
-    let (extensions, tools) = task_domain::domain_components()?;
+    let task_domain::DomainComponents {
+        extensions, tools, ..
+    } = task_domain::domain_components(None)?;
     let extensions = extensions.freeze();
     let mut available = tools
         .iter()

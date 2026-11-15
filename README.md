@@ -47,9 +47,9 @@ Retrieval/RAG, generalized background scheduling and Python bindings remain unav
 
 The development checkout provides task execution for research, support, reports, code, operations, world-state and tool-free analysis. Explicit Rust/CLI tasks and enabled YAML state/skill tasks use the same controller, with per-run settings, verified completion gates, retained questions and approvals, composition, task events, CLI/TUI hosting and shared application/evaluation integrations. Ordinary chat remains unchanged when autonomy is omitted or disabled. Task profiles have no implicit cumulative count/time budget; explicit limits and host ceilings remain effective, and evaluation budgets are separate.
 
-Prepared safe-pause reconstruction requires an explicitly installed compatible host and its clock, binding, authorization and storage contracts. The default CLI does not install production new-process reconstruction. Arbitrary in-flight stack restoration, automatic abandoned-owner takeover and exactly-once external effects remain unsupported. Final integration and release are separate from these development contracts.
+Configured safe-pause reconstruction uses file-backed SQLite, an explicit restoration work timeout, OS time evidence and fresh review. The CLI supplies this host for declarative tasks; Rust component factories preserve application-specific state. Arbitrary in-flight stack restoration, automatic abandoned-owner takeover and exactly-once external effects remain unsupported. Final integration and release are separate from these development contracts.
 
-These additions are not part of published 1.1.2. Existing public Rust structs, enum matches and mutation return types also have migration requirements. See [Support and compatibility](https://ai-agents.rs/docs/compatibility/) for the supported development paths, host prerequisites and migration details; the next release version is not yet selected.
+These additions are not part of published 1.1.2. Existing public Rust structs, enum matches and mutation return types also have migration requirements. See [Support and compatibility](https://ai-agents.rs/docs/compatibility/) for the supported development paths, host prerequisites and migration details; the development target is 1.2.
 
 See [Concepts](https://ai-agents.rs/docs/concepts/) for architecture details and [Providers](https://ai-agents.rs/docs/providers/) for per-provider setup.
 
@@ -164,7 +164,7 @@ ai-agents-cli eval --agent agent.yaml --scenarios eval/suite.yaml --output eval_
 
 Use `eval` to run YAML or JSONL scenario suites with strict fail-closed assertions, exact replay, synchronized record fixtures, optional LLM judge checks, retries, strict default redaction, JSON/Markdown/JUnit outputs, and observability reports when enabled. Real and record modes require explicit `--real-llm` or `--record` authorization.
 
-In the development checkout, `cargo run -p ai-agents-cli -- task run agent.yaml "objective"` starts an explicit task; `run agent.yaml` also services automatic state/skill tasks in the interactive TUI, or in the plain REPL with `--plain`. These commands are unreleased, and the default CLI does not provide production new-process task reconstruction. See the [CLI Guide](https://ai-agents.rs/docs/cli/) for task commands and limitations, REPL controls, evaluation options, metadata configuration, and full reference.
+In the development checkout, `cargo run -p ai-agents-cli -- task run agent.yaml "objective"` starts an explicit task; `run agent.yaml` also services automatic state/skill tasks in the interactive TUI, or in the plain REPL with `--plain`. These commands are unreleased. Configured restart preserves prepared pauses and still requires current bindings, clock evidence and separate restoration review. See the [CLI Guide](https://ai-agents.rs/docs/cli/) for task commands and limitations, REPL controls, evaluation options, metadata configuration, and full reference.
 
 ## Roadmap
 

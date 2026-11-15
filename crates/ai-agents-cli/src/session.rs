@@ -139,10 +139,12 @@ pub(crate) enum OperationResult {
     Chat(AgentResponse),
     Task(Box<TaskRunResult>),
 }
+pub(crate) type RestoredTask = (Arc<ai_agents::autonomy::AutonomyRunner>, TaskRunResult);
 pub(crate) struct SessionResult {
     pub primary: OperationResult,
     pub results: BTreeMap<String, TaskRunResult>,
     pub quit: bool,
+    pub prepared_pauses: BTreeMap<String, u64>,
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Endpoint {
@@ -160,6 +162,7 @@ enum Prompt {
     Callback(Callback),
 }
 struct View {
+    restart_prepared: bool,
     details: Option<ai_agents::TaskHostDetails>,
     run: TaskHostRun,
     display: TaskRunDisplay,
@@ -460,7 +463,33 @@ impl FrontendSession {
     pub(crate) async fn drive<F>(
         &mut self,
         work: F,
+        events: mpsc::Receiver<String>,
+    ) -> Result<SessionResult>
+    where
+        F: Future<Output = Result<OperationResult>> + Send,
+    {
+        self.drive_inner(work, events, None).await
+    }
+
+    // Startup uses the same foreground loop and exact controls; the restored runner remains an actual live owner throughout delivery.
+    pub(crate) async fn drive_restored(&mut self, restored: RestoredTask) -> Result<SessionResult> {
+        let initial = restored.1.clone();
+        let (tx, rx) = mpsc::channel(1);
+        drop(tx);
+        self.drive_inner(
+            async { Ok(OperationResult::Task(Box::new(initial))) },
+            rx,
+            Some(restored),
+        )
+        .await
+    }
+
+    // The optional initial result is an actual reconstructed operation, not a checkpoint or label adopted as execution authority.
+    async fn drive_inner<F>(
+        &mut self,
+        work: F,
         mut events: mpsc::Receiver<String>,
+        restored: Option<RestoredTask>,
     ) -> Result<SessionResult>
     where
         F: Future<Output = Result<OperationResult>> + Send,
@@ -484,6 +513,9 @@ impl FrontendSession {
             .into());
         }
         let host = TaskHostSession::new(!self.eof || !self.queued.is_empty());
+        if let Some((runner, result)) = restored {
+            host.observe_result(runner, &result).await?;
+        }
         let scoped = host.clone();
         let mut work = Box::pin(async move { scoped.scope(work).await });
         let mut primary = None;
@@ -560,7 +592,13 @@ impl FrontendSession {
                         continue;
                     }
                     if view.display.summary.status == TaskRunStatus::Paused
-                        && view.run.published_revision().is_some()
+                        && (view.run.published_revision() == Some(view.display.summary.revision)
+                            || (view.display.summary.cancel_requested
+                                && view.run.published_revision().is_some()))
+                        && !(view.restart_prepared
+                            && !stopping
+                            && !view.display.summary.cancel_requested
+                            && !host.interaction_available())
                         && (stopping
                             || !host.interaction_available()
                             || view.display.summary.cancel_requested)
@@ -638,6 +676,7 @@ impl FrontendSession {
                 // RecoveryRequired ends this foreground operation but deliberately retains protected runtime custody.
                 let all_settled = views.iter().all(|view| {
                     view.display.summary.status.is_terminal()
+                        || (view.restart_prepared && !stopping && !host.interaction_available())
                         || (view.display.summary.status == TaskRunStatus::RecoveryRequired
                             && view.run.published_revision() == Some(view.display.summary.revision))
                 });
@@ -802,6 +841,11 @@ impl FrontendSession {
             });
         }
         Ok(SessionResult {
+            prepared_pauses: views
+                .iter()
+                .filter(|view| view.restart_prepared)
+                .map(|view| (view.run.key.run_id.clone(), view.display.summary.revision))
+                .collect(),
             primary: primary.context("foreground operation returned no result")?,
             results,
             quit,
@@ -846,6 +890,25 @@ async fn inspect(session: &TaskHostSession, ui: bool) -> Result<Vec<View>> {
             None
         };
         views.push(View {
+            restart_prepared: if display.summary.status == TaskRunStatus::Paused
+                && run.published_revision() == Some(display.summary.revision)
+            {
+                // A concurrent acknowledged control can replace this display revision while the observation awaits storage.
+                // Withhold restart readiness until the next view; actual control-operation conflicts remain errors.
+                match run
+                    .runner
+                    .prepared_restart_available(&run.key.run_id, display.summary.revision)
+                    .await
+                {
+                    Ok(ready) => ready,
+                    Err(ai_agents::error::AgentError::TaskRunStorage(
+                        ai_agents::TaskRunStorageError::Conflict,
+                    )) => false,
+                    Err(error) => return Err(error.into()),
+                }
+            } else {
+                false
+            },
             details,
             run,
             display,

@@ -210,6 +210,13 @@ pub struct FileVersionStore {
 }
 
 impl FileVersionStore {
+    /// Captures remembered reads as recovery data; restored writes must still compare actual current file contents.
+    pub fn snapshot(&self) -> Vec<FileVersionEvidence> {
+        let mut values: Vec<_> = self.inner.read().values().cloned().collect();
+        values.sort_by(|left, right| left.path.cmp(&right.path));
+        values
+    }
+
     /// Record a file version under its normalized path key.
     pub fn record(&self, evidence: FileVersionEvidence) {
         self.inner.write().insert(evidence.path.clone(), evidence);

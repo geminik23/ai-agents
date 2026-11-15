@@ -5,6 +5,9 @@
 #[path = "../src/task_domain.rs"]
 mod task_domain;
 
+#[path = "support/task_domain_restoration.rs"]
+mod restoration;
+
 use ai_agents::AgentBuilder;
 use ai_agents::autonomy::{GateOutcome, TaskRunEventKind, TaskRunStatus};
 use ai_agents_eval::fixtures::AttemptFixtureContext;

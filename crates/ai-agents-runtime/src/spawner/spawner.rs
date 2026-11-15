@@ -168,6 +168,8 @@ impl std::fmt::Debug for SpawnedAgent {
 
 /// Factory for creating agents at runtime from YAML, specs, or templates.
 pub struct AgentSpawner {
+    configured_restoration: bool,
+    restore_components: Option<Arc<dyn crate::autonomy::TaskRestoreComponents>>,
     /// Shared LLM regstry - spawned agents reuse these connections.
     llm_registry: Option<LLMRegistry>,
 
@@ -206,8 +208,11 @@ pub struct AgentSpawner {
 }
 
 impl AgentSpawner {
+    /// Creates an empty capacity owner without constructing children or installing application restoration factories.
     pub fn new() -> Self {
         Self {
+            configured_restoration: false,
+            restore_components: None,
             llm_registry: None,
             llm_registry_observed: false,
             storage: None,
@@ -221,6 +226,22 @@ impl AgentSpawner {
             counter: AtomicU32::new(1),
             agent_count: Arc::new(AtomicU32::new(0)),
         }
+    }
+
+    // The actual factory is inherited by child construction; serialized component identifiers cannot install it.
+    pub(crate) fn with_restore_components(
+        mut self,
+        components: Arc<dyn crate::autonomy::TaskRestoreComponents>,
+    ) -> Self {
+        self.restore_components = Some(components);
+        self.configured_restoration = true;
+        self
+    }
+
+    // Only a configured restoration constructor requests receipts; ordinary spawning must not acquire new task-host preconditions.
+    pub(crate) fn with_configured_restoration(mut self) -> Self {
+        self.configured_restoration = true;
+        self
     }
 
     /// Captures naming high-water and configured capacity without serializing shared providers or host credentials.
@@ -241,7 +262,13 @@ impl AgentSpawner {
                     .collect::<Result<std::collections::BTreeMap<_, _>>>()
             })
             .transpose()?;
-        let config = serde_json::json!({"maximum":self.max_agents,"prefix":self.name_prefix,"tools":self.allowed_tools,"context":self.shared_context,"templates":templates,"shared":shared,"observed":self.llm_registry_observed,"storage":self.storage.is_some()});
+        let mut config = serde_json::json!({"maximum":self.max_agents,"prefix":self.name_prefix,"tools":self.allowed_tools,"context":self.shared_context,"templates":templates,"shared":shared,"observed":self.llm_registry_observed,"storage":self.storage.is_some()});
+        if let Some(factory) = &self.restore_components {
+            config["restore_components"] = serde_json::to_value(factory.identity())?;
+        }
+        if self.configured_restoration {
+            config["configured_restoration"] = serde_json::json!(true);
+        }
         Ok(
             serde_json::json!({"version":1,"counter":self.counter.load(Ordering::SeqCst),"occupied":self.agent_count.load(Ordering::SeqCst),"maximum":self.max_agents,"prefix":self.name_prefix,"shared":self.llm_registry.is_some(),"observed":self.llm_registry_observed,"storage":self.storage.is_some(),"configuration":format!("{:x}",Sha256::digest(serde_json::to_vec(&config)?))}),
         )
@@ -497,22 +524,78 @@ impl AgentSpawner {
             base_dir,
         } = admitted;
 
-        let mut builder = match base_dir {
-            Some(base_dir) => AgentBuilder::from_spec_with_base_dir(spec.clone(), base_dir),
-            None => AgentBuilder::from_spec(spec.clone()),
-        }
-        .task_iteration_policy(task_iteration_policy);
+        let prepared = crate::spec::PreparedAgentSpec::new(spec.clone(), task_iteration_policy);
+        let agent = self.construct_child(&id, prepared, base_dir, None).await?;
+        info!(agent_id = %id, name = %spec.name, "Agent spawned");
+        Ok(SpawnedAgent::tracked(id, agent, spec, reservation))
+    }
 
-        if let Some(ref shared_reg) = self.llm_registry {
-            // Shared providers are authoritative. Child provider declarations are never constructed or allowed to read credentials in this mode.
-            builder =
-                builder.authoritative_llm_registry(shared_reg.clone(), self.llm_registry_observed);
+    // Restored children use the same construction path without allocating new capacity or running registry callbacks.
+    pub(crate) async fn construct_child(
+        &self,
+        id: &str,
+        prepared: crate::spec::PreparedAgentSpec,
+        base_dir: Option<PathBuf>,
+        state: Option<crate::autonomy::ConfiguredTaskState>,
+    ) -> Result<RuntimeAgent> {
+        self.validate_admission(id, prepared.spec())?;
+        if state.is_some() && !self.configured_restoration {
+            return Err(AgentError::Config(
+                "spawner has no configured reconstruction factory".into(),
+            ));
+        }
+        let mut source = if self.configured_restoration {
+            let directory = match &base_dir {
+                Some(directory) => directory.clone(),
+                None => std::env::current_dir()?,
+            };
+            Some(crate::autonomy::ConfiguredTaskSource {
+                prepared: prepared.clone(),
+                base_dir: directory,
+                state,
+                process_commands: false,
+                components: self.restore_components.clone(),
+                component_state: None,
+            })
         } else {
-            // Local mode configures both the single llm declaration and the multi-alias llms map.
-            builder = builder.auto_configure_llms()?;
+            None
+        };
+        let mut builder = match base_dir {
+            Some(base_dir) => AgentBuilder::from_prepared_spec_with_base_dir(prepared, base_dir),
+            None => AgentBuilder::from_prepared_spec(prepared),
+        };
+        if let Some(shared) = &self.llm_registry {
+            builder =
+                builder.authoritative_llm_registry(shared.clone(), self.llm_registry_observed);
         }
-
-        builder = builder.auto_configure_features()?;
+        if let (Some(factory), Some(source)) = (&self.restore_components, source.as_mut()) {
+            let saved = source
+                .state
+                .as_ref()
+                .and_then(|state| state.components.as_ref());
+            if let Some(saved) = saved {
+                factory.validate(&source.prepared, saved)?;
+            }
+            let (configured, installed) =
+                factory.install(&source.prepared, builder, saved, self.llm_registry.as_ref())?;
+            builder = configured;
+            if let Some(shared) = &self.llm_registry
+                && (!builder
+                    .prepared_registry()
+                    .is_some_and(|providers| providers.same_bindings(shared))
+                    || builder.prepared_registry_observed() != self.llm_registry_observed)
+            {
+                return Err(AgentError::Config(
+                    "component factory replaced authoritative shared providers".into(),
+                ));
+            }
+            source.component_state = Some(installed);
+        } else {
+            if self.llm_registry.is_none() {
+                builder = builder.auto_configure_llms()?;
+            }
+            builder = builder.auto_configure_features()?;
+        }
 
         if let Some(ref manager) = self.observability_manager {
             builder = builder.observability(Arc::clone(manager));
@@ -522,10 +605,13 @@ impl AgentSpawner {
         }
 
         if let Some(ref shared_storage) = self.storage {
-            let namespaced = Arc::new(NamespacedStorage::new(Arc::clone(shared_storage), &id));
+            let namespaced = Arc::new(NamespacedStorage::new(Arc::clone(shared_storage), id));
             builder = builder.storage(namespaced);
         }
 
+        if let Some(source) = source {
+            builder = builder.configured_task_source(source);
+        }
         let agent = builder.build()?;
         // A child is not ready for registration until required injected or configured storage capabilities and fact initialization have completed.
         agent.init_storage().await?;
@@ -534,8 +620,7 @@ impl AgentSpawner {
             agent.set_context(key, value.clone())?;
         }
 
-        info!(agent_id = %id, name = %spec.name, "Agent spawned");
-        Ok(SpawnedAgent::tracked(id, agent, spec, reservation))
+        Ok(agent)
     }
 
     /// Spawn from a named template with caller-provided variables.

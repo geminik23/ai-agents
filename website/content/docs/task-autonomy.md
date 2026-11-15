@@ -83,7 +83,7 @@ The reusable installer does not replace caller hosting options, storage or ceili
 
 For your own domain, replace the record integration and pure predicate/config validation, then select the installed IDs in YAML. Keep callback work bounded and pure. Return managed observation requests or a typed external wait for required I/O. Checkpoints and registered IDs do not serialize executable authority. See [validator and progress contracts](@/docs/rust-api.md#completion-validation-and-progress-development-only).
 
-The module deliberately has **no eval dependency**. It owns its named adapter registry; combine additional domain adapters before applying that registry once, rather than replacing a previously captured implementation. Each installation creates fresh state; a retained pause keeps that actual installation alive. A new runtime needs an explicitly compatible application/reconstruction host rather than silently starting a new ticket record and calling it a restored task.
+The module deliberately has **no eval dependency**. It owns its named adapter registry; combine additional domain adapters before applying that registry once, rather than replacing a previously captured implementation. Ordinary installation creates fresh state; a retained pause keeps that actual installation alive. `install_domain_state` additionally accepts a checked domain binding for the configured component factory, preserving ticket records, source references, corpus read receipts and their revisions. The public Rust consumer in `examples/rust/custom-llm/tests/support/task_domain_restoration.rs` demonstrates this integration. A new runtime must not silently start a new ticket record and call it a restored task.
 
 ## 3. Run a real domain round trip offline
 
@@ -96,6 +96,38 @@ cargo run --manifest-path examples/Cargo.toml -p example-custom-llm --bin task-d
 This executable loads `support_resolution.yaml`, installs that same domain module, then uses a finite offline provider. It records a ticket source reference before asking the actual typed question, retains the same installation across the answer, and completes only after the actual ticket validator passes. It checks that the original reference survived, each domain operation ran once, limits stayed unchanged and model usage accumulated, then prints a bounded safe display. It opens no socket and uses no customer system or provider credentials. Fixed replies prove this protocol, not live answer quality.
 
 For a normal application, configure providers/features first, install your domain before final construction, declare whether you can service responses, and retain the runtime/runner across pauses. `build_task_host().await` prepares configured task-capable storage; it does not start an objective or install production restart support.
+
+## Configured process restart
+
+Use `ConfiguredTaskRestoreHost` for declarative runtimes that must survive a prepared pause. The CLI installs this host when `autonomy.restoration_timeout_ms` is present. The complete `examples/yaml/autonomy/restartable_analysis.yaml` example configures a clarification question and semantic completion check:
+
+```yaml
+storage: {type: sqlite, path: data/tasks.sqlite}
+autonomy:
+  enabled: true
+  restoration_timeout_ms: 5000
+  persistence: {enabled: true, resume_on_start: true}
+  hitl: {on_user_question: pause_run, on_approval_required: pause_run}
+```
+
+Choose a positive restoration transaction bound for your deployment. It is an agent-wide host setting, outside profiles and invocation overrides, with no implicit default. The entire bound is conservatively charged for each capture, reconstruction and review transaction; it does not introduce a cumulative task budget. Original active allowances, whole expiry, pending-request deadlines and accumulated usage are retained.
+
+```sh
+ai-agents-cli task run agent.yaml "Explain the selected topic" --non-interactive --json
+ai-agents-cli task resume agent.yaml RUN_ID --revision REVISION
+```
+
+A confirmed saved pause exits with code **3** and reports its run ID and revision. Resume validates that exact revision, reconstructs unpublished objects, then asks for **restoration review** before asking the original question. Neither approval authorizes a policy-denied operation. With `resume_on_start: true`, `run agent.yaml` performs the same selection and interaction through plain or TUI hosting before starting new input. Ambiguous candidates require explicit run selection; an unfinished owned or recovery-required run is not silently replaced by a new task.
+
+Keep the current working directory, prepared YAML/loaded skills, declared children, actor, storage and implementation bindings compatible. Credentials come from the current host; do not put them in recovery state. Saved native history, state/skill positions, shared child topology, file-read evidence and usage are reconstructed. A changed source or policy is rejected before pending work executes. Ordinary/disabled autonomy and volatile pauses continue to work without SQLite or synchronized-time evidence.
+
+The configured host requires actual file-backed SQLite with full synchronization, checks the acknowledged snapshot through a fresh backend connection, and uses a process-held file lock during preparation/recovery. An in-memory database or a `TaskRuns` capability alone does not justify exiting with a durable pause. Protect the database and its adjacent lock directory as application state.
+
+Linux reads `adjtimex`; macOS has an `ntp_adjtime` reader. Both require synchronized OS status and a reported error bound. Capture projects deadlines from the interval's earlier UTC bound; admission uses the later bound. Missing evidence or a demonstrable rollback blocks restoration. After reboot or suspend, fresh valid OS evidence and the original stored cuts are required; this is not an authentication mechanism for VM snapshot replay or a different machine. Local process acceptance was performed on Linux; native macOS acceptance remains pending, and the Windows CLI issue remains deferred.
+
+`task cancel` only records a request. Use `task cleanup agent.yaml RUN_ID --revision REVISION` to reconstruct and acknowledge cleanup of a cancellation-requested prepared pause. After a failed preparation, `task recover ... --action resume-prepared|cancel-prepared --reason TEXT` can reconcile only work for which the host proves exclusive preparation and no unknown semantic effect. A dead process or released file lock does not prove that a dispatched tool stopped. Unknown effects remain protected for application-specific recovery.
+
+Application tools, domain validators, services and opaque MCP state use an installed Rust `TaskRestoreComponents` factory. It validates immutable bindings, restores actual state and constructs resources without replaying model/tool/business work. The default CLI does not invent that contract for opaque remote services. See [configured Rust hosting](@/docs/rust-api.md#configured-restart-host-development-only) for the extension boundary. This is prepared continuation recovery, not transparent reconstruction of an arbitrary in-flight call stack.
 
 ## 4. Service exact decisions and keep polling
 

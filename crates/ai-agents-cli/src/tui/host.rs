@@ -16,10 +16,34 @@ use tokio::sync::mpsc;
 /// Polls original work and its controls through the same foreground session used by the plain REPL.
 /// The caller polls this future until return, including after display/input loss; dropping it is not cleanup acknowledgement.
 pub(crate) async fn run(
-    mut io: FrontendSession,
+    io: FrontendSession,
     agent: Arc<RuntimeAgent>,
     config: CliReplConfig,
 ) -> Result<()> {
+    run_with_startup(io, agent, config, None).await
+}
+
+// A saved startup pause is serviced through the same loop before any new user input can start another root operation.
+pub(crate) async fn run_with_startup(
+    mut io: FrontendSession,
+    agent: Arc<RuntimeAgent>,
+    config: CliReplConfig,
+    restored: Option<crate::session::RestoredTask>,
+) -> Result<()> {
+    if let Some(restored) = restored {
+        let result = io.drive_restored(restored).await?;
+        let quit = result.quit;
+        if !io.output_suppressed() {
+            io.send_ui(Output::Result {
+                generation: io.generation(),
+                result: Box::new(result),
+            })
+            .await?;
+        }
+        if quit {
+            return Ok(());
+        }
+    }
     while let Some(line) = io.next_line().await? {
         let line = line.trim();
         if line.is_empty() {

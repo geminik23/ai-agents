@@ -5,7 +5,7 @@ template = "docs.html"
 description = "Understand the development task support boundaries and migration from the published 1.1.2 Rust, YAML, CLI and report contracts."
 +++
 
-This page compares the development checkout with published **1.1.2**. The checkout still carries that manifest version; it does not mean the development additions were published in 1.1.2. The next release version has not been selected. The Rust minimum remains **1.88**.
+This page compares the development checkout with published **1.1.2**. The checkout still carries that manifest version; it does not mean the development additions were published in 1.1.2. The development target is 1.2; publication remains separate. The Rust minimum remains **1.88**.
 
 ## Task support boundaries
 
@@ -20,11 +20,11 @@ A task continues, pauses or finishes according to configured completion evidence
 | CLI, REPL, TUI and task events | Foreground execution, local review and bounded observations | Exact local prompts are sensitive; cancellation requests are distinct from acknowledged cleanup |
 | Composition and managed background/speculative work | Supported child and runtime work participates in task accounting | Actual participants must preserve ownership, admission and result acknowledgement; arbitrary custom background work is not automatically covered |
 | Validation and resource admission | Configured completion gates, fresh evidence and explicit cost/write capabilities | Domain implementations and actual provider/tool bindings must be installed; names and approvals alone confer no authority |
-| Task storage | Conditional task operations in SQLite and process-local task storage | File/Redis snapshot persistence does not provide task transactions |
-| Prepared safe-pause reconstruction | Explicit Rust hosts can restore supported prepared pauses | Matching configuration, live bindings, clock guarantees and required review are necessary; opening SQLite alone does not install reconstruction |
+| Task storage | Conditional task operations in SQLite and process-local task storage | Process exit requires a file-backed durable journal; File/Redis snapshots and in-memory SQLite do not provide it |
+| Prepared safe-pause reconstruction | Configured YAML/CLI hosting and explicit Rust APIs restore acknowledged prepared pauses | SQLite, positive restoration work timeout, OS time evidence, matching bindings and fresh review; application services supply their own component state contract |
 | Evaluation and observation | Typed task operations and shared application/eval hosts | Scenario success proves its assertions, including expected refusals; it is not unconditional business success |
 
-The default CLI supports retained work in the original session. A new-process `task resume` requires a reconstruction host that the default CLI does not install. Automatic abandoned-owner takeover, arbitrary in-flight call-stack reconstruction, OS sandboxing and exactly-once external effects are not provided.
+The CLI supports retained work and configured new-process `task resume --revision`. Set `autonomy.restoration_timeout_ms` and enable persistence with file-backed SQLite. An acknowledged saved pause uses exit code 3; it does not grant permission to execute its pending work. Automatic abandoned-owner takeover, arbitrary in-flight call-stack reconstruction, OS sandboxing and exactly-once external effects are not provided.
 
 New task profiles have no implicit cumulative count/time budget. Explicit limits, host ceilings, per-invocation bounds, accounting, cancellation and completion checks still apply. Evaluation budgets belong to the evaluation suite, not ordinary application defaults.
 
@@ -32,7 +32,7 @@ See [task hosting](@/docs/task-autonomy.md), [YAML configuration](@/docs/yaml-re
 
 ## Rust migration from 1.1.2
 
-The development checkout contains source-breaking changes to existing public types. Optional YAML fields and serde defaults do not preserve exhaustive Rust literals or matches. Using the crate facade also does not hide changes to the types it re-exports. These changes must be considered when choosing the next release version; the earlier routing migration's one-time exception does not apply automatically.
+The development checkout contains source-breaking changes to existing public types. Optional YAML fields and serde defaults do not preserve exhaustive Rust literals or matches. Using the crate facade also does not hide changes to the types it re-exports. The 1.2 migration includes the changes below; the version label does not make existing exhaustive Rust usage source-compatible.
 
 For struct construction, prefer existing constructors or `..Default::default()` where the type supports them. Existing exhaustive literals need the following additions. Exhaustive destructuring also needs the added fields or `..` where ignoring them is appropriate.
 
@@ -78,6 +78,8 @@ Task participation requires the corresponding real capability. A custom memory i
 
 Omitted autonomy remains ordinary. Existing explicit settings retain their meaning; unknown framework keys remain errors. New task configuration is not expected to load in the older release.
 
+`AutonomyConfig` adds the optional agent-wide `restoration_timeout_ms` field; explicit Rust literals must initialize it (usually `None` for volatile hosting). Development `TaskRestoreManifest` Rust literals also need `clock_evidence` (`None` only for the original explicit-host contract); JSON readers retain its optional default. CLI task subcommands add explicit cleanup/recovery and require an exact revision for resume. Configured restart manifests use version 3 with OS UTC evidence. Existing lower-level host versions 1/2 remain readable under their original contracts; they do not automatically acquire configured-host or process-durability authority. `StorageCapability::DurableTaskRuns` describes actual journal lifetime and is separate from `TaskRuns`.
+
 Older messages and memory snapshots can be read with defaults for the new fields. Older readers may discard task provenance and incomplete native-history observations when saving new data again. Therefore readability is not a lossless downgrade promise. A custom memory backend must preserve the new information before declaring the corresponding task support.
 
 Task checkpoints have their own envelope and runtime payload versions. Their decoding, configuration compatibility and executable restoration are separate checks. A serialized identity or successfully decoded checkpoint is not a live execution binding.
@@ -90,4 +92,4 @@ Ordinary chat JSONL input remains supported. Task operations and participant int
 
 The facade retains `default`, `sqlite`, `redis-storage`, `http-context`, `full-storage` and `full`. A workspace build can unify features from other members, including the CLI. Check an embedded consumer with its own selected features rather than inferring its available APIs from a workspace all-features build.
 
-Linux and macOS have native CLI/PTY and MCP integration evidence. Windows CLI stack-overflow investigation and platform CI are deferred; that does not establish failure of every Windows library use. Redis remains an experimental snapshot backend, and SQLite currently has one documented audit exception pending an upstream dependency fix. Neither limitation is resolved by passing compatibility checks.
+Existing Linux/macOS evidence covers CLI/PTY and MCP integration. Configured restart has Linux process acceptance; native macOS verification of the new clock and recovery path remains separate. Windows CLI stack-overflow investigation and platform CI are deferred; that does not establish failure of every Windows library use. Redis remains an experimental snapshot backend, and SQLite currently has one documented audit exception pending an upstream dependency fix. Neither limitation is resolved by passing compatibility checks.

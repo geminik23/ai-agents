@@ -5,7 +5,7 @@ use ai_agents::autonomy::*;
 use ai_agents::tools::{Tool, ToolExecutionContext, ToolResult};
 use ai_agents::{AgentError, Result};
 use async_trait::async_trait;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{
@@ -28,6 +28,40 @@ pub fn documents() -> Value {
 pub struct Corpus {
     read: Mutex<BTreeMap<String, String>>,
     revision: AtomicU64,
+}
+/// Actual read receipts and their revision belong to the application, not the model's citation text.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CorpusSnapshot {
+    read: BTreeMap<String, String>,
+    revision: u64,
+}
+impl Corpus {
+    pub fn snapshot(&self) -> CorpusSnapshot {
+        let read = self.read.lock().expect("corpus state");
+        CorpusSnapshot {
+            read: read.clone(),
+            revision: self.revision.load(Ordering::SeqCst),
+        }
+    }
+    pub fn from_snapshot(saved: CorpusSnapshot) -> Result<Self> {
+        let known = documents();
+        if saved.revision != saved.read.len() as u64
+            || saved.read.values().any(|id| {
+                !known
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|document| document["id"] == *id)
+            })
+        {
+            return Err(AgentError::Config("invalid corpus recovery state".into()));
+        }
+        Ok(Self {
+            read: Mutex::new(saved.read),
+            revision: AtomicU64::new(saved.revision),
+        })
+    }
 }
 impl HostRevisionSource for Corpus {
     fn revision(&self) -> Result<String> {
@@ -247,8 +281,7 @@ impl AutonomyValidator for CorpusValidator {
     }
 }
 
-pub fn register(extensions: &mut AutonomyExtensions) -> Result<Arc<dyn Tool>> {
-    let corpus = Arc::new(Corpus::default());
+pub fn register(extensions: &mut AutonomyExtensions, corpus: Arc<Corpus>) -> Result<Arc<dyn Tool>> {
     extensions.register_validator(Arc::new(CorpusValidator::new(corpus.clone())))?;
     extensions.register_validation_target("corpus", "research-corpus", corpus.clone())?;
     Ok(Arc::new(Catalog(corpus)))
