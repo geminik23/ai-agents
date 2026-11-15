@@ -74,7 +74,7 @@ Parses and validates the YAML spec. Fixed framework-owned configuration objects 
 
 ## Development task CLI
 
-These commands describe the development tree, not the published 1.1.1 CLI. They run the existing general-purpose task controller; they do not install a coding-specific loop, scheduler, daemon or production restart host. A selected profile must be enabled, and ordinary chat remains unchanged when autonomy is omitted or disabled.
+These commands describe the development tree, not the published 1.1.2 CLI. They run the existing general-purpose task controller; they do not install a coding-specific loop, scheduler, daemon or production restart host. A selected profile must be enabled, and ordinary chat remains unchanged when autonomy is omitted or disabled.
 
 ```sh
 cargo run -p ai-agents-cli -- task run agent.yaml "Research the requested topic"
@@ -370,7 +370,7 @@ Use `--plain` to skip the TUI and use the traditional line REPL instead.
 
 ### Development task TUI
 
-This section describes the development checkout, not the published 1.1.1 CLI. The TUI uses the same checked YAML/base-directory, actor scope, configured runtime/runner/store and controller as the plain REPL. `/task run [--profile ID] OBJECTIVE` starts explicit work; ordinary input can enter enabled state/selected-skill tasks without enabling provider token streaming. Omitted or disabled autonomy preserves ordinary chat.
+This section describes the development checkout, not the published 1.1.2 CLI. The TUI uses the same checked YAML/base-directory, actor scope, configured runtime/runner/store and controller as the plain REPL. `/task run [--profile ID] OBJECTIVE` starts explicit work; ordinary input can enter enabled state/selected-skill tasks without enabling provider token streaming. Omitted or disabled autonomy preserves ordinary chat.
 
 `F10` toggles the task view: run/revision/status, readable objective/profile/stage, optional canonical todos, historical tri-state validation, domain progress/stagnation/replan observations, file or non-file artifact references, cumulative turn/LLM/tool/command usage with finite or unlimited allowances, and stored active-time/wall-expiry facts. An inherited wall expiry remains visible even without a task wall budget. `Ctrl+Up/Down` selects an observed run, and `Ctrl+PageUp/PageDown` scrolls its details. These are observations, not fresh completion proofs or UI-enforced clocks. Missing measurements remain unavailable, not zero or Pass. Authoritative final answers return to chat; hiding the task view does not cancel execution.
 

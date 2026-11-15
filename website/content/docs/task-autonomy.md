@@ -9,7 +9,7 @@ learning_guide = true
 
 # From an objective to verified work
 
-This guide covers the **development checkout**, not the published 1.1.1 API. A task asks when the host may stop, not just how often a model should answer. The same controller supports research, support, reports, code, operations, world-state and tool-free analysis. Normal chat remains ordinary unless an enabled state or selected skill promotes accepted input into a task, or the application explicitly invokes a task.
+This guide covers the **development checkout**, not the published 1.1.2 API. A task asks when the host may stop, not just how often a model should answer. The same controller supports research, support, reports, code, operations, world-state and tool-free analysis. Normal chat remains ordinary unless an enabled state or selected skill promotes accepted input into a task, or the application explicitly invokes a task.
 
 ```text
 YAML objective / strategy / gates / policies
@@ -28,6 +28,8 @@ Rust providers / tools / domain bindings / ceilings
 ```
 
 Explicit task/skill invocations can supply a partial profile through Rust `*_with_overrides` methods or CLI `task run --overrides FILE`. It follows named/scoped settings, preserves required reviews and host ceilings, and remains bound to the same run through continuation and supported reconstruction. See [invocation settings](@/docs/rust-api.md#invocation-settings-development-only) and [CLI usage](@/docs/cli.md#development-task-cli).
+
+See [support and compatibility](@/docs/compatibility.md) for host prerequisites, release boundaries and migration from 1.1.2.
 
 ## 1. Choose the smallest appropriate profile
 

@@ -30,7 +30,7 @@ AI Agents supports 12 LLM providers out of the box - from cloud APIs like OpenAI
 
 ## Declared-priced task capabilities (development only)
 
-Ordinary provider support is not hard-priced task support. The development standalone Rust task runner can use an immutable host-audited `DeclaredPricing` contract installed before provider handles are captured. The same object can be declared as `llm.declared_pricing` or on a named `llms` entry; it is optional and is not forwarded as provider JSON. It does not activate YAML task entry or change the published 1.1.1 task contract.
+Ordinary provider support is not hard-priced task support. The development standalone Rust task runner can use an immutable host-audited `DeclaredPricing` contract installed before provider handles are captured. The same object can be declared as `llm.declared_pricing` or on a named `llms` entry; it is optional and is not forwarded as provider JSON. It does not activate YAML task entry or change the published 1.1.2 task contract.
 
 | Adapter | Priced request classes with an audited contract | Explicit limits |
 |---|---|---|
