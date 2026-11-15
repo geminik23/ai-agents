@@ -177,6 +177,7 @@ See the [full roadmap](https://ai-agents.rs/roadmap/) for what's shipped, what's
 | [Providers](https://ai-agents.rs/docs/providers/) | Setup for all 12 LLM providers |
 | [Concepts](https://ai-agents.rs/docs/concepts/) | Architecture, lifecycle, and core ideas |
 | [Examples](https://ai-agents.rs/examples/) | YAML and Rust examples for every feature |
+| [Developer MCP checks](xtask/tests/mcp/README.md) | Explicit YAML integration against a local Rust MCP server |
 | [API Docs](https://docs.rs/ai-agents) | Auto-generated Rust API reference |
 
 ## Key Dependencies

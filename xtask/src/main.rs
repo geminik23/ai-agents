@@ -3,9 +3,7 @@ use std::path::PathBuf;
 fn main() {
     let mut args = std::env::args().skip(1);
     let command = args.next();
-    if args.next().is_some() {
-        usage();
-    }
+    let remaining: Vec<_> = args.collect();
 
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -13,8 +11,24 @@ fn main() {
         .to_path_buf();
 
     match command.as_deref() {
-        Some("public-contract") => run_public_contract(&root),
-        Some("release-preflight") => run_release_preflight(&root),
+        Some("public-contract") if remaining.is_empty() => run_public_contract(&root),
+        Some("release-preflight") if remaining.is_empty() => run_release_preflight(&root),
+        #[cfg(feature = "mcp-integration")]
+        Some("mcp-integration") if remaining.is_empty() => {
+            if let Err(error) = xtask::mcp_integration::run(&root) {
+                eprintln!("MCP integration failed: {error:#}");
+                std::process::exit(1);
+            }
+        }
+        #[cfg(feature = "mcp-integration")]
+        Some("mcp-test-server") if remaining.len() == 2 => {
+            if let Err(error) =
+                xtask::mcp_integration::serve(&remaining[0], &PathBuf::from(&remaining[1]))
+            {
+                eprintln!("MCP test server failed: {error:#}");
+                std::process::exit(1);
+            }
+        }
         _ => usage(),
     }
 }
@@ -72,5 +86,6 @@ fn run_release_preflight(root: &std::path::Path) {
 
 fn usage() -> ! {
     eprintln!("usage: cargo run -p xtask -- <public-contract|release-preflight>");
+    eprintln!("MCP integration: cargo run -p xtask --features mcp-integration -- mcp-integration");
     std::process::exit(2);
 }
