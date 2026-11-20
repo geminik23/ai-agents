@@ -757,10 +757,12 @@ impl FrontendSession {
                 }
                 value=async { refresh.as_mut().unwrap().await }, if refresh.is_some() => {
                     refresh=None;
+                    // Start the next periodic wait after this read. A timer alone cannot invalidate the view before settlement considers it.
+                    observation_tick.reset();
                     match value { Ok(new_views)=>views=new_views, Err(error)=>{operation_error=Some(error);stopping=true;host.close_input();} }
                 }
                 _=host.changed() => {dirty=true;}
-                _=observation_tick.tick(), if !host.runs().is_empty() => {dirty=true;}
+                _=observation_tick.tick(), if refresh.is_none() && !dirty && !host.runs().is_empty() => {dirty=true;}
                 update=updates_rx.recv(), if pending_output.is_none() => {if let Some(text)=update && !stopping {pending_output=Some(Output::Text(text));}}
                 callback=self.callbacks.recv(), if presented.is_none() && pending_output.is_none() => {
                     if let Some(callback)=callback {
@@ -914,6 +916,17 @@ async fn inspect(session: &TaskHostSession, ui: bool) -> Result<Vec<View>> {
             display,
             interaction,
         });
+    }
+    #[cfg(test)]
+    if !views.is_empty()
+        && views
+            .iter()
+            .all(|view| view.display.summary.status.is_terminal())
+        && let Ok(barriers) = tests::SETTLED_INSPECTION.try_with(Clone::clone)
+    {
+        let (release, wait) = oneshot::channel();
+        barriers.send(release).await?;
+        wait.await?;
     }
     Ok(views)
 }
@@ -1626,6 +1639,10 @@ pub(crate) async fn chat_work(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    tokio::task_local! {
+        pub(super) static SETTLED_INSPECTION: mpsc::Sender<oneshot::Sender<()>>;
+    }
     #[tokio::test]
     async fn configured_auto_approval_uses_the_bridge_without_terminal_io() {
         let (io, _input, mut output) = FrontendSession::embedded();
@@ -1724,6 +1741,45 @@ mod tests {
         fn supports(&self, _: ai_agents::llm::LLMFeature) -> bool {
             false
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_inspection_does_not_starve_foreground_exit() {
+        let agent = ai_agents::AgentBuilder::from_yaml(
+            "name: SlowInspection\nsystem_prompt: Helpful\nautonomy:\n  enabled: true\n  completion: {response_contains: done}\n",
+        )
+        .unwrap()
+        .llm(Arc::new(DoneProvider))
+        .build_task_host()
+        .await
+        .unwrap();
+        let runner = agent.task_runner().unwrap();
+        let completed = runner.run("analysis", None).await.unwrap();
+        let (mut io, _input, _output) = FrontendSession::embedded();
+        io.eof = true;
+        let (barriers, mut inspections) = mpsc::channel(1);
+        let work = SETTLED_INSPECTION.scope(barriers, io.drive_restored((runner, completed)));
+        let release_slow_reads = async {
+            while let Some(release) = inspections.recv().await {
+                // Keep each real inspection in flight across periodic observation ticks.
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                release.send(()).unwrap();
+            }
+        };
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            tokio::select! {
+                result = work => result,
+                _ = release_slow_reads => panic!("the foreground closed without its result"),
+            }
+        })
+        .await
+        .expect("a display refresh must not prevent a settled operation from exiting")
+        .unwrap();
+        let OperationResult::Task(result) = result.primary else {
+            panic!("expected task result");
+        };
+        assert_eq!(result.run.status, TaskRunStatus::Completed);
+        assert_eq!(result.run.counters.llm_attempts, 1);
     }
 
     #[tokio::test]

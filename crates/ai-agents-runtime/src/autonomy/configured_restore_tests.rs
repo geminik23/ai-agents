@@ -613,6 +613,33 @@ async fn configured_process_restart_and_interrupted_preparation_preserve_domain_
             if crash_effect { "crash-effect" } else { "seed" },
         )
         .await;
+        let diagnostic = String::from_utf8_lossy(&seed.stderr);
+        if seed.status.code() == Some(101)
+            && diagnostic
+                .contains("task restoration requires synchronized OS time with a valid error bound")
+            && std::env::var_os("AI_AGENTS_REQUIRE_NATIVE_RESTORE_CLOCK").as_deref()
+                != Some(std::ffi::OsStr::new("1"))
+            && SystemTaskClock::sample().is_err()
+        {
+            assert!(!directory.join("calls.log").exists());
+            assert!(!directory.join("effects.log").exists());
+            assert!(!directory.join("request.json").exists());
+            if directory.join("tasks.sqlite").exists() {
+                let store = host(&directory, "normal")
+                    .scope()
+                    .open_store()
+                    .await
+                    .unwrap();
+                assert!(store.list().await.unwrap().is_empty());
+            }
+            println!(
+                "native restoration: refused before model calls, tool effects and task creation: {diagnostic}"
+            );
+            crate::remove_sqlite_test_directory(&directory)
+                .await
+                .unwrap();
+            continue;
+        }
         assert_eq!(
             seed.status.code(),
             Some(if crash_effect { 74 } else { 0 }),

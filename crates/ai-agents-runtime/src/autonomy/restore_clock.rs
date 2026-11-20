@@ -72,10 +72,15 @@ impl SystemTaskClock {
 
 // Errors describe the missing authority without presenting an unchecked OS timestamp as a certified fallback.
 fn unavailable() -> AgentError {
-    AgentError::Config(
-        "task restoration requires synchronized OS time with a valid error bound".into(),
-    )
+    AgentError::Config(CLOCK_REQUIREMENT.into())
 }
+
+const CLOCK_REQUIREMENT: &str =
+    "task restoration requires synchronized OS time with a valid error bound";
+#[cfg(target_os = "linux")]
+const KERNEL_READER: &str = "adjtimex";
+#[cfg(target_os = "macos")]
+const KERNEL_READER: &str = "ntp_adjtime";
 
 // A zero modes mask only reads the kernel's clock state; it never requests an adjustment or needs elevated privileges.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -88,23 +93,38 @@ fn synchronized_error() -> Result<i64> {
     #[cfg(target_os = "macos")]
     // SAFETY: reading is initialized, correctly aligned and lives for the complete system call.
     let state = unsafe { libc::ntp_adjtime(&mut reading) };
+    if state == -1 {
+        // Read errno before interpreting the output buffer, which the kernel may not have populated.
+        let error = std::io::Error::last_os_error();
+        return Err(AgentError::Config(format!(
+            "{CLOCK_REQUIREMENT}: {KERNEL_READER} returned {state}: {error}"
+        )));
+    }
     checked_error(state, &reading)
 }
 
 // Missing synchronization or kernel clock errors cannot authorize a raw UTC fallback.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn checked_error(state: libc::c_int, reading: &libc::timex) -> Result<i64> {
-    // Leap adjustments are not treated as ordinary continuity until the kernel reports synchronized steady time again.
-    if state != libc::TIME_OK || reading.status & (libc::STA_UNSYNC | libc::STA_CLOCKERR) != 0 {
-        return Err(unavailable());
-    }
     // c_long is 32 bits on some Linux targets and 64 bits on the current native targets.
     #[allow(clippy::unnecessary_cast)]
     let error = reading.maxerror as i64;
-    if error < 0 {
-        return Err(unavailable());
-    }
-    Ok(error)
+    let reason = if reading.status & libc::STA_CLOCKERR != 0 {
+        "kernel reported a clock error"
+    } else if reading.status & libc::STA_UNSYNC != 0 {
+        "kernel clock is unsynchronized"
+    } else if state != libc::TIME_OK {
+        // Leap adjustments require a fresh steady-time sample before admitting restoration.
+        "kernel did not report steady synchronized time"
+    } else if error < 0 {
+        "kernel reported a negative maximum error"
+    } else {
+        return Ok(error);
+    };
+    Err(AgentError::Config(format!(
+        "{CLOCK_REQUIREMENT}: {KERNEL_READER}: {reason} (state={state}, status={:#x}, maxerror={error} us)",
+        reading.status
+    )))
 }
 
 // Platforms without an implemented evidence reader retain explicit rejection rather than a weaker clock contract.
@@ -125,16 +145,27 @@ mod tests {
         let mut reading: libc::timex = unsafe { std::mem::zeroed() };
         reading.maxerror = 200;
         assert_eq!(checked_error(libc::TIME_OK, &reading).unwrap(), 200);
-        for status in [libc::STA_UNSYNC, libc::STA_CLOCKERR] {
+        for (status, reason) in [
+            (libc::STA_UNSYNC, "unsynchronized"),
+            (libc::STA_CLOCKERR, "clock error"),
+        ] {
             reading.status = status;
-            assert!(checked_error(libc::TIME_OK, &reading).is_err());
+            let error = checked_error(libc::TIME_OK, &reading)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(reason), "{error}");
+            assert!(error.contains(&format!("status={status:#x}, maxerror=200 us")));
         }
         reading.status = 0;
         for state in [-1, libc::TIME_ERROR, libc::TIME_INS, libc::TIME_DEL] {
             assert!(checked_error(state, &reading).is_err());
         }
         reading.maxerror = -1;
-        assert!(checked_error(libc::TIME_OK, &reading).is_err());
+        let error = checked_error(libc::TIME_OK, &reading)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("negative maximum error"));
+        assert!(error.contains("maxerror=-1 us"));
     }
 
     // Better synchronization may lower the reported upper error bound without moving real time backward.

@@ -693,6 +693,50 @@ fn fixture_worker_failure_is_reported_without_replacing_primary_panic() {
 
 const TASK: &str = "tools: []\nautonomy:\n  enabled: true\n  mode: until_complete\n  max_turns: 4\n  max_llm_calls: 4\n  completion: {response_contains: done}\n";
 
+// A host without synchronized kernel time must prove safe refusal through the production binary.
+// Acceptance hosts can require the positive continuation with a test-only setting.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn assert_configured_seed(
+    fixture: &Fixture,
+    output: &Output,
+    expected: i32,
+    agent: &std::path::Path,
+    db: &std::path::Path,
+) -> bool {
+    if output.status.code() == Some(expected) {
+        println!("native restoration: prepared producer accepted");
+        return true;
+    }
+    const CLOCK_REFUSAL: &str =
+        "task restoration requires synchronized OS time with a valid error bound";
+    let diagnostic = String::from_utf8_lossy(&output.stderr);
+    if std::env::var_os("AI_AGENTS_REQUIRE_NATIVE_RESTORE_CLOCK").as_deref()
+        != Some(std::ffi::OsStr::new("1"))
+        && diagnostic.contains(CLOCK_REFUSAL)
+        && ai_agents::autonomy::SystemTaskClock::sample().is_err()
+    {
+        let automatic = expected == 0;
+        assert_exit(output, if automatic { 1 } else { 2 });
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+        if !automatic {
+            assert!(
+                !db.exists(),
+                "task run must refuse before opening the task journal"
+            );
+        }
+        if db.exists() {
+            let list = fixture.run(&["task", "list", agent.to_str().unwrap(), "--json"], "");
+            assert_exit(&list, 0);
+            let rows: Value = serde_json::from_slice(&list.stdout).unwrap();
+            assert_eq!(rows, json!([]), "refusal must leave no task run");
+        }
+        println!("native restoration: refused before model calls and task creation: {diagnostic}");
+        return false;
+    }
+    assert_exit(output, expected);
+    unreachable!("the exit assertion reports any unclassified failure");
+}
+
 fn assert_exit(output: &Output, code: i32) {
     assert_eq!(
         output.status.code(),
@@ -737,7 +781,9 @@ fn task_subprocess_configured_restart_preserves_attempts_and_requires_fresh_revi
             ),
             "",
         );
-        assert_exit(&first, 3);
+        if !assert_configured_seed(&f, &first, 3, &agent, &db) {
+            continue;
+        }
         let saved: Value = serde_json::from_str(
             String::from_utf8_lossy(&first.stdout)
                 .lines()
@@ -1917,7 +1963,9 @@ fn task_subprocess_configured_startup_resumes_same_task_before_new_chat() {
                 "",
             )
         };
-        assert_exit(&first, if automatic { 0 } else { 3 });
+        if !assert_configured_seed(&f, &first, if automatic { 0 } else { 3 }, &agent, &db) {
+            continue;
+        }
         assert_eq!(f.calls.load(Ordering::SeqCst), 1);
         let list = f.run(&["task", "list", agent.to_str().unwrap(), "--json"], "");
         assert_exit(&list, 0);
@@ -1967,7 +2015,9 @@ fn tui_pty_configured_startup_restores_task_and_terminal() {
         ],
         "",
     );
-    assert_exit(&seed, 3);
+    if !assert_configured_seed(&f, &seed, 3, &agent, &db) {
+        return;
+    }
     assert_eq!(f.calls.load(Ordering::SeqCst), 1);
     run_tui_pty(&agent, "", "Agent: done", "yes", "complete");
     assert_eq!(f.calls.load(Ordering::SeqCst), 2);
@@ -2005,7 +2055,9 @@ fn task_subprocess_configured_skill_startup_preserves_activation() {
         &["run", agent.to_str().unwrap(), "--plain"],
         "Research the sources\n",
     );
-    assert_exit(&seed, 0);
+    if !assert_configured_seed(&f, &seed, 0, &agent, &db) {
+        return;
+    }
     assert_eq!(f.calls.load(Ordering::SeqCst), 2);
     let list = f.run(&["task", "list", agent.to_str().unwrap(), "--json"], "");
     assert_exit(&list, 0);
@@ -2078,7 +2130,10 @@ fn task_subprocess_configured_child_restart_preserves_topology_and_exact_call_li
         ],
         "",
     );
-    assert_exit(&first, 3);
+    if !assert_configured_seed(&root, &first, 3, &agent, &db) {
+        assert_eq!(child.calls.load(Ordering::SeqCst), 0);
+        return;
+    }
     let saved: Value = serde_json::from_str(
         String::from_utf8_lossy(&first.stdout)
             .lines()
@@ -2152,7 +2207,9 @@ fn task_subprocess_configured_constructor_crash_recovers_without_replay() {
         ],
         "",
     );
-    assert_exit(&first, 3);
+    if !assert_configured_seed(&f, &first, 3, &agent, &db) {
+        return;
+    }
     let saved: Value = serde_json::from_str(
         String::from_utf8_lossy(&first.stdout)
             .lines()
@@ -2283,7 +2340,9 @@ fn task_subprocess_configured_cancelled_pause_cleans_up_without_model_work() {
         ],
         "",
     );
-    assert_exit(&first, 3);
+    if !assert_configured_seed(&f, &first, 3, &agent, &db) {
+        return;
+    }
     let saved: Value = serde_json::from_str(
         String::from_utf8_lossy(&first.stdout)
             .lines()
