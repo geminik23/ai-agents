@@ -106,27 +106,28 @@ impl SkillExecutionObserver for TaskSkillJournal<'_> {
             crate::autonomy::current_child_operation().unwrap_or_default(),
             cursor.execution_id
         );
-        Box::pin(execution.update(|payload| {
-            self.agent.validate_skill_cursor_binding(
-                cursor,
-                self.actions.as_deref(),
-                self.generation,
-            )?;
-            let adapter = crate::autonomy::TaskAdapterCheckpoint {
-                id: id.clone(),
-                adapter: "runtime.skill".into(),
-                contract_version: 1,
-                config: serde_json::to_value(&cursor.definition)?,
-                state: serde_json::to_value(&state)?,
-            };
-            if let Some(old) = payload.adapters.iter_mut().find(|old| old.id == id) {
-                *old = adapter;
-            } else {
-                payload.adapters.push(adapter);
-            }
-            Ok(())
-        }))
-        .await?;
+        execution
+            .update(|payload| {
+                self.agent.validate_skill_cursor_binding(
+                    cursor,
+                    self.actions.as_deref(),
+                    self.generation,
+                )?;
+                let adapter = crate::autonomy::TaskAdapterCheckpoint {
+                    id: id.clone(),
+                    adapter: "runtime.skill".into(),
+                    contract_version: 1,
+                    config: serde_json::to_value(&cursor.definition)?,
+                    state: serde_json::to_value(&state)?,
+                };
+                if let Some(old) = payload.adapters.iter_mut().find(|old| old.id == id) {
+                    *old = adapter;
+                } else {
+                    payload.adapters.push(adapter);
+                }
+                Ok(())
+            })
+            .await?;
         self.agent
             .validate_skill_cursor_binding(cursor, self.actions.as_deref(), self.generation)
     }
@@ -640,7 +641,7 @@ impl RuntimeAgent {
                         };
                         self.acknowledge_completed_task_batch().await?;
                         execution.parked_batches.lock().remove(&self.info.id);
-                        Box::pin(self.finish_task_location_record(location, record)).await
+                        self.finish_task_location_record(location, record).await
                     }),
                 ),
             )

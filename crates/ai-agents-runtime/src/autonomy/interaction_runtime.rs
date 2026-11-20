@@ -539,12 +539,12 @@ impl RuntimeAgent {
                                             disambiguation_epoch,
                                             state_generation,
                                         } => {
-                                            Box::pin(self.recheck_skill_disambiguation(
+                                            self.recheck_skill_disambiguation(
                                                 &skill_id,
                                                 &enriched_input,
                                                 disambiguation_epoch,
                                                 state_generation,
-                                            ))
+                                            )
                                             .await
                                         }
                                     }
@@ -628,7 +628,7 @@ impl RuntimeAgent {
                                         )
                                         .await
                                     } else if let Some(data) = prepared {
-                                        Box::pin(self.run_accepted_input(data.clone())).await
+                                        self.run_accepted_input(data.clone()).await
                                     } else {
                                         Box::pin(self.run_loop_internal(input)).await
                                     }
