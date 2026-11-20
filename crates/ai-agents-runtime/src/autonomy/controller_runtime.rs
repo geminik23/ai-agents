@@ -508,6 +508,7 @@ impl AutonomyRunner {
                     }
                     state.driver = Some(Box::new(restored));
                     *execution.controller.lock() = Some(state.clone());
+                    // Keep the extra indirection here because direct polling under the resume scopes overflows the default debug stack in the foreground checker path.
                     let future = super::super::suspension::scope_resumed_executor(
                         cursor,
                         super::super::suspension::scope_resumed_approval(
