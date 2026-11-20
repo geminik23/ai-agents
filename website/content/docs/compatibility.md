@@ -97,7 +97,7 @@ The facade retains `default`, `sqlite`, `redis-storage`, `http-context`, `full-s
 
 | Environment or integration | 1.2 support boundary |
 |---|---|
-| Linux and macOS configured restart | Configured restart requires file-backed SQLite, compatible bindings, fresh review and valid synchronized kernel time evidence. Linux process tests cover normal restart and failure recovery. Native macOS acceptance for the current candidate is pending after the hosted runner rejected restoration at the clock check. |
+| Linux and macOS configured restart | Configured restart requires file-backed SQLite, compatible bindings, fresh review and valid synchronized kernel time evidence. Linux process tests cover normal restart and failure recovery. The macOS hosted runner reported `STA_UNSYNC`. Hosted tests exercise safe refusal in that environment. Native macOS restart acceptance requires synchronized kernel time evidence and remains pending. |
 | Reboot, suspend and clock correction | The same original deadlines and fresh OS evidence are required. Missing evidence or detected discontinuity blocks restoration. These lifecycle transitions have not been exercised in dedicated real-machine experiments. |
 | VM snapshot replay or host migration | No automatic certification of clock or external-state continuity; restoring a copied journal alone grants no execution authority. |
 | Windows CLI and configured restart | Deferred: the CLI stack-overflow investigation remains open and the native restoration clock/lease implementation is unavailable. This does not establish failure of every Windows library API. |

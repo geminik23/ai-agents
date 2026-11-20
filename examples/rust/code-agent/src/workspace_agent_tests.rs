@@ -1258,7 +1258,7 @@ async fn selected_new_file_and_repair_report_dirty_baseline() {
 // The actual foreground REPL consumes the same workspace host, exact approvals and local report.
 #[tokio::test]
 async fn workspace_foreground_process_creates_repairs_and_reports() {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
     if std::env::var_os("CODE_AGENT_FOREGROUND_FIXTURE").is_some() {
         let root = PathBuf::from(std::env::var_os("CODE_AGENT_FIXTURE_ROOT").unwrap());
         let checker = PathBuf::from(std::env::var_os("CODE_AGENT_FIXTURE_CHECKER").unwrap());
@@ -1359,12 +1359,18 @@ async fn workspace_foreground_process_creates_repairs_and_reports() {
         .env("CODE_AGENT_FIXTURE_CHECKER", &sandbox.checker)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
         .kill_on_drop(true)
         .spawn()
         .unwrap();
     let mut input = child.stdin.take().unwrap();
     let output = child.stdout.take().unwrap();
+    let mut stderr = child.stderr.take().unwrap();
+    let read_diagnostics = async {
+        let mut bytes = Vec::new();
+        stderr.read_to_end(&mut bytes).await.unwrap();
+        bytes
+    };
     let process = async {
         input
             .write_all(b"/task run Add the feature.\nyes\nyes\nyes\nyes\nyes\n")
@@ -1384,19 +1390,22 @@ async fn workspace_foreground_process_creates_repairs_and_reports() {
         let status = child.wait().await.unwrap();
         (status, captured, quit_sent)
     };
-    let (status, output, quit_sent) =
-        tokio::time::timeout(std::time::Duration::from_secs(90), process)
-            .await
-            .unwrap_or_else(|_| {
-                panic!(
-                    "foreground timed out; fixture retained at {}",
-                    sandbox.parent.display()
-                )
-            });
+    let ((status, output, quit_sent), diagnostics) =
+        tokio::time::timeout(std::time::Duration::from_secs(90), async {
+            tokio::join!(process, read_diagnostics)
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "foreground timed out; fixture retained at {}",
+                sandbox.parent.display()
+            )
+        });
     assert!(
         status.success(),
-        "foreground failed; fixture retained at {}: {output}",
-        sandbox.parent.display()
+        "foreground failed ({status}); fixture retained at {}: {output}\nstderr: {}",
+        sandbox.parent.display(),
+        String::from_utf8_lossy(&diagnostics)
     );
     assert!(quit_sent, "no workspace report: {output}");
     assert!(

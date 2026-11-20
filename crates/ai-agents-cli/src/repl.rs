@@ -238,10 +238,17 @@ impl CliRepl {
             .map_err(|error| ai_agents::error::AgentError::Other(error.to_string()))
     }
 
-    pub(crate) async fn run_with_io(
-        mut self,
-        mut io: crate::session::FrontendSession,
-    ) -> anyhow::Result<()> {
+    /// The REPL owns the terminal and its foreground driver until shutdown.
+    /// Keep that driver behind one allocation so callers do not store the full poll state inline.
+    pub(crate) fn run_with_io(
+        self,
+        io: crate::session::FrontendSession,
+    ) -> futures::future::LocalBoxFuture<'static, anyhow::Result<()>> {
+        Box::pin(self.run_loop(io))
+    }
+
+    // Polls operations in the original task so the terminal session and foreground work share one lifetime.
+    async fn run_loop(mut self, mut io: crate::session::FrontendSession) -> anyhow::Result<()> {
         if let Some(ref welcome) = self.config.welcome {
             println!("{}", welcome);
             println!();
