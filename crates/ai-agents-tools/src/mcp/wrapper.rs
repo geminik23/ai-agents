@@ -338,10 +338,7 @@ impl MCPWrapperTool {
                 let output = result
                     .content
                     .iter()
-                    .filter_map(|c| match &c.raw {
-                        mcp_model::RawContent::Text(t) => Some(t.text.as_str()),
-                        _ => None,
-                    })
+                    .filter_map(|content| content.as_text().map(|text| text.text.as_str()))
                     .collect::<Vec<_>>()
                     .join("\n");
 
@@ -834,3 +831,7 @@ views:
         assert!(desc.contains("create_issue"));
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "transport_tests.rs"]
+mod transport_tests;

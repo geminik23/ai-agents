@@ -7,11 +7,13 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex as AsyncMutex;
 
-use ai_agents_core::{ChatMessage, MemorySnapshot, Result};
+use ai_agents_core::{ChatMessage, IncompleteNativeExchange, MemorySnapshot, Result};
 
 use super::Memory;
-use super::context::{CompressResult, ConversationContext, estimate_tokens};
-use super::native::{NativeRetentionInspection, readable_projection};
+use super::context::{
+    CompressResult, ConversationContext, estimate_tokens, format_incomplete_native_exchanges,
+};
+use super::native::{NativeRetentionInspection, extract_legacy_incomplete, readable_projection};
 use super::summarizer::Summarizer;
 
 fn prefix_at_char_boundary(text: &str, max_chars: usize) -> &str {
@@ -25,9 +27,27 @@ fn prefix_at_char_boundary(text: &str, max_chars: usize) -> &str {
     }
 }
 
+#[derive(Clone, Default)]
+struct SummaryState {
+    text: Option<String>,
+    incomplete: Vec<IncompleteNativeExchange>,
+}
+
+// Keeps the legacy readable summary while recording observations separately from model text.
+fn rendered_summary(state: &SummaryState) -> Option<String> {
+    if state.incomplete.is_empty() {
+        return state.text.clone();
+    }
+    let observations = format_incomplete_native_exchanges(&state.incomplete);
+    Some(match &state.text {
+        Some(text) if !text.is_empty() => format!("{text}\n{observations}"),
+        _ => observations,
+    })
+}
+
 pub struct CompactingMemory {
     operation_lock: AsyncMutex<()>,
-    summary: RwLock<Option<String>>,
+    summary: RwLock<SummaryState>,
     messages: RwLock<Vec<ChatMessage>>,
     summarized_count: RwLock<usize>,
     config: CompactingMemoryConfig,
@@ -108,7 +128,7 @@ impl CompactingMemory {
     pub fn new(summarizer: Arc<dyn Summarizer>, config: CompactingMemoryConfig) -> Self {
         Self {
             operation_lock: AsyncMutex::new(()),
-            summary: RwLock::new(None),
+            summary: RwLock::new(SummaryState::default()),
             messages: RwLock::new(Vec::new()),
             summarized_count: RwLock::new(0),
             config,
@@ -126,7 +146,7 @@ impl CompactingMemory {
     }
 
     pub fn summary(&self) -> Option<String> {
-        self.summary.read().clone()
+        rendered_summary(&self.summary.read())
     }
 
     pub fn summarized_count(&self) -> usize {
@@ -169,7 +189,7 @@ impl ai_agents_core::Memory for CompactingMemory {
 
     async fn clear(&self) -> Result<()> {
         let _operation = self.operation_lock.lock().await;
-        *self.summary.write() = None;
+        *self.summary.write() = SummaryState::default();
         self.messages.write().clear();
         *self.summarized_count.write() = 0;
         self.compression_history.write().clear();
@@ -186,8 +206,10 @@ impl ai_agents_core::Memory for CompactingMemory {
         let summary = self.summary.read().clone();
         let summarized_count = *self.summarized_count.read();
 
-        let mut snapshot = MemorySnapshot::new(messages).with_summarized_count(summarized_count);
-        if let Some(s) = summary {
+        let mut snapshot = MemorySnapshot::new(messages)
+            .with_summarized_count(summarized_count)
+            .with_incomplete_native_exchanges(summary.incomplete.clone());
+        if let Some(s) = rendered_summary(&summary) {
             snapshot = snapshot.with_summary(s);
         }
         Ok(snapshot)
@@ -196,7 +218,21 @@ impl ai_agents_core::Memory for CompactingMemory {
     async fn restore(&self, snapshot: MemorySnapshot) -> Result<()> {
         let _operation = self.operation_lock.lock().await;
         *self.messages.write() = snapshot.messages;
-        *self.summary.write() = snapshot.summary;
+        let mut text = snapshot.summary;
+        let mut incomplete = snapshot.incomplete_native_exchanges;
+        if incomplete.is_empty() {
+            (text, incomplete) = extract_legacy_incomplete(text);
+        } else {
+            let observations = format_incomplete_native_exchanges(&incomplete);
+            if let Some(summary) = text.as_mut() {
+                if summary == &observations {
+                    text = None;
+                } else if let Some(prefix) = summary.strip_suffix(&format!("\n{observations}")) {
+                    *summary = prefix.to_string();
+                }
+            }
+        }
+        *self.summary.write() = SummaryState { text, incomplete };
         *self.summarized_count.write() = snapshot.summarized_count;
         self.compression_history.write().clear();
         Ok(())
@@ -212,6 +248,11 @@ impl ai_agents_core::Memory for CompactingMemory {
         } else {
             inspection
                 .safe_prefix_len_between(requested, messages.len())
+                .filter(|count| {
+                    inspection
+                        .incomplete_suffix_start()
+                        .is_none_or(|start| *count <= start)
+                })
                 .ok_or_else(|| {
                     ai_agents_core::AgentError::MemoryError(
                         "eviction would split the protected signed native exchange".to_string(),
@@ -225,6 +266,16 @@ impl ai_agents_core::Memory for CompactingMemory {
 
 #[async_trait]
 impl Memory for CompactingMemory {
+    /// Captured summarizer handles must already use admission; replacing them after construction is not safe.
+    fn supports_task_admission(&self) -> bool {
+        self.summarizer.supports_task_admission()
+    }
+
+    /// Restored structured observations are kept independently of the summarizer and projected as untrusted data.
+    fn supports_incomplete_native_restore(&self) -> bool {
+        true
+    }
+
     async fn get_context(&self) -> Result<ConversationContext> {
         let _operation = self.operation_lock.lock().await;
         let messages = self.messages.read().clone();
@@ -232,10 +283,12 @@ impl Memory for CompactingMemory {
         let summarized_count = *self.summarized_count.read();
         let total_messages = messages.len() + summarized_count;
 
-        let mut ctx = ConversationContext::with_messages(messages);
+        let mut ctx = ConversationContext::with_messages(messages)
+            .with_incomplete_native_exchanges(summary.incomplete);
         ctx.total_messages = total_messages;
+        ctx.summarized_count = summarized_count;
 
-        if let Some(s) = summary {
+        if let Some(s) = summary.text {
             ctx = ctx.with_summary(s, summarized_count);
         }
 
@@ -295,46 +348,15 @@ impl Memory for CompactingMemory {
             .into_iter()
             .filter(|(message_index, _)| *message_index < batch_size)
             .collect::<Vec<_>>();
-        for (message_index, missing_result_ids) in &incomplete_exchanges {
-            let status = serde_json::json!({
-                "native_exchange_status": "incomplete",
-                "missing_result_ids": missing_result_ids,
-                "description": "final execution result was not recorded"
-            });
-            messages_to_summarize[*message_index].content.push('\n');
-            messages_to_summarize[*message_index]
-                .content
-                .push_str(&status.to_string());
-        }
-
-        let new_summary = summarizer.summarize(&messages_to_summarize).await?;
-
-        let summary_before_len = self.summary.read().as_ref().map(|s| s.len()).unwrap_or(0);
-
-        let existing_summary = self.summary.read().clone();
-        let existing_summary_tokens = existing_summary
-            .as_deref()
-            .map(estimate_tokens)
-            .unwrap_or(0);
-        let combined_summary = match existing_summary {
-            Some(existing) => summarizer.merge_summaries(&[existing, new_summary]).await?,
-            None => new_summary,
-        };
-
-        // The framework, rather than a fallible/custom summarizer, owns the durable uncertainty
-        // marker so completed compression cannot erase evidence that a tool result was missing.
-        let incomplete_suffix = incomplete_exchanges
-            .iter()
-            .map(|(_, missing_result_ids)| {
-                serde_json::json!({
-                    "native_exchange_status": "incomplete",
-                    "missing_result_ids": missing_result_ids,
-                    "description": "final execution result was not recorded"
-                })
-                .to_string()
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
+        // Reject a known impossible status budget before invoking a summarizer or changing stored history.
+        let existing = self.summary.read().clone();
+        let mut incomplete = existing.incomplete.clone();
+        incomplete.extend(
+            incomplete_exchanges
+                .iter()
+                .map(|(_, observation)| observation.clone()),
+        );
+        let incomplete_suffix = format_incomplete_native_exchanges(&incomplete);
         let suffix = (!incomplete_suffix.is_empty()).then(|| format!("\n{incomplete_suffix}"));
         let suffix_chars = suffix
             .as_deref()
@@ -345,17 +367,44 @@ impl Memory for CompactingMemory {
                 "summary limit cannot retain incomplete native exchange status".to_string(),
             ));
         }
+        for (message_index, observation) in &incomplete_exchanges {
+            let status = serde_json::json!({
+                "native_exchange_status": "incomplete",
+                "exchange_id": observation.exchange_id,
+                "missing_result_ids": observation.missing_result_ids,
+                "description": "final execution result was not recorded"
+            });
+            messages_to_summarize[*message_index].content.push('\n');
+            messages_to_summarize[*message_index]
+                .content
+                .push_str(&status.to_string());
+        }
+
+        let new_summary = summarizer.summarize(&messages_to_summarize).await?;
+
+        let summary_before_len = rendered_summary(&existing)
+            .as_ref()
+            .map(|s| s.len())
+            .unwrap_or(0);
+        let existing_summary_tokens = existing.text.as_deref().map(estimate_tokens).unwrap_or(0);
+        let combined_summary = match existing.text {
+            Some(existing) => summarizer.merge_summaries(&[existing, new_summary]).await?,
+            None => new_summary,
+        };
+
+        // Observations come from inspected history, never by parsing the summarizer's new text.
         let content_limit = self.config.max_summary_length - suffix_chars;
         let truncated = prefix_at_char_boundary(&combined_summary, content_limit);
-        let mut final_summary = if truncated.len() < combined_summary.len() {
+        let final_text = if truncated.len() < combined_summary.len() {
             truncated.to_string()
         } else {
             combined_summary
         };
-        if let Some(suffix) = suffix {
-            final_summary.push_str(&suffix);
-        }
-
+        let final_state = SummaryState {
+            text: Some(final_text),
+            incomplete,
+        };
+        let final_summary = rendered_summary(&final_state).unwrap_or_default();
         let summary_after_len = final_summary.len();
 
         {
@@ -363,7 +412,7 @@ impl Memory for CompactingMemory {
             messages.drain(..batch_size);
         }
 
-        *self.summary.write() = Some(final_summary.clone());
+        *self.summary.write() = final_state;
         *self.summarized_count.write() += batch_size;
 
         self.record_compression(batch_size, summary_before_len, summary_after_len);
@@ -404,6 +453,7 @@ mod tests {
 
     fn make_message(content: &str) -> ChatMessage {
         ChatMessage {
+            provenance: None,
             role: Role::User,
             content: content.to_string(),
             name: None,
@@ -539,6 +589,20 @@ mod tests {
     impl Summarizer for DroppingStatusSummarizer {
         async fn summarize(&self, _messages: &[ChatMessage]) -> Result<String> {
             Ok("summary that omitted the native status".to_string())
+        }
+
+        async fn merge_summaries(&self, _summaries: &[String]) -> Result<String> {
+            Ok("merged summary without native status".to_string())
+        }
+    }
+
+    struct CountingSummarizer(std::sync::atomic::AtomicUsize);
+
+    #[async_trait]
+    impl Summarizer for CountingSummarizer {
+        async fn summarize(&self, _messages: &[ChatMessage]) -> Result<String> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok("summary".to_string())
         }
     }
 
@@ -1352,6 +1416,290 @@ compress_thresold: 10
         assert!(summary.contains("summary that omitted the native status"));
         assert!(summary.contains("native_exchange_status"));
         assert!(!summary.contains("fixture-signature"));
+    }
+
+    #[tokio::test]
+    async fn incomplete_status_survives_a_later_summary_merge() {
+        let config = CompactingMemoryConfig {
+            max_recent_messages: 1,
+            compress_threshold: 4,
+            summarize_batch_size: 2,
+            max_summary_length: 100_000,
+        };
+        let memory = CompactingMemory::new(Arc::new(DroppingStatusSummarizer), config);
+        let mut incomplete = signed_turn("earlier-incomplete");
+        incomplete.remove(2);
+        for message in incomplete {
+            memory.add_message(message).await.unwrap();
+        }
+        memory
+            .add_message(ChatMessage::user("next turn"))
+            .await
+            .unwrap();
+        assert!(matches!(
+            memory.compress(None).await.unwrap(),
+            CompressResult::Compressed { .. }
+        ));
+        assert!(
+            memory
+                .summary()
+                .unwrap()
+                .contains("earlier-incomplete-call")
+        );
+
+        memory
+            .add_message(ChatMessage::assistant("progress"))
+            .await
+            .unwrap();
+        memory
+            .add_message(ChatMessage::user("another turn"))
+            .await
+            .unwrap();
+        memory
+            .add_message(ChatMessage::assistant("more progress"))
+            .await
+            .unwrap();
+        assert!(matches!(
+            memory.compress(None).await.unwrap(),
+            CompressResult::Compressed { .. }
+        ));
+
+        let summary = memory.summary().unwrap();
+        assert!(summary.contains("merged summary without native status"));
+        assert!(summary.contains("earlier-incomplete-call"), "{summary}");
+        assert!(summary.contains("final execution result was not recorded"));
+    }
+
+    #[tokio::test]
+    async fn incomplete_status_survives_snapshot_and_zero_summary_allocation() {
+        let config = CompactingMemoryConfig {
+            max_recent_messages: 1,
+            compress_threshold: 4,
+            summarize_batch_size: 2,
+            max_summary_length: 100_000,
+        };
+        let memory = CompactingMemory::new(Arc::new(DroppingStatusSummarizer), config.clone());
+        let mut incomplete = signed_turn("restored-incomplete");
+        incomplete.remove(2);
+        for message in incomplete {
+            memory.add_message(message).await.unwrap();
+        }
+        memory
+            .add_message(ChatMessage::user("next turn"))
+            .await
+            .unwrap();
+        memory.compress(None).await.unwrap();
+        let encoded = serde_json::to_string(&memory.snapshot().await.unwrap()).unwrap();
+        let snapshot: MemorySnapshot = serde_json::from_str(&encoded).unwrap();
+        let restored = CompactingMemory::new(Arc::new(DroppingStatusSummarizer), config);
+        restored.restore(snapshot).await.unwrap();
+
+        let context = restored.get_context().await.unwrap();
+        let allocation = crate::TokenAllocation {
+            summary: 0,
+            recent_messages: 0,
+            facts: 0,
+            relationships: 0,
+        };
+        for messages in [
+            context.to_llm_messages_with_allocation(&allocation),
+            context.to_llm_messages_with_budget(0),
+        ] {
+            let text = messages
+                .iter()
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(text.contains("restored-incomplete-call"), "{text}");
+            assert!(text.contains("final execution result was not recorded"));
+        }
+
+        restored
+            .add_message(ChatMessage::assistant("progress"))
+            .await
+            .unwrap();
+        restored
+            .add_message(ChatMessage::user("another turn"))
+            .await
+            .unwrap();
+        restored
+            .add_message(ChatMessage::assistant("more progress"))
+            .await
+            .unwrap();
+        restored.compress(None).await.unwrap();
+        assert!(
+            restored
+                .summary()
+                .unwrap()
+                .contains("restored-incomplete-call")
+        );
+        assert_eq!(
+            restored
+                .get_context()
+                .await
+                .unwrap()
+                .incomplete_native_exchanges
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn separate_incomplete_exchanges_survive_multiple_compactions() {
+        let memory = CompactingMemory::new(
+            Arc::new(DroppingStatusSummarizer),
+            CompactingMemoryConfig {
+                max_recent_messages: 1,
+                compress_threshold: 4,
+                summarize_batch_size: 2,
+                max_summary_length: 2000,
+            },
+        );
+        for id in ["first", "second"] {
+            let mut turn = signed_turn(id);
+            turn.remove(2);
+            for message in &mut turn {
+                message.content = message
+                    .content
+                    .replace(&format!("{id}-call"), "shared-call");
+            }
+            for message in turn {
+                memory.add_message(message).await.unwrap();
+            }
+            memory
+                .add_message(ChatMessage::user("later turn"))
+                .await
+                .unwrap();
+            assert!(matches!(
+                memory.compress(None).await.unwrap(),
+                CompressResult::Compressed { .. }
+            ));
+        }
+        let snapshot = memory.snapshot().await.unwrap();
+        assert_eq!(snapshot.incomplete_native_exchanges.len(), 2);
+        assert_eq!(
+            snapshot.incomplete_native_exchanges[0]
+                .exchange_id
+                .as_deref(),
+            Some("first")
+        );
+        assert_eq!(
+            snapshot.incomplete_native_exchanges[1]
+                .exchange_id
+                .as_deref(),
+            Some("second")
+        );
+        let context = memory.get_context().await.unwrap();
+        let status = context.incomplete_native_message().unwrap();
+        assert_eq!(status.content.matches("shared-call").count(), 2);
+    }
+
+    #[tokio::test]
+    async fn excessive_incomplete_status_rejects_compression_without_mutation() {
+        let first = IncompleteNativeExchange {
+            exchange_id: Some("first-incomplete".into()),
+            missing_result_ids: vec!["first-incomplete-call".into()],
+            unverified_legacy: false,
+        };
+        let config = CompactingMemoryConfig {
+            max_recent_messages: 1,
+            compress_threshold: 4,
+            summarize_batch_size: 2,
+            max_summary_length: format_incomplete_native_exchanges(&[first]).chars().count() + 50,
+        };
+        let summarizer = Arc::new(CountingSummarizer(std::sync::atomic::AtomicUsize::new(0)));
+        let memory = CompactingMemory::new(summarizer.clone(), config);
+        let mut first_turn = signed_turn("first-incomplete");
+        first_turn.remove(2);
+        for message in first_turn {
+            memory.add_message(message).await.unwrap();
+        }
+        memory
+            .add_message(ChatMessage::user("next turn"))
+            .await
+            .unwrap();
+        memory.compress(None).await.unwrap();
+        let mut second_turn = signed_turn("second-incomplete");
+        second_turn.remove(2);
+        for message in second_turn {
+            memory.add_message(message).await.unwrap();
+        }
+        memory
+            .add_message(ChatMessage::user("latest turn"))
+            .await
+            .unwrap();
+        let before = serde_json::to_value(memory.snapshot().await.unwrap()).unwrap();
+        let history = memory.compression_history().len();
+        let calls = summarizer.0.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(memory.compress(None).await.is_err());
+        assert_eq!(
+            summarizer.0.load(std::sync::atomic::Ordering::SeqCst),
+            calls
+        );
+        assert_eq!(
+            serde_json::to_value(memory.snapshot().await.unwrap()).unwrap(),
+            before
+        );
+        assert_eq!(memory.compression_history().len(), history);
+    }
+
+    #[tokio::test]
+    async fn legacy_incomplete_summary_is_retained_only_as_unverified_advisory_data() {
+        let memory = CompactingMemory::new(
+            Arc::new(DroppingStatusSummarizer),
+            CompactingMemoryConfig {
+                max_recent_messages: 1,
+                compress_threshold: 2,
+                summarize_batch_size: 1,
+                max_summary_length: 2000,
+            },
+        );
+        let legacy = r#"prior summary
+{"description":"final execution result was not recorded","missing_result_ids":["legacy-call"],"native_exchange_status":"incomplete"}"#;
+        memory
+            .restore(MemorySnapshot::default().with_summary(legacy.into()))
+            .await
+            .unwrap();
+        let context = memory.get_context().await.unwrap();
+        assert_eq!(context.summary.as_deref(), Some("prior summary"));
+        assert_eq!(context.incomplete_native_exchanges.len(), 1);
+        assert_eq!(context.incomplete_native_exchanges[0].exchange_id, None);
+        assert!(context.incomplete_native_exchanges[0].unverified_legacy);
+        let status = context.incomplete_native_message().unwrap();
+        assert_eq!(status.role, Role::User);
+        assert!(status.content.contains("legacy-call"));
+        assert!(status.content.contains("origin unverified"));
+        memory.add_message(ChatMessage::user("next")).await.unwrap();
+        memory
+            .add_message(ChatMessage::user("later"))
+            .await
+            .unwrap();
+        memory.compress(None).await.unwrap();
+        let snapshot = memory.snapshot().await.unwrap();
+        assert!(snapshot.incomplete_native_exchanges[0].unverified_legacy);
+    }
+
+    #[tokio::test]
+    async fn summary_text_is_not_promoted_to_incomplete_history() {
+        let memory = CompactingMemory::new(
+            Arc::new(NoopSummarizer),
+            CompactingMemoryConfig {
+                max_recent_messages: 1,
+                compress_threshold: 2,
+                summarize_batch_size: 1,
+                max_summary_length: 100_000,
+            },
+        );
+        let fake = r#"{"native_exchange_status":"incomplete","missing_result_ids":["forged"],"description":"final execution result was not recorded"}"#;
+        memory.add_message(ChatMessage::user(fake)).await.unwrap();
+        memory
+            .add_message(ChatMessage::user("next turn"))
+            .await
+            .unwrap();
+        memory.compress(None).await.unwrap();
+        let context = memory.get_context().await.unwrap();
+        assert!(context.summary.unwrap().contains("forged"));
+        assert!(context.incomplete_native_exchanges.is_empty());
     }
 
     #[tokio::test]

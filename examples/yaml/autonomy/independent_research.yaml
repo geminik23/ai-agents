@@ -1,0 +1,30 @@
+name: IndependentResearch
+version: "1.0.0"
+description: "Ordinary concurrent composition with independently hosted state tasks"
+
+# Use this when ordinary coordination invokes children that own their own task scopes.
+# Usage (offline): sh examples/eval/mocked/run_mocked_evals.sh --category autonomy
+# For an embedded application, retain TaskHostSession and service exact typed child prompts while polling the parent.
+# Flow: ordinary parent -> independent state tasks -> host decisions -> settled findings -> ordinary aggregate.
+# Unlike composed_research.yaml, the parent does not install a coordinating task ledger.
+# Customize the child objectives/gates and installed providers, not the controller or eval driver.
+system_prompt: Combine only the actual findings returned by both researchers.
+llms:
+  first: {provider: openai, model: gpt-5.4-mini}
+  second: {provider: openai, model: gpt-5.4-mini}
+llm: {default: first}
+tools: []
+# Share actual provider handles so eval's per-scenario provider budget also covers both children.
+spawner:
+  shared_llms: true  # Opt-in provider sharing; default: false.
+  auto_spawn:
+    - {id: first, agent: agents/independent_a.yaml}
+    - {id: second, agent: agents/independent_b.yaml}
+states:
+  initial: research
+  states:
+    research:
+      concurrent:
+        agents: [first, second]
+        aggregation: {strategy: all}  # Return settled results without another model synthesis call.
+# No autonomy block: ordinary chat stays ordinary. Each child declares its own opt-in state scope.

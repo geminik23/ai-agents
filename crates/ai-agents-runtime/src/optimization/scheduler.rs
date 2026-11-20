@@ -23,6 +23,8 @@ pub struct ScheduledBranchSet<'a> {
     scheduler: TurnBranchScheduler,
     pending: HashMap<String, RuntimeBranch>,
     futures: FuturesUnordered<Pin<Box<dyn Future<Output = RuntimeBranchOutcome> + Send + 'a>>>,
+    admission_closed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    admissions: HashMap<String, std::sync::Arc<crate::autonomy::speculation::BranchAdmission>>,
 }
 
 impl TurnBranchScheduler {
@@ -78,6 +80,8 @@ impl<'a> ScheduledBranchSet<'a> {
             scheduler: TurnBranchScheduler::new(max_parallel_tasks)?,
             pending: HashMap::new(),
             futures: FuturesUnordered::new(),
+            admission_closed: Default::default(),
+            admissions: HashMap::new(),
         })
     }
 
@@ -89,6 +93,7 @@ impl<'a> ScheduledBranchSet<'a> {
         self.scheduler.release_task();
     }
 
+    /// Schedules an inert branch under the existing capacity bound and a task-only final admission restriction.
     pub fn schedule(&mut self, branch: RuntimeBranch, future: BranchFuture<'a>) -> bool {
         if !self.scheduler.can_schedule_branch() {
             return false;
@@ -96,9 +101,12 @@ impl<'a> ScheduledBranchSet<'a> {
         self.scheduler.active_tasks += 1;
         let id = branch.branch_id();
         self.pending.insert(id.clone(), branch.clone());
+        let closed = self.admission_closed.clone();
+        let witness = std::sync::Arc::new(crate::autonomy::speculation::BranchAdmission::default());
+        self.admissions.insert(id, witness.clone());
         self.futures.push(Box::pin(async move {
             let mut branch = branch;
-            let result = future.await;
+            let result = crate::autonomy::speculation::scope_branch(closed, witness, future).await;
             let _ = branch.complete();
             RuntimeBranchOutcome { branch, result }
         }));
@@ -110,6 +118,23 @@ impl<'a> ScheduledBranchSet<'a> {
         self.pending.remove(&outcome.branch.branch_id());
         self.scheduler.release_task();
         Some(outcome)
+    }
+
+    /// Distinguishes unfinished work refused by local closure from actual completed or uncertain provider work.
+    pub(crate) fn unfinished(&self, outcome: &RuntimeBranchOutcome) -> bool {
+        self.admissions
+            .get(&outcome.branch.branch_id())
+            .is_some_and(|witness| {
+                witness.unfinished()
+                    || (matches!(outcome.result, RuntimeBranchResult::Cancelled)
+                        && !witness.admitted())
+            })
+    }
+
+    /// Closes new task invocations without dropping already dispatched branches that still need settlement.
+    pub(crate) fn close_admission(&self) {
+        self.admission_closed
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     pub fn cancel_pending(&mut self) -> Vec<RuntimeBranch> {

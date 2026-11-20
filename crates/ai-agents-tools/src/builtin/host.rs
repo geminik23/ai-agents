@@ -89,6 +89,27 @@ struct DiagnosticsInput {
     max_results: Option<usize>,
 }
 
+// Capability checks and execution normalize the same bounded request without calling the host provider.
+fn diagnostics_request(
+    args: &Value,
+    ctx: &ToolExecutionContext,
+) -> Result<DiagnosticsRequest, String> {
+    let input: DiagnosticsInput =
+        serde_json::from_value(args.clone()).map_err(|error| format!("Invalid input: {error}"))?;
+    crate::validate_positive_max_results(ctx.limits.max_results).map_err(str::to_string)?;
+    Ok(DiagnosticsRequest {
+        path: input.path,
+        severity: parse_severity(input.severity.as_deref())?,
+        max_results: Some(
+            input
+                .max_results
+                .unwrap_or(DEFAULT_MAX_RESULTS)
+                .min(DEFAULT_MAX_RESULTS * 5)
+                .min(ctx.limits.max_results.unwrap_or(DEFAULT_MAX_RESULTS * 5)),
+        ),
+    })
+}
+
 #[derive(Debug, Serialize)]
 struct DiagnosticsOutput {
     available: bool,
@@ -189,6 +210,31 @@ struct SleepOutput {
 
 #[async_trait]
 impl Tool for DiagnosticsTool {
+    fn prepare_write_footprint(
+        &self,
+        args: &Value,
+        ctx: &ToolExecutionContext,
+        max_targets: usize,
+    ) -> ai_agents_core::Result<Option<ai_agents_core::autonomy::ToolWriteAdmission>> {
+        let request = diagnostics_request(args, ctx).map_err(ai_agents_core::AgentError::Tool)?;
+        let provider = self.provider.read().clone();
+        let footprint = provider.declared_write_footprint(&request, ctx, max_targets)?;
+        Ok(crate::footprint::prepare(
+            &self.provider,
+            provider,
+            footprint,
+        ))
+    }
+    fn declared_write_footprint(
+        &self,
+        args: &Value,
+        ctx: &ToolExecutionContext,
+        max_targets: usize,
+    ) -> ai_agents_core::Result<Option<ai_agents_core::autonomy::ToolWriteFootprint>> {
+        Ok(self
+            .prepare_write_footprint(args, ctx, max_targets)?
+            .map(|prepared| prepared.footprint))
+    }
     fn id(&self) -> &str {
         "diagnostics"
     }
@@ -253,19 +299,138 @@ impl Tool for DiagnosticsTool {
             .min(DEFAULT_MAX_RESULTS * 5)
             .min(ctx.limits.max_results.unwrap_or(DEFAULT_MAX_RESULTS * 5));
         let provider = self.provider.read().clone();
-        let response = provider
-            .diagnostics(DiagnosticsRequest {
-                path: input.path,
-                severity,
-                max_results: Some(max_results),
-            })
-            .await;
+        let request = DiagnosticsRequest {
+            path: input.path,
+            severity,
+            max_results: Some(max_results),
+        };
+        if let Err(error) = crate::footprint::verify_host(&ctx, &provider) {
+            return ToolResult::error(error.to_string());
+        }
+        let response = provider.diagnostics(request).await;
         diagnostics_to_result(response, max_results)
     }
 }
 
 #[async_trait]
 impl Tool for AskUserTool {
+    fn prepare_write_footprint(
+        &self,
+        args: &Value,
+        ctx: &ToolExecutionContext,
+        max_targets: usize,
+    ) -> ai_agents_core::Result<Option<ai_agents_core::autonomy::ToolWriteAdmission>> {
+        let input: AskUserInput = serde_json::from_value(args.clone())?;
+        let handler = self.handler.read().clone();
+        let footprint = if let Some(handler) = &handler {
+            let request = QuestionRequest {
+                question: input.question,
+                options: input.options,
+                multi_select: input.multi_select,
+                allow_other: input.allow_other,
+                default: input.default,
+                timeout_seconds: input.timeout_seconds,
+            };
+            handler.declared_write_footprint(&request, ctx, max_targets)?
+        } else {
+            Some(ai_agents_core::autonomy::ToolWriteFootprint::empty(
+                "builtin.ask_user.no_handler.v1",
+            ))
+        };
+        Ok(crate::footprint::prepare_optional(
+            &self.handler,
+            handler,
+            footprint,
+        ))
+    }
+    fn declared_write_footprint(
+        &self,
+        args: &Value,
+        ctx: &ToolExecutionContext,
+        max_targets: usize,
+    ) -> ai_agents_core::Result<Option<ai_agents_core::autonomy::ToolWriteFootprint>> {
+        Ok(self
+            .prepare_write_footprint(args, ctx, max_targets)?
+            .map(|prepared| prepared.footprint))
+    }
+    // Resumed answers use only this built-in response validator and never invoke the ordinary host handler.
+    fn prepare_question_write_footprint(
+        &self,
+        _: &Value,
+        _: &ToolExecutionContext,
+        _: usize,
+    ) -> ai_agents_core::Result<Option<ai_agents_core::autonomy::ToolWriteAdmission>> {
+        Ok(Some(ai_agents_core::autonomy::ToolWriteAdmission {
+            footprint: ai_agents_core::autonomy::ToolWriteFootprint::empty(
+                "builtin.ask_user.response.v1",
+            ),
+            binding: None,
+        }))
+    }
+    /// Only validated questions without a declared default need a suspended host response.
+    fn task_question(&self, args: &Value) -> ai_agents_core::Result<Option<Value>> {
+        let input: AskUserInput = serde_json::from_value(args.clone())
+            .map_err(|error| ai_agents_core::AgentError::Tool(format!("Invalid input: {error}")))?;
+        if input.question.trim().is_empty() {
+            return Err(ai_agents_core::AgentError::Tool("empty question".into()));
+        }
+        if input.default.is_some() {
+            return Ok(None);
+        }
+        Ok(Some(serde_json::to_value(QuestionRequest {
+            question: input.question,
+            options: input.options,
+            multi_select: input.multi_select,
+            allow_other: input.allow_other,
+            default: None,
+            timeout_seconds: input.timeout_seconds,
+        })?))
+    }
+
+    /// A resume answer cannot invent options, bypass selection cardinality or claim an unavailable host.
+    fn task_question_result(
+        &self,
+        args: &Value,
+        answer: &Value,
+    ) -> ai_agents_core::Result<ToolResult> {
+        let input: AskUserInput = serde_json::from_value(args.clone())?;
+        let response: QuestionResponse = serde_json::from_value(answer.clone())?;
+        let invalid = || {
+            ai_agents_core::AgentError::Tool("answer does not match the pending question".into())
+        };
+        if answer.as_object().is_none_or(|fields| {
+            fields.keys().any(|key| {
+                !matches!(
+                    key.as_str(),
+                    "answered" | "selected" | "other_text" | "timed_out" | "unavailable"
+                )
+            })
+        }) || !response.answered
+            || response.unavailable
+            || response.timed_out
+            || (!input.multi_select && response.selected.len() > 1)
+            || response
+                .selected
+                .iter()
+                .any(|option| !input.options.contains(option))
+            || response
+                .selected
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+                != response.selected.len()
+            || response
+                .other_text
+                .as_ref()
+                .is_some_and(|text| !input.allow_other || text.trim().is_empty())
+            || (response.selected.is_empty() && response.other_text.is_none())
+            || (!response.selected.is_empty() && response.other_text.is_some())
+        {
+            return Err(invalid());
+        }
+        Ok(json_result(&response, None))
+    }
+
     fn id(&self) -> &str {
         "ask_user"
     }
@@ -305,7 +470,7 @@ impl Tool for AskUserTool {
         ToolPolicyBindings::default()
     }
 
-    async fn execute(&self, args: Value, _ctx: ToolExecutionContext) -> ToolResult {
+    async fn execute(&self, args: Value, ctx: ToolExecutionContext) -> ToolResult {
         let input: AskUserInput = match serde_json::from_value(args) {
             Ok(input) => input,
             Err(error) => return ToolResult::error(format!("Invalid input: {}", error)),
@@ -321,6 +486,9 @@ impl Tool for AskUserTool {
                 default: input.default,
                 timeout_seconds: timeout.map(|duration| duration.as_secs()),
             };
+            if let Err(error) = crate::footprint::verify_host(&ctx, &handler) {
+                return ToolResult::error(error.to_string());
+            }
             let response = if let Some(timeout) = timeout {
                 match tokio::time::timeout(timeout, handler.ask_question(request.clone())).await {
                     Ok(response) => response,
@@ -332,6 +500,14 @@ impl Tool for AskUserTool {
             return json_result(&response, None);
         }
 
+        if let Err(error) = crate::footprint::verify(
+            &ctx,
+            Some(ai_agents_core::autonomy::ToolWriteFootprint::empty(
+                "builtin.ask_user.no_handler.v1",
+            )),
+        ) {
+            return ToolResult::error(error.to_string());
+        }
         let response = default_question_response(input.default, false);
         json_result(&response, Some("question_unavailable"))
     }
@@ -339,6 +515,19 @@ impl Tool for AskUserTool {
 
 #[async_trait]
 impl Tool for TodoTool {
+    fn manages_task_todos(&self) -> bool {
+        true
+    }
+    fn declared_write_footprint(
+        &self,
+        _args: &Value,
+        _ctx: &ToolExecutionContext,
+        _max_targets: usize,
+    ) -> ai_agents_core::Result<Option<ai_agents_core::autonomy::ToolWriteFootprint>> {
+        Ok(Some(ai_agents_core::autonomy::ToolWriteFootprint::empty(
+            "builtin.todo.memory.v1",
+        )))
+    }
     fn id(&self) -> &str {
         "todo"
     }
@@ -386,28 +575,33 @@ impl Tool for TodoTool {
             Ok(input) => input,
             Err(error) => return ToolResult::error(format!("Invalid input: {}", error)),
         };
+        let store = match crate::current_task_todo_store() {
+            Ok(Some(store)) => store,
+            Ok(None) => self.store.clone(),
+            Err(error) => return ToolResult::error(error.to_string()),
+        };
         let (operation, updated) = match input.operation {
             TodoOperation::List => ("list", None),
             TodoOperation::Set => {
                 let items = input.items.into_iter().map(TodoItem::from).collect();
-                self.store.set(items);
+                if !store.try_set(items) {
+                    return ToolResult::error("todo list exceeds the run's max_open_todos");
+                }
                 ("set", None)
             }
             TodoOperation::Update => {
                 let Some(id) = input.id.as_deref() else {
                     return ToolResult::error("id is required for todo update");
                 };
-                let updated = self
-                    .store
-                    .update(id, input.content, input.active_form, input.status);
+                let updated = store.update(id, input.content, input.active_form, input.status);
                 ("update", Some(updated))
             }
             TodoOperation::Clear => {
-                self.store.clear();
+                store.clear();
                 ("clear", None)
             }
         };
-        let items = self.store.list();
+        let items = store.list();
         let output = TodoOutput {
             operation: operation.to_string(),
             count: items.len(),
@@ -420,6 +614,16 @@ impl Tool for TodoTool {
 
 #[async_trait]
 impl Tool for SleepTool {
+    fn declared_write_footprint(
+        &self,
+        _args: &Value,
+        _ctx: &ToolExecutionContext,
+        _max_targets: usize,
+    ) -> ai_agents_core::Result<Option<ai_agents_core::autonomy::ToolWriteFootprint>> {
+        Ok(Some(ai_agents_core::autonomy::ToolWriteFootprint::empty(
+            "builtin.sleep.v1",
+        )))
+    }
     fn id(&self) -> &str {
         "sleep"
     }

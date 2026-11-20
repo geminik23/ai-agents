@@ -1,0 +1,512 @@
+//! Invocation-scoped admission shared by frozen provider handles without a runtime dependency.
+
+use crate::{
+    ChatMessage, LLMChunk, LLMConfig, LLMError, LLMFeature, LLMProvider, LLMResponse,
+    LLMToolRequest, ToolChoice,
+};
+use async_trait::async_trait;
+use std::future::Future;
+use std::sync::Arc;
+
+use ai_agents_core::autonomy::{
+    InvocationAdmission, ProviderCostBound, ProviderCostSettlement, ProviderRequest,
+    validate_cost_settlement,
+};
+
+tokio::task_local! {
+    static INVOCATION_ADMISSION: Arc<dyn InvocationAdmission>;
+}
+
+/// Captures explicit authority for transfer across Tokio task boundaries; IDs and labels cannot mint it.
+pub fn current_invocation_admission() -> Option<Arc<dyn InvocationAdmission>> {
+    INVOCATION_ADMISSION.try_with(Arc::clone).ok()
+}
+
+/// Scope belongs to one invocation tree, not to a globally shared provider or registry.
+pub async fn scope_invocation_admission<F: Future>(
+    admission: Arc<dyn InvocationAdmission>,
+    future: F,
+) -> F::Output {
+    INVOCATION_ADMISSION.scope(admission, future).await
+}
+
+struct Attempt {
+    admission: Arc<dyn InvocationAdmission>,
+    id: String,
+    settled: bool,
+    dispatched: bool,
+    bound: Option<ProviderCostBound>,
+}
+
+impl Attempt {
+    // Acknowledgement precedes execution, including auxiliary consumers with frozen provider handles.
+    async fn admit(
+        provider: &dyn LLMProvider,
+        messages: &[ChatMessage],
+        config: Option<&LLMConfig>,
+        tools: Option<&LLMToolRequest>,
+        streaming: bool,
+    ) -> Result<Option<Self>, LLMError> {
+        if crate::validate_invocation_evidence().is_err()
+            || crate::current_invocation_bounds().is_some_and(|bounds| bounds.remaining().is_zero())
+        {
+            return Err(LLMError::Other(
+                "validation invocation deadline exceeded before provider admission".into(),
+            ));
+        }
+        let Some(admission) = current_invocation_admission() else {
+            return Ok(None);
+        };
+        let bound = if admission.requires_priced_llm() {
+            let request_id = uuid::Uuid::new_v4().to_string();
+            let bound = provider
+                .request_cost_bound(&ProviderRequest {
+                    request_id: &request_id,
+                    messages,
+                    config,
+                    tools,
+                    streaming,
+                })
+                .inspect_err(|_| admission.reject_priced_request())?;
+            if let Some(bound) = &bound {
+                bound
+                    .validate(&request_id)
+                    .inspect_err(|_| admission.reject_priced_request())?;
+            }
+            bound
+        } else {
+            None
+        };
+        let id = admission.admit_priced_llm(bound.clone()).await?;
+        Ok(Some(Self {
+            admission,
+            id,
+            settled: false,
+            dispatched: false,
+            bound,
+        }))
+    }
+
+    // Failed settlement retains the admitted marker; it is never converted into a refund or cached success.
+    async fn settle(&mut self, result: serde_json::Value) -> Result<(), LLMError> {
+        self.admission
+            .settle_priced_llm(&self.id, result, None)
+            .await?;
+        self.settled = true;
+        Ok(())
+    }
+
+    // Billing comes only from the conforming implementation and must match the exact admitted request.
+    async fn settle_response(
+        &mut self,
+        provider: &dyn LLMProvider,
+        result: &Result<LLMResponse, LLMError>,
+    ) -> Result<(), LLMError> {
+        let settlement: Option<ProviderCostSettlement> = match (&self.bound, result) {
+            (Some(bound), Ok(response)) => provider.settle_request_cost(bound, response)?,
+            _ => None,
+        };
+        if let (Some(bound), Some(settlement)) = (&self.bound, &settlement) {
+            validate_cost_settlement(bound, settlement)?;
+        }
+        let data = match result {
+            Ok(response) => serde_json::json!({"response":response}),
+            Err(error) => serde_json::json!({"error":error.to_string()}),
+        };
+        self.admission
+            .settle_priced_llm(&self.id, data, settlement)
+            .await?;
+        self.settled = true;
+        Ok(())
+    }
+
+    // Final stream billing uses a distinct capability; unary hooks must never receive a fabricated ordinary response.
+    async fn settle_stream(
+        &mut self,
+        provider: &dyn LLMProvider,
+        usage: Option<&ai_agents_core::TokenUsage>,
+    ) -> Result<(), LLMError> {
+        let settlement = self
+            .bound
+            .as_ref()
+            .map(|bound| provider.settle_stream_request_cost(bound, usage))
+            .transpose()?
+            .flatten();
+        if let (Some(bound), Some(settlement)) = (&self.bound, &settlement) {
+            validate_cost_settlement(bound, settlement)?;
+        }
+        self.admission
+            .settle_priced_llm(
+                &self.id,
+                serde_json::json!({"stream_finished":true}),
+                settlement,
+            )
+            .await?;
+        self.settled = true;
+        Ok(())
+    }
+}
+
+impl Drop for Attempt {
+    // Dispatch may have occurred, so abandoned work remains charged even when its speculative branch loses.
+    fn drop(&mut self) {
+        if !self.settled {
+            self.admission.abandon_llm(&self.id);
+        }
+    }
+}
+
+// Result eligibility is separate from settlement: an acknowledged late result stays charged but cannot be exposed as successful work.
+// Sample clocks after synchronous proof and host checks so neither may consume the allowance and admit a late body.
+fn check_provider_result(admission: Option<&Arc<dyn InvocationAdmission>>) -> Result<(), LLMError> {
+    let proof = crate::invocation_bounds::validate_dispatched_evidence();
+    let stopped = admission.is_some_and(|admission| admission.execution_stopped());
+    let remaining = admission.and_then(|admission| admission.remaining_duration());
+    if proof.is_err()
+        || stopped
+        || remaining.is_some_and(|duration| duration.is_zero())
+        || crate::current_invocation_bounds().is_some_and(|bounds| bounds.remaining().is_zero())
+    {
+        Err(LLMError::Other(
+            "provider result exceeded its original authority".into(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+// Final admission rechecks the shrinking run allowance after synchronous host proof sampling.
+// A known pre-dispatch stop refunds only its own acknowledged attempt; stream/body drops after dispatch retain uncertainty.
+async fn bounded_provider<F: Future>(
+    mut attempt: Option<&mut Attempt>,
+    future: F,
+) -> Result<F::Output, LLMError> {
+    let bounds = crate::current_invocation_bounds();
+    let admission = attempt.as_ref().map(|attempt| attempt.admission.clone());
+    if admission
+        .as_ref()
+        .is_some_and(|admission| admission.execution_stopped())
+    {
+        if let Some(attempt) = attempt.as_mut()
+            && !attempt.dispatched
+        {
+            attempt
+                .settle(serde_json::json!({"not_invoked":true}))
+                .await?;
+        }
+        return Err(LLMError::Other("task execution stopped".into()));
+    }
+    let remaining = match (
+        admission
+            .as_ref()
+            .and_then(|admission| admission.remaining_duration()),
+        bounds.map(|b| b.remaining()),
+    ) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    };
+    let work = async {
+        let mut dispatched = attempt.as_ref().is_some_and(|attempt| attempt.dispatched);
+        let mut future = std::pin::pin!(future);
+        let result = std::future::poll_fn(|cx| {
+            let proof = if dispatched {
+                crate::invocation_bounds::validate_dispatched_evidence()
+            } else {
+                crate::validate_invocation_evidence()
+            };
+            let stopped = admission
+                .as_ref()
+                .is_some_and(|admission| admission.execution_stopped());
+            let remaining = admission
+                .as_ref()
+                .and_then(|admission| admission.remaining_duration());
+            if proof.is_err()
+                || stopped
+                || remaining.is_some_and(|duration| duration.is_zero())
+                || bounds.is_some_and(|bounds| bounds.remaining().is_zero())
+            {
+                return std::task::Poll::Ready(Err(LLMError::Other(
+                    "validation proof or original deadline changed before provider poll".into(),
+                )));
+            }
+            // Only this final non-awaiting boundary proves dispatch; a rejected first poll remains an acknowledged non-invocation.
+            if let Some(attempt) = attempt.as_mut() {
+                attempt.dispatched = true;
+            }
+            dispatched = true;
+            future.as_mut().poll(cx).map(Ok)
+        })
+        .await;
+        if result.is_err()
+            && !dispatched
+            && let Some(attempt) = attempt.as_mut()
+        {
+            attempt
+                .settle(serde_json::json!({"not_invoked":true}))
+                .await?;
+        }
+        let result = result?;
+        // Cooperative timeouts cannot preempt a synchronous poll; reject its late result without inventing non-invocation or cleanup.
+        check_provider_result(admission.as_ref())?;
+        Ok(result)
+    };
+    let monitored = async {
+        let mut work = Box::pin(work);
+        if let Some(admission) = admission.clone() {
+            let mut tick = tokio::time::interval(std::time::Duration::from_millis(10));
+            loop {
+                tokio::select! {
+                    biased;
+                    result = &mut work => return result,
+                    _ = tick.tick() => if check_provider_result(Some(&admission)).is_err() {
+                        return Err(LLMError::Other("task execution stopped".into()));
+                    }
+                }
+            }
+        } else {
+            work.await
+        }
+    };
+    if let Some(duration) = remaining {
+        tokio::time::timeout(duration, monitored)
+            .await
+            .map_err(|_| LLMError::Other("task provider deadline exceeded".into()))?
+    } else {
+        monitored.await
+    }
+}
+
+/// Accounts direct borrowed auxiliary providers without replacing captured handles or charging an already managed layer twice.
+pub async fn managed_completion(
+    provider: &dyn LLMProvider,
+    messages: &[ChatMessage],
+    config: Option<&LLMConfig>,
+) -> Result<LLMResponse, LLMError> {
+    if provider.manages_invocation_admission() {
+        return provider.complete(messages, config).await;
+    }
+    let mut attempt = Attempt::admit(provider, messages, config, None, false).await?;
+    let result = bounded_provider(attempt.as_mut(), provider.complete(messages, config)).await?;
+    if let Some(attempt) = &mut attempt {
+        attempt.settle_response(provider, &result).await?;
+    }
+    check_provider_result(attempt.as_ref().map(|attempt| &attempt.admission))?;
+    result
+}
+
+struct ManagedProvider {
+    inner: Arc<dyn LLMProvider>,
+}
+
+/// Installs one transparent admission layer before consumers freeze handles; ordinary calls remain unchanged.
+pub fn managed_provider(provider: Arc<dyn LLMProvider>) -> Arc<dyn LLMProvider> {
+    if provider.manages_invocation_admission() {
+        provider
+    } else {
+        Arc::new(ManagedProvider { inner: provider })
+    }
+}
+
+#[async_trait]
+impl LLMProvider for ManagedProvider {
+    /// Each retry/fallback call enters separately; cached provider configuration stays owned by the inner adapter.
+    async fn complete(
+        &self,
+        messages: &[ChatMessage],
+        config: Option<&LLMConfig>,
+    ) -> Result<LLMResponse, LLMError> {
+        let mut attempt =
+            Attempt::admit(self.inner.as_ref(), messages, config, None, false).await?;
+        let result =
+            bounded_provider(attempt.as_mut(), self.inner.complete(messages, config)).await?;
+        if let Some(attempt) = &mut attempt {
+            attempt
+                .settle_response(self.inner.as_ref(), &result)
+                .await?;
+        }
+        check_provider_result(attempt.as_ref().map(|attempt| &attempt.admission))?;
+        result
+    }
+
+    /// Native definitions are passed unchanged through the same attempt boundary as normal completion.
+    async fn complete_with_tools(
+        &self,
+        messages: &[ChatMessage],
+        config: Option<&LLMConfig>,
+        request: &LLMToolRequest,
+    ) -> Result<LLMResponse, LLMError> {
+        let mut attempt =
+            Attempt::admit(self.inner.as_ref(), messages, config, Some(request), false).await?;
+        let result = bounded_provider(
+            attempt.as_mut(),
+            self.inner.complete_with_tools(messages, config, request),
+        )
+        .await?;
+        if let Some(attempt) = &mut attempt {
+            attempt
+                .settle_response(self.inner.as_ref(), &result)
+                .await?;
+        }
+        check_provider_result(attempt.as_ref().map(|attempt| &attempt.admission))?;
+        result
+    }
+
+    /// The attempt survives stream opening and settles only on EOF/error; dropping it retains uncertainty.
+    async fn complete_stream(
+        &self,
+        messages: &[ChatMessage],
+        config: Option<&LLMConfig>,
+    ) -> Result<Box<dyn futures::Stream<Item = Result<LLMChunk, LLMError>> + Unpin + Send>, LLMError>
+    {
+        let bounds = crate::current_invocation_bounds();
+        let evidence = crate::current_invocation_evidence();
+        let mut attempt = Attempt::admit(self.inner.as_ref(), messages, config, None, true).await?;
+        let source = match bounded_provider(
+            attempt.as_mut(),
+            self.inner.complete_stream(messages, config),
+        )
+        .await?
+        {
+            Ok(source) => source,
+            Err(error) => {
+                if let Some(attempt) = &mut attempt {
+                    attempt
+                        .settle(serde_json::json!({"error":error.to_string()}))
+                        .await?;
+                }
+                return Err(error);
+            }
+        };
+        if attempt.is_none() && bounds.is_none() && evidence.is_empty() {
+            return Ok(source);
+        }
+        use futures::StreamExt;
+        let provider = self.inner.clone();
+        let stream = futures::stream::unfold(
+            (source, attempt, false, bounds, None),
+            move |(mut source, mut attempt, done, bounds, mut final_usage)| {
+                let evidence = evidence.clone();
+                let provider = provider.clone();
+                async move {
+                    crate::scope_invocation_evidence(
+                        evidence,
+                        crate::scope_invocation_bounds(bounds, async move {
+                            if done {
+                                return None;
+                            }
+                            // EOF/error acknowledgement belongs to the same captured restriction scope as the returned stream body.
+                            let next = match bounded_provider(attempt.as_mut(), source.next()).await
+                            {
+                                Ok(next) => next,
+                                Err(error) => {
+                                    return Some((
+                                        Err(error),
+                                        (source, attempt, true, bounds, final_usage),
+                                    ));
+                                }
+                            };
+                            match next {
+                                Some(Ok(chunk)) => {
+                                    // Only an explicit final receipt may become billing evidence; partial frames never release a bound.
+                                    if chunk.is_final {
+                                        final_usage = chunk.usage;
+                                    }
+                                    Some((Ok(chunk), (source, attempt, false, bounds, final_usage)))
+                                }
+                                Some(Err(error)) => {
+                                    let settlement = if let Some(attempt) = &mut attempt {
+                                        attempt
+                                            .settle(serde_json::json!({"error":error.to_string()}))
+                                            .await
+                                    } else {
+                                        Ok(())
+                                    };
+                                    Some((
+                                        Err(settlement.err().unwrap_or(error)),
+                                        (source, attempt, true, bounds, final_usage),
+                                    ))
+                                }
+                                None => {
+                                    if let Some(admitted) = &mut attempt
+                                        && let Err(error) = admitted
+                                            .settle_stream(provider.as_ref(), final_usage.as_ref())
+                                            .await
+                                    {
+                                        return Some((
+                                            Err(error),
+                                            (source, attempt, true, bounds, final_usage),
+                                        ));
+                                    }
+                                    if let Err(error) = check_provider_result(
+                                        attempt.as_ref().map(|attempt| &attempt.admission),
+                                    ) {
+                                        return Some((
+                                            Err(error),
+                                            (source, attempt, true, bounds, final_usage),
+                                        ));
+                                    }
+                                    None
+                                }
+                            }
+                        }),
+                    )
+                    .await
+                }
+            },
+        );
+        Ok(Box::new(Box::pin(stream)))
+    }
+
+    /// Wrapper identity does not replace the underlying provider's public identity.
+    fn provider_name(&self) -> &str {
+        self.inner.provider_name()
+    }
+    /// Capability probing is unchanged by invocation accounting.
+    fn supports(&self, feature: LLMFeature) -> bool {
+        self.inner.supports(feature)
+    }
+    /// Consumer-side wrapping is idempotent, including inherited and observed registries.
+    fn manages_invocation_admission(&self) -> bool {
+        true
+    }
+    fn priced_capability_identity(&self) -> Option<String> {
+        self.inner.priced_capability_identity()
+    }
+    fn request_cost_bound(
+        &self,
+        request: &ProviderRequest<'_>,
+    ) -> Result<Option<ProviderCostBound>, LLMError> {
+        self.inner.request_cost_bound(request)
+    }
+    fn settle_request_cost(
+        &self,
+        bound: &ProviderCostBound,
+        response: &LLMResponse,
+    ) -> Result<Option<ProviderCostSettlement>, LLMError> {
+        self.inner.settle_request_cost(bound, response)
+    }
+
+    fn settle_stream_request_cost(
+        &self,
+        bound: &ProviderCostBound,
+        usage: Option<&ai_agents_core::TokenUsage>,
+    ) -> Result<Option<ProviderCostSettlement>, LLMError> {
+        self.inner.settle_stream_request_cost(bound, usage)
+    }
+
+    /// Tool choice remains a provider selection contract, never an execution grant.
+    fn configured_tool_choice(&self) -> Option<ToolChoice> {
+        self.inner.configured_tool_choice()
+    }
+    /// Native-choice readiness remains owned by the actual provider implementation.
+    fn supports_tool_choice(&self, choice: &ToolChoice) -> bool {
+        self.inner.supports_tool_choice(choice)
+    }
+    /// Run stops and closed branch-local restrictions prohibit new retry/backoff/fallback without stopping unrelated winning work.
+    fn is_terminal_error(&self, error: &LLMError) -> bool {
+        current_invocation_admission().is_some_and(|scope| scope.execution_stopped())
+            || crate::validate_invocation_evidence().is_err()
+            || crate::current_invocation_bounds().is_some_and(|bounds| bounds.remaining().is_zero())
+            || self.inner.is_terminal_error(error)
+    }
+}

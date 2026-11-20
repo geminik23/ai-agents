@@ -13,6 +13,12 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::google::GoogleProvider;
+use super::pricing::DeclaredPricing;
+use ai_agents_core::autonomy::{ProviderCostBound, ProviderCostSettlement, ProviderRequest};
+
+#[cfg(test)]
+#[path = "pricing_tests.rs"]
+mod pricing_tests;
 
 static NEXT_NORMALIZED_TOOL_CALL_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -126,6 +132,7 @@ impl FromStr for ProviderType {
 struct CachedClient {
     llm: Box<dyn llm::LLMProvider>,
     config_hash: u64,
+    config_key: serde_json::Value,
 }
 
 pub struct UnifiedLLMProvider {
@@ -138,6 +145,7 @@ pub struct UnifiedLLMProvider {
     tool_choice: Option<ToolChoice>,
     client: std::sync::Arc<tokio::sync::Mutex<Option<CachedClient>>>,
     google: Option<GoogleProvider>,
+    pricing: Option<DeclaredPricing>,
 }
 
 impl std::fmt::Debug for UnifiedLLMProvider {
@@ -154,6 +162,32 @@ impl std::fmt::Debug for UnifiedLLMProvider {
             .field("google", &self.google)
             .finish()
     }
+}
+
+/// Keeps typed settings and extra fallbacks distinct so flattening or hash collisions cannot select a foreign client.
+fn request_config_key(
+    config: &LLMConfig,
+    system_prompt: Option<&str>,
+    tool_choice: Option<&ToolChoice>,
+    tools: Option<&[LLMToolDefinition]>,
+) -> Result<serde_json::Value, LLMError> {
+    let mut typed = config.clone();
+    typed.extra.clear();
+    let float_bits = [
+        config.temperature.map(f32::to_bits),
+        config.top_p.map(f32::to_bits),
+        config.frequency_penalty.map(f32::to_bits),
+        config.presence_penalty.map(f32::to_bits),
+    ];
+    serde_json::to_value((
+        typed,
+        &config.extra,
+        float_bits,
+        system_prompt,
+        tool_choice,
+        tools,
+    ))
+    .map_err(|error| LLMError::Config(format!("cannot bind request configuration: {error}")))
 }
 
 /// Compute a hash over the config fields that affect the LLM builder, plus the system prompt.
@@ -192,6 +226,10 @@ fn compute_config_hash(
     }
     // Extra keys forwarded to the builder
     const FORWARDED_EXTRA_KEYS: &[&str] = &[
+        "timeout_seconds",
+        "reasoning",
+        "reasoning_effort",
+        "reasoning_budget_tokens",
         "normalize_response",
         "api_version",
         "deployment_id",
@@ -525,7 +563,14 @@ impl UnifiedLLMProvider {
             None
         };
 
-        Ok(Self {
+        let pricing = default_config
+            .extra
+            .get("declared_pricing")
+            .cloned()
+            .map(serde_json::from_value::<DeclaredPricing>)
+            .transpose()
+            .map_err(|_| LLMError::Config("invalid declared_pricing contract".into()))?;
+        let mut provider = Self {
             provider_type,
             model: model.to_string(),
             api_key: Some(actual_api_key),
@@ -535,7 +580,12 @@ impl UnifiedLLMProvider {
             tool_choice: None,
             client: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
             google,
-        })
+            pricing: None,
+        };
+        if let Some(pricing) = pricing {
+            provider = provider.with_declared_pricing(pricing)?;
+        }
+        Ok(provider)
     }
 
     pub fn from_env(
@@ -995,6 +1045,41 @@ impl UnifiedLLMProvider {
             .map_err(|e| LLMError::Config(format!("Failed to build LLM: {}", e)))
     }
 
+    /// Installs an immutable audited model/endpoint contract before registry consumers capture this provider.
+    /// Unsupported upstream transports remain usable without hard pricing, but cannot advertise an unverified priced capability.
+    pub fn with_declared_pricing(mut self, pricing: DeclaredPricing) -> Result<Self, LLMError> {
+        let endpoint = self.priced_endpoint()?;
+        pricing.validate(&self.model, &endpoint)?;
+        self.pricing = Some(pricing);
+        Ok(self)
+    }
+
+    // Only transports whose actual endpoint selection and request-class mapping are audited participate here.
+    fn priced_endpoint(&self) -> Result<String, LLMError> {
+        if let Some(google) = &self.google {
+            return Ok(google.accounting_endpoint().to_owned());
+        }
+        let default = match self.provider_type {
+            ProviderType::OpenAI => "https://api.openai.com/v1/",
+            ProviderType::OpenAICompatible => "",
+            ProviderType::Google => "https://generativelanguage.googleapis.com/v1beta/",
+            ProviderType::Groq => "https://api.groq.com/openai/v1/",
+            ProviderType::Cohere => "https://api.cohere.ai/compatibility/v1/",
+            ProviderType::Mistral => "https://api.mistral.ai/v1/",
+            ProviderType::OpenRouter => "https://openrouter.ai/api/v1/",
+            _ => {
+                return Err(LLMError::Config(
+                    "this upstream adapter has no audited hard-priced dispatch contract".into(),
+                ));
+            }
+        };
+        // Match the exact normalization performed by the pinned OpenAI-compatible upstream implementation.
+        let raw = self.base_url.as_deref().unwrap_or(default);
+        reqwest::Url::parse(&format!("{}/", raw.trim_end_matches('/')))
+            .map(|url| url.to_string())
+            .map_err(|_| LLMError::Config("invalid priced endpoint".into()))
+    }
+
     /// Public backward-compatible `build_llm` — used by tests and legacy call-sites.
     pub fn build_llm(
         &self,
@@ -1004,31 +1089,31 @@ impl UnifiedLLMProvider {
         self.build_llm_with_system(cfg, None, None, None)
     }
 
-    /// Ensure the cached client is built (or rebuilt) for the given config + system prompt.
-    /// Returns after the cache is populated; callers should then lock and use `self.client`.
-    async fn ensure_client(
+    /// Holds the request-specific client lock through use so concurrent requests cannot replace its prompt or config after validation.
+    async fn client_for_request(
         &self,
         config: Option<&LLMConfig>,
         system_prompt: Option<&str>,
         tool_choice: Option<&ToolChoice>,
         tools: Option<&[LLMToolDefinition]>,
-    ) -> Result<(), LLMError> {
+    ) -> Result<tokio::sync::MutexGuard<'_, Option<CachedClient>>, LLMError> {
         let cfg = config.unwrap_or(&self.default_config);
         let hash = compute_config_hash(cfg, system_prompt, tool_choice, tools);
+        let config_key = request_config_key(cfg, system_prompt, tool_choice, tools)?;
 
         let mut lock = self.client.lock().await;
-        if let Some(ref cached) = *lock
-            && cached.config_hash == hash
+        if lock
+            .as_ref()
+            .is_none_or(|cached| cached.config_hash != hash || cached.config_key != config_key)
         {
-            return Ok(());
+            let llm = self.build_llm_with_system(cfg, system_prompt, tool_choice, tools)?;
+            *lock = Some(CachedClient {
+                llm,
+                config_hash: hash,
+                config_key,
+            });
         }
-        // Build a new client
-        let llm = self.build_llm_with_system(cfg, system_prompt, tool_choice, tools)?;
-        *lock = Some(CachedClient {
-            llm,
-            config_hash: hash,
-        });
-        Ok(())
+        Ok(lock)
     }
 }
 
@@ -1051,15 +1136,10 @@ impl LLMProvider for UnifiedLLMProvider {
             .map(|m| self.convert_message(m))
             .collect();
 
-        // Ensure client is built for this config + system prompt
-        self.ensure_client(config, system_prompt.as_deref(), None, None)
+        let lock = self
+            .client_for_request(config, system_prompt.as_deref(), None, None)
             .await?;
-
-        // Use the cached client
-        let lock = self.client.lock().await;
-        let cached = lock
-            .as_ref()
-            .expect("client must be built after ensure_client");
+        let cached = lock.as_ref().expect("client must be built under this lock");
 
         let response = cached
             .llm
@@ -1125,17 +1205,15 @@ impl LLMProvider for UnifiedLLMProvider {
             .map(map_tool_definition)
             .collect::<Vec<_>>();
 
-        self.ensure_client(
-            config,
-            system_prompt.as_deref(),
-            Some(choice),
-            Some(&request.tools),
-        )
-        .await?;
-        let lock = self.client.lock().await;
-        let cached = lock
-            .as_ref()
-            .expect("client must be built after ensure_client");
+        let lock = self
+            .client_for_request(
+                config,
+                system_prompt.as_deref(),
+                Some(choice),
+                Some(&request.tools),
+            )
+            .await?;
+        let cached = lock.as_ref().expect("client must be built under this lock");
         let response = cached
             .llm
             .chat_with_tools(&llm_messages, Some(&tools))
@@ -1183,22 +1261,17 @@ impl LLMProvider for UnifiedLLMProvider {
             .map(|m| self.convert_message(m))
             .collect();
 
-        // Ensure client is built for this config + system prompt
-        self.ensure_client(config, system_prompt.as_deref(), None, None)
-            .await?;
-
-        // Acquire lock, call chat_stream, get owned stream, then release lock
+        // Keep the selected client stable until stream creation returns its owned stream.
         let stream = {
-            let lock = self.client.lock().await;
-            let cached = lock
-                .as_ref()
-                .expect("client must be built after ensure_client");
+            let lock = self
+                .client_for_request(config, system_prompt.as_deref(), None, None)
+                .await?;
+            let cached = lock.as_ref().expect("client must be built under this lock");
             cached
                 .llm
                 .chat_stream(&llm_messages)
                 .await
                 .map_err(|e| self.map_llm_crate_error(e))?
-            // lock is dropped here at end of block
         };
 
         let provider_type = self.provider_type;
@@ -1216,6 +1289,81 @@ impl LLMProvider for UnifiedLLMProvider {
         }));
 
         Ok(Box::new(Box::pin(final_stream)))
+    }
+
+    fn priced_capability_identity(&self) -> Option<String> {
+        self.pricing
+            .as_ref()
+            .map(|pricing| pricing.identity(self.provider_name()))
+    }
+
+    fn request_cost_bound(
+        &self,
+        request: &ProviderRequest<'_>,
+    ) -> Result<Option<ProviderCostBound>, LLMError> {
+        let Some(pricing) = &self.pricing else {
+            return Ok(None);
+        };
+        // Run the same conversion and local protocol validation used by dispatch before admitting any paid attempt.
+        if let Some(google) = &self.google {
+            google.validate_priced_request(request)?;
+        } else {
+            let projected = Self::project_foreign_messages(request.messages)?;
+            let (_, non_system) = extract_system_and_messages(&projected);
+            if let Some(tools) = request.tools {
+                self.convert_messages_with_tools(&non_system)?;
+                if !self.supports_tool_choice(&tools.choice)
+                    || (matches!(tools.choice, ToolChoice::Required | ToolChoice::Specific(_))
+                        && tools.tools.is_empty())
+                    || matches!(&tools.choice, ToolChoice::Specific(name) if !tools.tools.iter().any(|tool| &tool.name == name))
+                {
+                    return Err(LLMError::Config(
+                        "unsupported priced native tool choice".into(),
+                    ));
+                }
+            } else {
+                for message in non_system {
+                    self.convert_message(message);
+                }
+            }
+        }
+        pricing
+            .quote(self.provider_name(), request, &self.default_config)
+            .map(Some)
+    }
+
+    fn settle_request_cost(
+        &self,
+        bound: &ProviderCostBound,
+        response: &LLMResponse,
+    ) -> Result<Option<ProviderCostSettlement>, LLMError> {
+        self.pricing.as_ref().map_or(Ok(None), |pricing| {
+            pricing.settle(self.provider_name(), bound, response)
+        })
+    }
+
+    fn settle_stream_request_cost(
+        &self,
+        bound: &ProviderCostBound,
+        usage: Option<&TokenUsage>,
+    ) -> Result<Option<ProviderCostSettlement>, LLMError> {
+        let Some(pricing) = &self.pricing else {
+            return Ok(None);
+        };
+        // Only GenerateContent currently preserves a complete raw final billing receipt through stream normalization.
+        if self.provider_type != ProviderType::Google {
+            return Ok(None);
+        }
+        let Some(usage) = usage else {
+            return Ok(None);
+        };
+        let mut response = LLMResponse::new("", FinishReason::Stop);
+        response.usage = Some(*usage);
+        response.metadata.insert(
+            "_ai_agents_complete_priced_usage".into(),
+            serde_json::Value::Bool(true),
+        );
+        pricing.settle(self.provider_name(), bound, &response)
     }
 
     fn provider_name(&self) -> &str {
@@ -1378,6 +1526,8 @@ impl Default for ProviderBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     #[test]
     fn test_builder() {
@@ -1491,6 +1641,196 @@ mod tests {
         let (system_prompt, non_system) = extract_system_and_messages(&messages);
         assert!(system_prompt.is_none());
         assert_eq!(non_system.len(), 2);
+    }
+
+    // Serves two bounded, local OpenAI responses and captures the requests actually dispatched.
+    async fn local_chat_fixture() -> (
+        String,
+        tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>,
+    ) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let header_end = loop {
+                    let mut buffer = [0; 4096];
+                    let size = socket.read(&mut buffer).await.unwrap();
+                    assert!(size > 0, "request ended before HTTP headers");
+                    request.extend_from_slice(&buffer[..size]);
+                    if let Some(index) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                        break index + 4;
+                    }
+                };
+                let headers = std::str::from_utf8(&request[..header_end]).unwrap();
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().unwrap())
+                    })
+                    .unwrap();
+                while request.len() - header_end < content_length {
+                    let mut buffer = [0; 4096];
+                    let size = socket.read(&mut buffer).await.unwrap();
+                    assert!(size > 0, "request ended before HTTP body");
+                    request.extend_from_slice(&buffer[..size]);
+                }
+                let body: serde_json::Value =
+                    serde_json::from_slice(&request[header_end..header_end + content_length])
+                        .unwrap();
+                let streaming = body["stream"] == true;
+                sender.send(body).unwrap();
+                let content_type = if streaming {
+                    "text/event-stream"
+                } else {
+                    "application/json"
+                };
+                let response_body = if streaming {
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n"
+                } else {
+                    "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"ok\"}}]}"
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
+                    response_body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+                socket.shutdown().await.unwrap();
+            }
+        });
+        (format!("http://{address}/v1/"), receiver)
+    }
+
+    // Makes the lock requests contend in a known order before checking the actual provider payloads.
+    #[tokio::test]
+    async fn concurrent_requests_dispatch_with_their_own_client_config() {
+        async fn dispatch(provider: &UnifiedLLMProvider, kind: &str, name: &str, max_tokens: u32) {
+            let messages = [
+                ChatMessage::system(format!("system {name}")),
+                ChatMessage::user("hi"),
+            ];
+            let config = LLMConfig {
+                max_tokens: Some(max_tokens),
+                ..LLMConfig::default()
+            };
+            match kind {
+                "complete" => {
+                    provider.complete(&messages, Some(&config)).await.unwrap();
+                }
+                "native" => {
+                    let request = LLMToolRequest {
+                        choice: ToolChoice::Auto,
+                        tools: vec![LLMToolDefinition {
+                            name: name.to_string(),
+                            description: "Test tool".to_string(),
+                            input_schema: serde_json::json!({"type": "object"}),
+                        }],
+                    };
+                    provider
+                        .complete_with_tools(&messages, Some(&config), &request)
+                        .await
+                        .unwrap();
+                }
+                "stream" => {
+                    let mut stream = provider
+                        .complete_stream(&messages, Some(&config))
+                        .await
+                        .unwrap();
+                    while let Some(chunk) = stream.next().await {
+                        chunk.unwrap();
+                    }
+                }
+                _ => unreachable!(),
+            }
+        }
+
+        for kind in ["complete", "native", "stream"] {
+            let (base_url, mut received) = local_chat_fixture().await;
+            let provider = ProviderBuilder::new()
+                .provider(ProviderType::OpenAI)
+                .model("test-model")
+                .api_key("test-key")
+                .base_url(base_url)
+                .build()
+                .unwrap();
+            let guard = provider.client.lock().await;
+            let mut first = Box::pin(dispatch(&provider, kind, "first", 20));
+            let mut second = Box::pin(dispatch(&provider, kind, "second", 200));
+            assert!(futures::poll!(first.as_mut()).is_pending());
+            assert!(futures::poll!(second.as_mut()).is_pending());
+            drop(guard);
+
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                tokio::join!(first, second);
+                for (name, max_tokens) in [("first", 20), ("second", 200)] {
+                    let body = received.recv().await.unwrap();
+                    assert!(body.to_string().contains(&format!("system {name}")));
+                    assert_eq!(body["max_completion_tokens"], max_tokens);
+                    if kind == "native" {
+                        assert_eq!(body["tools"][0]["function"]["name"], name);
+                        assert_eq!(body["tool_choice"], "auto");
+                    }
+                }
+            })
+            .await
+            .expect("local provider fixture did not complete");
+        }
+    }
+
+    #[tokio::test]
+    async fn prepared_client_stays_bound_to_its_request_until_use() {
+        let provider = ProviderBuilder::new()
+            .provider(ProviderType::OpenAI)
+            .model("test-model")
+            .api_key("test-key")
+            .build()
+            .unwrap();
+        let first = LLMConfig {
+            max_tokens: Some(20),
+            ..LLMConfig::default()
+        };
+        let second = LLMConfig {
+            max_tokens: Some(200),
+            ..LLMConfig::default()
+        };
+        let tools = [LLMToolDefinition {
+            name: "lookup".to_string(),
+            description: "Look up data".to_string(),
+            input_schema: serde_json::json!({"type": "object"}),
+        }];
+        let expected = compute_config_hash(
+            &first,
+            Some("first system prompt"),
+            Some(&ToolChoice::Auto),
+            Some(&tools),
+        );
+        let first_client = provider
+            .client_for_request(
+                Some(&first),
+                Some("first system prompt"),
+                Some(&ToolChoice::Auto),
+                Some(&tools),
+            )
+            .await
+            .unwrap();
+        let mut replacement = Box::pin(provider.client_for_request(
+            Some(&second),
+            Some("second system prompt"),
+            None,
+            None,
+        ));
+        assert!(futures::poll!(replacement.as_mut()).is_pending());
+        assert_eq!(first_client.as_ref().unwrap().config_hash, expected);
+        drop(first_client);
+
+        let second_client = replacement.await.unwrap();
+        let expected_second =
+            compute_config_hash(&second, Some("second system prompt"), None, None);
+        assert_eq!(second_client.as_ref().unwrap().config_hash, expected_second);
     }
 
     #[test]
@@ -1619,6 +1959,56 @@ mod tests {
         let hash_a = compute_config_hash(&config_a, None, None, None);
         let hash_b = compute_config_hash(&config_b, None, None, None);
         assert_ne!(hash_a, hash_b);
+    }
+
+    // Legacy extra settings are actual builder inputs and must participate in exact client selection.
+    #[tokio::test]
+    async fn extra_fallback_settings_remain_bound_to_the_actual_cached_client() {
+        let provider = ProviderBuilder::new()
+            .provider(ProviderType::OpenAI)
+            .model("o3")
+            .api_key("fixture")
+            .build()
+            .unwrap();
+        let initial = LLMConfig::default();
+        let expected_initial = request_config_key(&initial, None, None, None).unwrap();
+        for (key, value) in [
+            ("timeout_seconds", serde_json::json!(120)),
+            ("reasoning", serde_json::json!(true)),
+            ("reasoning_effort", serde_json::json!("high")),
+            ("reasoning_budget_tokens", serde_json::json!(4096)),
+        ] {
+            let config = initial.clone().with_extra(key, value);
+            let client = provider
+                .client_for_request(Some(&config), None, None, None)
+                .await
+                .unwrap();
+            let expected = request_config_key(&config, None, None, None).unwrap();
+            assert_ne!(expected, expected_initial);
+            assert_eq!(client.as_ref().unwrap().config_key, expected);
+            assert_ne!(
+                compute_config_hash(&initial, None, None, None),
+                compute_config_hash(&config, None, None, None)
+            );
+        }
+    }
+
+    // Flattened extras cannot hide a differing authoritative typed field in an exact cache key.
+    #[test]
+    fn request_key_distinguishes_typed_fields_from_shadowing_extras() {
+        let first = LLMConfig {
+            reasoning: Some(false),
+            ..LLMConfig::default()
+        }
+        .with_extra("reasoning", serde_json::json!(true));
+        let second = LLMConfig {
+            reasoning: Some(true),
+            ..first.clone()
+        };
+        assert_ne!(
+            request_config_key(&first, None, None, None).unwrap(),
+            request_config_key(&second, None, None, None).unwrap()
+        );
     }
 
     #[test]

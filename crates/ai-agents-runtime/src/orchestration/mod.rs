@@ -8,6 +8,7 @@ pub mod group_chat;
 pub mod handoff;
 pub mod pipeline;
 pub mod route;
+pub(crate) mod task_tools;
 pub mod tools;
 pub mod types;
 

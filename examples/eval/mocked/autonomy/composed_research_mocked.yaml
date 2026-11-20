@@ -1,0 +1,26 @@
+name: Composed Research Retained Prefix
+agent: ../../../yaml/autonomy/composed_research.yaml
+settings: {timeout_per_turn_ms: 10000, retries: 0}
+fixtures:
+  llm:
+    mode: mock
+    responses_by_alias:
+      default:
+        - Settled finding from one researcher.
+        - '{"tool":"ask_user","arguments":{"question":"Confirm the other finding","options":["yes"]}}'
+        - Confirmed finding from the paused researcher.
+      router: [aggregated research from both settled findings]
+scenarios:
+  - id: completed-sibling-and-aggregator-share-the-original-four-call-cap
+    steps:
+      - !task
+        operation: {action: run, objective: Research with both specialists.}
+        assert: {task: {status: paused, pending_kind: user_question, counters: {path: llm_attempts, eq: 2}, event_result_parity: true}}
+      - !task
+        operation: {action: resume, response: {kind: answer, value: {answered: true, selected: [yes]}}}
+        assert:
+          all:
+            - task: {status: completed, same_run: true, counters: {path: llm_attempts, eq: 4}, event_result_parity: true}
+            - orchestration: {type: concurrent, agents_include: [source_a, source_b]}
+            - response_contains: aggregated research
+            - tool_called: {id: ask_user, count: 1, executed: true, success: true}

@@ -158,6 +158,7 @@ mod tests {
     fn create_test_skills() -> Vec<SkillDefinition> {
         vec![
             SkillDefinition {
+                autonomy: None,
                 id: "weather_clothes".to_string(),
                 description: "Recommend clothes based on weather".to_string(),
                 trigger: "When user asks about what to wear".to_string(),
@@ -170,6 +171,7 @@ mod tests {
                 disambiguation: None,
             },
             SkillDefinition {
+                autonomy: None,
                 id: "calculator".to_string(),
                 description: "Perform calculations".to_string(),
                 trigger: "When user needs math calculations".to_string(),

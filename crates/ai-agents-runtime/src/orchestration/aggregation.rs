@@ -125,7 +125,7 @@ async fn synthesize_with_llm(
 
     let response = with_observation_purpose(
         ObservationPurpose::OrchestrationAggregation,
-        llm.complete(&messages, None),
+        ai_agents_llm::managed_completion(llm, &messages, None),
     )
     .await
     .map_err(|e| AgentError::LLM(format!("Synthesis LLM failed: {}", e)))?;
@@ -133,6 +133,7 @@ async fn synthesize_with_llm(
     Ok(AgentResponse::new(response.content))
 }
 
+// Borrowed vote providers share task admission; provider-visible result ordering and weights stay unchanged.
 async fn extract_vote(
     llm: &dyn LLMProvider,
     result: &AgentResult,
@@ -151,7 +152,7 @@ async fn extract_vote(
 
     let extraction = with_observation_purpose(
         ObservationPurpose::OrchestrationAggregation,
-        llm.complete(&messages, None),
+        ai_agents_llm::managed_completion(llm, &messages, None),
     )
     .await
     .map_err(|e| AgentError::LLM(format!("Vote extraction failed: {}", e)))?;
@@ -211,7 +212,7 @@ async fn vote_with_llm(
 
                     let extraction = with_observation_purpose(
                         ObservationPurpose::OrchestrationAggregation,
-                        llm.complete(&messages, None),
+                        ai_agents_llm::managed_completion(llm, &messages, None),
                     )
                     .await
                     .map_err(|e| AgentError::LLM(format!("Vote extraction failed: {}", e)))?;
@@ -326,7 +327,7 @@ async fn vote_with_llm(
     Ok(AgentResponse::new(summary))
 }
 
-/// Ask the LLM to break a vote tie.
+/// Resolves a vote tie under the same task admission as participant and aggregation calls.
 async fn resolve_tie_with_llm(llm: &dyn LLMProvider, tied_choices: &[String]) -> Result<String> {
     let choices_list = tied_choices
         .iter()
@@ -348,7 +349,7 @@ async fn resolve_tie_with_llm(llm: &dyn LLMProvider, tied_choices: &[String]) ->
 
     let response = with_observation_purpose(
         ObservationPurpose::OrchestrationAggregation,
-        llm.complete(&messages, None),
+        ai_agents_llm::managed_completion(llm, &messages, None),
     )
     .await
     .map_err(|e| AgentError::LLM(format!("Tiebreaker LLM failed: {}", e)))?;

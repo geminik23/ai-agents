@@ -13,6 +13,13 @@ use crate::types::{
 /// Evaluates how a relationship should change after a turn.
 #[async_trait]
 pub trait RelationshipEvaluatorTrait: Send + Sync {
+    /// Certifies caller-owned work with no detached effects and exposes the actual captured providers for task admission preflight.
+    /// Custom evaluators default to unsupported; deterministic conforming evaluators may return an empty list.
+    /// Certified evaluators compute proposals without hidden mutations; the caller owns committing their returned changes.
+    fn task_providers(&self) -> Option<Vec<Arc<dyn LLMProvider>>> {
+        None
+    }
+
     /// Evaluate recent messages and propose relationship changes for the current actor.
     async fn evaluate_turn(
         &self,
@@ -156,6 +163,11 @@ impl RelationshipEvaluator {
 
 #[async_trait]
 impl RelationshipEvaluatorTrait for RelationshipEvaluator {
+    /// Keeps the original provider binding while allowing the host to verify managed and priced request capability.
+    fn task_providers(&self) -> Option<Vec<Arc<dyn LLMProvider>>> {
+        Some(vec![self.llm.clone()])
+    }
+
     async fn evaluate_turn(
         &self,
         current: &Relationship,

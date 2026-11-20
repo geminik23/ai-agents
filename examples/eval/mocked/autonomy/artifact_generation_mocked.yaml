@@ -1,0 +1,30 @@
+# Eval host: task-domain-evals
+# A present but malformed host report cannot pass the content validator.
+name: Report Content Evidence
+agent: ../../../yaml/autonomy/report_records.yaml
+settings: {timeout_per_turn_ms: 10000, retries: 0}
+fixtures:
+  llm:
+    mode: mock
+    responses:
+      - The report is complete.
+      - '{"tool":"domain","arguments":{"op":"report","value":{"title":17,"rows":[1]}}}'
+      - The invalid report is saved.
+      - '{"tool":"domain","arguments":{"op":"report","value":{"title":"Verified","rows":[1,2]}}}'
+      - The stored report has a string title and two numeric rows.
+scenarios:
+  - id: artifact-existence-does-not-prove-content
+    steps:
+      - !task
+        operation: {action: run, objective: Generate the requested report.}
+        assert:
+          all:
+            - task:
+                status: completed
+                counters: {path: turns, eq: 3}
+                checks: [{id: records, outcome: pass}]
+                events_include: [artifact_observed, validation_completed]
+                event_result_parity: true
+            - tool_called: {id: domain, count: 2, executed: true, success: true}
+            - response_contains: two numeric rows
+            - tool_not_called: command

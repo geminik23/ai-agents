@@ -1,4 +1,4 @@
-use std::future::{Future, pending};
+use std::future::Future;
 
 use ai_agents::{AgentStreamEvent, StreamChunk};
 use futures::{Stream, StreamExt};
@@ -19,13 +19,14 @@ pub(crate) enum StreamDriveOutcome {
     ConsumerClosed,
 }
 
-// Drives one event stream so every first-party client shares the same terminal contract.
+// Exercises the ordinary terminal contract without a consumer-close signal; production consumers also retain their lifetime signal.
+#[cfg(test)]
 pub(crate) async fn drive_agent_stream<S, F>(stream: S, on_event: F) -> StreamDriveOutcome
 where
     S: Stream<Item = AgentStreamEvent>,
     F: FnMut(AgentStreamEvent) -> StreamDriveControl,
 {
-    drive_agent_stream_until_closed(stream, on_event, pending()).await
+    drive_agent_stream_until_closed(stream, on_event, std::future::pending()).await
 }
 
 // Drops a pending source stream as soon as its consumer is no longer available.

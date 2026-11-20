@@ -2,6 +2,10 @@
 
 use std::str::FromStr;
 
+#[cfg(test)]
+#[path = "sqlite_cancel_tests.rs"]
+mod cancellation_tests;
+
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -74,14 +78,32 @@ pub enum SessionOrderBy {
 
 #[cfg(feature = "sqlite")]
 pub struct SqliteStorage {
-    pool: sqlx::SqlitePool,
+    pub(super) pool: sqlx::SqlitePool,
+    durable_task_runs: bool,
 }
 
 #[cfg(feature = "sqlite")]
 impl SqliteStorage {
+    /// Opens the actual database and distinguishes file-backed durable commits from process-local SQLite databases.
     pub async fn new(path: &str) -> Result<Self> {
         let pool = Self::connect(path).await?;
-        let storage = Self { pool };
+        let databases: Vec<(i64, String, String)> = sqlx::query_as("PRAGMA database_list")
+            .fetch_all(&pool)
+            .await
+            .map_err(|error| AgentError::Persistence(error.to_string()))?;
+        let synchronous: i64 = sqlx::query_scalar("PRAGMA synchronous")
+            .fetch_one(&pool)
+            .await
+            .map_err(|error| AgentError::Persistence(error.to_string()))?;
+        // SQLite FULL (2) or EXTRA (3) acknowledges synchronized file commits; an in-memory database has no main filename.
+        let durable_task_runs = databases
+            .iter()
+            .any(|(_, name, file)| name == "main" && !file.is_empty())
+            && matches!(synchronous, 2 | 3);
+        let storage = Self {
+            pool,
+            durable_task_runs,
+        };
         storage.run_migrations().await?;
         Ok(storage)
     }
@@ -95,6 +117,7 @@ impl SqliteStorage {
         self.pool.close().await;
     }
 
+    /// Returns connections only after cancelled custom transaction initialization has relinquished its write lock.
     async fn connect(path: &str) -> Result<sqlx::SqlitePool> {
         // Ensure parent directories exist -- SQLite's create_if_missing only creates the file.
         if path != ":memory:"
@@ -113,14 +136,32 @@ impl SqliteStorage {
         let options = sqlx::sqlite::SqliteConnectOptions::from_str(path)
             .map_err(|e| AgentError::Persistence(e.to_string()))?
             .create_if_missing(true)
-            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal);
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+            .synchronous(sqlx::sqlite::SqliteSynchronous::Full);
 
-        sqlx::SqlitePool::connect_with(options)
+        sqlx::sqlite::SqlitePoolOptions::new()
+            .after_release(|connection, _| {
+                Box::pin(Self::rollback_cancelled_initialization(connection))
+            })
+            .connect_with(options)
             .await
             .map_err(|e| AgentError::Persistence(e.to_string()))
     }
 
+    // SQLx custom BEGIN may be acknowledged before its Transaction guard exists; cancellation must not leak that writer into the pool.
+    // Backend rollback repairs only the connection, never invocation receipts, effect certainty or retained task ownership.
+    async fn rollback_cancelled_initialization(
+        connection: &mut sqlx::SqliteConnection,
+    ) -> std::result::Result<bool, sqlx::Error> {
+        use sqlx::{TransactionManager, sqlite::SqliteTransactionManager};
+        while SqliteTransactionManager::get_transaction_depth(connection) > 0 {
+            SqliteTransactionManager::rollback(connection).await?;
+        }
+        Ok(true)
+    }
+
     async fn run_migrations(&self) -> Result<()> {
+        super::sqlite_tasks::migrate(&self.pool).await?;
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS sessions (
@@ -586,7 +627,49 @@ impl SqliteStorage {
 #[cfg(feature = "sqlite")]
 #[async_trait]
 impl AgentStorage for SqliteStorage {
+    /// SQL operations contain no provider invocations; commit acknowledgements and cancellation retain the existing backend contract.
+    fn task_providers(&self) -> Option<Vec<std::sync::Arc<dyn ai_agents_core::LLMProvider>>> {
+        Some(vec![])
+    }
+
+    async fn create_task_run(
+        &self,
+        snapshot: &ai_agents_core::autonomy::TaskRunSnapshot,
+    ) -> Result<()> {
+        self.task_create(snapshot).await
+    }
+    async fn load_task_run(
+        &self,
+        key: &ai_agents_core::autonomy::TaskRunKey,
+    ) -> Result<Option<ai_agents_core::autonomy::TaskRunSnapshot>> {
+        self.task_load(key).await
+    }
+    async fn list_task_runs(
+        &self,
+        filter: &ai_agents_core::autonomy::TaskRunFilter,
+    ) -> Result<Vec<ai_agents_core::autonomy::TaskRunSummary>> {
+        self.task_list(filter).await
+    }
+    async fn mutate_task_run(
+        &self,
+        key: &ai_agents_core::autonomy::TaskRunKey,
+        mutation: &ai_agents_core::autonomy::TaskRunMutation,
+    ) -> Result<ai_agents_core::autonomy::TaskRunSnapshot> {
+        self.task_mutate(key, mutation).await
+    }
+    async fn delete_task_run(
+        &self,
+        key: &ai_agents_core::autonomy::TaskRunKey,
+        revision: u64,
+    ) -> Result<()> {
+        self.task_delete(key, revision).await
+    }
+
+    /// Distinguishes transactional task support from the lifetime of this actual database's backing file.
     fn supports(&self, capability: StorageCapability) -> bool {
+        if capability == StorageCapability::DurableTaskRuns {
+            return self.durable_task_runs;
+        }
         matches!(
             capability,
             StorageCapability::Snapshot
@@ -596,6 +679,7 @@ impl AgentStorage for SqliteStorage {
                 | StorageCapability::ActorFacts
                 | StorageCapability::ActorRelationships
                 | StorageCapability::ActorDataDeletion
+                | StorageCapability::TaskRuns
         )
     }
 
@@ -1053,12 +1137,15 @@ impl AgentStorage for SqliteStorage {
         Ok(())
     }
 
+    /// Deletes actor data only after excluding active task writers within the same write transaction.
     async fn delete_actor_data(&self, agent_id: &str, actor_id: &str) -> Result<()> {
         let mut transaction = self
             .pool
-            .begin()
+            .begin_with("BEGIN IMMEDIATE")
             .await
             .map_err(|e| AgentError::Persistence(e.to_string()))?;
+
+        super::sqlite_tasks::delete_actor_tasks(&mut transaction, agent_id, actor_id).await?;
 
         sqlx::query("DELETE FROM actor_facts WHERE agent_id = ? AND actor_id = ?")
             .bind(agent_id)
@@ -1288,12 +1375,14 @@ mod tests {
         let mut snapshot = AgentSnapshot::new("test-agent".into());
         snapshot.memory = MemorySnapshot::new(vec![
             ChatMessage {
+                provenance: None,
                 role: Role::User,
                 content: "Hello".to_string(),
                 name: None,
                 timestamp: None,
             },
             ChatMessage {
+                provenance: None,
                 role: Role::Assistant,
                 content: "Hi there!".to_string(),
                 name: None,
@@ -1846,5 +1935,34 @@ mod tests {
 
         let not_found = storage.get_session_info("nonexistent").await.unwrap();
         assert!(not_found.is_none());
+    }
+}
+
+#[cfg(all(test, feature = "sqlite"))]
+mod task_lifetime_tests {
+    use super::*;
+
+    // Identical conditional operations do not make an in-memory database survive process exit.
+    #[tokio::test]
+    async fn task_durability_comes_from_the_actual_database() {
+        let memory = SqliteStorage::in_memory().await.unwrap();
+        assert!(memory.supports(StorageCapability::TaskRuns));
+        assert!(!memory.supports(StorageCapability::DurableTaskRuns));
+        let directory =
+            std::env::temp_dir().join(format!("task-durability-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let file = SqliteStorage::new(directory.join("tasks.sqlite").to_str().unwrap())
+            .await
+            .unwrap();
+        assert!(file.supports(StorageCapability::TaskRuns));
+        assert!(file.supports(StorageCapability::DurableTaskRuns));
+        let synchronous: i64 = sqlx::query_scalar("PRAGMA synchronous")
+            .fetch_one(&file.pool)
+            .await
+            .unwrap();
+        assert_eq!(synchronous, 2);
+        memory.close().await;
+        file.close().await;
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }

@@ -8,7 +8,7 @@ use super::skill::SkillCandidate;
 use super::turn::TransitionCandidate;
 
 /// Runtime branch category used for observation and winner selection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum RuntimeOptimizationKind {
     ParallelStateTransition,
     SpeculativeSkillRouting,
@@ -28,7 +28,7 @@ impl RuntimeOptimizationKind {
 }
 
 /// Describes what can commit if a branch wins.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum RuntimeCommitBehavior {
     FinalResponse,
     TransitionDecision,

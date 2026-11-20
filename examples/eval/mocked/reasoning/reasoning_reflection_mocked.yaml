@@ -58,7 +58,8 @@ scenarios:
                   - "You are a technical writing assistant."
                   - "always include a concrete example"
                 user_contains: "Explain how TCP/IP works."
-                count: 1
+                # Actual provider evidence includes the original request and its reflection retry; evaluator requests do not match this persona.
+                count: 2
                 same_request: true
             - metadata_path:
                 path: reflection.attempts

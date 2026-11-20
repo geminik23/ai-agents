@@ -1,0 +1,21 @@
+# Eval host: task-domain-evals
+name: World State Evidence
+agent: ../../../yaml/autonomy/world_state.yaml
+settings: {timeout_per_turn_ms: 10000, retries: 0}
+fixtures:
+  llm:
+    mode: mock
+    responses:
+      - I have reached the world goal.
+      - '{"tool":"domain","arguments":{"op":"world","value":10}}'
+      - The admitted world action reached the goal.
+scenarios:
+  - id: response-claim-cannot-replace-world-revision
+    steps:
+      - !task
+        operation: {action: run, objective: Reach world position ten.}
+        assert:
+          all:
+            - task: {status: completed, counters: {path: turns, eq: 2}, checks: [{id: records, outcome: pass}], event_result_parity: true}
+            - tool_called: {id: domain, count: 1, executed: true, success: true}
+            - response_contains: admitted world action

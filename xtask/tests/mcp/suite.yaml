@@ -1,0 +1,75 @@
+name: Rust MCP YAML integration
+agent: agent.yaml
+settings:
+  timeout_per_turn_ms: 10000
+  retries: 0
+  isolation: scenario
+fixtures:
+  llm:
+    mode: mock
+    responses:
+      - '{"tool":"sdk_math","arguments":{"function":"accumulate","params":{"delta":7}}}'
+      - first mutation completed
+      - '{"tool":"sdk","arguments":{"function":"accumulate","params":{"delta":"invalid"}}}'
+      - invalid arguments handled
+      - '{"tool":"sdk","arguments":{"function":"fail","params":{}}}'
+      - remote error handled
+      - '{"tool":"sdk","arguments":{"function":"blocked","params":{}}}'
+      - blocked function handled
+      - '{"tool":"sdk_math","arguments":{"function":"fail","params":{}}}'
+      - view restriction handled
+      - '{"tool":"sdk_review","arguments":{"function":"accumulate","params":{"delta":1000}}}'
+      - '{"tool":"sdk_review","arguments":{"function":"accumulate","params":{"delta":11}}}'
+      - approved mutation completed
+  approvals:
+    rules:
+      - trigger:
+          type: tool
+          name: sdk_review
+          args: {function: accumulate, params: {delta: 1000}}
+        outcome: reject
+        reason: integration rejection
+      - trigger:
+          type: tool
+          name: sdk_review
+          args: {function: accumulate, params: {delta: 11}}
+        outcome: approve
+    default: {outcome: reject, reason: unexpected approval}
+scenarios:
+  - id: real-mcp-effects
+    turns:
+      - input: Accumulate through the allowed view.
+        assert:
+          tool_called:
+            id: sdk_math
+            count: 1
+            executed: true
+            success: true
+            source_in: [llm]
+            result_path: {path: total, eq: 7}
+      - input: Attempt invalid arguments.
+        assert:
+          tool_called: {id: sdk, count: 1, success: false}
+      - input: Exercise a real remote error.
+        assert:
+          tool_called: {id: sdk, count: 1, executed: true, success: false}
+          llm_request: {any_contains: intentional Rust MCP error, count: 1}
+      - input: Attempt a blocked function.
+        assert:
+          tool_called: {id: sdk, count: 1, success: false}
+      - input: Attempt a function outside the view.
+        assert:
+          tool_called: {id: sdk_math, count: 1, success: false}
+      - input: Reject a mutation.
+        assert:
+          tool_called: {id: sdk_review, count: 1, executed: false, success: false}
+          approval_requested: {count: 1, raw_decision: rejected, effective_decision: rejected}
+      - input: Approve a mutation.
+        assert:
+          tool_called:
+            id: sdk_review
+            count: 1
+            executed: true
+            success: true
+            result_path: {path: total, eq: 18}
+          approval_requested: {count: 1, raw_decision: approved, effective_decision: approved}

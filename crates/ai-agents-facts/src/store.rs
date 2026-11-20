@@ -17,6 +17,11 @@ pub struct FactStore {
 }
 
 impl FactStore {
+    /// Exposes the actual storage consumer for task participation without treating its feature flags as execution authority.
+    pub fn task_providers(&self) -> Option<Vec<Arc<dyn ai_agents_core::LLMProvider>>> {
+        self.storage.task_providers()
+    }
+
     pub fn new(storage: Arc<dyn AgentStorage>, agent_id: String, config: FactsConfig) -> Self {
         Self {
             storage,
@@ -26,8 +31,8 @@ impl FactStore {
     }
 
     /// Add new facts for an actor, enforcing max_facts by evicting lowest priority rows.
-    /// Returns the authoritative post-write set of facts for the actor so callers can
-    /// refresh their cache without re-reading from storage.
+    /// Returns the authoritative post-write set only after every eviction and upsert succeeds.
+    /// A failed deletion may have partially committed; callers must not publish a trimmed cache or replay it as a successful write.
     pub async fn add_facts(&self, actor_id: &str, mut facts: Vec<KeyFact>) -> Result<Vec<KeyFact>> {
         if facts.is_empty() {
             return self.storage.load_facts(&self.agent_id, actor_id).await;
@@ -53,18 +58,10 @@ impl FactStore {
             let mut evicted = 0usize;
             for old in &existing {
                 if !kept_ids.contains(old.id.as_str()) {
-                    if let Err(e) = self
-                        .storage
+                    self.storage
                         .delete_fact(&self.agent_id, actor_id, &old.id)
-                        .await
-                    {
-                        debug!(
-                            "fact store: failed to delete evicted fact {}: {}",
-                            old.id, e
-                        );
-                    } else {
-                        evicted += 1;
-                    }
+                        .await?;
+                    evicted += 1;
                 }
             }
 

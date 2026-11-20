@@ -1,0 +1,29 @@
+# Eval host: task-domain-evals
+name: Synthetic Corpus Research
+agent: ../../../yaml/autonomy/research_corpus_task.yaml
+
+# No-key regression for the same read receipts and managed judge used by the live application.
+# Flow: read A and B -> factual comparison -> managed judge -> verified completion.
+settings: {timeout_per_turn_ms: 10000, retries: 0}
+fixtures:
+  llm:
+    mode: mock
+    responses_by_alias:
+      main:
+        - '{"tool":"research_catalog","arguments":{"op":"read","id":"alerts-a"}}'
+        - '{"tool":"research_catalog","arguments":{"op":"read","id":"alerts-b"}}'
+        - '{"sources":[{"id":"alerts-a","monthly_usd":20,"events_per_minute":100,"p95_ms":800},{"id":"alerts-b","monthly_usd":40,"events_per_minute":400,"p95_ms":250}],"comparison":"Birch meets the 40 USD, 300 events/min and 300 ms constraints. Aster is cheaper but too slow and small.","uncertainty":"Synthetic tests do not establish outage reliability; failover is manual."}'
+      judge: ['{"overall_score":0.9}']
+scenarios:
+  - id: live-research
+    tags: [autonomy, research, mock, fixture]
+    steps:
+      - !task
+        operation: {action: run, profile: research, objective: Compare the synthetic alert services for a budget of 40 USD and explain trade-offs.}
+        assert:
+          all:
+            - task: {status: completed, checks: [{id: corpus, outcome: pass}], event_result_parity: true}
+            - tool_called: {id: research_catalog, count: 2, executed: true, success: true}
+            - response_contains: Birch
+            - tool_not_called: web_fetch
+            - tool_not_called: command

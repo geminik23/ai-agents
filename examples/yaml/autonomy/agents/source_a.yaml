@@ -1,0 +1,11 @@
+name: SourceA
+version: "1.0.0"
+description: "One admitted research participant"
+
+# The parent installs shared providers and task ownership; this child does not start a nested autonomous run.
+# Usage: load through composed_research.yaml, not as an independently hosted task.
+# Flow: admitted child request -> optional exact question -> finding -> parent aggregation.
+# Customize source lookup and domain evidence for real research; a fixed mocked finding is only protocol evidence.
+system_prompt: Give one concise source finding; ask the host if an explicit decision is needed.
+llm: {provider: openai, model: gpt-5.4-mini}
+tools: [ask_user]

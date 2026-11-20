@@ -3,6 +3,15 @@ use crate::event::{EventType, ObservationError, ObservationEvent};
 use serde_json::Value;
 use std::collections::HashSet;
 
+// Output permission follows source-bearing tool/skill failures into error channels before ordinary text retention is applied.
+pub(crate) fn tool_error_text(config: &PrivacyConfig, text: &str) -> String {
+    if config.include_tool_outputs {
+        text.to_owned()
+    } else {
+        "Tool or skill execution failed (details omitted)".into()
+    }
+}
+
 /// Privacy helper that redacts keys, paths, errors, tags, and raw text.
 #[derive(Debug, Clone)]
 pub struct Redactor {
@@ -140,6 +149,8 @@ fn is_safe_dimension(key: &str) -> bool {
     matches!(
         key,
         "agent"
+            // Framework-minted opaque run IDs allow scoped numeric collection; they are not execution authority or task content.
+            | "task_run"
             | "actor"
             | "session"
             | "purpose"
