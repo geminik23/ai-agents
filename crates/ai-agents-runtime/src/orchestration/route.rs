@@ -64,7 +64,7 @@ pub(crate) async fn route_task(
     let actor = current_turn_actor_context();
     let response = crate::autonomy::message::scope_message(
         invocation,
-        Box::pin(registry.route_task_message(&selected, input, actor, &reason)),
+        registry.route_task_message(&selected, input, actor, &reason),
     )
     .await?;
     Ok(RouteResult {

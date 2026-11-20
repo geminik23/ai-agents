@@ -777,7 +777,7 @@ impl RunExecution {
         footprint: Option<&ToolWriteFootprint>,
     ) -> Result<String> {
         let id = uuid::Uuid::new_v4().to_string();
-        Box::pin(self.update(|payload| {
+        self.update(|payload| {
             self.check(payload)?;
             if tool.is_none()
                 && let Some(limit) = payload.limits.max_micro_usd
@@ -931,7 +931,7 @@ impl RunExecution {
                 result: None,
             });
             Ok(())
-        }))
+        })
         .await?;
         super::invocation::capacity_admitted();
         // Reload under serialization so a sibling settlement cannot turn an owned revision into a spurious conflict.

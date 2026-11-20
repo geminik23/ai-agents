@@ -255,27 +255,28 @@ impl RuntimeAgent {
         let runtime =
             crate::autonomy::TaskRuntimeCheckpoint::between_turns(self.save_state_full().await?)?;
         let operation = crate::autonomy::current_child_operation();
-        Box::pin(execution.update(|payload| {
-            if let Some(operation) = operation {
-                let child = payload
-                    .children
-                    .iter_mut()
-                    .find(|child| child.child_id == operation)
-                    .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
-                if let Some(pending) = child.pending.take() {
-                    payload.consumed_request_ids.push(pending.id);
+        execution
+            .update(|payload| {
+                if let Some(operation) = operation {
+                    let child = payload
+                        .children
+                        .iter_mut()
+                        .find(|child| child.child_id == operation)
+                        .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
+                    if let Some(pending) = child.pending.take() {
+                        payload.consumed_request_ids.push(pending.id);
+                    }
+                    child.runtime = runtime;
+                } else {
+                    if let Some(pending) = payload.pending.take() {
+                        payload.consumed_request_ids.push(pending.id);
+                    }
+                    payload.runtime = runtime;
+                    payload.pause_reason = None;
                 }
-                child.runtime = runtime;
-            } else {
-                if let Some(pending) = payload.pending.take() {
-                    payload.consumed_request_ids.push(pending.id);
-                }
-                payload.runtime = runtime;
-                payload.pause_reason = None;
-            }
-            Ok(())
-        }))
-        .await?;
+                Ok(())
+            })
+            .await?;
         execution.delegate_frames.lock().remove(&self.info.id);
         Ok(())
     }

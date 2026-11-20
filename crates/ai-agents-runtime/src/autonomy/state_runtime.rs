@@ -340,23 +340,24 @@ impl RuntimeAgent {
             }
         );
         let value = serde_json::to_value(state)?;
-        Box::pin(execution.update(|payload| {
-            let adapter = crate::autonomy::TaskAdapterCheckpoint {
-                id: id.clone(),
-                adapter: "runtime.actions".into(),
-                contract_version: 1,
-                config: serde_json::to_value(&state.actions)?,
-                state: value,
-            };
-            if let Some(old) = payload.adapters.iter_mut().find(|old| old.id == id) {
-                *old = adapter;
-            } else {
-                payload.adapters.push(adapter);
-            }
-            Ok(())
-        }))
-        .await
-        .map(|_| ())
+        execution
+            .update(|payload| {
+                let adapter = crate::autonomy::TaskAdapterCheckpoint {
+                    id: id.clone(),
+                    adapter: "runtime.actions".into(),
+                    contract_version: 1,
+                    config: serde_json::to_value(&state.actions)?,
+                    state: value,
+                };
+                if let Some(old) = payload.adapters.iter_mut().find(|old| old.id == id) {
+                    *old = adapter;
+                } else {
+                    payload.adapters.push(adapter);
+                }
+                Ok(())
+            })
+            .await
+            .map(|_| ())
     }
 
     /// Resumed actions retain branch observation custody until completion or another acknowledged typed suspension.
@@ -452,12 +453,12 @@ impl RuntimeAgent {
                 )
                 .await
             }
-            TaskStateReturn::Prepared { data } => Box::pin(self.run_accepted_input(data)).await,
+            TaskStateReturn::Prepared { data } => self.run_accepted_input(data).await,
             TaskStateReturn::ReadyContext { input } => {
                 self.context_manager.refresh_per_turn().await?;
                 self.context_manager.validate()?;
                 self.clear_disambiguation_context();
-                Box::pin(self.run_after_ready_context(&input)).await
+                self.run_after_ready_context(&input).await
             }
             TaskStateReturn::ModelContinue { mut state } => {
                 if let Some(finalization) = &mut state.deferred_final {

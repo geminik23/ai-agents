@@ -774,7 +774,8 @@ impl RuntimeAgent {
                 .await;
         }
         if batch.location.is_some() {
-            return Box::pin(self.resume_task_location_batch(input, batch, request_id, result))
+            return self
+                .resume_task_location_batch(input, batch, request_id, result)
                 .await;
         }
         let approval = batch

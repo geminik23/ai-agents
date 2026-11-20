@@ -177,7 +177,7 @@ where
             }
             ai_agents_llm::validate_invocation_evidence()?;
             started.store(true, std::sync::atomic::Ordering::Release);
-            let mut body = Box::pin(future);
+            let mut body = future;
             let mut tick = tokio::time::interval(Duration::from_millis(10));
             let result = {
             let mut watched = std::pin::pin!(std::future::poll_fn(|cx| {

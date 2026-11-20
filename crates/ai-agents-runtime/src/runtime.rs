@@ -9909,7 +9909,7 @@ OVERALL: PASS/FAIL"#,
             // Automatic arrival consumes the original preparation before ordinary redispatch could repeat extraction.
             self.promote_automatic_state(&data).await?;
             if crate::autonomy::current_turn_input(&self.root_turn_gate).is_some() {
-                return Box::pin(self.run_accepted_input(data)).await.map(Some);
+                return self.run_accepted_input(data).await.map(Some);
             }
         }
         self.redispatch_current_state(processed_input)
@@ -10750,7 +10750,7 @@ OVERALL: PASS/FAIL"#,
                 &mut selection,
                 Some(RuntimeCommitBehavior::TransitionDecision),
             );
-            return Box::pin(self.run_accepted_input(selection.data)).await;
+            return self.run_accepted_input(selection.data).await;
         }
         let data = selection.data.clone();
         let skill = if selection.skill_checked {
@@ -12578,7 +12578,7 @@ Respond in JSON format:
         // Clear stale disambiguation context from previous turns.
         // This prevents resolved_intent from leaking across turns and causing incorrect deterministic routing on subsequent inputs.
         self.clear_disambiguation_context();
-        Box::pin(self.run_after_ready_context(input)).await
+        self.run_after_ready_context(input).await
     }
 
     /// Readiness and receive hooks are already complete when a saved timeout or clarification returns here.
@@ -14288,27 +14288,28 @@ Respond in JSON format:
                 self.save_state_full().await?,
             )?;
             let operation = crate::autonomy::current_child_operation();
-            Box::pin(execution.update(|payload| {
-                if let Some(operation) = &operation {
-                    let child = payload
-                        .children
-                        .iter_mut()
-                        .find(|child| child.child_id == *operation)
-                        .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
-                    if let Some(pending) = child.pending.take() {
-                        payload.consumed_request_ids.push(pending.id);
+            execution
+                .update(|payload| {
+                    if let Some(operation) = &operation {
+                        let child = payload
+                            .children
+                            .iter_mut()
+                            .find(|child| child.child_id == *operation)
+                            .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
+                        if let Some(pending) = child.pending.take() {
+                            payload.consumed_request_ids.push(pending.id);
+                        }
+                        child.runtime = runtime;
+                    } else {
+                        if let Some(pending) = payload.pending.take() {
+                            payload.consumed_request_ids.push(pending.id);
+                        }
+                        payload.runtime = runtime;
+                        payload.pause_reason = None;
                     }
-                    child.runtime = runtime;
-                } else {
-                    if let Some(pending) = payload.pending.take() {
-                        payload.consumed_request_ids.push(pending.id);
-                    }
-                    payload.runtime = runtime;
-                    payload.pause_reason = None;
-                }
-                Ok(())
-            }))
-            .await?;
+                    Ok(())
+                })
+                .await?;
             execution.delegate_frames.lock().remove(&self.info.id);
         }
 
@@ -14470,8 +14471,7 @@ Respond in JSON format:
             ),
         ));
         let result = if frame.is_some() {
-            crate::autonomy::composition::scope_composition(self.info.id.clone(), Box::pin(work))
-                .await?
+            crate::autonomy::composition::scope_composition(self.info.id.clone(), work).await?
         } else {
             work.await?
         };
@@ -15091,7 +15091,7 @@ Respond in JSON format:
         {
             return Ok(response);
         }
-        Box::pin(self.run_accepted_input(input_data)).await
+        self.run_accepted_input(input_data).await
     }
 
     /// Continues an accepted input after a saved transition without repeating processing or semantic transition selection.
@@ -15161,13 +15161,14 @@ Respond in JSON format:
         // The speculative future is boxed to keep the runtime future size manageable.
         // Removing the box can overflow small test stacks because this function is recursive through redispatch.
         //
-        if let Some(response) =
-            Box::pin(self.try_speculative_branches(processed_input, &input_data.context)).await?
+        if let Some(response) = self
+            .try_speculative_branches(processed_input, &input_data.context)
+            .await?
         {
             return Ok(response);
         }
 
-        match Box::pin(self.try_skill_route(processed_input)).await? {
+        match self.try_skill_route(processed_input).await? {
             SkillRouteResult::Response { skill_id, content } => {
                 self.commit_root_user_message(processed_input).await?;
                 return Box::pin(self.handle_skill_response(

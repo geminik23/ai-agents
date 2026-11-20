@@ -539,19 +539,20 @@ impl RuntimeAgent {
         }
         // Resuming owned work restores the dispatched marker without reserving another slot.
         // Until the child acknowledges its next result or park, drop retains conservative effect custody.
-        Box::pin(execution.update(|payload| {
-            let reservation = payload
-                .reservations
-                .iter_mut()
-                .find(|r| r.id == state.attempt)
-                .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
-            if reservation.state != crate::autonomy::TaskEffectState::Suspended {
-                return Err(crate::autonomy::TaskRunStorageError::Conflict.into());
-            }
-            reservation.state = crate::autonomy::TaskEffectState::Dispatched;
-            Ok(())
-        }))
-        .await?;
+        execution
+            .update(|payload| {
+                let reservation = payload
+                    .reservations
+                    .iter_mut()
+                    .find(|r| r.id == state.attempt)
+                    .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
+                if reservation.state != crate::autonomy::TaskEffectState::Suspended {
+                    return Err(crate::autonomy::TaskRunStorageError::Conflict.into());
+                }
+                reservation.state = crate::autonomy::TaskEffectState::Dispatched;
+                Ok(())
+            })
+            .await?;
         drop(admission);
         // Storage acknowledgement can await; recheck actual registry and control authority immediately before child polling.
         let resolved = self.tools.resolve(&state.record.requested_name);
@@ -823,7 +824,9 @@ impl RuntimeAgent {
                         .into(),
                 ));
             }
-            return Box::pin(self.finish_task_location_record(location, state.record)).await;
+            return self
+                .finish_task_location_record(location, state.record)
+                .await;
         }
         let mut loop_state = batch
             .loop_state
