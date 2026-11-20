@@ -1336,7 +1336,7 @@ impl AutonomyRunner {
             return Err(TaskRunStorageError::AdmissionExpired.into());
         }
         if controller_checkpoint(&payload)?.is_some() {
-            return Box::pin(self.resume_controller(snapshot, payload, input)).await;
+            return self.resume_controller(snapshot, payload, input).await;
         }
         let capacity = payload
             .pending
@@ -1951,10 +1951,10 @@ impl AutonomyRunner {
         if let Some(session) = crate::autonomy::host_session::current_session() {
             session.admitted(&run_id);
         }
-        // Box the controller before layering task scopes so default-stack polling matches the ordinary runtime entry.
+        // The controller future already keeps its poll state on the heap inside the task scope.
         let result = scope_execution(
             execution.clone(),
-            Box::pin(self.execute(
+            self.execute(
                 &owner,
                 &execution,
                 &bound,
@@ -1964,7 +1964,7 @@ impl AutonomyRunner {
                 lifecycle,
                 todo.as_ref(),
                 None,
-            )),
+            ),
         )
         .await;
         let result = self.finish_execution_error(&execution, result).await;
@@ -2517,17 +2517,18 @@ impl AutonomyRunner {
                             continue;
                         }
                         let driver = continuation.as_mut().and_then(|saved| saved.driver.take());
-                        if let Some(driver) = Box::pin(self.validate(
-                            check,
-                            &mut scope,
-                            &mut evidence,
-                            execution,
-                            bound,
-                            &executor,
-                            &journal,
-                            driver,
-                        ))
-                        .await?
+                        if let Some(driver) = self
+                            .validate(
+                                check,
+                                &mut scope,
+                                &mut evidence,
+                                execution,
+                                bound,
+                                &executor,
+                                &journal,
+                                driver,
+                            )
+                            .await?
                         {
                             let capacity_reason = driver.capacity_reason.clone();
                             *execution.controller.lock() = Some(Box::new(ControllerContinuation {
