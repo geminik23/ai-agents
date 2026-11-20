@@ -78,6 +78,8 @@
 - Rust configuration compatibility: typed autonomy fields, validation driver bounds and objective-bound todo identities require affected struct literals to be updated; these development additions are not the published stable API
 
 ### Fixed
+- Task CLI: let settled foreground operations exit when storage inspection takes longer than the display refresh interval
+- Task restoration clock: report the kernel call error or synchronization state and maximum error when configured restart rejects OS time evidence
 - MCP transport security: bound HTTP JSON and error response buffering and enable certificate-verified HTTPS through native TLS
 - Dependency security: refresh locked OpenSSL, rustls, and webpki versions to address TLS advisories
 - Command lifetimes: keep output readers under the original work deadline and caller lifetime, with explicit uncertain effects after unconfirmed cleanup
