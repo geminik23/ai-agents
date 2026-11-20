@@ -58,9 +58,31 @@ pub(crate) async fn run_prepared(
     agent: RuntimeAgent,
     config: CliReplConfig,
     theme_name: Option<String>,
+    session: FrontendSession,
+    input: mpsc::Sender<Input>,
+    output: mpsc::Receiver<Output>,
+) -> Result<()> {
+    run_prepared_shared(
+        Arc::new(agent),
+        config,
+        theme_name,
+        session,
+        input,
+        output,
+        None,
+    )
+    .await
+}
+
+// Both initial and reconstructed runtimes enter the same renderer and terminal-restoration lifetime.
+pub(crate) async fn run_prepared_shared(
+    agent: Arc<RuntimeAgent>,
+    config: CliReplConfig,
+    theme_name: Option<String>,
     mut session: FrontendSession,
     input: mpsc::Sender<Input>,
     mut output: mpsc::Receiver<Output>,
+    restored: Option<crate::session::RestoredTask>,
 ) -> Result<()> {
     let (tx, mut rx) = mpsc::channel::<AppMessage>(32);
     let log_level = std::env::var("RUST_LOG")
@@ -76,12 +98,16 @@ pub(crate) async fn run_prepared(
     terminal.clear()?;
     let name = theme_name.unwrap_or_else(|| "dark".into());
     let theme = resolve_theme(&name).unwrap_or_else(|| resolve_theme("dark").unwrap());
-    let agent = Arc::new(agent);
     let mut app = App::new(agent.clone(), config.clone(), tx, theme, name);
     app.attach_host(input.clone());
     let (endpoint, endpoint_rx) = tokio::sync::watch::channel(Endpoint::Open);
     session.set_endpoint(endpoint_rx);
-    let mut driver = Box::pin(host::run(session, agent, config));
+    let mut driver = Box::pin(async move {
+        match restored {
+            Some(restored) => host::run_with_startup(session, agent, config, Some(restored)).await,
+            None => host::run(session, agent, config).await,
+        }
+    });
     let mut reader = EventStream::new();
     let mut tick = tokio::time::interval(Duration::from_millis(100));
     let mut stopping = false;

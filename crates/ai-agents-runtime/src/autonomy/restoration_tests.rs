@@ -2002,3 +2002,132 @@ async fn overrides_restore_rejects_changed_configuration_before_claim() {
     assert_eq!(done.run.counters.llm_attempts, 2);
     assert_eq!(host.effects.load(Ordering::SeqCst), 1);
 }
+
+// Fresh review is an acknowledged host control; the existing foreground handle must advance before exposing the original question.
+#[tokio::test]
+async fn restoration_review_publishes_acknowledged_revision_to_existing_host_handle() {
+    let (host, store, prepared) = prepared_fixture(false).await;
+    let (runner, paused) = AutonomyRunner::restore_paused(
+        TaskRestoreRequest {
+            run_id: prepared.run.key.run_id.clone(),
+            expected_revision: prepared.run.revision,
+            config_identity: "restore.v1".into(),
+            config: config(),
+            ceilings: Default::default(),
+        },
+        store,
+        host.clone(),
+    )
+    .await
+    .unwrap();
+    let runner = Arc::new(runner);
+    let session = TaskHostSession::new(true);
+    session
+        .observe_result(runner.clone(), &paused)
+        .await
+        .unwrap();
+    let handle = session.runs().pop().unwrap();
+    assert_eq!(handle.published_revision(), Some(paused.run.revision));
+    let review = runner
+        .restoration_review(&paused.run.key.run_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let calls = host.calls.load(Ordering::SeqCst);
+    let approved = session
+        .scope(runner.approve_restoration(
+            &paused.run.key.run_id,
+            paused.run.revision,
+            &review.id,
+            ai_agents_hitl::ApprovalResult::Approved,
+        ))
+        .await
+        .unwrap();
+    assert!(approved.run.revision > paused.run.revision);
+    assert_eq!(handle.published_revision(), Some(approved.run.revision));
+    assert_eq!(host.calls.load(Ordering::SeqCst), calls);
+    let interaction = runner
+        .task_interaction(&approved.run.key.run_id, approved.run.revision)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(interaction.restoration_review.unwrap().approved);
+    assert!(matches!(
+        runner
+            .task_interaction(&approved.run.key.run_id, paused.run.revision)
+            .await,
+        Err(ai_agents_core::AgentError::TaskRunStorage(
+            TaskRunStorageError::Conflict
+        ))
+    ));
+}
+
+// A single cancellation revision preserves the prepared payload for cleanup only; ordinary resume and stale caller revisions remain forbidden.
+#[tokio::test]
+async fn restoration_requested_cancel_preserves_exact_prepared_cleanup_without_execution() {
+    for &sqlite in super::continuation_test_support::backends() {
+        let (host, store, prepared) = prepared_fixture(sqlite).await;
+        let cancelled = store
+            .mutate(
+                &prepared.run.key.run_id,
+                &TaskRunMutation::RequestCancel {
+                    expected_revision: prepared.run.revision,
+                },
+            )
+            .await
+            .unwrap();
+        let request = |revision| TaskRestoreRequest {
+            run_id: prepared.run.key.run_id.clone(),
+            expected_revision: revision,
+            config_identity: "restore.v1".into(),
+            config: config(),
+            ceilings: Default::default(),
+        };
+        let calls = host.calls.load(Ordering::SeqCst);
+        let effects = host.effects.load(Ordering::SeqCst);
+        assert!(
+            AutonomyRunner::restore_paused(
+                request(cancelled.revision),
+                store.clone(),
+                host.clone()
+            )
+            .await
+            .is_err()
+        );
+        assert!(matches!(
+            AutonomyRunner::restore_cancelled(
+                request(prepared.run.revision),
+                store.clone(),
+                host.clone()
+            )
+            .await,
+            Err(ai_agents_core::AgentError::TaskRunStorage(
+                TaskRunStorageError::Conflict
+            ))
+        ));
+        assert_eq!(
+            serde_json::to_value(store.load(&cancelled.key.run_id).await.unwrap().unwrap())
+                .unwrap(),
+            serde_json::to_value(&cancelled).unwrap()
+        );
+        let done = AutonomyRunner::restore_cancelled(
+            request(cancelled.revision),
+            store.clone(),
+            host.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(done.run.status, TaskRunStatus::Cancelled);
+        assert_eq!(host.calls.load(Ordering::SeqCst), calls);
+        assert_eq!(host.effects.load(Ordering::SeqCst), effects);
+        assert!(
+            store
+                .load(&cancelled.key.run_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .owner_token
+                .is_none()
+        );
+    }
+}

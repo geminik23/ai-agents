@@ -126,6 +126,7 @@ pub struct CliRepl {
     config: CliReplConfig,
     command_handler: Option<CommandHandler>,
     task_observer: Option<std::sync::Arc<dyn CliTaskObserver>>,
+    startup_task: Option<crate::session::RestoredTask>,
 }
 
 // Manual Debug impl because CommandHandler (a boxed closure) doesn't implement Debug.
@@ -153,6 +154,18 @@ impl CliRepl {
             config: CliReplConfig::default(),
             command_handler: None,
             task_observer: None,
+            startup_task: None,
+        }
+    }
+
+    // Preserve the exact restored runtime wrapper and controller until the shared foreground host takes ownership.
+    pub(crate) fn from_restored(restored: crate::session::RestoredTask) -> Self {
+        Self {
+            agent: restored.0.runtime().clone(),
+            config: CliReplConfig::default(),
+            command_handler: None,
+            task_observer: None,
+            startup_task: Some(restored),
         }
     }
 
@@ -226,7 +239,7 @@ impl CliRepl {
     }
 
     pub(crate) async fn run_with_io(
-        self,
+        mut self,
         mut io: crate::session::FrontendSession,
     ) -> anyhow::Result<()> {
         if let Some(ref welcome) = self.config.welcome {
@@ -254,6 +267,27 @@ impl CliRepl {
             println!("Type '/quit' to exit.");
         }
         println!();
+
+        if let Some(restored) = self.startup_task.take() {
+            let result = io.drive_restored(restored).await?;
+            if let crate::session::OperationResult::Task(initial) = &result.primary {
+                let done = result
+                    .results
+                    .get(&initial.run.key.run_id)
+                    .unwrap_or(initial);
+                io.write(format!(
+                    "Task {} revision {}: {:?}\n",
+                    done.run.key.run_id, done.run.revision, done.run.status
+                ))
+                .await?;
+                if let Some(response) = &done.final_response {
+                    io.write(format!("Agent: {}\n", response.content)).await?;
+                }
+            }
+            if result.quit {
+                return Ok(());
+            }
+        }
 
         // The foreground adapter and ordinary callbacks share exactly one bounded input reader.
 

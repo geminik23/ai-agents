@@ -20,7 +20,7 @@ pub enum AutonomyScope {
 }
 
 /// Host ceilings are configuration bounds, not runtime invocation permits.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct AutonomyHostCeilings {
     pub max_turns: Option<u32>,
     pub max_active_time_seconds: Option<u64>,
@@ -1021,6 +1021,30 @@ pub fn resolve_profile(
     })
 }
 
+/// Inspects startup intent using the same profile merge without inventing an invocation objective.
+/// This is configuration data only; candidate selection still validates the saved objective, scope, bindings and revision.
+pub fn declares_startup_resume(config: &AutonomyConfig) -> Result<bool> {
+    let declared = config
+        .defaults
+        .persistence
+        .as_ref()
+        .is_some_and(|policy| policy.resume_on_start == Some(true))
+        || config
+            .default_profile
+            .as_ref()
+            .and_then(|name| config.profiles.get(name))
+            .and_then(|profile| profile.persistence.as_ref())
+            .is_some_and(|policy| policy.resume_on_start == Some(true));
+    if !declared {
+        return Ok(false);
+    }
+    let raw = resolve_raw(config, None, None, None)?;
+    Ok(raw.enabled.unwrap_or(false)
+        && raw.persistence.as_ref().is_some_and(|policy| {
+            policy.enabled != Some(false) && policy.resume_on_start == Some(true)
+        }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1034,6 +1058,34 @@ mod tests {
     }
 
     // An omitted feature cannot alter existing YAML output or normal chat configuration.
+    // Startup inspects declaration intent without pretending that an actual objective has already been supplied.
+    #[test]
+    fn restoration_startup_intent_keeps_invocation_validation_separate() {
+        let mut config: AutonomyConfig = serde_yaml::from_str("enabled: true\npersistence: {enabled: true, resume_on_start: true}\ncompletion: {response_contains: done}\n").unwrap();
+        assert!(declares_startup_resume(&config).unwrap());
+        assert!(
+            resolve_profile(
+                &config,
+                AutonomyScope::Task,
+                None,
+                None,
+                None,
+                None,
+                &Default::default()
+            )
+            .is_err()
+        );
+        config.profiles.insert(
+            "volatile".into(),
+            serde_yaml::from_str("persistence: {enabled: false}").unwrap(),
+        );
+        config.default_profile = Some("volatile".into());
+        assert!(!declares_startup_resume(&config).unwrap());
+        config.default_profile = None;
+        config.defaults.enabled = Some(false);
+        assert!(!declares_startup_resume(&config).unwrap());
+    }
+
     #[test]
     fn omitted_autonomy_stays_disabled_and_preserves_serialization() {
         let spec = spec_with_autonomy("name: Plain\nsystem_prompt: Just chat.\n");

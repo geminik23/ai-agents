@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use clap::{ArgAction, Parser, Subcommand};
+use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -18,7 +18,7 @@ pub struct Cli {
 pub enum Command {
     /// Run an agent YAML file interactively
     Run(RunArgs),
-    /// Run and manage development task-controller work (not production restart hosting)
+    /// Run and manage configured task-controller work
     Task(TaskArgs),
     /// Evaluate an agent YAML against declarative scenarios
     Eval(EvalArgs),
@@ -90,8 +90,12 @@ pub struct TaskArgs {
 pub enum TaskCommand {
     /// Run an objective through the configured shared controller
     Run(TaskRunArgs),
-    /// Request new-process resume; the default host rejects unsupported reconstruction
+    /// Restore an exact prepared task revision with the configured host and fresh review
     Resume(TaskRevisionArgs),
+    /// Reconcile interrupted configured preparation after checking its worker lease and exact revision
+    Recover(TaskRecoveryArgs),
+    /// Finish cleanup for an exact prepared task after cancellation has been requested
+    Cleanup(TaskRevisionArgs),
     /// Record a cancellation request, not remote cleanup acknowledgement
     Cancel(TaskRevisionArgs),
     /// List task metadata without constructing providers or consuming pending decisions
@@ -140,9 +144,29 @@ pub struct TaskIdArgs {
 pub struct TaskRevisionArgs {
     #[command(flatten)]
     pub target: TaskIdArgs,
-    /// Exact observed revision; required for cancellation, never auto-refreshed
+    /// Exact observed revision; required for cancellation and restoration, never auto-refreshed
     #[arg(long)]
     pub revision: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum TaskRecoveryAction {
+    ResumePrepared,
+    CancelPrepared,
+}
+
+#[derive(Debug, Clone, Parser)]
+pub struct TaskRecoveryArgs {
+    #[command(flatten)]
+    pub target: TaskIdArgs,
+    /// Exact revision from current inspection; recovery never guesses a newer owner
+    #[arg(long)]
+    pub revision: u64,
+    #[arg(long, value_enum)]
+    pub action: TaskRecoveryAction,
+    /// Recorded local reason for this explicit recovery decision
+    #[arg(long)]
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Parser)]

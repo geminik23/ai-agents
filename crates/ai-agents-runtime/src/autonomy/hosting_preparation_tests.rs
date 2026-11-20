@@ -462,3 +462,59 @@ async fn host_preparation_sqlite_journal_uses_effective_configuration_and_surviv
         .await
         .unwrap();
 }
+
+// The reconstructed controller must retain the exact wrapper used by live guards without a runtime-service-runner ownership cycle.
+#[tokio::test]
+async fn host_restored_runner_retains_exact_runtime_without_service_cycle() {
+    let provider = RecordingProvider::new(&[]);
+    let storage = Arc::new(ai_agents_storage::InMemoryTaskStorage::default());
+    let agent = Arc::new(
+        AgentBuilder::from_yaml(TASK)
+            .unwrap()
+            .llm(provider.clone())
+            .storage(storage.clone())
+            .automatic_task_options(AutomaticTaskOptions {
+                config_identity: Some("configured-test".into()),
+                ..Default::default()
+            })
+            .build_task_host()
+            .await
+            .unwrap(),
+    );
+    let original = Arc::downgrade(&agent);
+    let store = Arc::new(
+        ScopedTaskRunStore::new(storage, agent.info().id, None, "configured-test".into()).unwrap(),
+    );
+    let config = crate::spec::AgentSpec::from_yaml_strict(TASK)
+        .unwrap()
+        .autonomy;
+    let runner = AutonomyRunner::try_new(
+        agent.clone(),
+        config,
+        Default::default(),
+        store,
+        "configured-test".into(),
+    )
+    .unwrap()
+    .into_configured_host()
+    .unwrap();
+    assert!(Arc::ptr_eq(&agent.task_runner().unwrap(), &runner));
+    assert!(
+        agent
+            .attach_configured_task_runner(runner.clone(), None)
+            .is_err()
+    );
+    let weak_runner = Arc::downgrade(&runner);
+    drop(agent);
+    assert!(
+        original.upgrade().is_some(),
+        "restoration guards refer to this exact runtime wrapper"
+    );
+    drop(runner);
+    assert!(weak_runner.upgrade().is_none());
+    assert!(
+        original.upgrade().is_none(),
+        "the hosting service must not retain a cycle"
+    );
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+}

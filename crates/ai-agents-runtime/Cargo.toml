@@ -50,6 +50,9 @@ minijinja = { workspace = true }
 rand = { workspace = true }
 sha2 = { workspace = true }
 
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+libc = "0.2"
+
 [features]
 default = []
 sqlite = ["ai-agents-storage/sqlite"]

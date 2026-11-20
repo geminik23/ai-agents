@@ -128,7 +128,8 @@ def main():
                 if not started and "Type a message" in text:
                     mask = termios.ICANON | termios.ECHO | termios.ISIG
                     assert termios.tcgetattr(slave)[3] & mask == 0, "TUI did not enter raw mode"
-                    os.write(master, initial.encode("utf-8") + b"\r")
+                    if initial:
+                        os.write(master, initial.encode("utf-8") + b"\r")
                     started = True
                 if started and not stopping:
                     decision = re.search(r"DECISION (\d+)", text)

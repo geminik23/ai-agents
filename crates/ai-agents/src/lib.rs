@@ -80,7 +80,7 @@
 //! | `full` | All optional features enabled |
 
 /// Development task execution, scoped YAML entry, foreground hosting and explicit prepared recovery.
-/// These APIs are unreleased; default production restart hosting and arbitrary in-flight restoration remain unavailable.
+/// These APIs are unreleased; configured hosts support prepared process restart while arbitrary in-flight restoration remains unavailable.
 /// Explicit safe-pause reconstruction uses installed host bindings and never consumes the pending response or takes over abandoned Running work.
 /// The host must authenticate restoration review separately before using the newly advertised pending request and revision.
 /// Opted-in persistence uses with_restore_host and restore_on_start; startup never consumes a pending decision or adopts an abandoned owner.

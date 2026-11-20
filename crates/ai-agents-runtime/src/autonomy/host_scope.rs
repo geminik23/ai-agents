@@ -82,6 +82,11 @@ impl TaskHostScope {
         &self.identity
     }
 
+    /// Returns the actor selected by the trusted host for this fixed namespace.
+    pub fn actor_id(&self) -> Option<&str> {
+        self.actor_id.as_deref()
+    }
+
     /// Supplies only the explicit namespace; hosts with external definitions should prefer the builder's checked task_host_scope binding.
     pub fn task_options(&self) -> AutomaticTaskOptions {
         AutomaticTaskOptions {

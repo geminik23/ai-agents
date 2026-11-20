@@ -16,6 +16,8 @@ use std::{
 #[cfg(unix)]
 fn run_tui_pty(agent: &std::path::Path, initial: &str, expected: &str, answer: &str, mode: &str) {
     let out = Command::new("python3")
+        // Match the isolated working directory used by the non-PTY producer and its relative resource bindings.
+        .current_dir(agent.parent().unwrap())
         .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/tui_pty.py"))
         .args([
             env!("CARGO_BIN_EXE_ai-agents-cli"),
@@ -499,7 +501,7 @@ impl Fixture {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         if args.first() == Some(&"run")
-            || (args.first() == Some(&"task") && args.get(1) == Some(&"run"))
+            || (args.first() == Some(&"task") && matches!(args.get(1), Some(&"run" | &"resume")))
         {
             command.env("TASK_FIXTURE_TOKEN", "isolated-test-placeholder");
         } else {
@@ -690,6 +692,7 @@ fn fixture_worker_failure_is_reported_without_replacing_primary_panic() {
 }
 
 const TASK: &str = "tools: []\nautonomy:\n  enabled: true\n  mode: until_complete\n  max_turns: 4\n  max_llm_calls: 4\n  completion: {response_contains: done}\n";
+
 fn assert_exit(output: &Output, code: i32) {
     assert_eq!(
         output.status.code(),
@@ -698,6 +701,154 @@ fn assert_exit(output: &Output, code: i32) {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+// Scope flags are shared between producer, inspection and consumer without changing the supplied revision.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn scoped_args<'a>(mut args: Vec<&'a str>, actor: Option<&'a str>) -> Vec<&'a str> {
+    if let Some(actor) = actor {
+        args.extend(["--actor", actor]);
+    }
+    args
+}
+
+// Two real CLI processes use the configured factory and surviving SQLite checkpoint, never a test restoration host.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn task_subprocess_configured_restart_preserves_attempts_and_requires_fresh_review() {
+    for actor in [None, Some("alice")] {
+        let f = Fixture::new(&["draft", "done"]);
+        let db = f.dir.join("restart.sqlite");
+        let agent = f.agent(&format!(
+            "{TASK}  restoration_timeout_ms: 5000\n  persistence: {{enabled: true}}\n  premature_finish: {{action: ask_user, on_unavailable: stop}}\nstorage: {{type: sqlite, path: '{}' }}\n",
+            db.display()
+        ));
+        let first = f.run(
+            &scoped_args(
+                vec![
+                    "task",
+                    "run",
+                    agent.to_str().unwrap(),
+                    "finish the report",
+                    "--json",
+                    "--non-interactive",
+                ],
+                actor,
+            ),
+            "",
+        );
+        assert_exit(&first, 3);
+        let saved: Value = serde_json::from_str(
+            String::from_utf8_lossy(&first.stdout)
+                .lines()
+                .last()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(saved["status"], "paused");
+        assert_eq!(f.calls.load(Ordering::SeqCst), 1);
+        let id = saved["run_id"].as_str().unwrap();
+        let revision = saved["revision"].as_u64().unwrap().to_string();
+        let show = || {
+            let out = f.run(
+                &scoped_args(
+                    vec!["task", "show", agent.to_str().unwrap(), id, "--json"],
+                    actor,
+                ),
+                "",
+            );
+            assert_exit(&out, 0);
+            serde_json::from_slice::<Value>(&out.stdout).unwrap()
+        };
+        let before = show();
+        let stale = (saved["revision"].as_u64().unwrap() - 1).to_string();
+        let rejected = f.run(
+            &scoped_args(
+                vec![
+                    "task",
+                    "resume",
+                    agent.to_str().unwrap(),
+                    id,
+                    "--revision",
+                    &stale,
+                    "--json",
+                ],
+                actor,
+            ),
+            "yes\ncontinue\n",
+        );
+        assert_exit(&rejected, 2);
+        assert_eq!(show(), before);
+        let wrong_actor = f.run(
+            &[
+                "task",
+                "resume",
+                agent.to_str().unwrap(),
+                id,
+                "--revision",
+                &revision,
+                "--actor",
+                "someone-else",
+            ],
+            "yes\ncontinue\n",
+        );
+        assert_exit(&wrong_actor, 2);
+        let original = std::fs::read_to_string(&agent).unwrap();
+        std::fs::write(
+            &agent,
+            original.replace(
+                "Complete the declared objective.",
+                "A different configured objective.",
+            ),
+        )
+        .unwrap();
+        let changed = f.run(
+            &scoped_args(
+                vec![
+                    "task",
+                    "resume",
+                    agent.to_str().unwrap(),
+                    id,
+                    "--revision",
+                    &revision,
+                ],
+                actor,
+            ),
+            "yes\ncontinue\n",
+        );
+        assert_exit(&changed, 2);
+        std::fs::write(&agent, original).unwrap();
+        assert_eq!(show(), before);
+        assert_eq!(f.calls.load(Ordering::SeqCst), 1);
+        let resumed = f.run(
+            &scoped_args(
+                vec![
+                    "task",
+                    "resume",
+                    agent.to_str().unwrap(),
+                    id,
+                    "--revision",
+                    &revision,
+                    "--json",
+                ],
+                actor,
+            ),
+            "yes\ncontinue\n",
+        );
+        assert_exit(&resumed, 0);
+        let done: Value = serde_json::from_str(
+            String::from_utf8_lossy(&resumed.stdout)
+                .lines()
+                .last()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(done["status"], "completed");
+        assert_eq!(done["run_id"], saved["run_id"]);
+        assert_eq!(done["counters"]["llm_attempts"], 2);
+        assert_eq!(f.calls.load(Ordering::SeqCst), 2);
+        assert!(String::from_utf8_lossy(&resumed.stderr).contains("Restoration"));
+    }
 }
 
 #[test]
@@ -1728,4 +1879,476 @@ fn task_overrides_preflight_precedes_provider_credentials() {
     assert!(String::from_utf8_lossy(&normal.stderr).contains("API key not found"));
     assert!(!db.exists());
     assert_eq!(f.calls.load(Ordering::SeqCst), 0);
+}
+
+// Startup selects the saved task before ordinary input or auto-spawn construction, for explicit and automatic-state entry alike.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn task_subprocess_configured_startup_resumes_same_task_before_new_chat() {
+    for automatic in [false, true] {
+        let f = Fixture::new(&["draft", "done"]);
+        let db = f.dir.join("startup.sqlite");
+        let extra = if automatic {
+            format!(
+                "tools: []\nautonomy:\n  restoration_timeout_ms: 5000\n  persistence: {{enabled: true, resume_on_start: true}}\nstates:\n  initial: work\n  states:\n    work:\n      autonomy:\n        enabled: true\n        mode: state_until_exit\n        completion: {{response_contains: done}}\n        premature_finish: {{action: ask_user, on_unavailable: stop}}\nstorage: {{type: sqlite, path: '{}' }}\n",
+                db.display()
+            )
+        } else {
+            format!(
+                "{TASK}  restoration_timeout_ms: 5000\n  persistence: {{enabled: true, resume_on_start: true}}\n  premature_finish: {{action: ask_user, on_unavailable: stop}}\nstorage: {{type: sqlite, path: '{}' }}\n",
+                db.display()
+            )
+        };
+        let agent = f.agent(&extra);
+        let first = if automatic {
+            f.run(
+                &["run", agent.to_str().unwrap(), "--plain"],
+                "finish the report\n",
+            )
+        } else {
+            f.run(
+                &[
+                    "task",
+                    "run",
+                    agent.to_str().unwrap(),
+                    "finish the report",
+                    "--non-interactive",
+                ],
+                "",
+            )
+        };
+        assert_exit(&first, if automatic { 0 } else { 3 });
+        assert_eq!(f.calls.load(Ordering::SeqCst), 1);
+        let list = f.run(&["task", "list", agent.to_str().unwrap(), "--json"], "");
+        assert_exit(&list, 0);
+        let rows: Value = serde_json::from_slice(&list.stdout).unwrap();
+        assert_eq!(rows.as_array().unwrap().len(), 1);
+        assert_eq!(rows[0]["status"], "paused");
+        let id = rows[0]["key"]["run_id"].as_str().unwrap();
+        let startup = f.run(
+            &["run", agent.to_str().unwrap(), "--plain"],
+            "yes\ncontinue\n",
+        );
+        assert_exit(&startup, 0);
+        assert!(
+            String::from_utf8_lossy(&startup.stdout).contains("Restoration review"),
+            "stdout={} stderr={}",
+            String::from_utf8_lossy(&startup.stdout),
+            String::from_utf8_lossy(&startup.stderr)
+        );
+        assert_eq!(f.calls.load(Ordering::SeqCst), 2);
+        let show = f.run(&["task", "show", agent.to_str().unwrap(), id, "--json"], "");
+        assert_exit(&show, 0);
+        let done: Value = serde_json::from_slice(&show.stdout).unwrap();
+        assert_eq!(done["summary"]["status"], "completed");
+        assert_eq!(done["counters"]["llm_attempts"], 2);
+    }
+}
+
+// The real TUI services restoration review and the original question, then restores the same live terminal on exit.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn tui_pty_configured_startup_restores_task_and_terminal() {
+    let question = r#"{"tool":"ask_user","arguments":{"question":"Confirm saved source","options":["yes"],"allow_other":false}}"#;
+    let f = Fixture::new(&[question, "done"]);
+    let db = f.dir.join("tui-restart.sqlite");
+    let task = TASK.replace("tools: []", "tools: [ask_user]");
+    let agent = f.agent(&format!(
+        "{task}  restoration_timeout_ms: 5000\n  persistence: {{enabled: true, resume_on_start: true}}\n  hitl: {{on_user_question: pause_run}}\nstorage: {{type: sqlite, path: '{}' }}\n",
+        db.display()
+    ));
+    let seed = f.run(
+        &[
+            "task",
+            "run",
+            agent.to_str().unwrap(),
+            "confirm source",
+            "--non-interactive",
+        ],
+        "",
+    );
+    assert_exit(&seed, 3);
+    assert_eq!(f.calls.load(Ordering::SeqCst), 1);
+    run_tui_pty(&agent, "", "Agent: done", "yes", "complete");
+    assert_eq!(f.calls.load(Ordering::SeqCst), 2);
+    let list = f.run(&["task", "list", agent.to_str().unwrap(), "--json"], "");
+    assert_exit(&list, 0);
+    let rows: Value = serde_json::from_slice(&list.stdout).unwrap();
+    assert_eq!(rows.as_array().unwrap().len(), 1);
+    assert_eq!(rows[0]["status"], "completed");
+}
+
+// A selected skill keeps its activation and cursor across processes instead of repeating routing or its completed prefix.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn task_subprocess_configured_skill_startup_preserves_activation() {
+    let f = Fixture::new(&["research", "draft", "done"]);
+    let db = f.dir.join("skill-restart.sqlite");
+    let skill = f.dir.join("research.skill.yaml");
+    let skill_source = "id: research\ndescription: Research the request\ntrigger: User requests research\nautonomy:\n  enabled: true\n  mode: skill_until_complete\n  completion: {response_contains: done}\n  premature_finish: {action: ask_user, on_unavailable: stop}\nsteps:\n  - prompt: 'Research {{ user_input }}'\n";
+    std::fs::write(&skill, skill_source).unwrap();
+    let extra = format!(
+        "tools: []\nautonomy:\n  restoration_timeout_ms: 5000\n  persistence: {{enabled: true, resume_on_start: true}}\nskills: [{{file: research.skill.yaml}}]\nstorage: {{type: sqlite, path: '{}' }}\n",
+        db.display()
+    );
+    let agent = f.agent(&extra);
+    let yaml = std::fs::read_to_string(&agent).unwrap();
+    let prefix = yaml.split("tools: []").next().unwrap();
+    let provider = prefix.split("llm:\n").nth(1).unwrap();
+    let provider = provider
+        .lines()
+        .map(|line| format!("  {line}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(&agent, format!("name: Fixture\nsystem_prompt: Research\nllm: {{default: default, router: router}}\nllms:\n  default:\n{provider}\n  router:\n{provider}\n{extra}")).unwrap();
+    let seed = f.run(
+        &["run", agent.to_str().unwrap(), "--plain"],
+        "Research the sources\n",
+    );
+    assert_exit(&seed, 0);
+    assert_eq!(f.calls.load(Ordering::SeqCst), 2);
+    let list = f.run(&["task", "list", agent.to_str().unwrap(), "--json"], "");
+    assert_exit(&list, 0);
+    let rows: Value = serde_json::from_slice(&list.stdout).unwrap();
+    assert_eq!(rows.as_array().unwrap().len(), 1);
+    assert_eq!(rows[0]["status"], "paused");
+    let id = rows[0]["key"]["run_id"].as_str().unwrap();
+    // The loaded definition belongs to the construction identity even though the root YAML did not change.
+    std::fs::write(
+        &skill,
+        skill_source.replace("Research {{ user_input }}", "Changed instruction"),
+    )
+    .unwrap();
+    let revision = rows[0]["revision"].as_u64().unwrap().to_string();
+    let changed = f.run(
+        &[
+            "task",
+            "resume",
+            agent.to_str().unwrap(),
+            id,
+            "--revision",
+            &revision,
+        ],
+        "yes\ncontinue\n",
+    );
+    assert!(!changed.status.success());
+    assert_eq!(f.calls.load(Ordering::SeqCst), 2);
+    std::fs::write(&skill, skill_source).unwrap();
+    let resumed = f.run(
+        &["run", agent.to_str().unwrap(), "--plain"],
+        "yes\ncontinue\n",
+    );
+    assert_exit(&resumed, 0);
+    assert_eq!(f.calls.load(Ordering::SeqCst), 3);
+    let show = f.run(&["task", "show", agent.to_str().unwrap(), id, "--json"], "");
+    assert_exit(&show, 0);
+    let done: Value = serde_json::from_slice(&show.stdout).unwrap();
+    assert_eq!(done["summary"]["status"], "completed");
+    // Initial routing precedes task activation, so only the two task-owned calls belong to this ledger.
+    assert_eq!(done["counters"]["llm_attempts"], 2);
+}
+
+// A coordinating task restores fresh declared child objects and original shared accounting instead of re-sending its completed prefix.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn task_subprocess_configured_child_restart_preserves_topology_and_exact_call_limit() {
+    let question = r#"{"tool":"ask_user","arguments":{"question":"Confirm child result","options":["yes"],"allow_other":false}}"#;
+    let child = Fixture::new(&[question, "done-child"]);
+    let child_yaml = child.agent("tools: [ask_user]\n");
+    let text = std::fs::read_to_string(&child_yaml).unwrap();
+    std::fs::write(
+        &child_yaml,
+        text.replacen("name: Fixture", "name: Worker", 1),
+    )
+    .unwrap();
+    let message = r#"{"tool":"send_agent_message","arguments":{"to":"worker","message":"verify the child result"}}"#;
+    let root = Fixture::new(&[message, "done"]);
+    let db = root.dir.join("children.sqlite");
+    let agent = root.agent(&format!(
+        "{TASK}  restoration_timeout_ms: 5000\n  persistence: {{enabled: true}}\n  hitl: {{on_user_question: pause_run, on_approval_required: pause_run}}\nspawner:\n  shared_llms: false\n  management_tools: [send_agent_message]\n  auto_spawn: [{{id: worker, agent: '{}' }}]\nstorage: {{type: sqlite, path: '{}' }}\n", child_yaml.display(), db.display()
+    ));
+    let first = root.run(
+        &[
+            "task",
+            "run",
+            agent.to_str().unwrap(),
+            "verify",
+            "--non-interactive",
+            "--json",
+        ],
+        "",
+    );
+    assert_exit(&first, 3);
+    let saved: Value = serde_json::from_str(
+        String::from_utf8_lossy(&first.stdout)
+            .lines()
+            .last()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(saved["status"], "paused");
+    assert_eq!(root.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(child.calls.load(Ordering::SeqCst), 1);
+    let revision = saved["revision"].as_u64().unwrap().to_string();
+    let resumed = root.run(
+        &[
+            "task",
+            "resume",
+            agent.to_str().unwrap(),
+            saved["run_id"].as_str().unwrap(),
+            "--revision",
+            &revision,
+            "--json",
+        ],
+        "yes\nyes\n",
+    );
+    assert_exit(&resumed, 0);
+    let done: Value = serde_json::from_str(
+        String::from_utf8_lossy(&resumed.stdout)
+            .lines()
+            .last()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(done["status"], "completed");
+    assert_eq!(done["run_id"], saved["run_id"]);
+    assert_eq!(done["counters"]["llm_attempts"], 4);
+    assert_eq!(root.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(child.calls.load(Ordering::SeqCst), 2);
+}
+
+// A real configuration read blocks only after the restore work journal is committed; killing the process tests actual CLI recovery without a product fault switch.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn task_subprocess_configured_constructor_crash_recovers_without_replay() {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::process::ExitStatusExt;
+    struct ChildGuard(Option<std::process::Child>);
+    impl Drop for ChildGuard {
+        // A failing assertion must not leave a blocked fixture process or its lease behind.
+        fn drop(&mut self) {
+            if let Some(child) = self.0.as_mut() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+    let f = Fixture::new(&["draft", "done"]);
+    let db = f.dir.join("crash.sqlite");
+    let pricing = f.dir.join("pricing.json");
+    std::fs::write(&pricing, "{}").unwrap();
+    let agent = f.agent(&format!(
+        "{TASK}  restoration_timeout_ms: 5000\n  persistence: {{enabled: true}}\n  premature_finish: {{action: ask_user, on_unavailable: stop}}\nstorage: {{type: sqlite, path: '{}' }}\nobservability:\n  enabled: true\n  cost:\n    pricing_file: '{}'\n", db.display(), pricing.display()
+    ));
+    let first = f.run(
+        &[
+            "task",
+            "run",
+            agent.to_str().unwrap(),
+            "report",
+            "--non-interactive",
+            "--json",
+        ],
+        "",
+    );
+    assert_exit(&first, 3);
+    let saved: Value = serde_json::from_str(
+        String::from_utf8_lossy(&first.stdout)
+            .lines()
+            .last()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(saved["status"], "paused");
+    let id = saved["run_id"].as_str().unwrap();
+    let revision = saved["revision"].as_u64().unwrap().to_string();
+    std::fs::remove_file(&pricing).unwrap();
+    let fifo = std::ffi::CString::new(pricing.as_os_str().as_bytes()).unwrap();
+    // SAFETY: fifo is a live NUL-terminated path in the isolated fixture directory; only this process owns its creation.
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+    let mut child = ChildGuard(Some(
+        Command::new(env!("CARGO_BIN_EXE_ai-agents-cli"))
+            .args([
+                "task",
+                "resume",
+                agent.to_str().unwrap(),
+                id,
+                "--revision",
+                &revision,
+                "--json",
+            ])
+            .current_dir(&f.dir)
+            .env("RUST_LOG", "off")
+            .env("TASK_FIXTURE_TOKEN", "isolated-test-placeholder")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    ));
+    let started = Instant::now();
+    let gate = loop {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&pricing)
+        {
+            Ok(gate) => break gate,
+            Err(error) if error.raw_os_error() == Some(libc::ENXIO) => {}
+            Err(error) => panic!("pricing gate: {error}"),
+        }
+        if child.0.as_mut().unwrap().try_wait().unwrap().is_some() {
+            let out = child.0.take().unwrap().wait_with_output().unwrap();
+            panic!(
+                "constructor returned before the read gate: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(25),
+            "constructor did not reach its real read boundary"
+        );
+        thread::sleep(Duration::from_millis(5));
+    };
+    let show = f.run(&["task", "show", agent.to_str().unwrap(), id, "--json"], "");
+    assert_exit(&show, 0);
+    let running: Value = serde_json::from_slice(&show.stdout).unwrap();
+    assert_eq!(running["summary"]["status"], "running");
+    assert_eq!(running["counters"]["llm_attempts"], 1);
+    let revision = running["summary"]["revision"].as_u64().unwrap().to_string();
+    let args = [
+        "task",
+        "recover",
+        agent.to_str().unwrap(),
+        id,
+        "--revision",
+        &revision,
+        "--action",
+        "resume-prepared",
+        "--reason",
+        "interrupted configured preparation",
+        "--json",
+    ];
+    let held = f.run(&args, "");
+    assert_exit(&held, 2);
+    assert!(
+        String::from_utf8_lossy(&held.stderr).contains("active owner"),
+        "{}",
+        String::from_utf8_lossy(&held.stderr)
+    );
+    assert_eq!(f.calls.load(Ordering::SeqCst), 1);
+    child.0.as_mut().unwrap().kill().unwrap();
+    let stopped = child.0.take().unwrap().wait_with_output().unwrap();
+    assert_eq!(stopped.status.signal(), Some(libc::SIGKILL));
+    drop(gate);
+    std::fs::remove_file(&pricing).unwrap();
+    std::fs::write(&pricing, "{}").unwrap();
+    let recovery = f.run(&args, "");
+    assert_exit(&recovery, 0);
+    let ready: Value = serde_json::from_slice(&recovery.stdout).unwrap();
+    assert_eq!(ready["status"], "paused");
+    let revision = ready["revision"].as_u64().unwrap().to_string();
+    let done = f.run(
+        &[
+            "task",
+            "resume",
+            agent.to_str().unwrap(),
+            id,
+            "--revision",
+            &revision,
+            "--json",
+        ],
+        "yes\ncontinue\n",
+    );
+    assert_exit(&done, 0);
+    assert_eq!(f.calls.load(Ordering::SeqCst), 2);
+}
+
+// A provider-free cancellation request blocks execution; explicit configured cleanup acknowledges retirement without consuming the pending question.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn task_subprocess_configured_cancelled_pause_cleans_up_without_model_work() {
+    let f = Fixture::new(&["draft", "must not execute"]);
+    let db = f.dir.join("cancelled.sqlite");
+    let agent = f.agent(&format!("{TASK}  restoration_timeout_ms: 5000\n  persistence: {{enabled: true}}\n  premature_finish: {{action: ask_user, on_unavailable: stop}}\nstorage: {{type: sqlite, path: '{}' }}\n", db.display()));
+    let first = f.run(
+        &[
+            "task",
+            "run",
+            agent.to_str().unwrap(),
+            "report",
+            "--non-interactive",
+            "--json",
+        ],
+        "",
+    );
+    assert_exit(&first, 3);
+    let saved: Value = serde_json::from_str(
+        String::from_utf8_lossy(&first.stdout)
+            .lines()
+            .last()
+            .unwrap(),
+    )
+    .unwrap();
+    let id = saved["run_id"].as_str().unwrap();
+    let revision = saved["revision"].as_u64().unwrap().to_string();
+    let cancel = f.run(
+        &[
+            "task",
+            "cancel",
+            agent.to_str().unwrap(),
+            id,
+            "--revision",
+            &revision,
+            "--json",
+        ],
+        "",
+    );
+    assert_exit(&cancel, 0);
+    let requested: Value = serde_json::from_slice(&cancel.stdout).unwrap();
+    assert_eq!(requested["disposition"], "requested");
+    let current = requested["run"]["revision"].as_u64().unwrap().to_string();
+    let resume = f.run(
+        &[
+            "task",
+            "resume",
+            agent.to_str().unwrap(),
+            id,
+            "--revision",
+            &current,
+        ],
+        "yes\ncontinue\n",
+    );
+    assert_exit(&resume, 2);
+    let stale = f.run(
+        &[
+            "task",
+            "cleanup",
+            agent.to_str().unwrap(),
+            id,
+            "--revision",
+            &revision,
+        ],
+        "",
+    );
+    assert_exit(&stale, 2);
+    assert_eq!(f.calls.load(Ordering::SeqCst), 1);
+    let cleanup = f.run(
+        &[
+            "task",
+            "cleanup",
+            agent.to_str().unwrap(),
+            id,
+            "--revision",
+            &current,
+            "--json",
+        ],
+        "",
+    );
+    assert_exit(&cleanup, 0);
+    let done: Value = serde_json::from_slice(&cleanup.stdout).unwrap();
+    assert_eq!(done["status"], "cancelled");
+    assert_eq!(done["counters"]["llm_attempts"], 1);
+    assert_eq!(f.calls.load(Ordering::SeqCst), 1);
 }

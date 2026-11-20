@@ -74,7 +74,7 @@ Parses and validates the YAML spec. Fixed framework-owned configuration objects 
 
 ## Development task CLI
 
-These commands describe the development tree, not the published 1.1.2 CLI. They run the existing general-purpose task controller; they do not install a coding-specific loop, scheduler, daemon or production restart host. A selected profile must be enabled, and ordinary chat remains unchanged when autonomy is omitted or disabled.
+These commands describe the development tree, not the published 1.1.2 CLI. They run the existing general-purpose task controller; they do not install a coding-specific loop, scheduler or daemon. Configured restart is described below. A selected profile must be enabled, and ordinary chat remains unchanged when autonomy is omitted or disabled.
 
 ```sh
 cargo run -p ai-agents-cli -- task run agent.yaml "Research the requested topic"
@@ -84,10 +84,12 @@ cargo run -p ai-agents-cli -- task run agent.yaml "Produce a report" --non-inter
 cargo run -p ai-agents-cli -- task list agent.yaml --json
 cargo run -p ai-agents-cli -- task show agent.yaml RUN_ID --json
 cargo run -p ai-agents-cli -- task cancel agent.yaml RUN_ID --revision REVISION --json
-cargo run -p ai-agents-cli -- task resume agent.yaml RUN_ID
+cargo run -p ai-agents-cli -- task resume agent.yaml RUN_ID --revision REVISION
+cargo run -p ai-agents-cli -- task cleanup agent.yaml RUN_ID --revision REVISION --json
+cargo run -p ai-agents-cli -- task recover agent.yaml RUN_ID --revision REVISION --action resume-prepared --reason "reviewed interrupted preparation" --json
 ```
 
-`--overrides FILE` loads a strict partial autonomy profile once for this invocation. For example, a file containing `max_llm_calls: 12` inherits the selected profile's other settings. Raw conflicts, invalid resolved declarations and persistence unsupported by the default CLI reject before provider, storage or MCP preparation. The same typed input reaches execution, where actual bindings and host limits are checked again. An invocation cannot waive an inherited required stage/plan review. This option belongs to the command-line `task run`; the REPL/TUI task command retains its existing syntax.
+`--overrides FILE` loads a strict partial autonomy profile once for this invocation. For example, a file containing `max_llm_calls: 12` inherits the selected profile's other settings. Raw conflicts, invalid resolved declarations and missing configured-persistence prerequisites reject before execution. The configured CLI requires SQLite, a positive agent-wide restoration work timeout and OS time evidence; opaque MCP state needs a Rust component binding. The same typed input reaches execution, where actual bindings and host limits are checked again. An invocation cannot waive an inherited required stage/plan review. This option belongs to the command-line `task run`; the REPL/TUI task command retains its existing syntax.
 
 Run-specific settings remain in the task payload. `list/show/cancel` use the original agent declaration and actor namespace without the override file or provider credentials. Original invocation settings survive supported retained/explicit-host reconstruction; changing the file does not change a paused run. See [Rust invocation settings](@/docs/rust-api.md#invocation-settings-development-only) for payload compatibility and the separate authenticated host controls.
 
@@ -144,7 +146,7 @@ Ordinary composing parents can wait for independently hosted child tasks. Their 
 | `0` | Completed |
 | `1` | Failed, Cancelled, Incomplete, LimitReached or RecoveryRequired |
 | `2` | Configuration, validation, storage, usage or command I/O error |
-| `3` | Reserved for an actually acknowledged prepared durable pause that survives process exit; the default CLI cannot produce this |
+| `3` | An exact acknowledged prepared pause was confirmed in a surviving backend; later resume still requires validation and fresh review |
 
 `list`, `show` and `cancel` check the current source-aware namespace and the exact compatible legacy typed namespace without constructing providers or converting stored finite limits. They report command/config/storage success separately from the task's status. A successful remote `cancel` records a request, not remote termination. Its receipt distinguishes `requested`, `acknowledged` and `already_terminal`; store-only callers cannot certify live cleanup. Obtain the exact revision from an authorized observation rather than retrying arbitrary revisions after an error.
 
@@ -156,7 +158,13 @@ No-storage and retained in-memory runs can complete or pause/resume in the same 
 
 The declarative scope includes the normalized agent declaration and loaded skills. Execution verifies the definitions actually prepared by the builder rather than trusting a filename or an independent reread. This namespace is not caller authentication, opaque implementation binding or reconstruction authority. Protect the configuration and database using the host's normal access controls.
 
-The default CLI has no production reconstruction host or portable restart-clock binding. Explicit durable requests are rejected before task execution; `task resume` in a new process returns a clear unsupported-capability error before provider construction. SQLite existence and session `/save`/`/load` do not make a task restartable. Use retained in-process controls, or the explicitly prepared [Rust restoration APIs](@/docs/rust-api.md#automatic-state-and-skill-tasks-development-only) with an actual host binding. Arbitrary in-flight stack restoration and automatic abandoned-owner takeover remain unsupported.
+For configured restart, set `autonomy.restoration_timeout_ms` to a positive whole-millisecond bound and enable `autonomy.persistence` with file-backed SQLite. The timeout bounds each capture, restoration and review transaction and is conservatively charged in full; it is not a cumulative task limit or a human response timeout. Keep the same compatible YAML, loaded definitions, working directory and actor. See [configured process restart](@/docs/task-autonomy.md#configured-process-restart).
+
+`task resume` requires the exact observed revision. It reconstructs the prepared work, asks for a fresh restoration review, then separately services the original pending question or approval. `run agent.yaml` also uses `resume_on_start` to select one compatible prepared task before new chat. It does not choose among multiple candidates, adopt an owned task or replace saved context with new `--context` input.
+
+`cancel` remains a provider-free request. After an acknowledged cancellation request on a prepared pause, `cleanup` explicitly prepares the configured components and performs typed retirement without model/tool execution. `recover` is for interrupted preparation: it requires the observed revision, an explicit reason, a free process lease and unchanged safe state. `resume-prepared` returns a prepared revision requiring a later resume/review; `cancel-prepared` preserves an existing cancellation request and performs cleanup after reconciliation. A reason or process death alone cannot clear unknown task effects. Cleanup/recovery report command success separately from business completion.
+
+Session `/save`/`/load` does not reconstruct tasks. In-memory journals, arbitrary in-flight stack restoration, automatic abandoned-owner takeover and inferred MCP server state remain unsupported restart paths. Existing invocation deadlines and current automatic policy still apply after human review.
 
 The development `eval` command also accepts typed `!task` steps and task assertions through the configured controller. Stock integrations use this CLI directly; domain suites with named Rust adapters use the fixed host route documented by the mocked helper. Development report schema 3, foreground participant controls, migration and timeout/cleanup behavior are described in [task evaluation](@/docs/evaluation.md#development-task-evaluation-foundation). Custom host executables can install the same domain bindings with `EvalHost`; the helper's fixed marker is not a plugin loader. See the [task walkthrough](@/docs/task-autonomy.md). These development evaluation features do not install default production task reconstruction.
 
@@ -382,7 +390,7 @@ The first `Ctrl+C` or `/quit` requests foreground shutdown and keeps polling the
 
 Input and ordinary callback queues are bounded (16 and 32); display/control delivery uses bounded queues of 32. Tick/resize are coalesced by the event loop and log hints may be dropped under pressure. Chat history is display-only (up to 256 entries and 32 KiB content), previews and local task details are bounded, and truncation never changes the exact retained result or checkpoint. Local objectives, question/default text and host-selected review context are trusted UI data, not safe log/export payloads. JSON task snapshots retain default redaction. Slow or closed display delivery must not block shutdown settlement.
 
-Session save/load does not reconstruct tasks. Default production new-process restart remains unsupported; an embedding Rust host must explicitly supply the existing prepared reconstruction contract. Low-level Rust TUI integrations now pass bounded `tokio::sync::mpsc::Sender` values to app/question/log constructors; modal constructors initialize review scrolling, while direct modal literals must include `review_scroll`.
+Session save/load does not reconstruct tasks. Configured `resume_on_start` restores through the same foreground driver, including fresh review before the original decision; embedding Rust hosts can use the configured or lower-level prepared reconstruction APIs. Low-level Rust TUI integrations now pass bounded `tokio::sync::mpsc::Sender` values to app/question/log constructors; modal constructors initialize review scrolling, while direct modal literals must include `review_scroll`.
 
 ### Layout
 

@@ -791,6 +791,22 @@ pub struct RuntimeAgent {
     automatic_host: Option<Arc<crate::autonomy::automatic::AutomaticTaskHost>>,
 }
 
+// Construction catalogues observe actual runtime identity without retaining removed children or creating host-service cycles.
+#[derive(Clone)]
+pub(crate) struct WeakRuntimeAgent(std::sync::Weak<RuntimeAgentState>);
+
+impl WeakRuntimeAgent {
+    // Upgrading borrows the same inner state and never constructs a new runtime or grants task ownership.
+    pub(crate) fn upgrade(&self) -> Option<Arc<RuntimeAgent>> {
+        self.0.upgrade().map(|inner| {
+            Arc::new(RuntimeAgent {
+                inner,
+                automatic_host: None,
+            })
+        })
+    }
+}
+
 /// Private-field storage for the runtime's single live identity, exposed only as the target of field delegation.
 #[doc(hidden)]
 pub struct RuntimeAgentState {
@@ -900,6 +916,7 @@ pub struct RuntimeAgentState {
     /// Session mutations and direct host operations exclude run reservation without changing ordinary root reentry.
     autonomy_mutations: tokio::sync::RwLock<()>,
     autonomy_extensions: Arc<crate::autonomy::FrozenAutonomyExtensions>,
+    configured_task_recipe: Option<Box<crate::autonomy::ConfiguredTaskRecipe>>,
 }
 
 impl std::ops::Deref for RuntimeAgent {
@@ -1187,6 +1204,7 @@ impl RuntimeAgent {
                 autonomy_owner: Arc::new(RwLock::new(None)),
                 autonomy_mutations: tokio::sync::RwLock::new(()),
                 autonomy_extensions: crate::autonomy::AutonomyExtensions::builtins().freeze(),
+                configured_task_recipe: None,
             }),
         })
     }
@@ -1194,6 +1212,11 @@ impl RuntimeAgent {
     /// Compares the actual shared runtime identity, not the address of an internal controller handle.
     pub(crate) fn same_runtime(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    // Factory bookkeeping must not keep a runtime alive after its actual execution and registry owners release it.
+    pub(crate) fn weak_task_handle(&self) -> WeakRuntimeAgent {
+        WeakRuntimeAgent(Arc::downgrade(&self.inner))
     }
 
     /// Borrows the live state into an owned controller handle without retaining its hosting service in a cycle.

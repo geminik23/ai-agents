@@ -1,7 +1,7 @@
 // Application-owned domain integration shared by the embedded host and ordinary EvalRunner.
 // Flow: authorized state/tool changes -> target revision -> pure validator/progress -> controller evidence.
 // Replace Records and its domain predicates for your application; no core gate or executor changes are needed.
-// Each installation creates fresh state. Resume retains that installation; rebuilding intentionally starts a new domain instance.
+// Ordinary installation creates fresh state; configured restoration explicitly supplies the saved domain binding.
 
 #[path = "task_corpus.rs"]
 pub mod corpus;
@@ -11,6 +11,7 @@ use ai_agents::tools::{Tool, ToolExecutionContext, ToolResult, ToolSafetyMetadat
 use ai_agents::{AgentBuilder, AgentError};
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{
@@ -39,6 +40,59 @@ impl HostRevisionSource for Records {
         Ok(self.revision.load(Ordering::SeqCst).to_string())
     }
 }
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DomainSnapshot {
+    records: Value,
+    revision: u64,
+    corpus: corpus::CorpusSnapshot,
+}
+struct DomainRecovery {
+    records: Arc<Records>,
+    corpus: Arc<corpus::Corpus>,
+}
+impl TaskRestoreComponentState for DomainRecovery {
+    // Capture actual application state under its mutation lock; credentials and executable authority are not serialized.
+    fn binding(&self) -> ai_agents::Result<TaskRestoreBinding> {
+        let records = self.records.value.lock().expect("domain state");
+        Ok(TaskRestoreBinding {
+            id: "example.domain".into(),
+            contract_version: 1,
+            configuration: json!({"corpus":corpus::VERSION}),
+            state: serde_json::to_value(DomainSnapshot {
+                records: records.clone(),
+                revision: self.records.revision.load(Ordering::SeqCst),
+                corpus: self.corpus.snapshot(),
+            })?,
+        })
+    }
+}
+
+/// Validates this application's versioned saved data before constructing replacement components.
+pub fn validate_domain_binding(binding: &TaskRestoreBinding) -> ai_agents::Result<()> {
+    if binding.id != "example.domain"
+        || binding.contract_version != 1
+        || binding.configuration != json!({"corpus":corpus::VERSION})
+    {
+        return Err(AgentError::Config(
+            "domain recovery implementation differs".into(),
+        ));
+    }
+    let saved: DomainSnapshot = serde_json::from_value(binding.state.clone())?;
+    if !saved.records["sources"]
+        .as_array()
+        .is_some_and(|values| values.iter().all(Value::is_string))
+        || !saved.records["ticket"].is_string()
+        || !saved.records["health"].is_string()
+        || !saved.records["source"].is_string()
+        || !saved.records["world"].is_number()
+    {
+        return Err(AgentError::Config("invalid domain record state".into()));
+    }
+    corpus::Corpus::from_snapshot(saved.corpus)?;
+    Ok(())
+}
+
 struct RecordTool(Arc<Records>);
 #[async_trait]
 impl Tool for RecordTool {
@@ -296,10 +350,35 @@ impl ProgressAdapter for RecordProgress {
         })
     }
 }
-/// Installs actual tools and immutable named adapters without replacing providers, hooks, storage or their admission layers.
-/// This installer owns the named adapter registry; combine additional adapters here before freezing, and set hosting options explicitly in the caller.
-pub fn domain_components() -> ai_agents::Result<(AutonomyExtensions, Vec<Arc<dyn Tool>>)> {
-    let records = Records::new();
+/// The installed registry and tools share the exact application state exposed for configured recovery.
+pub struct DomainComponents {
+    pub extensions: AutonomyExtensions,
+    pub tools: Vec<Arc<dyn Tool>>,
+    pub state: Arc<dyn TaskRestoreComponentState>,
+}
+
+/// Creates ordinary or restored application components without replacing caller-owned execution layers.
+/// This installer owns the named adapter registry; combine additional adapters here before freezing.
+pub fn domain_components(
+    saved: Option<&TaskRestoreBinding>,
+) -> ai_agents::Result<DomainComponents> {
+    let (records, corpus) = if let Some(binding) = saved {
+        validate_domain_binding(binding)?;
+        let saved: DomainSnapshot = serde_json::from_value(binding.state.clone())?;
+        (
+            Arc::new(Records {
+                value: Mutex::new(saved.records),
+                revision: AtomicU64::new(saved.revision),
+            }),
+            Arc::new(corpus::Corpus::from_snapshot(saved.corpus)?),
+        )
+    } else {
+        (Records::new(), Arc::new(corpus::Corpus::default()))
+    };
+    let recovery = Arc::new(DomainRecovery {
+        records: records.clone(),
+        corpus: corpus.clone(),
+    });
     let mut extensions = AutonomyExtensions::builtins();
     extensions.register_validator(Arc::new(FileReportValidator(AdapterDescriptor {
         id: "host.file_report".into(),
@@ -325,15 +404,32 @@ pub fn domain_components() -> ai_agents::Result<(AutonomyExtensions, Vec<Arc<dyn
     for check in ["records", "health", "review_result"] {
         extensions.register_validation_target(check, "domain-state", records.clone())?;
     }
-    let catalog = corpus::register(&mut extensions)?;
-    Ok((extensions, vec![Arc::new(RecordTool(records)), catalog]))
+    let catalog = corpus::register(&mut extensions, corpus)?;
+    Ok(DomainComponents {
+        extensions,
+        tools: vec![Arc::new(RecordTool(records)), catalog],
+        state: recovery,
+    })
 }
 
 /// Installs the same domain components used by pure configuration checks, preserving caller-owned execution layers.
-pub fn install_domain(mut builder: AgentBuilder) -> ai_agents::Result<AgentBuilder> {
-    let (extensions, tools) = domain_components()?;
+pub fn install_domain(builder: AgentBuilder) -> ai_agents::Result<AgentBuilder> {
+    install_domain_state(builder, None).map(|(builder, _)| builder)
+}
+
+/// Supplies saved state only through the installed configured factory; ordinary callers pass None for fresh records.
+/// The returned object observes the exact components installed on this builder.
+pub fn install_domain_state(
+    mut builder: AgentBuilder,
+    saved: Option<&TaskRestoreBinding>,
+) -> ai_agents::Result<(AgentBuilder, Arc<dyn TaskRestoreComponentState>)> {
+    let DomainComponents {
+        extensions,
+        tools,
+        state,
+    } = domain_components(saved)?;
     for tool in tools {
         builder = builder.tool(tool);
     }
-    Ok(builder.autonomy_extensions(extensions))
+    Ok((builder.autonomy_extensions(extensions), state))
 }

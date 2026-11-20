@@ -172,10 +172,11 @@ pub(super) fn validate_manifest(
     payload: &TaskCheckpointPayload,
     host: &dyn TaskRestoreHost,
 ) -> Result<()> {
-    if !matches!(manifest.version, 1 | 2)
+    if !matches!(manifest.version, 1..=3)
+        || (manifest.version == 3) != manifest.clock_evidence.is_some()
         || manifest.nodes.values().any(|node| match manifest.version {
             1 => node.task_iteration_policy.is_some(),
-            2 => node.task_iteration_policy.is_none(),
+            2 | 3 => node.task_iteration_policy.is_none(),
             _ => true,
         })
         || manifest.host != host.identity()
@@ -1031,7 +1032,8 @@ impl AutonomyRunner {
             ));
         }
         let started = Instant::now();
-        let started_at = host.now()?;
+        // The earlier possible start prevents uncertainty from refunding interrupted reconstruction time.
+        let started_at = host.capture_now()?;
         let snapshot = store
             .load(&request.run_id)
             .await?
@@ -1039,10 +1041,11 @@ impl AutonomyRunner {
         let mut payload: TaskCheckpointPayload = serde_json::from_value(snapshot.payload.clone())?;
         payload.validate(&snapshot, &request.config_identity)?;
         safe_pause_mode(&snapshot, &payload, host.now()?, false, cleanup_only)?;
+        let _work_lease = host.work_lease(&snapshot)?;
         if snapshot.revision != request.expected_revision {
             return Err(TaskRunStorageError::Conflict.into());
         }
-        let manifest: TaskRestoreManifest = serde_json::from_value(
+        let mut manifest: TaskRestoreManifest = serde_json::from_value(
             payload
                 .adapters
                 .iter()
@@ -1053,6 +1056,19 @@ impl AutonomyRunner {
                 .state
                 .clone(),
         )?;
+        // RequestCancel preserves the complete payload and adds one restrictive revision; only cleanup may use that successor.
+        // This never refreshes execution authority, accepts an arbitrary newer revision, or clears cancellation.
+        if cleanup_only && manifest.revision != snapshot.revision {
+            if manifest.revision.checked_add(1) != Some(snapshot.revision)
+                || snapshot.status != TaskRunStatus::Paused
+                || snapshot.owner_token.is_some()
+                || !snapshot.cancel_requested
+                || manifest.payload_digest != payload_digest(&payload)?
+            {
+                return Err(TaskRunStorageError::Conflict.into());
+            }
+            manifest.revision = snapshot.revision;
+        }
         validate_manifest(&manifest, &snapshot, &payload, host.as_ref())
             .map_err(|error| AgentError::Config(format!("restoration preflight: {error}")))?;
         validate_current_host(&request, &payload)?;
@@ -1113,10 +1129,13 @@ impl AutonomyRunner {
             &store, &claimed, &payload, "restore", budget, started_at, deadline,
         )
         .await?;
-        let graph = tokio::time::timeout_at(
-            tokio::time::Instant::from_std(deadline),
-            host.stage(&manifest),
-        )
+        // Resource preparation and pure staging share one charged deadline and one subsequent validation/publication path.
+        let graph = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), async {
+            match host.prepare_graph(&manifest).await? {
+                Some(graph) => Ok(graph),
+                None => host.stage(&manifest).await,
+            }
+        })
         .await
         .map_err(|_| TaskRunStorageError::AdmissionExpired)??;
         if Instant::now() >= deadline {
@@ -1408,6 +1427,7 @@ impl AutonomyRunner {
     /// Fresh restoration approval covers exactly the reconstructed ongoing operations; pending tool/question replies remain separate.
     /// Modification and timeout are not blanket approvals, and a policy/generation change invalidates the review before a write.
     /// The installed host's certified clock remains authoritative after awaited storage reads, just as at capture and reconstruction.
+    /// Foreground hosts learn the new revision only after the review checkpoint and local approval flag are acknowledged.
     pub async fn approve_restoration(
         &self,
         run_id: &str,
@@ -1424,7 +1444,8 @@ impl AutonomyRunner {
             .and_then(|paused| paused.restoration.as_ref())
             .map(|review| review.host.clone())
             .ok_or(TaskRunStorageError::NotResumable)?;
-        let started_at = clock_host.now()?;
+        // Fresh review is active work and keeps the same conservative start contract as reconstruction.
+        let started_at = clock_host.capture_now()?;
         let snapshot = self
             .store
             .load(run_id)
@@ -1432,6 +1453,7 @@ impl AutonomyRunner {
             .ok_or(TaskRunStorageError::NotFound)?;
         let mut payload: TaskCheckpointPayload = serde_json::from_value(snapshot.payload.clone())?;
         safe_pause(&snapshot, &payload, clock_host.now()?, false)?;
+        let _work_lease = clock_host.work_lease(&snapshot)?;
         if snapshot.revision != expected_revision {
             return Err(TaskRunStorageError::Conflict.into());
         }
@@ -1550,7 +1572,7 @@ impl AutonomyRunner {
             .view = view;
         self.paused.lock().insert(run_id.into(), paused);
         cleanup.finish();
-        Ok(TaskRunResult {
+        self.acknowledged_automatic_result(TaskRunResult {
             run: TaskRun::from_checkpoint(&saved, &self.config_identity)?,
             final_response: None,
         })

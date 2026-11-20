@@ -20,15 +20,53 @@ impl Drop for PromotionCleanup {
 }
 
 impl RuntimeAgent {
+    /// Installs only the actual restored controller into an otherwise unused configured host service.
+    /// Matching a run identifier is insufficient: the runtime identity itself must match and no prior runner may be displaced.
+    pub(crate) fn attach_configured_task_runner(
+        &self,
+        runner: Arc<AutonomyRunner>,
+        outcome: Option<Arc<automatic::AutomaticOutcome>>,
+    ) -> Result<()> {
+        if !runner.runtime().same_runtime(self) {
+            return Err(AgentError::Config(
+                "restored runner belongs to another runtime".into(),
+            ));
+        }
+        let host = self.automatic_host().ok_or_else(|| {
+            AgentError::Config("restored runtime has no configured hosting service".into())
+        })?;
+        let slot = host.runner.lock();
+        let mut restored = host.restored_runner.lock();
+        if slot.is_some() || restored.upgrade().is_some() {
+            return Err(AgentError::Config(
+                "configured task runner is already installed".into(),
+            ));
+        }
+        *restored = Arc::downgrade(&runner);
+        if let Some(outcome) = outcome {
+            *host.outcome.lock() = outcome;
+        }
+        Ok(())
+    }
     /// Validates final component and declaration bindings without provider calls, storage construction or task admission.
     /// None defers only the configured store check to explicit preparation; an installed restore host is still required for persistent automatic entry.
     pub(crate) fn preflight_task_hosting(
         &self,
         config: &AutonomyConfig,
         options: &AutomaticTaskOptions,
-        reconstruction: Option<bool>,
+        store_capabilities: Option<(bool, bool)>,
     ) -> Result<()> {
         self.preflight_standalone_autonomy()?;
+        let store_capabilities = options
+            .store
+            .as_ref()
+            .map(|store| {
+                (
+                    store.supports_reconstruction(),
+                    store.supports_process_restart(),
+                )
+            })
+            .or(store_capabilities);
         let validate = |scope,
                         settings: &ai_agents_core::autonomy::AutonomyOverride|
          -> Result<()> {
@@ -49,9 +87,22 @@ impl RuntimeAgent {
                     .persistence
                     .as_ref()
                     .is_some_and(|p| p.enabled != Some(false))
-                    && (options.restore_host.is_none() || reconstruction == Some(false))
+                    && (options.restore_host.is_none()
+                        || store_capabilities.is_some_and(|caps| !caps.0))
                 {
                     return Err(AgentError::Config("automatic task persistence requires an explicit reconstruction store and restore host".into()));
+                }
+                if profile
+                    .settings
+                    .persistence
+                    .as_ref()
+                    .is_some_and(|policy| policy.enabled != Some(false))
+                {
+                    options
+                        .restore_host
+                        .as_ref()
+                        .ok_or(crate::autonomy::TaskRunStorageError::NotResumable)?
+                        .preflight_persistence(store_capabilities.map(|caps| caps.1))?;
                 }
             }
             Ok(())
@@ -117,11 +168,23 @@ impl RuntimeAgent {
         storage: Option<Arc<dyn ai_agents_core::AgentStorage>>,
         interaction_delivery: bool,
     ) -> Result<Self> {
-        let reconstruction = options.store.as_ref().map_or_else(
-            || storage.is_some(),
-            |store| store.supports_reconstruction(),
+        let store_capabilities = options.store.as_ref().map_or_else(
+            || {
+                (
+                    storage.is_some(),
+                    storage.as_ref().is_some_and(|storage| {
+                        storage.supports(ai_agents_core::StorageCapability::DurableTaskRuns)
+                    }),
+                )
+            },
+            |store| {
+                (
+                    store.supports_reconstruction(),
+                    store.supports_process_restart(),
+                )
+            },
         );
-        self.preflight_task_hosting(&config, &options, Some(reconstruction))?;
+        self.preflight_task_hosting(&config, &options, Some(store_capabilities))?;
         let host = Arc::new(AutomaticTaskHost {
             config,
             options,
@@ -129,6 +192,7 @@ impl RuntimeAgent {
             storage: storage
                 .unwrap_or_else(|| Arc::new(ai_agents_storage::InMemoryTaskStorage::default())),
             runner: Default::default(),
+            restored_runner: Default::default(),
             outcome: Default::default(),
         });
         *self.inner.automatic_host.write() = Arc::downgrade(&host);
@@ -145,8 +209,12 @@ impl RuntimeAgent {
 
     /// Exposes the retained controller to trusted hosts for task events and explicit review, never as serialized authority.
     pub fn automatic_task_runner(&self) -> Option<Arc<AutonomyRunner>> {
-        self.automatic_host()
-            .and_then(|host| host.runner.lock().clone())
+        self.automatic_host().and_then(|host| {
+            host.runner
+                .lock()
+                .clone()
+                .or_else(|| host.restored_runner.lock().upgrade())
+        })
     }
 
     /// Resolves the configured runner for explicit and automatic work without starting a task or cloning runtime state.
@@ -170,6 +238,14 @@ impl RuntimeAgent {
                 "task hosting is not configured; supply autonomy settings and task options".into(),
             )
         })?;
+        if let Some(runner) = host.restored_runner.lock().upgrade() {
+            if runner.actor_scope != self.effective_actor_id() {
+                return Err(AgentError::Config(
+                    "restored task actor differs from configured runtime".into(),
+                ));
+            }
+            return Ok(runner);
+        }
         let mut slot = host.runner.lock();
         let actor = self.effective_actor_id();
         if let Some(runner) = slot.as_ref()
@@ -313,10 +389,8 @@ impl RuntimeAgent {
             .automatic_host()
             .ok_or_else(|| AgentError::Config("automatic task hosting is not installed".into()))?;
         let outcome = host.outcome.lock().clone();
-        let runner = host
-            .runner
-            .lock()
-            .clone()
+        let runner = self
+            .automatic_task_runner()
             .ok_or(crate::autonomy::TaskRunStorageError::NotResumable)?;
         let mut stream = runner.stream_operation(operation, Default::default())?;
         while stream.next_event().await.is_some() {}

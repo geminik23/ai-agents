@@ -206,6 +206,41 @@ impl Drop for PausedTask {
 }
 
 impl AutonomyRunner {
+    /// Attaches an already reconstructed controller while retaining the exact runtime objects referenced by restoration guards.
+    /// The caller or foreground session owns this runner and the configured service keeps only its weak lookup.
+    pub(crate) fn into_configured_host(mut self) -> Result<Arc<Self>> {
+        let runtime = self.agent.clone();
+        self.actor_scope = runtime.effective_actor_id();
+        let automatic_outcome = self
+            .active
+            .lock()
+            .as_ref()
+            .map(|execution| execution.acknowledged_snapshot())
+            .map(|snapshot| -> Result<_> {
+                let payload: TaskCheckpointPayload =
+                    serde_json::from_value(snapshot.payload.clone())?;
+                if super::automatic::binding(&payload)?.is_none() {
+                    return Ok(None);
+                }
+                Ok(Some(Arc::new(super::automatic::AutomaticOutcome {
+                    key: Some(snapshot.key.clone()),
+                    result: parking_lot::Mutex::new(Some(TaskRunResult {
+                        run: TaskRun::from_checkpoint(&snapshot, &self.config_identity)?,
+                        final_response: None,
+                    })),
+                    changed: Default::default(),
+                    failed: Default::default(),
+                })))
+            })
+            .transpose()?
+            .flatten();
+        if let Some(outcome) = &automatic_outcome {
+            self.bind_automatic_outcome(outcome.clone());
+        }
+        let runner = Arc::new(self);
+        runtime.attach_configured_task_runner(runner.clone(), automatic_outcome)?;
+        Ok(runner)
+    }
     /// Retains only the exact acknowledged cursor that agrees with private live controller, batch or composition authority.
     fn capture_pause(
         &self,

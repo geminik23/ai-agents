@@ -485,6 +485,9 @@ pub struct AutonomyConfig {
     pub defaults: AutonomyProfile,
     pub default_profile: Option<String>,
     pub profiles: HashMap<String, AutonomyProfile>,
+    /// Host-wide work bound for each configured reconstruction transaction, not a cumulative task budget.
+    /// Named profiles and per-invocation overrides cannot replace this construction setting.
+    pub restoration_timeout_ms: Option<std::num::NonZeroU64>,
 }
 
 /// State and skill overrides are flattened externally without accepting unknown framework keys.
@@ -515,10 +518,16 @@ impl<'de> Deserialize<'de> for AutonomyConfig {
             .transpose()
             .map_err(serde::de::Error::custom)?
             .unwrap_or_default();
+        let restoration_timeout_ms = fields
+            .remove(Value::String("restoration_timeout_ms".into()))
+            .map(serde_yaml::from_value)
+            .transpose()
+            .map_err(serde::de::Error::custom)?;
         Ok(Self {
             defaults: parse_flat_profile(Value::Mapping(fields))?,
             default_profile,
             profiles,
+            restoration_timeout_ms,
         })
     }
 }
@@ -542,6 +551,12 @@ impl Serialize for AutonomyConfig {
             fields.insert(
                 Value::String("profiles".into()),
                 serde_yaml::to_value(&self.profiles).map_err(serde::ser::Error::custom)?,
+            );
+        }
+        if let Some(timeout) = self.restoration_timeout_ms {
+            fields.insert(
+                Value::String("restoration_timeout_ms".into()),
+                serde_yaml::to_value(timeout).map_err(serde::ser::Error::custom)?,
             );
         }
         Value::Mapping(fields).serialize(serializer)
@@ -689,5 +704,29 @@ mod tests {
                 "{value}"
             );
         }
+    }
+
+    #[test]
+    fn restoration_work_bound_is_host_wide_positive_and_not_a_task_limit() {
+        let config: AutonomyConfig =
+            serde_yaml::from_str("enabled: true\nrestoration_timeout_ms: 5000\n").unwrap();
+        assert_eq!(config.restoration_timeout_ms.unwrap().get(), 5000);
+        assert_eq!(config.defaults.max_turns, None);
+        assert_eq!(config.defaults.max_active_time_seconds, None);
+        let decoded: AutonomyConfig =
+            serde_json::from_str(&serde_json::to_string(&config).unwrap()).unwrap();
+        assert_eq!(decoded, config);
+        for yaml in [
+            "restoration_timeout_ms: 0",
+            "restoration_timeout_ms: -1",
+            "restoration_timeout_ms: '5000'",
+            "profiles: {fast: {restoration_timeout_ms: 5000}}",
+        ] {
+            assert!(
+                serde_yaml::from_str::<AutonomyConfig>(yaml).is_err(),
+                "{yaml}"
+            );
+        }
+        assert!(serde_yaml::from_str::<AutonomyOverride>("restoration_timeout_ms: 5000").is_err());
     }
 }

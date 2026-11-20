@@ -79,13 +79,31 @@ pub enum SessionOrderBy {
 #[cfg(feature = "sqlite")]
 pub struct SqliteStorage {
     pub(super) pool: sqlx::SqlitePool,
+    durable_task_runs: bool,
 }
 
 #[cfg(feature = "sqlite")]
 impl SqliteStorage {
+    /// Opens the actual database and distinguishes file-backed durable commits from process-local SQLite databases.
     pub async fn new(path: &str) -> Result<Self> {
         let pool = Self::connect(path).await?;
-        let storage = Self { pool };
+        let databases: Vec<(i64, String, String)> = sqlx::query_as("PRAGMA database_list")
+            .fetch_all(&pool)
+            .await
+            .map_err(|error| AgentError::Persistence(error.to_string()))?;
+        let synchronous: i64 = sqlx::query_scalar("PRAGMA synchronous")
+            .fetch_one(&pool)
+            .await
+            .map_err(|error| AgentError::Persistence(error.to_string()))?;
+        // SQLite FULL (2) or EXTRA (3) acknowledges synchronized file commits; an in-memory database has no main filename.
+        let durable_task_runs = databases
+            .iter()
+            .any(|(_, name, file)| name == "main" && !file.is_empty())
+            && matches!(synchronous, 2 | 3);
+        let storage = Self {
+            pool,
+            durable_task_runs,
+        };
         storage.run_migrations().await?;
         Ok(storage)
     }
@@ -118,7 +136,8 @@ impl SqliteStorage {
         let options = sqlx::sqlite::SqliteConnectOptions::from_str(path)
             .map_err(|e| AgentError::Persistence(e.to_string()))?
             .create_if_missing(true)
-            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal);
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+            .synchronous(sqlx::sqlite::SqliteSynchronous::Full);
 
         sqlx::sqlite::SqlitePoolOptions::new()
             .after_release(|connection, _| {
@@ -646,7 +665,11 @@ impl AgentStorage for SqliteStorage {
         self.task_delete(key, revision).await
     }
 
+    /// Distinguishes transactional task support from the lifetime of this actual database's backing file.
     fn supports(&self, capability: StorageCapability) -> bool {
+        if capability == StorageCapability::DurableTaskRuns {
+            return self.durable_task_runs;
+        }
         matches!(
             capability,
             StorageCapability::Snapshot
@@ -1912,5 +1935,34 @@ mod tests {
 
         let not_found = storage.get_session_info("nonexistent").await.unwrap();
         assert!(not_found.is_none());
+    }
+}
+
+#[cfg(all(test, feature = "sqlite"))]
+mod task_lifetime_tests {
+    use super::*;
+
+    // Identical conditional operations do not make an in-memory database survive process exit.
+    #[tokio::test]
+    async fn task_durability_comes_from_the_actual_database() {
+        let memory = SqliteStorage::in_memory().await.unwrap();
+        assert!(memory.supports(StorageCapability::TaskRuns));
+        assert!(!memory.supports(StorageCapability::DurableTaskRuns));
+        let directory =
+            std::env::temp_dir().join(format!("task-durability-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let file = SqliteStorage::new(directory.join("tasks.sqlite").to_str().unwrap())
+            .await
+            .unwrap();
+        assert!(file.supports(StorageCapability::TaskRuns));
+        assert!(file.supports(StorageCapability::DurableTaskRuns));
+        let synchronous: i64 = sqlx::query_scalar("PRAGMA synchronous")
+            .fetch_one(&file.pool)
+            .await
+            .unwrap();
+        assert_eq!(synchronous, 2);
+        memory.close().await;
+        file.close().await;
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }

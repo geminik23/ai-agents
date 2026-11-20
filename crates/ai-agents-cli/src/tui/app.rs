@@ -2330,6 +2330,7 @@ mod tests {
                 primary: crate::session::OperationResult::Chat(AgentResponse::new("old")),
                 results: Default::default(),
                 quit: false,
+                prepared_pauses: Default::default(),
             }),
         });
         assert!(app.host_busy);
@@ -2434,6 +2435,7 @@ mod tests {
                 primary: crate::session::OperationResult::Chat(AgentResponse::new(&exact)),
                 results: Default::default(),
                 quit: false,
+                prepared_pauses: Default::default(),
             }),
         });
         let crate::session::OperationResult::Chat(response) =

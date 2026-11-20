@@ -139,9 +139,50 @@ pub struct AgentBuilder {
     task_hosting_requested: bool,
     task_interaction_delivery: bool,
     bound_task_scope: Option<crate::autonomy::TaskHostScope>,
+    configured_task_source: Option<Box<crate::autonomy::ConfiguredTaskSource>>,
+    configured_route: Option<Arc<crate::orchestration::tools::RouteToAgentTool>>,
 }
 
 impl AgentBuilder {
+    // Component installers may extend behavior but cannot silently replace the configured host's namespace, ceilings or storage authority.
+    pub(crate) fn verify_configured_host(
+        &self,
+        options: &crate::autonomy::AutomaticTaskOptions,
+        scope: &crate::autonomy::TaskHostScope,
+        prepared: &crate::spec::PreparedAgentSpec,
+    ) -> Result<()> {
+        let same_host = match (&self.automatic_options.restore_host, &options.restore_host) {
+            (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+            (None, None) => true,
+            _ => false,
+        };
+        let expected_storage = serde_json::to_value(&prepared.spec().storage)?;
+        let current_storage = self
+            .storage_config
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()?;
+        if !same_host
+            || self.automatic_options.store.is_some()
+            || self.storage.is_some()
+            || self.automatic_options.config_identity != options.config_identity
+            || self.automatic_options.ceilings != options.ceilings
+            || self.bound_task_scope.as_ref().is_none_or(|bound| {
+                bound.identity() != scope.identity() || bound.actor_id() != scope.actor_id()
+            })
+            || self
+                .automatic_config
+                .as_ref()
+                .is_some_and(|config| config != &prepared.spec().autonomy)
+            || current_storage.is_some_and(|storage| storage != expected_storage)
+        {
+            return Err(AgentError::Config(
+                "component installer replaced configured task hosting or storage".into(),
+            ));
+        }
+        Ok(())
+    }
+    /// Starts ordinary construction without installing a restoration factory or changing task defaults.
     pub fn new() -> Self {
         Self {
             autonomy_extensions: None,
@@ -150,6 +191,8 @@ impl AgentBuilder {
             task_hosting_requested: false,
             task_interaction_delivery: true,
             bound_task_scope: None,
+            configured_task_source: None,
+            configured_route: None,
             reasoning: None,
             reflection: None,
             spec: None,
@@ -192,6 +235,15 @@ impl AgentBuilder {
         }
     }
 
+    // Only first-party construction paths mint this receipt; serialized names cannot mark a custom builder as reconstructible.
+    pub(crate) fn configured_task_source(
+        mut self,
+        source: crate::autonomy::ConfiguredTaskSource,
+    ) -> Self {
+        self.configured_task_source = Some(Box::new(source));
+        self
+    }
+
     /// Freezes host adapters before runtime construction without granting or exposing their observation tools.
     pub fn autonomy_extensions(mut self, registry: crate::autonomy::AutonomyExtensions) -> Self {
         self.autonomy_extensions = Some(registry.freeze());
@@ -224,6 +276,7 @@ impl AgentBuilder {
         self
     }
 
+    /// Keeps typed source configuration while leaving restoration authority to explicit host construction.
     pub fn from_spec(spec: AgentSpec) -> Self {
         let system_prompt = spec.system_prompt.clone();
         let max_iterations = Some(spec.max_iterations);
@@ -239,6 +292,8 @@ impl AgentBuilder {
             task_hosting_requested: false,
             task_interaction_delivery: true,
             bound_task_scope: None,
+            configured_task_source: None,
+            configured_route: None,
             llm: None,
             llm_registry: None,
             memory: None,
@@ -1092,8 +1147,20 @@ impl AgentBuilder {
 
     /// Wire spawner tools when the spec has a `spawner:` section.
     /// Call after `auto_configure_llms()` and `auto_configure_features()`.
-    pub async fn auto_configure_spawner(mut self) -> Result<Self> {
+    pub async fn auto_configure_spawner(self) -> Result<Self> {
+        self.configure_spawner(true).await
+    }
+
+    /// Prepares the same configured spawner and tools without creating or registering its initial children.
+    /// The restoration driver alone installs validated saved membership after claiming the prepared checkpoint.
+    pub(crate) async fn prepare_restore_spawner(self) -> Result<Self> {
+        self.configure_spawner(false).await
+    }
+
+    // Construction is shared; only an ordinary fresh start runs declarative auto-spawn and checks its live membership.
+    async fn configure_spawner(mut self, start_children: bool) -> Result<Self> {
         self.prepare_routing(false)?;
+        let configured_restoration = self.configured_task_source.is_some();
         let spawner_config = match self.spec.as_ref().and_then(|s| s.spawner.as_ref()) {
             Some(c) => c.clone(),
             None => return Ok(self),
@@ -1123,6 +1190,17 @@ impl AgentBuilder {
         };
 
         let mut spawner = AgentSpawner::new();
+        if self.configured_task_source.is_some() {
+            spawner = spawner.with_configured_restoration();
+        }
+
+        if let Some(components) = self
+            .configured_task_source
+            .as_ref()
+            .and_then(|source| source.components.as_ref())
+        {
+            spawner = spawner.with_restore_components(components.clone());
+        }
 
         if let Some(ref manager) = observability_manager {
             spawner = spawner.with_observability(Arc::clone(manager));
@@ -1202,26 +1280,55 @@ impl AgentBuilder {
 
         let tool_registry = self.tools.get_or_insert_with(create_builtin_registry);
         for tool in tools {
-            let _ = tool_registry.register(tool);
+            let registered = tool_registry.register(tool);
+            if configured_restoration {
+                registered.map_err(|error| {
+                    AgentError::Config(format!("configured spawner tool conflict: {error}"))
+                })?;
+            }
         }
 
         tracing::info!("Spawner tools registered");
 
         // Register orchestration tools if configured.
         if spawner_config.orchestration_tools.is_enabled() {
-            let orch_tools = crate::orchestration::tools::configure_orchestration_tools(
+            let position = self
+                .configured_task_source
+                .as_ref()
+                .and_then(|source| source.state.as_ref())
+                .and_then(|state| state.route_position);
+            let route = Arc::new(
+                crate::orchestration::tools::RouteToAgentTool::new(
+                    registry.clone(),
+                    llm_for_tools.clone(),
+                )
+                .with_round_robin_position(position.unwrap_or_default()),
+            );
+            if spawner_config
+                .orchestration_tools
+                .includes("route_to_agent")
+            {
+                self.configured_route = Some(route.clone());
+            }
+            let orch_tools = crate::orchestration::tools::configure_tools_with_route(
                 &spawner_config.orchestration_tools,
                 Arc::clone(&registry),
                 Arc::clone(&llm_for_tools),
+                route,
             );
             let tool_registry = self.tools.get_or_insert_with(create_builtin_registry);
             for tool in orch_tools {
-                let _ = tool_registry.register(tool);
+                let registered = tool_registry.register(tool);
+                if configured_restoration {
+                    registered.map_err(|error| {
+                        AgentError::Config(format!("configured spawner tool conflict: {error}"))
+                    })?;
+                }
             }
             tracing::info!("Orchestration tools registered");
         }
 
-        for entry in &spawner_config.auto_spawn {
+        for entry in spawner_config.auto_spawn.iter().filter(|_| start_children) {
             let yaml_path = if let Some(ref dir) = self.yaml_dir {
                 dir.join(&entry.agent)
             } else {
@@ -1250,7 +1357,8 @@ impl AgentBuilder {
         }
 
         // Validate that all orchestration state references have matching agents.
-        if let Some(ref spec) = self.spec
+        if start_children
+            && let Some(ref spec) = self.spec
             && let Some(ref state_config) = spec.states
         {
             let refs = collect_orchestration_refs(&state_config.states);
@@ -1950,6 +2058,9 @@ impl AgentBuilder {
 
         // Install the source policy after typed component setters, which conservatively mark their numeric inputs explicit.
         agent = agent.with_task_iteration_policy(self.task_iteration_policy);
+        if let Some(source) = self.configured_task_source {
+            agent = agent.with_configured_task_source(source, self.configured_route)?;
+        }
         let hosting = install_automatic.then_some(PreparedTaskHosting {
             config: automatic_config,
             options: self.automatic_options,

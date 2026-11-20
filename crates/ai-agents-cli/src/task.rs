@@ -159,27 +159,7 @@ async fn run_inner(args: TaskArgs) -> Result<u8> {
                 .results
                 .get(&initial.run.key.run_id)
                 .unwrap_or(&initial);
-            let text = if args.host.json {
-                format!(
-                    "{}\n",
-                    serde_json::to_string(
-                        &serde_json::json!({"type":"result","run_id":final_result.run.key.run_id,"revision":final_result.run.revision,"status":final_result.run.status,"counters":final_result.run.counters})
-                    )?
-                )
-            } else {
-                let response = final_result
-                    .final_response
-                    .as_ref()
-                    .map(|r| r.content.as_str())
-                    .unwrap_or("");
-                format!(
-                    "\nTask {} revision {}: {:?}\n{}\n",
-                    final_result.run.key.run_id,
-                    final_result.run.revision,
-                    final_result.run.status,
-                    response
-                )
-            };
+            let text = result_text(final_result, args.host.json)?;
             if io.output_suppressed() {
                 eprintln!(
                     "Task {} revision {}: {:?}; stdout delivery suppressed during shutdown",
@@ -189,7 +169,11 @@ async fn run_inner(args: TaskArgs) -> Result<u8> {
                 io.write(text).await?;
                 io.finish().await?;
             }
-            Ok(result_code(final_result))
+            Ok(result_code(
+                final_result,
+                result.prepared_pauses.get(&final_result.run.key.run_id)
+                    == Some(&final_result.run.revision),
+            ))
         }
         TaskCommand::List(host) => {
             let mut rows = Vec::new();
@@ -229,17 +213,150 @@ async fn run_inner(args: TaskArgs) -> Result<u8> {
             }
             Ok(0)
         }
+        TaskCommand::Cleanup(args) => {
+            let revision = args
+                .revision
+                .context("cleanup requires --revision from an observed cancellation receipt")?;
+            let prepared = crate::run::load_prepared_spec(&args.target.host.agent)?;
+            let timeout = prepared
+                .spec()
+                .autonomy
+                .restoration_timeout_ms
+                .context("configured cleanup requires autonomy.restoration_timeout_ms")?;
+            let host = Arc::new(ai_agents::autonomy::ConfiguredTaskRestoreHost::new(
+                prepared,
+                args.target
+                    .host
+                    .agent
+                    .parent()
+                    .unwrap_or(Path::new("."))
+                    .into(),
+                args.target.host.actor.clone(),
+                std::time::Duration::from_millis(timeout.get()),
+            )?);
+            let cancelled = host.cancel_prepared(args.target.run_id, revision).await?;
+            print!("{}", result_text(&cancelled, args.target.host.json)?);
+            Ok(if cancelled.run.status == TaskRunStatus::Cancelled {
+                0
+            } else {
+                1
+            })
+        }
+        TaskCommand::Recover(args) => {
+            let prepared = crate::run::load_prepared_spec(&args.target.host.agent)?;
+            let timeout = prepared
+                .spec()
+                .autonomy
+                .restoration_timeout_ms
+                .context("configured task recovery requires autonomy.restoration_timeout_ms")?;
+            let host = Arc::new(ai_agents::autonomy::ConfiguredTaskRestoreHost::new(
+                prepared,
+                args.target
+                    .host
+                    .agent
+                    .parent()
+                    .unwrap_or(Path::new("."))
+                    .into(),
+                args.target.host.actor.clone(),
+                std::time::Duration::from_millis(timeout.get()),
+            )?);
+            let disposition = match args.action {
+                crate::cli::TaskRecoveryAction::ResumePrepared => {
+                    ai_agents::autonomy::TaskRecoveryDisposition::ResumePrepared
+                }
+                crate::cli::TaskRecoveryAction::CancelPrepared => {
+                    ai_agents::autonomy::TaskRecoveryDisposition::CancelPrepared
+                }
+            };
+            let recovered = host
+                .recover_prepared(args.target.run_id, args.revision, disposition, args.reason)
+                .await?;
+            if matches!(
+                disposition,
+                ai_agents::autonomy::TaskRecoveryDisposition::CancelPrepared
+            ) {
+                let cancelled = host
+                    .cancel_prepared(recovered.key.run_id, recovered.revision)
+                    .await?;
+                print!("{}", result_text(&cancelled, args.target.host.json)?);
+                return Ok(if cancelled.run.status == TaskRunStatus::Cancelled {
+                    0
+                } else {
+                    1
+                });
+            } else if args.target.host.json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&serde_json::json!({
+                        "type":"recovery", "run_id": recovered.key.run_id, "revision": recovered.revision, "status": recovered.status,
+                    }))?
+                );
+            } else {
+                println!(
+                    "Task {} revision {}: {:?}; resume still requires fresh review",
+                    recovered.key.run_id, recovered.revision, recovered.status
+                );
+            }
+            Ok(0)
+        }
         TaskCommand::Resume(args) => {
-            // No provider is configured just to discover that the default CLI has no production reconstruction host.
-            let _namespace = scope(&args.target.host)?;
-            anyhow::bail!(
-                "new-process task resume requires an explicitly installed reconstruction host; the default CLI does not provide one. Use retained /task resume in the original session. Session save or SQLite alone is not restart authority"
-            )
+            let revision = args
+                .revision
+                .context("resume requires --revision from an observed snapshot")?;
+            let namespace = scope(&args.target.host)?;
+            let prepared = crate::run::load_prepared_spec(&args.target.host.agent)?;
+            let timeout = prepared
+                .spec()
+                .autonomy
+                .restoration_timeout_ms
+                .context("configured task resume requires autonomy.restoration_timeout_ms")?;
+            let mut io = FrontendSession::terminal(args.target.host.json, true);
+            let host = crate::run::configured_restore_host(
+                &args.target.host.agent,
+                prepared,
+                io.bridge(),
+                Some(namespace),
+                timeout,
+            )?;
+            let (tx, rx) = mpsc::channel(32);
+            let id = args.target.run_id;
+            let result = io
+                .drive(
+                    async move {
+                        let (_runner, paused) = host.restore(id, revision).await?;
+                        drop(tx);
+                        Ok(OperationResult::Task(Box::new(paused)))
+                    },
+                    rx,
+                )
+                .await?;
+            let OperationResult::Task(initial) = result.primary else {
+                unreachable!()
+            };
+            let final_result = result
+                .results
+                .get(&initial.run.key.run_id)
+                .unwrap_or(&initial);
+            if io.output_suppressed() {
+                eprintln!(
+                    "Task {} revision {}: {:?}; stdout delivery suppressed during shutdown",
+                    final_result.run.key.run_id, final_result.run.revision, final_result.run.status
+                );
+            } else {
+                io.write(result_text(final_result, args.target.host.json)?)
+                    .await?;
+                io.finish().await?;
+            }
+            Ok(result_code(
+                final_result,
+                result.prepared_pauses.get(&final_result.run.key.run_id)
+                    == Some(&final_result.run.revision),
+            ))
         }
     }
 }
 
-/// The default CLI cannot install restart authority; resolve the selected profile before any preparation I/O.
+/// Resolves the selected profile and validates configured restoration prerequisites before provider or storage preparation.
 pub(crate) fn preflight_run(
     spec: &ai_agents::spec::AgentSpec,
     selected: Option<&str>,
@@ -264,16 +381,58 @@ pub(crate) fn preflight_run(
         .as_ref()
         .is_some_and(|policy| policy.enabled != Some(false))
     {
-        anyhow::bail!(
-            "durable task execution requires an explicitly installed reconstruction host; the default CLI supports volatile retained work, not production restart"
-        );
+        if spec.autonomy.restoration_timeout_ms.is_none() {
+            anyhow::bail!(
+                "durable task execution requires autonomy.restoration_timeout_ms for the configured host's work budget"
+            );
+        }
+        if !matches!(spec.storage, ai_agents::spec::StorageConfig::Sqlite(_)) {
+            anyhow::bail!("durable task execution requires SQLite task storage");
+        }
+        if spec
+            .tools
+            .iter()
+            .flatten()
+            .any(|tool| tool.to_mcp_config().is_some())
+        {
+            anyhow::bail!(
+                "durable MCP hosting requires a Rust component state binding; the CLI cannot infer server state from registration"
+            );
+        }
+        ai_agents::autonomy::SystemTaskClock::sample()?;
     }
     Ok(())
 }
 
-pub(crate) fn result_code(result: &TaskRunResult) -> u8 {
+// Initial and reconstructed tasks expose the same bounded result shape, never the sensitive restoration checkpoint.
+fn result_text(result: &TaskRunResult, json_mode: bool) -> Result<String> {
+    if json_mode {
+        Ok(format!(
+            "{}\n",
+            serde_json::to_string(&serde_json::json!({
+                "type":"result", "run_id": result.run.key.run_id, "revision": result.run.revision,
+                "status": result.run.status, "counters": result.run.counters,
+            }))?
+        ))
+    } else {
+        Ok(format!(
+            "\nTask {} revision {}: {:?}\n{}\n",
+            result.run.key.run_id,
+            result.run.revision,
+            result.run.status,
+            result
+                .final_response
+                .as_ref()
+                .map_or("", |response| response.content.as_str())
+        ))
+    }
+}
+
+// A Paused status alone cannot claim the reserved durable-exit code; the foreground host must confirm that exact revision.
+pub(crate) fn result_code(result: &TaskRunResult, prepared_pause: bool) -> u8 {
     match result.run.status {
         TaskRunStatus::Completed => 0,
+        TaskRunStatus::Paused if prepared_pause => 3,
         _ => 1,
     }
 }
