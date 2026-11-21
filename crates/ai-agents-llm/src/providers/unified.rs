@@ -12,8 +12,10 @@ use std::hash::{Hash, Hasher};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use super::chat_adapter;
 use super::google::GoogleProvider;
 use super::pricing::DeclaredPricing;
+use crate::sdk::ChatClient;
 use ai_agents_core::autonomy::{ProviderCostBound, ProviderCostSettlement, ProviderRequest};
 
 #[cfg(test)]
@@ -76,6 +78,21 @@ impl ProviderType {
             Self::OpenRouter => Some("OPENROUTER_API_KEY"),
             Self::Ollama => None,           // Ollama doesn't need an API key
             Self::OpenAICompatible => None, // User specifies via api_key_env or it's optional
+        }
+    }
+
+    /// Resolves an explicitly selected credential source at provider construction time.
+    /// The official preset must not fall back to another key. Compatible servers can operate without credentials.
+    pub fn configured_api_key(&self, variable: Option<&str>) -> Result<Option<String>, LLMError> {
+        let Some(name) = variable else {
+            return Ok(None);
+        };
+        match std::env::var(name) {
+            Ok(key) => Ok(Some(key)),
+            Err(_) if *self == Self::OpenAI => Err(LLMError::Config(format!(
+                "API key not found in configured environment variable {name}"
+            ))),
+            Err(_) => Ok(None),
         }
     }
 
@@ -145,6 +162,7 @@ pub struct UnifiedLLMProvider {
     tool_choice: Option<ToolChoice>,
     client: std::sync::Arc<tokio::sync::Mutex<Option<CachedClient>>>,
     google: Option<GoogleProvider>,
+    chat: Option<ChatClient>,
     pricing: Option<DeclaredPricing>,
 }
 
@@ -271,7 +289,9 @@ fn compute_config_hash(
 
 /// Extract system messages from a message slice, returning the combined system prompt
 /// (if any) and the remaining non-system messages.
-fn extract_system_and_messages(messages: &[ChatMessage]) -> (Option<String>, Vec<&ChatMessage>) {
+pub(super) fn extract_system_and_messages(
+    messages: &[ChatMessage],
+) -> (Option<String>, Vec<&ChatMessage>) {
     let mut system_parts: Vec<&str> = Vec::new();
     let mut non_system: Vec<&ChatMessage> = Vec::new();
 
@@ -506,19 +526,42 @@ fn map_provider_error(
 }
 
 impl UnifiedLLMProvider {
+    fn supports_choice_for_provider(&self, choice: &ToolChoice) -> bool {
+        if self.feature_overrides.get(&LLMFeature::FunctionCalling) == Some(&false) {
+            return false;
+        }
+        let known_choice = matches!(
+            choice,
+            ToolChoice::Auto | ToolChoice::Required | ToolChoice::Specific(_) | ToolChoice::None
+        );
+        match self.provider_type {
+            ProviderType::OpenAI | ProviderType::Anthropic | ProviderType::OpenRouter => {
+                known_choice
+            }
+            ProviderType::Google => matches!(choice, ToolChoice::Auto),
+            ProviderType::OpenAICompatible => {
+                self.feature_overrides
+                    .get(&LLMFeature::FunctionCalling)
+                    .copied()
+                    .unwrap_or(false)
+                    && known_choice
+            }
+            _ => false,
+        }
+    }
+
     pub fn new(
         provider_type: ProviderType,
         model: String,
         api_key: Option<String>,
         base_url: Option<String>,
     ) -> Result<Self, LLMError> {
-        Self::from_spec_config(
-            provider_type,
-            &model,
-            api_key,
-            base_url,
-            LLMConfig::default(),
-        )
+        let mut config = LLMConfig::default();
+        if provider_type == ProviderType::OpenAI {
+            config.temperature = None;
+            config.top_p = None;
+        }
+        Self::from_spec_config(provider_type, &model, api_key, base_url, config)
     }
 
     /// Create a new UnifiedLLMProvider with explicit config defaults.
@@ -529,6 +572,28 @@ impl UnifiedLLMProvider {
         base_url: Option<String>,
         default_config: LLMConfig,
     ) -> Result<Self, LLMError> {
+        let is_chat = matches!(
+            provider_type,
+            ProviderType::OpenAI | ProviderType::OpenAICompatible
+        );
+        if !is_chat
+            && (default_config.extra.contains_key("protocol")
+                || default_config.extra.contains_key("provider_options"))
+        {
+            return Err(LLMError::Config(
+                "SDK protocol/options require a Chat Completions provider".into(),
+            ));
+        }
+        if provider_type == ProviderType::OpenAI
+            && api_key.is_none()
+            && let Some(base) = base_url.as_deref()
+            && !reqwest::Url::parse(base)
+                .is_ok_and(|u| u.origin().ascii_serialization() == "https://api.openai.com")
+        {
+            return Err(LLMError::Config(
+                "custom OpenAI origin requires explicitly selected credentials".into(),
+            ));
+        }
         let actual_api_key = if let Some(key) = api_key {
             key
         } else if let Some(env_var) = provider_type.api_key_env_var() {
@@ -552,6 +617,29 @@ impl UnifiedLLMProvider {
             ));
         }
 
+        let chat = if is_chat {
+            if default_config
+                .extra
+                .get("protocol")
+                .is_some_and(|v| v.as_str() != Some("chat-completions"))
+            {
+                return Err(LLMError::Config(
+                    "unsupported Chat Completions protocol".into(),
+                ));
+            }
+            Some(
+                ChatClient::new(
+                    actual_base_url
+                        .as_deref()
+                        .unwrap_or("https://api.openai.com/v1/"),
+                    Some(actual_api_key.clone()),
+                )
+                .map_err(chat_adapter::error)?
+                .with_openai_contract(provider_type == ProviderType::OpenAI),
+            )
+        } else {
+            None
+        };
         let google = if provider_type == ProviderType::Google {
             Some(GoogleProvider::new(
                 model.to_string(),
@@ -580,6 +668,7 @@ impl UnifiedLLMProvider {
             tool_choice: None,
             client: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
             google,
+            chat,
             pricing: None,
         };
         if let Some(pricing) = pricing {
@@ -1127,6 +1216,20 @@ impl LLMProvider for UnifiedLLMProvider {
         if let Some(google) = &self.google {
             return google.complete(messages, config).await;
         }
+        if let Some(chat) = &self.chat
+            && let Some(wire) = chat_adapter::request(
+                self.provider_type,
+                &self.model,
+                messages,
+                config.unwrap_or(&self.default_config),
+                None,
+            )?
+        {
+            return chat_adapter::response(
+                chat.complete(&wire).await.map_err(chat_adapter::error)?,
+                &self.model,
+            );
+        }
         let projected_messages = Self::project_foreign_messages(messages)?;
         // Separate system messages from non-system messages
         let (system_prompt, non_system_msgs) = extract_system_and_messages(&projected_messages);
@@ -1173,9 +1276,8 @@ impl LLMProvider for UnifiedLLMProvider {
         if let Some(google) = &self.google {
             return google.complete_with_tools(messages, config, request).await;
         }
-        let projected_messages = Self::project_foreign_messages(messages)?;
         let choice = &request.choice;
-        if !self.supports_tool_choice(choice) {
+        if !self.supports_choice_for_provider(choice) {
             return Err(LLMError::Config(format!(
                 "provider '{}' does not support native tool choice {:?}",
                 self.provider_name(),
@@ -1197,6 +1299,21 @@ impl LLMProvider for UnifiedLLMProvider {
             )));
         }
 
+        if let Some(chat) = &self.chat
+            && let Some(wire) = chat_adapter::request(
+                self.provider_type,
+                &self.model,
+                messages,
+                config.unwrap_or(&self.default_config),
+                Some(request),
+            )?
+        {
+            return chat_adapter::response(
+                chat.complete(&wire).await.map_err(chat_adapter::error)?,
+                &self.model,
+            );
+        }
+        let projected_messages = Self::project_foreign_messages(messages)?;
         let (system_prompt, non_system_msgs) = extract_system_and_messages(&projected_messages);
         let llm_messages = self.convert_messages_with_tools(&non_system_msgs)?;
         let tools = request
@@ -1251,6 +1368,22 @@ impl LLMProvider for UnifiedLLMProvider {
     {
         if let Some(google) = &self.google {
             return google.complete_stream(messages, config).await;
+        }
+        if let Some(chat) = &self.chat
+            && let Some(wire) = chat_adapter::request(
+                self.provider_type,
+                &self.model,
+                messages,
+                config.unwrap_or(&self.default_config),
+                None,
+            )?
+        {
+            return Ok(Box::new(Box::pin(
+                chat.stream(&wire)
+                    .await
+                    .map_err(chat_adapter::error)?
+                    .map(chat_adapter::chunk),
+            )));
         }
         let projected_messages = Self::project_foreign_messages(messages)?;
         // Separate system messages from non-system messages
@@ -1308,11 +1441,53 @@ impl LLMProvider for UnifiedLLMProvider {
         if let Some(google) = &self.google {
             google.validate_priced_request(request)?;
         } else {
+            if self.chat.is_some() {
+                let cfg = request.config.unwrap_or(&self.default_config);
+                if let Some(wire) = chat_adapter::request(
+                    self.provider_type,
+                    &self.model,
+                    request.messages,
+                    cfg,
+                    request.tools,
+                )? {
+                    if request
+                        .tools
+                        .is_some_and(|t| !self.supports_choice_for_provider(&t.choice))
+                    {
+                        return Err(LLMError::Config(
+                            "unsupported priced native tool choice".into(),
+                        ));
+                    }
+                    wire.body(request.streaming).map_err(chat_adapter::error)?;
+                    // Only extensions with the same audited semantics as a typed setting can be quoted.
+                    let mut effective = cfg.clone();
+                    effective.extra.remove("protocol");
+                    if let Some(serde_json::Value::Object(mut options)) =
+                        effective.extra.remove("provider_options")
+                    {
+                        if let Some(serde_json::Value::String(effort)) =
+                            options.remove("reasoning_effort")
+                        {
+                            effective.reasoning_effort = Some(effort);
+                        }
+                        if !options.is_empty() {
+                            return Err(LLMError::Config("unbounded Chat provider option".into()));
+                        }
+                    }
+                    let priced = ProviderRequest {
+                        config: Some(&effective),
+                        ..*request
+                    };
+                    return pricing
+                        .quote(self.provider_name(), &priced, &effective)
+                        .map(Some);
+                }
+            }
             let projected = Self::project_foreign_messages(request.messages)?;
             let (_, non_system) = extract_system_and_messages(&projected);
             if let Some(tools) = request.tools {
                 self.convert_messages_with_tools(&non_system)?;
-                if !self.supports_tool_choice(&tools.choice)
+                if !self.supports_choice_for_provider(&tools.choice)
                     || (matches!(tools.choice, ToolChoice::Required | ToolChoice::Specific(_))
                         && tools.tools.is_empty())
                     || matches!(&tools.choice, ToolChoice::Specific(name) if !tools.tools.iter().any(|tool| &tool.name == name))
@@ -1350,8 +1525,8 @@ impl LLMProvider for UnifiedLLMProvider {
         let Some(pricing) = &self.pricing else {
             return Ok(None);
         };
-        // Only GenerateContent currently preserves a complete raw final billing receipt through stream normalization.
-        if self.provider_type != ProviderType::Google {
+        // First-party codecs attach complete usage only to an observed terminal event.
+        if self.google.is_none() && self.chat.is_none() {
             return Ok(None);
         }
         let Some(usage) = usage else {
@@ -1388,30 +1563,20 @@ impl LLMProvider for UnifiedLLMProvider {
     }
 
     fn supports_tool_choice(&self, choice: &ToolChoice) -> bool {
-        if self.feature_overrides.get(&LLMFeature::FunctionCalling) == Some(&false) {
-            return false;
-        }
-        let known_choice = matches!(
-            choice,
-            ToolChoice::Auto | ToolChoice::Required | ToolChoice::Specific(_) | ToolChoice::None
-        );
-        match self.provider_type {
-            ProviderType::OpenAI | ProviderType::Anthropic | ProviderType::OpenRouter => {
-                known_choice
-            }
-            ProviderType::Google => matches!(choice, ToolChoice::Auto),
-            ProviderType::OpenAICompatible => {
-                self.feature_overrides
-                    .get(&LLMFeature::FunctionCalling)
-                    .copied()
-                    .unwrap_or(false)
-                    && known_choice
-            }
-            _ => false,
-        }
+        super::openai_chat::allows_tools(self.provider_type, &self.model, &self.default_config)
+            && self.supports_choice_for_provider(choice)
     }
 
     fn supports(&self, feature: LLMFeature) -> bool {
+        if feature == LLMFeature::FunctionCalling
+            && !super::openai_chat::allows_tools(
+                self.provider_type,
+                &self.model,
+                &self.default_config,
+            )
+        {
+            return false;
+        }
         if let Some(enabled) = self.feature_overrides.get(&feature) {
             return *enabled;
         }
@@ -1444,6 +1609,12 @@ impl LLMProvider for UnifiedLLMProvider {
     }
 
     fn is_terminal_error(&self, error: &LLMError) -> bool {
+        if self.chat.is_some() {
+            return matches!(
+                error,
+                LLMError::Serialization(_) | LLMError::Config(_) | LLMError::ContentFiltered(_)
+            ) || matches!(error,LLMError::API{status:Some(s),..} if (300..500).contains(s) && !matches!(s,408|429));
+        }
         self.google
             .as_ref()
             .is_some_and(|google| google.is_terminal_error(error))
@@ -1690,9 +1861,9 @@ mod tests {
                     "application/json"
                 };
                 let response_body = if streaming {
-                    "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n"
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"
                 } else {
-                    "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"ok\"}}]}"
+                    "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}"
                 };
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
@@ -1705,7 +1876,7 @@ mod tests {
         (format!("http://{address}/v1/"), receiver)
     }
 
-    // Makes the lock requests contend in a known order before checking the actual provider payloads.
+    // Concurrent calls share a transport, but each wire payload must keep its own prompt and options.
     #[tokio::test]
     async fn concurrent_requests_dispatch_with_their_own_client_config() {
         async fn dispatch(provider: &UnifiedLLMProvider, kind: &str, name: &str, max_tokens: u32) {
@@ -1757,17 +1928,22 @@ mod tests {
                 .base_url(base_url)
                 .build()
                 .unwrap();
-            let guard = provider.client.lock().await;
+
             let mut first = Box::pin(dispatch(&provider, kind, "first", 20));
             let mut second = Box::pin(dispatch(&provider, kind, "second", 200));
             assert!(futures::poll!(first.as_mut()).is_pending());
             assert!(futures::poll!(second.as_mut()).is_pending());
-            drop(guard);
 
             tokio::time::timeout(std::time::Duration::from_secs(5), async {
                 tokio::join!(first, second);
-                for (name, max_tokens) in [("first", 20), ("second", 200)] {
-                    let body = received.recv().await.unwrap();
+                let mut requests = [
+                    received.recv().await.unwrap(),
+                    received.recv().await.unwrap(),
+                ];
+                requests.sort_by_key(|body| body["max_completion_tokens"].as_u64());
+                for (body, (name, max_tokens)) in
+                    requests.into_iter().zip([("first", 20), ("second", 200)])
+                {
                     assert!(body.to_string().contains(&format!("system {name}")));
                     assert_eq!(body["max_completion_tokens"], max_tokens);
                     if kind == "native" {
@@ -2375,7 +2551,73 @@ mod tests {
         assert!(!google.is_terminal_error(&LLMError::Network("temporary".to_string())));
 
         let openai = test_provider(ProviderType::OpenAI);
-        assert!(!openai.is_terminal_error(&LLMError::Config("legacy".to_string())));
+        assert!(openai.is_terminal_error(&LLMError::Config("conflicting chat options".into())));
+    }
+
+    #[tokio::test]
+    async fn gpt_6_2_openai_preset_keeps_native_tool_calls_out_of_chat() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let provider = UnifiedLLMProvider::new(
+            ProviderType::OpenAI,
+            "gpt-6.2-sol".into(),
+            Some("fixture-key".into()),
+            Some(format!("http://{}/v1", listener.local_addr().unwrap())),
+        )
+        .unwrap()
+        .with_feature_override(LLMFeature::FunctionCalling, true);
+        assert!(provider.default_config.temperature.is_none());
+        assert!(provider.default_config.top_p.is_none());
+        assert!(!provider.supports(LLMFeature::FunctionCalling));
+        assert!(!provider.supports_tool_choice(&ToolChoice::Auto));
+        let request = LLMToolRequest {
+            choice: ToolChoice::Auto,
+            tools: vec![],
+        };
+        let result = provider.complete_with_tools(&[], None, &request).await;
+        assert!(
+            matches!(result, Err(LLMError::Config(message)) if message.contains("Responses API"))
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_sampling_and_native_tools_follow_the_effective_request_effort() {
+        let (url, mut received) = local_chat_fixture().await;
+        let provider = UnifiedLLMProvider::new(
+            ProviderType::OpenAI,
+            "gpt-6-luna".into(),
+            Some("fixture".into()),
+            Some(url),
+        )
+        .unwrap();
+        let choice = LLMToolRequest {
+            choice: ToolChoice::Auto,
+            tools: vec![LLMToolDefinition {
+                name: "lookup".into(),
+                description: "test".into(),
+                input_schema: serde_json::json!({"type":"object"}),
+            }],
+        };
+        assert!(!provider.supports_tool_choice(&choice.choice));
+        assert!(matches!(
+            provider.complete_with_tools(&[], None, &choice).await,
+            Err(LLMError::Config(_))
+        ));
+        for field in ["provider_options", "extra_body"] {
+            let config = LLMConfig {
+                temperature: Some(0.4),
+                top_p: None,
+                ..LLMConfig::default()
+            }
+            .with_extra(field, serde_json::json!({"reasoning_effort":"none"}));
+            provider
+                .complete_with_tools(&[ChatMessage::user("hi")], Some(&config), &choice)
+                .await
+                .unwrap();
+            let body = received.recv().await.unwrap();
+            assert_eq!(body["temperature"], 0.4);
+            assert_eq!(body["reasoning_effort"], "none");
+            assert_eq!(body["tools"][0]["function"]["name"], "lookup");
+        }
     }
 
     #[test]
@@ -2406,6 +2648,33 @@ mod tests {
         .unwrap();
         let marker =
             ai_agents_core::encode_native_tool_call_markers(&[call], Some(&state)).unwrap();
+        let history = vec![
+            ChatMessage::user("question"),
+            ChatMessage::assistant(marker.clone()),
+        ];
+        let tools = LLMToolRequest {
+            choice: ToolChoice::Auto,
+            tools: vec![],
+        };
+        let wire = chat_adapter::request(
+            ProviderType::OpenAI,
+            "fixture",
+            &history,
+            &LLMConfig::default(),
+            Some(&tools),
+        )
+        .unwrap()
+        .unwrap()
+        .body(false)
+        .unwrap();
+        assert!(
+            wire["messages"][1]["content"]
+                .as_str()
+                .unwrap()
+                .contains("native_tool_calls")
+        );
+        assert!(wire["messages"][1].get("tool_calls").is_none());
+        assert!(!wire.to_string().contains("must-not-reach-foreign-provider"));
         let original = vec![ChatMessage::assistant(marker)];
 
         let projected = UnifiedLLMProvider::project_foreign_messages(&original).unwrap();

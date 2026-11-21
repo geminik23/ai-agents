@@ -1,0 +1,22 @@
+[
+  {
+    "models": ["gpt-6.2-astra", "gpt-6.2-sol", "gpt-6-astra", "gpt-6.1-sol"],
+    "sampling": "never", "tools": "never", "default_effort": "medium", "allows_none": false
+  },
+  {
+    "models": ["gpt-6.1-terra"],
+    "sampling": "without_reasoning", "tools": "never", "default_effort": "medium", "allows_none": true
+  },
+  {
+    "models": ["gpt-6-sol", "gpt-6-luna"],
+    "sampling": "without_reasoning", "tools": "without_reasoning", "default_effort": "medium", "allows_none": true
+  },
+  {
+    "models": ["gpt-5.4", "gpt-5.2"],
+    "sampling": "without_reasoning", "tools": "always", "default_effort": "none", "allows_none": true
+  },
+  {
+    "models": ["gpt-5", "gpt-5-mini", "gpt-5-nano"],
+    "sampling": "never", "tools": "always", "default_effort": "medium", "allows_none": false
+  }
+]

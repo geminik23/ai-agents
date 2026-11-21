@@ -130,8 +130,7 @@ async fn fixture_stream(
                     .clone()
                     .unwrap_or_else(|| format!("data: {google_body}\n\n"))
             } else {
-                "data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n\ndata: [DONE]\n\n"
-                    .into()
+                stream_payload.clone().unwrap_or_else(|| "data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n".into())
             };
             let content_type = if streaming {
                 "text/event-stream"
@@ -328,6 +327,10 @@ fn rs_paid_inventory_rejects_unaudited_upstream_and_unknown_request_options() {
         (
             "extra_body",
             serde_json::json!({"max_completion_tokens": 99999}),
+        ),
+        (
+            "extra_body",
+            serde_json::json!({"response_format": {"type": "json_object"}}),
         ),
         ("openai_enable_web_search", serde_json::json!(true)),
         ("resilient", serde_json::json!(true)),
@@ -549,4 +552,58 @@ fn rs_paid_checked_rounding_identity_and_partial_usage() {
             .validate("fixture-model", "https://example.test/v1/")
             .is_err()
     );
+}
+
+// Only an acknowledged end with matching terminal usage can release the priced reservation.
+#[tokio::test]
+async fn chat_sdk_stream_billing_uses_only_a_complete_final_receipt() {
+    let finish = r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#;
+    let complete =
+        r#"{"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":4,"total_tokens":14}}"#;
+    let partial = r#"{"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":4}}"#;
+    for (frames, expected_charge, drop_before_eof) in [
+        (vec![finish, complete], Some(16), false),
+        (vec![complete, finish], None, false),
+        (vec![finish, partial], None, false),
+        (vec![finish, complete], None, true),
+    ] {
+        let mut payload = String::new();
+        for frame in frames {
+            payload.push_str(&format!("data: {frame}\n\n"));
+        }
+        payload.push_str("data: [DONE]\n\n");
+        let (endpoint, _requests) = fixture_stream(false, 1, false, Some(payload)).await;
+        let provider = crate::managed_provider(Arc::new(
+            ProviderBuilder::new()
+                .provider(ProviderType::OpenAICompatible)
+                .model("fixture-model")
+                .base_url(&endpoint)
+                .build()
+                .unwrap()
+                .with_declared_pricing(schedule(&endpoint))
+                .unwrap(),
+        ));
+        let ledger = Arc::new(Ledger::default());
+        let messages = [ChatMessage::user("test")];
+        let mut stream = crate::scope_invocation_admission(
+            ledger.clone(),
+            provider.complete_stream(&messages, None),
+        )
+        .await
+        .unwrap();
+        assert!(stream.next().await.unwrap().unwrap().is_final);
+        if drop_before_eof {
+            drop(stream);
+            assert!(ledger.settlements.lock().is_empty());
+            assert_eq!(ledger.abandoned.load(Ordering::SeqCst), 1);
+        } else {
+            assert!(stream.next().await.is_none());
+            let settlements = ledger.settlements.lock();
+            assert_eq!(settlements.len(), 1);
+            assert_eq!(
+                settlements[0].as_ref().map(|s| s.charged_micro_usd),
+                expected_charge
+            );
+        }
+    }
 }

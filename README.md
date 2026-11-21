@@ -37,6 +37,8 @@ A Rust framework for building AI agents from a single YAML specification. No cod
 
 Ordinary model-callable tools are fail-closed through explicit grants. Optional tool security adds path, command, domain, approval, timeout, and result-limit enforcement. These controls are not an OS sandbox; hosts remain responsible for deployment isolation, filesystem ownership, network egress, credentials, custom integrations, and provider-internal I/O.
 
+The development checkout includes a direct Rust Chat Completions client with ordered text, image and audio inputs, streamed text and assembled function calls. See the [provider guide](https://ai-agents.rs/docs/providers/) for framework integration.
+
 ## Feature Status
 
 ai-agents.rs 1.1 includes YAML and Rust agent construction, blocking and streaming chat, tools, state machines, skills, memory, storage, evaluation, observability, spawning, orchestration, and the CLI/TUI.
