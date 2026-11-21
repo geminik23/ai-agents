@@ -1436,20 +1436,7 @@ fn build_real_provider(
     use std::str::FromStr;
     let provider_type = ProviderType::from_str(&config.provider)
         .map_err(|error| EvalError::Config(error.to_string()))?;
-    let core_config = ai_agents_core::LLMConfig {
-        temperature: Some(config.temperature),
-        max_tokens: Some(config.max_tokens),
-        top_p: config.top_p,
-        top_k: None,
-        frequency_penalty: None,
-        presence_penalty: None,
-        stop_sequences: None,
-        timeout_seconds: config.timeout_seconds,
-        reasoning: config.reasoning,
-        reasoning_effort: config.reasoning_effort.clone(),
-        reasoning_budget_tokens: config.reasoning_budget_tokens,
-        extra: config.extra.clone(),
-    };
+    let core_config = config.to_provider_config(provider_type);
     let base_url = config.base_url.clone().or_else(|| {
         config
             .extra

@@ -1745,6 +1745,8 @@ This page covers the most common patterns. For the complete API - every struct, 
 
 Use `ai_agents_llm::sdk` directly when your application owns the conversation and any tool execution. Provide the API base URL, credentials for that endpoint and a compatible model. An image URL is passed to the server. For image or audio bytes, the SDK builds the appropriate wire representation.
 
+The direct client leaves omitted sampling options unset. On the official origin, the provider validates known model and reasoning-effort combinations. With `https://api.openai.com/v1` and `gpt-6.2-astra` or `gpt-6.2-sol`, leave sampling fields and extensions `temperature`, `top_p`, `logprobs` and `top_logprobs` unset. The client rejects those options and native tool requests before sending HTTP. [Chat model and option support](@/docs/providers.md#first-party-chat-completions-development)
+
 ```rust
 use ai_agents_llm::sdk::{ChatClient, ChatRequest, InputPart, Message};
 

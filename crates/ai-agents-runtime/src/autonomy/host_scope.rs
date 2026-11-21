@@ -126,6 +126,7 @@ fn declaration_identity(
     skills: &[SkillDefinition],
     policy: &TaskIterationPolicy,
 ) -> Result<String> {
+    let spec = spec.identity_value()?;
     if *policy == TaskIterationPolicy::configured() {
         let value = serde_json::json!({"contract":1,"spec":spec,"loaded_skills":skills});
         return Ok(format!(

@@ -1,8 +1,9 @@
 //! LLM configuration types
 
 use ai_agents_core::ToolChoice;
+use ai_agents_llm::providers::ProviderType;
 pub use ai_agents_llm::{RouterRolesConfig, RouterSelector};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -75,8 +76,13 @@ pub struct LLMConfig {
 
     pub model: String,
 
-    #[serde(default = "default_temperature")]
-    pub temperature: f32,
+    /// An explicit temperature, or no temperature for a preset that requires omission.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_temperature",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub temperature: Option<f32>,
 
     #[serde(default = "default_max_tokens")]
     pub max_tokens: u32,
@@ -135,16 +141,24 @@ fn default_temperature() -> f32 {
     0.7
 }
 
+// Explicit null remains invalid in YAML; only an absent field means omission.
+fn deserialize_temperature<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<f32>, D::Error> {
+    f32::deserialize(deserializer).map(Some)
+}
+
 fn default_max_tokens() -> u32 {
     2000
 }
 
 impl Default for LLMConfig {
+    // Keep declaration defaults independent of the model selected by a Rust struct update.
     fn default() -> Self {
         Self {
             provider: "openai".to_string(),
             model: "gpt-4".to_string(),
-            temperature: default_temperature(),
+            temperature: None,
             max_tokens: default_max_tokens(),
             top_p: None,
             base_url: None,
@@ -159,6 +173,61 @@ impl Default for LLMConfig {
             json_mode: None,
             extra: HashMap::new(),
         }
+    }
+}
+
+impl LLMConfig {
+    // Only framework presets with a historical sampling default materialize it for execution.
+    fn effective_temperature(&self, provider: ProviderType) -> Option<f32> {
+        self.temperature
+            .or_else(|| (provider != ProviderType::OpenAI).then(default_temperature))
+    }
+
+    /// Resolves declaration defaults for both runtime and eval without modifying the saved spec.
+    pub fn to_provider_config(&self, provider: ProviderType) -> ai_agents_core::LLMConfig {
+        let temperature = self.effective_temperature(provider);
+        ai_agents_core::LLMConfig {
+            temperature,
+            max_tokens: Some(self.max_tokens),
+            top_p: self.top_p,
+            top_k: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            stop_sequences: None,
+            timeout_seconds: self.timeout_seconds,
+            reasoning: self.reasoning,
+            reasoning_effort: self.reasoning_effort.clone(),
+            reasoning_budget_tokens: self.reasoning_budget_tokens,
+            extra: self.extra.clone(),
+        }
+    }
+}
+
+impl super::AgentSpec {
+    // Compare effective declarations while preserving the historical serialized identity of equivalent preset defaults.
+    // Persistence itself keeps the original presence so an OpenAI omission is distinct from an explicit temperature.
+    pub(crate) fn identity_value(&self) -> ai_agents_core::Result<serde_json::Value> {
+        let mut value = serde_json::to_value(self)?;
+        let normalize = |config: &LLMConfig, target: &mut serde_json::Value| {
+            if config.temperature.is_none()
+                && let Ok(provider) = config.provider.parse()
+                && let Some(temperature) = config.effective_temperature(provider)
+            {
+                target["temperature"] = serde_json::json!(temperature);
+            }
+        };
+        if let Some(config) = self.llm.as_config() {
+            // A named registry takes precedence over the inline provider; older saved specs still include its numeric default.
+            if !self.llms.is_empty() && config.temperature.is_none() {
+                value["llm"]["temperature"] = serde_json::json!(default_temperature());
+            } else {
+                normalize(config, &mut value["llm"]);
+            }
+        }
+        for (alias, config) in &self.llms {
+            normalize(config, &mut value["llms"][alias]);
+        }
+        Ok(value)
     }
 }
 
@@ -241,7 +310,7 @@ disable_builtin_commands: false
         let config = LLMConfig::default();
         assert_eq!(config.provider, "openai");
         assert_eq!(config.model, "gpt-4");
-        assert_eq!(config.temperature, 0.7);
+        assert_eq!(config.temperature, None);
         assert_eq!(config.max_tokens, 2000);
         assert_eq!(config.base_url, None);
         assert_eq!(config.api_key_env, None);
@@ -296,7 +365,7 @@ max_tokens: 1000
         let config: LLMConfig = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(config.provider, "openai");
         assert_eq!(config.model, "gpt-3.5-turbo");
-        assert_eq!(config.temperature, 0.5);
+        assert_eq!(config.temperature, Some(0.5));
         assert_eq!(config.max_tokens, 1000);
     }
 
@@ -325,8 +394,98 @@ provider: openai
 model: gpt-4
 "#;
         let config: LLMConfig = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(config.temperature, 0.7); // default
+        assert_eq!(
+            config.to_provider_config(ProviderType::OpenAI).temperature,
+            None
+        );
         assert_eq!(config.max_tokens, 2000); // default
+    }
+
+    #[test]
+    fn agent_spec_round_trips_gpt_6_2_omission_and_legacy_defaults() {
+        let yaml = "name: Sampling\nsystem_prompt: Test\nllm: {provider: openai, model: gpt-6.2-astra}\nllms:\n  omitted: {provider: openai, model: gpt-6.2-sol}\n  explicit: {provider: openai, model: gpt-6.2-sol, temperature: 0.7}\n  compatible: {provider: openai-compatible, model: gpt-6.2-sol}\n";
+        let spec = crate::spec::AgentSpec::from_yaml_strict(yaml).unwrap();
+        let yaml = serde_yaml::to_string(&spec).unwrap();
+        let restored = crate::spec::AgentSpec::from_yaml_strict(&yaml).unwrap();
+        assert_eq!(restored.llm.as_config().unwrap().temperature, None);
+        assert_eq!(restored.llms["omitted"].temperature, None);
+        assert_eq!(restored.llms["explicit"].temperature, Some(0.7));
+        assert_eq!(restored.llms["compatible"].temperature, None);
+
+        let raw: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+        assert!(raw["llm"].get("temperature").is_none());
+        assert!(raw["llms"]["omitted"].get("temperature").is_none());
+        assert!(raw["llms"]["compatible"].get("temperature").is_none());
+        assert!(
+            serde_yaml::from_str::<LLMConfig>(
+                "provider: openai\nmodel: gpt-6.2-sol\ntemperature: null\n"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn rust_sampling_declaration_and_task_scope_survive_yaml() {
+        use crate::autonomy::TaskHostScope;
+        use crate::spec::{AgentSpec, LLMConfigOrSelector};
+        let scope = |spec: &AgentSpec| {
+            TaskHostScope::from_spec(spec, std::path::Path::new("."), None)
+                .unwrap()
+                .identity()
+                .to_owned()
+        };
+        for provider in [ProviderType::OpenAI, ProviderType::OpenAICompatible] {
+            let config = LLMConfig {
+                provider: if provider == ProviderType::OpenAI {
+                    "openai"
+                } else {
+                    "openai-compatible"
+                }
+                .into(),
+                model: "gpt-6.2-sol".into(),
+                ..Default::default()
+            };
+            assert_eq!(config.temperature, None);
+            assert_eq!(
+                config.to_provider_config(provider).temperature,
+                (provider == ProviderType::OpenAICompatible).then_some(0.7)
+            );
+            for named in [false, true] {
+                let declaration = |config: LLMConfig| {
+                    let mut spec = AgentSpec::default();
+                    if named {
+                        spec.llm = LLMConfigOrSelector::Selector(LLMSelector::default());
+                        spec.llms.insert("default".into(), config);
+                    } else {
+                        spec.llm = LLMConfigOrSelector::Config(config);
+                    }
+                    spec
+                };
+                let spec = declaration(config.clone());
+                let loaded =
+                    AgentSpec::from_yaml_strict(&serde_yaml::to_string(&spec).unwrap()).unwrap();
+                assert_eq!(scope(&spec), scope(&loaded));
+                assert_eq!(
+                    serde_json::to_value(&spec).unwrap(),
+                    serde_json::to_value(&loaded).unwrap()
+                );
+                let explicit = declaration(LLMConfig {
+                    temperature: Some(0.7),
+                    ..config.clone()
+                });
+                if provider == ProviderType::OpenAICompatible {
+                    // Legacy declarations serialized the numeric default directly into the namespace hash.
+                    assert_eq!(
+                        loaded.identity_value().unwrap(),
+                        serde_json::to_value(&explicit).unwrap()
+                    );
+                }
+                assert_eq!(
+                    scope(&explicit) == scope(&loaded),
+                    provider == ProviderType::OpenAICompatible
+                );
+            }
+        }
     }
 
     #[test]

@@ -45,6 +45,7 @@
 - Task validation: development-only tri-state checks, tool/fallback/child observation continuation and external signals preserve post-turn controller progress; fixed host permits and single logical journal charges survive re-pause, without adding a second executor or inferring completion from unavailable evidence
 
 ### Changed
+- OpenAI Chat: preserve omitted sampling options, validate documented model and effort restrictions, and keep the compatible-server temperature default. Rust agent specifications use `Option<f32>` for `temperature`.
 - Rust command compatibility: command response literals include a defaulted execution state; legacy exited observations remain compatible while ambiguous interruptions retain recovery protection
 - Observation privacy: approval completion events retain decision states rather than free-form reasons, and tool arguments or copied failure bodies follow their respective disclosure opt-ins
 - Rust memory compatibility: `MemorySnapshot` and `ConversationContext` literals include defaulted incomplete-history observations; custom memory implementations explicitly opt into restoring them

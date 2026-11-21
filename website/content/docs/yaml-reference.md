@@ -342,7 +342,7 @@ The simplest form: one LLM for everything. Use `llm` as a flat object.
 |-------|------|---------|-------------|
 | `provider` | `string` | `"openai"` | Provider identifier |
 | `model` | `string` | `"gpt-4"` | Model name |
-| `temperature` | `f32` | `0.7` | Sampling temperature |
+| `temperature` | `f32` | omitted for OpenAI, `0.7` for other presets | Sampling temperature. Explicit values follow the selected endpoint and model. |
 | `max_tokens` | `u32` | `2000` | Max response tokens |
 | `top_p` | `f32` | `null` | Nucleus sampling |
 | `base_url` | `string` | `null` | API endpoint override (required for `openai-compatible`) |
@@ -371,7 +371,7 @@ llm:
   max_tokens: 4000
 ```
 
-Capability override fields (`function_calling`, `vision`, `json_mode`) are not sent as model parameters. They control framework capability checks; `function_calling: false` also disables native tool selection, while `function_calling: true` opts an OpenAI-compatible server into the native path. Ollama named fields (`num_ctx`, `keep_alive`, `num_gpu`) are captured as provider extras and merged into the Ollama request body.
+Capability override fields (`function_calling`, `vision`, `json_mode`) are not sent as model parameters. They control framework capability checks; `function_calling: false` also disables native tool selection, while `function_calling: true` opts an OpenAI-compatible server into the native path. The GPT-6.2 OpenAI Chat models require Responses for native tools. Ollama named fields (`num_ctx`, `keep_alive`, `num_gpu`) are captured as provider extras and merged into the Ollama request body. [Chat model and option support](@/docs/providers.md#first-party-chat-completions-development)
 
 Any field not listed above is captured in an `extra` map via `#[serde(flatten)]` and forwarded to the LLM client when a matching builder method exists. This includes transport-level resilience (`resilient`, `resilient_attempts`, etc.), Azure settings (`api_version`, `deployment_id`), and provider-native search (`openai_enable_web_search`, `xai_search_mode`, etc.). Provider-native search changes the LLM request and is separate from the granted built-in `web_search` tool, its `WebSearchProvider`, shared policy/HITL path, and tool evidence. See [LLM Providers > Extra Parameters](@/docs/providers.md#extra-parameters) for the full list.
 
@@ -3507,7 +3507,7 @@ settings:
 | `max_concurrent` | `usize` | `4` | Maximum concurrently running scenarios |
 | `fail_fast` | `bool` | `false` | Stop after the first failed or errored scenario; runs serially |
 | `redact_outputs` | `bool` | `true` | Store `[redacted]` for inputs, responses, and string assertion details; raw evidence is omitted from JSON outputs |
-| `temperature` | `f32?` | `null` | Override agent LLM temperatures during eval. This is useful for more deterministic live-provider smoke tests. |
+| `temperature` | `f32?` | `null` | Override agent LLM temperatures during eval. Omit for GPT-6.2 OpenAI Chat. |
 | `seed` | `u64?` | `null` | Stores `extra.seed` in the eval LLM configuration. Current built-in adapters do not forward that top-level key to provider requests or include it in client-cache identity; custom providers may interpret it. Do not claim deterministic live eval from this field. |
 
 `isolation: scenario` is the recommended default. It creates a fresh runtime and temp workspace per scenario attempt. `isolation: turn` resets conversation state between direct turns, while still reapplying fixture/scenario context. `isolation: suite` and `isolation: none` are rejected until shared-run isolation has a stronger public contract.

@@ -417,6 +417,7 @@ impl AgentBuilder {
 
     /// Constructs declared providers without consuming auxiliary routing until registrations are complete.
     /// An explicitly selected Chat credential is resolved before binding the provider to its configured endpoint.
+    /// Uses the same preset defaults as eval while preserving omission where the model requires it.
     pub fn auto_configure_llms(mut self) -> Result<Self> {
         if self.routing_frozen.is_some() {
             self.routing_dirty = true;
@@ -433,20 +434,7 @@ impl AgentBuilder {
                 let provider_type = ProviderType::from_str(&config.provider)
                     .map_err(|e| AgentError::Config(e.to_string()))?;
 
-                let core_config = ai_agents_core::LLMConfig {
-                    temperature: Some(config.temperature),
-                    max_tokens: Some(config.max_tokens),
-                    top_p: config.top_p,
-                    top_k: None,
-                    frequency_penalty: None,
-                    presence_penalty: None,
-                    stop_sequences: None,
-                    timeout_seconds: config.timeout_seconds,
-                    reasoning: config.reasoning,
-                    reasoning_effort: config.reasoning_effort.clone(),
-                    reasoning_budget_tokens: config.reasoning_budget_tokens,
-                    extra: config.extra.clone(),
-                };
+                let core_config = config.to_provider_config(provider_type);
                 // base_url: first-class field, fallback to extra for backward compat
                 let base_url = config.base_url.clone().or_else(|| {
                     config
@@ -491,20 +479,7 @@ impl AgentBuilder {
             let provider_type = ProviderType::from_str(&config.provider)
                 .map_err(|e| AgentError::Config(e.to_string()))?;
 
-            let core_config = ai_agents_core::LLMConfig {
-                temperature: Some(config.temperature),
-                max_tokens: Some(config.max_tokens),
-                top_p: config.top_p,
-                top_k: None,
-                frequency_penalty: None,
-                presence_penalty: None,
-                stop_sequences: None,
-                timeout_seconds: config.timeout_seconds,
-                reasoning: config.reasoning,
-                reasoning_effort: config.reasoning_effort.clone(),
-                reasoning_budget_tokens: config.reasoning_budget_tokens,
-                extra: config.extra.clone(),
-            };
+            let core_config = config.to_provider_config(provider_type);
             // base_url: first-class field, fallback to extra for backward compat
             let base_url = config.base_url.clone().or_else(|| {
                 config

@@ -43,7 +43,11 @@ llm:
     logprobs: true
 ```
 
-`protocol` is optional. The first-party codec sends an ordinary request's nonempty effort string verbatim and omits it when absent. Choose a value and extensions supported by your server. Existing YAML defaults for temperature and output tokens still apply. The adapter combines explicit `provider_options` and legacy `extra_body` on distinct JSON paths. Conflicting values and overrides of messages, tools, model, stream controls, output ceilings, credentials or other owned fields fail before sending a request. Hard-priced calls require the audited option set. An existing `extra_body.response_format` with `text`, `json_object`, or `json_schema` maps to the owned Chat response format. Direct SDK callers can set `ChatRequest::response_format`.
+`protocol` is optional. The first-party codec sends an ordinary request's nonempty effort string verbatim and omits it when absent. Choose a value and extensions supported by your server. The adapter combines explicit `provider_options` and legacy `extra_body` on distinct JSON paths. Conflicting values and overrides of messages, tools, model, stream controls, output ceilings, credentials or other owned fields fail before sending a request. Hard-priced calls require the audited option set. An existing `extra_body.response_format` with `text`, `json_object`, or `json_schema` maps to the owned Chat response format. Direct SDK callers can set `ChatRequest::response_format`.
+
+For `provider: openai`, an omitted temperature stays absent from the HTTP request. Other framework presets, including `openai-compatible`, resolve an omitted temperature to their historical `0.7` at provider construction. Both shorthand and named YAML configurations preserve omission on save. The output token default is `2000`.
+
+The direct client on the official OpenAI origin and the framework OpenAI preset apply the same documented Chat restrictions to explicit sampling options and native tools. For example, GPT-6.2 Astra/Sol and GPT-6 Astra/6.1 Sol require Responses for native tools and reject explicit sampling. GPT-6 Sol/Luna allow Chat native tools and sampling with effort `none`. GPT-5.2/5.4 allow sampling with effort `none`, their default. Unknown model IDs pass through to the endpoint. A compatible server owns its own model rules. [GPT-6.2 guide](https://developers.openai.com/api/docs/guides/latest-model?model=gpt-6.2-astra) · [GPT-6 guide](https://developers.openai.com/api/docs/guides/latest-model?model=gpt-6-astra) · [GPT-5.4 guide](https://developers.openai.com/api/docs/guides/latest-model?model=gpt-5.4)
 
 Legacy transport settings such as resilience, deployment/API version and hosted web search select the upstream backend before dispatch. The same applies to legacy reasoning/budget and unsupported typed sampling overrides. Enabled legacy transport settings conflict with explicit SDK options. Disabled resilience and web search, including their inactive tuning fields, keep the SDK path. Other providers and the public legacy `build_llm()` continue to use their existing paths.
 
@@ -591,7 +595,7 @@ llm:
 
 | Parameter | Type | Default | Description |
 | --- | --- | --- | --- |
-| `temperature` | `f32` | `0.7` | Sampling temperature |
+| `temperature` | `f32` | omitted for OpenAI, `0.7` for other presets | Sampling temperature. |
 | `max_tokens` | `u32` | `2000` | Maximum response tokens |
 | `top_p` | `f32` | - | Nucleus sampling threshold |
 | `timeout_seconds` | `u64` | - | Request timeout in seconds |

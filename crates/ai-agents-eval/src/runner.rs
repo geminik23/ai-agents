@@ -1996,7 +1996,7 @@ fn apply_llm_config_settings(
     settings: &crate::suite::EvalSettings,
 ) {
     if let Some(temperature) = settings.temperature {
-        config.temperature = temperature;
+        config.temperature = Some(temperature);
     }
     if let Some(seed) = settings.seed {
         config.extra.insert("seed".to_string(), json!(seed));

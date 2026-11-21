@@ -1,4 +1,5 @@
 //! Conversion between the framework provider contract and the independent Chat client.
+use super::unified::ProviderType;
 use crate::sdk;
 use ai_agents_core::{
     ChatMessage, FinishReason, LLMChunk, LLMConfig, LLMError, LLMResponse, LLMToolRequest, Role,
@@ -131,6 +132,7 @@ fn requires_legacy(cfg: &LLMConfig) -> Result<bool, LLMError> {
 }
 
 pub(super) fn request(
+    provider: ProviderType,
     model: &str,
     messages: &[ChatMessage],
     cfg: &LLMConfig,
@@ -186,7 +188,13 @@ pub(super) fn request(
             }
         }
     }
-    // Route legacy-only transports before dispatch. There is no retry from one backend into the other.
+    if provider == ProviderType::OpenAI {
+        let hosted_search = extra
+            .get("openai_enable_web_search")
+            .and_then(Value::as_bool)
+            == Some(true);
+        super::openai_chat::validate(&request, tools.is_some() || hosted_search).map_err(error)?;
+    }
     if requires_legacy(cfg)? {
         if extra.contains_key("provider_options") || extra.contains_key("protocol") {
             return Err(LLMError::Config(
@@ -316,7 +324,7 @@ mod tests {
             .insert("extra_body".into(), json!({"vendor":{"a":1}}));
         cfg.extra
             .insert("provider_options".into(), json!({"vendor":{"b":true}}));
-        let body = request("model", &[], &cfg, None)
+        let body = request(ProviderType::OpenAICompatible, "model", &[], &cfg, None)
             .unwrap()
             .unwrap()
             .body(false)
@@ -325,7 +333,7 @@ mod tests {
         cfg.extra
             .insert("provider_options".into(), json!({"vendor":{"a":2}}));
         assert!(
-            matches!(request("model",&[],&cfg,None), Err(LLMError::Config(e)) if e.contains("provider_options.vendor.a"))
+            matches!(request(ProviderType::OpenAICompatible,"model",&[],&cfg,None), Err(LLMError::Config(e)) if e.contains("provider_options.vendor.a"))
         );
     }
 
@@ -337,8 +345,10 @@ mod tests {
         ] {
             let cfg =
                 LLMConfig::default().with_extra("extra_body", json!({"response_format":format}));
-            assert!(matches!(request("model", &[], &cfg, None),
-                Err(LLMError::Config(error)) if error.contains("extra_body.response_format")));
+            assert!(
+                matches!(request(ProviderType::OpenAICompatible, "model", &[], &cfg, None),
+                Err(LLMError::Config(error)) if error.contains("extra_body.response_format"))
+            );
         }
     }
 
@@ -346,11 +356,15 @@ mod tests {
     fn legacy_transport_selection_never_discards_explicit_sdk_options() {
         let mut cfg = LLMConfig::default();
         cfg.extra.insert("resilient".into(), json!(true));
-        assert!(request("model", &[], &cfg, None).unwrap().is_none());
+        assert!(
+            request(ProviderType::OpenAICompatible, "model", &[], &cfg, None)
+                .unwrap()
+                .is_none()
+        );
         cfg.extra
             .insert("protocol".into(), json!("chat-completions"));
         assert!(matches!(
-            request("model", &[], &cfg, None),
+            request(ProviderType::OpenAICompatible, "model", &[], &cfg, None),
             Err(LLMError::Config(_))
         ));
     }

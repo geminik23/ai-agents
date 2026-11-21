@@ -526,19 +526,42 @@ fn map_provider_error(
 }
 
 impl UnifiedLLMProvider {
+    fn supports_choice_for_provider(&self, choice: &ToolChoice) -> bool {
+        if self.feature_overrides.get(&LLMFeature::FunctionCalling) == Some(&false) {
+            return false;
+        }
+        let known_choice = matches!(
+            choice,
+            ToolChoice::Auto | ToolChoice::Required | ToolChoice::Specific(_) | ToolChoice::None
+        );
+        match self.provider_type {
+            ProviderType::OpenAI | ProviderType::Anthropic | ProviderType::OpenRouter => {
+                known_choice
+            }
+            ProviderType::Google => matches!(choice, ToolChoice::Auto),
+            ProviderType::OpenAICompatible => {
+                self.feature_overrides
+                    .get(&LLMFeature::FunctionCalling)
+                    .copied()
+                    .unwrap_or(false)
+                    && known_choice
+            }
+            _ => false,
+        }
+    }
+
     pub fn new(
         provider_type: ProviderType,
         model: String,
         api_key: Option<String>,
         base_url: Option<String>,
     ) -> Result<Self, LLMError> {
-        Self::from_spec_config(
-            provider_type,
-            &model,
-            api_key,
-            base_url,
-            LLMConfig::default(),
-        )
+        let mut config = LLMConfig::default();
+        if provider_type == ProviderType::OpenAI {
+            config.temperature = None;
+            config.top_p = None;
+        }
+        Self::from_spec_config(provider_type, &model, api_key, base_url, config)
     }
 
     /// Create a new UnifiedLLMProvider with explicit config defaults.
@@ -611,7 +634,8 @@ impl UnifiedLLMProvider {
                         .unwrap_or("https://api.openai.com/v1/"),
                     Some(actual_api_key.clone()),
                 )
-                .map_err(chat_adapter::error)?,
+                .map_err(chat_adapter::error)?
+                .with_openai_contract(provider_type == ProviderType::OpenAI),
             )
         } else {
             None
@@ -1194,6 +1218,7 @@ impl LLMProvider for UnifiedLLMProvider {
         }
         if let Some(chat) = &self.chat
             && let Some(wire) = chat_adapter::request(
+                self.provider_type,
                 &self.model,
                 messages,
                 config.unwrap_or(&self.default_config),
@@ -1252,7 +1277,7 @@ impl LLMProvider for UnifiedLLMProvider {
             return google.complete_with_tools(messages, config, request).await;
         }
         let choice = &request.choice;
-        if !self.supports_tool_choice(choice) {
+        if !self.supports_choice_for_provider(choice) {
             return Err(LLMError::Config(format!(
                 "provider '{}' does not support native tool choice {:?}",
                 self.provider_name(),
@@ -1276,6 +1301,7 @@ impl LLMProvider for UnifiedLLMProvider {
 
         if let Some(chat) = &self.chat
             && let Some(wire) = chat_adapter::request(
+                self.provider_type,
                 &self.model,
                 messages,
                 config.unwrap_or(&self.default_config),
@@ -1345,6 +1371,7 @@ impl LLMProvider for UnifiedLLMProvider {
         }
         if let Some(chat) = &self.chat
             && let Some(wire) = chat_adapter::request(
+                self.provider_type,
                 &self.model,
                 messages,
                 config.unwrap_or(&self.default_config),
@@ -1416,12 +1443,16 @@ impl LLMProvider for UnifiedLLMProvider {
         } else {
             if self.chat.is_some() {
                 let cfg = request.config.unwrap_or(&self.default_config);
-                if let Some(wire) =
-                    chat_adapter::request(&self.model, request.messages, cfg, request.tools)?
-                {
+                if let Some(wire) = chat_adapter::request(
+                    self.provider_type,
+                    &self.model,
+                    request.messages,
+                    cfg,
+                    request.tools,
+                )? {
                     if request
                         .tools
-                        .is_some_and(|t| !self.supports_tool_choice(&t.choice))
+                        .is_some_and(|t| !self.supports_choice_for_provider(&t.choice))
                     {
                         return Err(LLMError::Config(
                             "unsupported priced native tool choice".into(),
@@ -1456,7 +1487,7 @@ impl LLMProvider for UnifiedLLMProvider {
             let (_, non_system) = extract_system_and_messages(&projected);
             if let Some(tools) = request.tools {
                 self.convert_messages_with_tools(&non_system)?;
-                if !self.supports_tool_choice(&tools.choice)
+                if !self.supports_choice_for_provider(&tools.choice)
                     || (matches!(tools.choice, ToolChoice::Required | ToolChoice::Specific(_))
                         && tools.tools.is_empty())
                     || matches!(&tools.choice, ToolChoice::Specific(name) if !tools.tools.iter().any(|tool| &tool.name == name))
@@ -1532,30 +1563,20 @@ impl LLMProvider for UnifiedLLMProvider {
     }
 
     fn supports_tool_choice(&self, choice: &ToolChoice) -> bool {
-        if self.feature_overrides.get(&LLMFeature::FunctionCalling) == Some(&false) {
-            return false;
-        }
-        let known_choice = matches!(
-            choice,
-            ToolChoice::Auto | ToolChoice::Required | ToolChoice::Specific(_) | ToolChoice::None
-        );
-        match self.provider_type {
-            ProviderType::OpenAI | ProviderType::Anthropic | ProviderType::OpenRouter => {
-                known_choice
-            }
-            ProviderType::Google => matches!(choice, ToolChoice::Auto),
-            ProviderType::OpenAICompatible => {
-                self.feature_overrides
-                    .get(&LLMFeature::FunctionCalling)
-                    .copied()
-                    .unwrap_or(false)
-                    && known_choice
-            }
-            _ => false,
-        }
+        super::openai_chat::allows_tools(self.provider_type, &self.model, &self.default_config)
+            && self.supports_choice_for_provider(choice)
     }
 
     fn supports(&self, feature: LLMFeature) -> bool {
+        if feature == LLMFeature::FunctionCalling
+            && !super::openai_chat::allows_tools(
+                self.provider_type,
+                &self.model,
+                &self.default_config,
+            )
+        {
+            return false;
+        }
         if let Some(enabled) = self.feature_overrides.get(&feature) {
             return *enabled;
         }
@@ -2533,6 +2554,72 @@ mod tests {
         assert!(openai.is_terminal_error(&LLMError::Config("conflicting chat options".into())));
     }
 
+    #[tokio::test]
+    async fn gpt_6_2_openai_preset_keeps_native_tool_calls_out_of_chat() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let provider = UnifiedLLMProvider::new(
+            ProviderType::OpenAI,
+            "gpt-6.2-sol".into(),
+            Some("fixture-key".into()),
+            Some(format!("http://{}/v1", listener.local_addr().unwrap())),
+        )
+        .unwrap()
+        .with_feature_override(LLMFeature::FunctionCalling, true);
+        assert!(provider.default_config.temperature.is_none());
+        assert!(provider.default_config.top_p.is_none());
+        assert!(!provider.supports(LLMFeature::FunctionCalling));
+        assert!(!provider.supports_tool_choice(&ToolChoice::Auto));
+        let request = LLMToolRequest {
+            choice: ToolChoice::Auto,
+            tools: vec![],
+        };
+        let result = provider.complete_with_tools(&[], None, &request).await;
+        assert!(
+            matches!(result, Err(LLMError::Config(message)) if message.contains("Responses API"))
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_sampling_and_native_tools_follow_the_effective_request_effort() {
+        let (url, mut received) = local_chat_fixture().await;
+        let provider = UnifiedLLMProvider::new(
+            ProviderType::OpenAI,
+            "gpt-6-luna".into(),
+            Some("fixture".into()),
+            Some(url),
+        )
+        .unwrap();
+        let choice = LLMToolRequest {
+            choice: ToolChoice::Auto,
+            tools: vec![LLMToolDefinition {
+                name: "lookup".into(),
+                description: "test".into(),
+                input_schema: serde_json::json!({"type":"object"}),
+            }],
+        };
+        assert!(!provider.supports_tool_choice(&choice.choice));
+        assert!(matches!(
+            provider.complete_with_tools(&[], None, &choice).await,
+            Err(LLMError::Config(_))
+        ));
+        for field in ["provider_options", "extra_body"] {
+            let config = LLMConfig {
+                temperature: Some(0.4),
+                top_p: None,
+                ..LLMConfig::default()
+            }
+            .with_extra(field, serde_json::json!({"reasoning_effort":"none"}));
+            provider
+                .complete_with_tools(&[ChatMessage::user("hi")], Some(&config), &choice)
+                .await
+                .unwrap();
+            let body = received.recv().await.unwrap();
+            assert_eq!(body["temperature"], 0.4);
+            assert_eq!(body["reasoning_effort"], "none");
+            assert_eq!(body["tools"][0]["function"]["name"], "lookup");
+        }
+    }
+
     #[test]
     fn non_google_projection_removes_signed_provider_state_without_mutating_history() {
         let call = ToolCall {
@@ -2569,11 +2656,17 @@ mod tests {
             choice: ToolChoice::Auto,
             tools: vec![],
         };
-        let wire = chat_adapter::request("fixture", &history, &LLMConfig::default(), Some(&tools))
-            .unwrap()
-            .unwrap()
-            .body(false)
-            .unwrap();
+        let wire = chat_adapter::request(
+            ProviderType::OpenAI,
+            "fixture",
+            &history,
+            &LLMConfig::default(),
+            Some(&tools),
+        )
+        .unwrap()
+        .unwrap()
+        .body(false)
+        .unwrap();
         assert!(
             wire["messages"][1]["content"]
                 .as_str()

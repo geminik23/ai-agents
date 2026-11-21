@@ -113,8 +113,7 @@ fn snapshot_identity(snapshot: &ai_agents_core::AgentSnapshot) -> Result<Value> 
             if let Some(text) = entry["spec_yaml"].as_str() {
                 let prepared = crate::spec::PreparedAgentSpec::from_persistence_yaml(text)?;
                 let (spec, policy) = prepared.into_parts();
-                entry["spec_yaml"] =
-                    serde_json::json!({"spec": spec, "task_iteration_policy": policy});
+                entry["spec_yaml"] = serde_json::json!({"spec": spec.identity_value()?, "task_iteration_policy": policy});
             }
         }
         entries.sort_by(|left, right| left["id"].as_str().cmp(&right["id"].as_str()));

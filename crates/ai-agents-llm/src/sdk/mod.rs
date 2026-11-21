@@ -437,6 +437,7 @@ pub struct ChatClient {
     client: Client,
     endpoint: Url,
     key: Option<String>,
+    openai_contract: bool,
 }
 impl ChatClient {
     /// The base URL includes the API prefix (for example `https://api.openai.com/v1`).
@@ -466,10 +467,20 @@ impl ChatClient {
             client,
             endpoint,
             key: api_key.filter(|k| !k.is_empty()),
+            openai_contract: url.origin().ascii_serialization() == "https://api.openai.com",
         })
     }
 
+    // A framework preset explicitly selects the contract, including when it uses a custom origin.
+    pub(crate) fn with_openai_contract(mut self, openai: bool) -> Self {
+        self.openai_contract = openai;
+        self
+    }
+
     async fn send(&self, request: &ChatRequest, stream: bool) -> Result<reqwest::Response, Error> {
+        if self.openai_contract {
+            crate::providers::openai_chat::validate(request, false)?;
+        }
         let mut http = self
             .client
             .post(self.endpoint.clone())
@@ -505,5 +516,40 @@ impl ChatClient {
             self.send(request, true).await?.bytes_stream(),
             ExpectedCalls::from_request(request),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn official_gpt_6_2_chat_rejects_unsupported_requests_before_io() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = ChatClient::new(
+            &format!("http://{}/v1", listener.local_addr().unwrap()),
+            None,
+        )
+        .unwrap()
+        .with_openai_contract(true);
+        let mut request = ChatRequest::new("gpt-6.2-astra", vec![Message::User("test".into())]);
+        request.timeout = Some(Duration::from_secs(2));
+        request.temperature = Some(0.0);
+        assert!(
+            matches!(client.complete(&request).await, Err(Error::Config(message)) if message.contains("temperature"))
+        );
+        request.temperature = None;
+        request.functions.push(Function {
+            name: "lookup".into(),
+            description: "look up a value".into(),
+            parameters: json!({"type":"object"}),
+        });
+        assert!(
+            matches!(client.stream(&request).await, Err(Error::Config(message)) if message.contains("Responses API"))
+        );
+        let accept = listener.accept();
+        tokio::pin!(accept);
+        assert!(futures::poll!(accept).is_pending());
     }
 }
