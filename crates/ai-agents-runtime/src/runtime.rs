@@ -419,13 +419,53 @@ struct MainProviderResponse {
     used_native_tools: bool,
 }
 
-//
-// Result of opening the main streaming provider call after recovery policy is applied.
-// A static fallback response is carried as text so the caller can emit it as one chunk and continue the shared post-response pipeline.
-//
+// Opening a stream may select a completed fallback response under the existing recovery policy.
 enum MainStreamSource {
     Stream(Box<dyn Stream<Item = std::result::Result<LLMChunk, LLMError>> + Unpin + Send>),
-    StaticResponse(String),
+    Complete(LLMResponse),
+}
+
+// Text deltas stay provisional until the managed stream acknowledges termination.
+#[derive(Default)]
+struct MainStreamOutput {
+    text: String,
+    finish_reason: Option<FinishReason>,
+    usage: Option<ai_agents_core::TokenUsage>,
+}
+
+impl MainStreamOutput {
+    // Only a final chunk supplies the finish and usage for the entire response.
+    fn observe(&mut self, chunk: &LLMChunk) {
+        self.text.push_str(&chunk.delta);
+        if chunk.is_final {
+            self.finish_reason.clone_from(&chunk.finish_reason);
+            self.usage = chunk.usage;
+        }
+    }
+
+    // Providers with the legacy text stream contract may end without a typed finish receipt.
+    fn into_response(self) -> LLMResponse {
+        let mut response =
+            LLMResponse::new(self.text, self.finish_reason.unwrap_or(FinishReason::Stop));
+        response.usage = self.usage;
+        response
+    }
+}
+
+// The raw text path can parse prompt-based tool requests only from normally completed output.
+fn require_complete_stream_text(reason: &FinishReason) -> Result<()> {
+    let detail = match reason {
+        FinishReason::Stop => return Ok(()),
+        FinishReason::Length => "length (output limit reached)",
+        FinishReason::ContentFilter => "content_filter (output filtered)",
+        FinishReason::UserStopped => "user_stopped",
+        FinishReason::Error => "error",
+        FinishReason::ToolCall => "tool_call (unexpected in a text stream)",
+        FinishReason::Other => "other (unrecognized finish)",
+    };
+    Err(AgentError::LLM(format!(
+        "Text stream did not complete normally: {detail}"
+    )))
 }
 
 // Tracks the latest committed signed model response only to detect custom-memory loss before continuation; replay data remains owned by memory.
@@ -6288,11 +6328,14 @@ impl RuntimeAgent {
                                 )
                                 .await
                                 .map_err(|error| AgentError::LLM(error.to_string()))?;
-                            Ok(MainStreamSource::StaticResponse(response.content))
+                            Ok(MainStreamSource::Complete(response))
                         }
                     }
                     LLMFailureAction::FallbackResponse { message } => {
-                        Ok(MainStreamSource::StaticResponse(message.clone()))
+                        Ok(MainStreamSource::Complete(LLMResponse::new(
+                            message.clone(),
+                            FinishReason::Stop,
+                        )))
                     }
                     LLMFailureAction::Error => Err(primary_error),
                 }
@@ -15235,6 +15278,8 @@ Respond in JSON format:
         .await
     }
 
+    // A speculative branch owns its buffered deltas until routing selects it.
+    // An incomplete provider response must fail before the branch can commit text or hand off tool work.
     async fn generate_buffered_streaming_draft(
         &self,
         processed_input: &str,
@@ -15255,21 +15300,21 @@ Respond in JSON format:
             .await?;
         let mut buffer = crate::optimization::StreamBranchBuffer::new(self.streaming.buffer_size)?;
         let mut chunks = Vec::new();
-        let mut accumulated = String::new();
-        match source {
-            MainStreamSource::StaticResponse(text) => {
-                accumulated.push_str(&text);
-                let stream_chunk = StreamChunk::content(text);
+        let response = match source {
+            MainStreamSource::Complete(response) => {
+                let stream_chunk = StreamChunk::content(&response.content);
                 if routing_resolved.load(Ordering::SeqCst) {
                     chunks.push(stream_chunk);
                 } else {
                     buffer.push(stream_chunk)?;
                 }
+                response
             }
             MainStreamSource::Stream(mut stream) => {
+                let mut output = MainStreamOutput::default();
                 while let Some(chunk_result) = stream.next().await {
                     let chunk = chunk_result.map_err(|e| AgentError::LLM(e.to_string()))?;
-                    accumulated.push_str(&chunk.delta);
+                    output.observe(&chunk);
                     let stream_chunk = StreamChunk::content(chunk.delta);
                     if routing_resolved.load(Ordering::SeqCst) {
                         chunks.push(stream_chunk);
@@ -15277,10 +15322,12 @@ Respond in JSON format:
                         buffer.push(stream_chunk)?;
                     }
                 }
+                output.into_response()
             }
-        }
+        };
+        require_complete_stream_text(&response.finish_reason)?;
         chunks.splice(0..0, buffer.drain());
-        let content = accumulated.trim().to_string();
+        let content = response.content.trim().to_string();
         let draft = if let Some(calls) = self.parse_tool_calls(&content)? {
             MainResponseDraft::ToolCalls {
                 raw_content: content,
@@ -15606,9 +15653,8 @@ Respond in JSON format:
         Ok(candidate)
     }
 
-    /// Streaming agent pipeline
-    /// Uses all the same shared helpers as run_loop_internal.
-    /// The ONLY difference: LLM calls use complete_stream() + yield deltas.
+    /// Streams provisional deltas while sharing tool execution and root-turn finalization with the blocking loop.
+    /// Reports terminal provider receipts after settlement and rejects incomplete text before interpretation or commit.
     fn run_loop_internal_stream<'a>(
         &'a self,
         input: &'a str,
@@ -15950,17 +15996,17 @@ Respond in JSON format:
                             return;
                         }
                     };
-                    let mut accumulated = String::new();
-                    match source {
-                        MainStreamSource::StaticResponse(text) => {
-                            accumulated.push_str(&text);
-                            yield StreamChunk::content(text);
+                    let mut response = match source {
+                        MainStreamSource::Complete(response) => {
+                            yield StreamChunk::content(&response.content);
+                            response
                         }
                         MainStreamSource::Stream(mut stream_inner) => {
+                            let mut output = MainStreamOutput::default();
                             while let Some(chunk_result) = stream_inner.next().await {
                                 match chunk_result {
                                     Ok(chunk) => {
-                                        accumulated.push_str(&chunk.delta);
+                                        output.observe(&chunk);
                                         yield StreamChunk::content(chunk.delta);
                                     }
                                     Err(e) => {
@@ -15970,16 +16016,17 @@ Respond in JSON format:
                                     }
                                 }
                             }
+                            output.into_response()
                         }
+                    };
+                    response.content = response.content.trim().to_owned();
+                    // Report the provider receipt only after the managed stream has settled.
+                    self.hooks.on_llm_complete(&response, llm_start.elapsed().as_millis() as u64).await;
+                    if let Err(error) = require_complete_stream_text(&response.finish_reason) {
+                        yield StreamChunk::error(error.to_string());
+                        return;
                     }
-                    let llm_duration_ms = llm_start.elapsed().as_millis() as u64;
-                    // Construct LLMResponse for hooks
-                    let llm_response = ai_agents_core::LLMResponse::new(
-                        accumulated.trim(),
-                        ai_agents_core::FinishReason::Stop,
-                    );
-                    self.hooks.on_llm_complete(&llm_response, llm_duration_ms).await;
-                    accumulated.trim().to_string()
+                    response.content
                 };
 
                 // Tool call handling

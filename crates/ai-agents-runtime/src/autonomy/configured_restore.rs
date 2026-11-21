@@ -146,14 +146,14 @@ impl ConfiguredTaskRestoreHost {
                 }
             }
         }
-        let declarations: BTreeMap<_, _> = declared.iter().map(|(id, (child, directory))| {
-            (id, json!({"spec": child.spec(), "policy": child.task_iteration_policy(), "directory": directory}))
-        }).collect();
+        let declarations = declared.iter().map(|(id, (child, directory))| {
+            Ok((id, json!({"spec": child.spec().identity_value()?, "policy": child.task_iteration_policy(), "directory": directory})))
+        }).collect::<Result<BTreeMap<_, _>>>()?;
         let scope = TaskHostScope::from_prepared_spec(&prepared, &base_dir, actor)?;
         let configuration = format!(
             "{:x}",
             Sha256::digest(serde_json::to_vec(&json!({
-                "spec": prepared.spec(),
+                "spec": prepared.spec().identity_value()?,
                 "policy": prepared.task_iteration_policy(),
                 "base_dir": base_dir,
             "working_dir": working_dir,
@@ -541,7 +541,7 @@ impl ConfiguredTaskRestoreHost {
         let definition = format!(
             "{:x}",
             Sha256::digest(serde_json::to_vec(&json!({
-                "spec": prepared.spec(), "policy": prepared.task_iteration_policy(),
+                "spec": prepared.spec().identity_value()?, "policy": prepared.task_iteration_policy(),
             }))?)
         );
         Ok(json!({"host": self.configuration, "definition": definition, "base_dir": base_dir}))
@@ -570,20 +570,19 @@ impl ConfiguredTaskRestoreHost {
                     continue;
                 };
                 let saved = PreparedAgentSpec::from_persistence_yaml(&declaration.spec_yaml)?;
-                let directory = if let Some((current, directory)) =
-                    self.declared.get(&declaration.id)
-                {
-                    if serde_json::to_value(current.spec())? != serde_json::to_value(saved.spec())?
-                        || current.task_iteration_policy() != saved.task_iteration_policy()
-                    {
-                        return Err(AgentError::Config(
-                            "declared child configuration changed".into(),
-                        ));
-                    }
-                    directory.clone()
-                } else {
-                    self.working_dir.clone()
-                };
+                let directory =
+                    if let Some((current, directory)) = self.declared.get(&declaration.id) {
+                        if current.spec().identity_value()? != saved.spec().identity_value()?
+                            || current.task_iteration_policy() != saved.task_iteration_policy()
+                        {
+                            return Err(AgentError::Config(
+                                "declared child configuration changed".into(),
+                            ));
+                        }
+                        directory.clone()
+                    } else {
+                        self.working_dir.clone()
+                    };
                 let spawner = entry.spawner.clone().ok_or_else(|| {
                     AgentError::Config(
                         "custom child requires an installed restoration factory".into(),

@@ -39,9 +39,10 @@ The development checkout contains source-breaking changes to existing public typ
 
 For struct construction, prefer existing constructors or `..Default::default()` where the type supports them. Existing exhaustive literals need the following additions. Exhaustive destructuring also needs the added fields or `..` where ignoring them is appropriate.
 
-| Public type | Added fields and migration |
+| Public type | Changes and migration |
 |---|---|
 | `AgentSpec` | `autonomy: AutonomyConfig::default()` preserves an ordinary agent |
+| `ai_agents::spec::LLMConfig` | `temperature` is now `Option<f32>`. Wrap explicit values in `Some(value)`. Rust and YAML preserve omission through serialization. OpenAI omits the option on the wire. Other presets apply the historical `0.7` when constructing the provider. Previously saved numeric values remain explicit. When moving an existing OpenAI declaration to provider defaults, its effective configuration and task namespace may change. |
 | `StateDefinition`, `SkillDefinition` | `autonomy: None` preserves the previous scope |
 | `ChatMessage` | `provenance: None` for ordinary messages; preserve actual task provenance when processing task history |
 | `MemorySnapshot`, `ConversationContext` | `incomplete_native_exchanges: Vec::new()` for legacy data with no such observations; preserve real observations when present |

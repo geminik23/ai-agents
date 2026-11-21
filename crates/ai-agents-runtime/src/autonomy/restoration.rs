@@ -540,7 +540,7 @@ impl TaskRestoreGraph {
                     }
                     self.runtimes.insert(id.clone(), entry.agent.clone());
                     if let Some(old) = self.declarations.get(&id)
-                        && serde_json::to_value(old)? != serde_json::to_value(&entry.spec)?
+                        && old.identity_value()? != entry.spec.identity_value()?
                     {
                         return Err(AgentError::Config("registry aliases with different retained declarations require an explicit host migration".into()));
                     }

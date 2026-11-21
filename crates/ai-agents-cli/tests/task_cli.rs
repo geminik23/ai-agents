@@ -340,6 +340,10 @@ struct Fixture {
 }
 impl Fixture {
     fn new(replies: &[&str]) -> Self {
+        Self::observe_requests(replies, |_| {})
+    }
+
+    fn observe_requests(replies: &[&str], observe: impl Fn(&Value) + Send + 'static) -> Self {
         let dir = std::env::temp_dir().join(format!(
             "task-cli-{}-{}",
             std::process::id(),
@@ -373,6 +377,7 @@ impl Fixture {
                     // A client may disconnect before sending a request; it does not stop the listener or consume a reply.
                     continue;
                 };
+                observe(&body);
                 let index = count.fetch_add(1, Ordering::SeqCst);
                 let reply = replies.get(index).cloned().unwrap_or_else(|| "done".into());
                 while held.load(Ordering::Acquire) && !stopped.load(Ordering::Acquire) {
@@ -384,7 +389,7 @@ impl Fixture {
                         "text/event-stream",
                         format!(
                             "data: {}\n\ndata: [DONE]\n\n",
-                            json!({"choices":[{"delta":{"content":reply},"finish_reason":null}]})
+                            json!({"choices":[{"delta":{"content":reply},"finish_reason":"stop"}]})
                         ),
                     )
                 } else {
@@ -573,6 +578,111 @@ impl Fixture {
         }
     }
 }
+
+#[test]
+fn chat_sampling_respects_the_yaml_provider_model_and_option_presence() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let captured = requests.clone();
+    let fixture = Fixture::observe_requests(&[], move |body| {
+        captured.lock().unwrap().push(body.clone());
+    });
+    let agent = fixture.agent("");
+    let path = agent.to_str().unwrap();
+    let run = |provider: &str, model: &str, options: &str, streaming| {
+        std::fs::write(
+            &agent,
+            format!(
+                "name: Fixture\nsystem_prompt: Test\nllm:\n  provider: {provider}\n  model: {model}\n  api_key_env: TASK_FIXTURE_TOKEN\n  base_url: {}\n{options}",
+                fixture.url
+            ),
+        )
+        .unwrap();
+        let mut args = vec!["run", path, "--plain"];
+        if streaming {
+            args.push("--stream");
+        }
+        fixture.run(&args, "hello\n")
+    };
+
+    for (model, streaming) in [
+        ("gpt-6-astra", false),
+        ("gpt-6.1-sol", true),
+        ("gpt-6.2-astra", false),
+        ("gpt-6.2-sol", true),
+        ("unregistered-model", false),
+    ] {
+        let output = run("openai", model, "  reasoning_effort: high\n", streaming);
+        assert_exit(&output, 0);
+        let body = requests.lock().unwrap().pop().unwrap();
+        assert_eq!(body["model"], model);
+        assert_eq!(body["stream"], streaming);
+        assert_eq!(body["reasoning_effort"], "high");
+        assert_eq!(body["max_completion_tokens"], 2000);
+        for field in ["temperature", "top_p", "logprobs", "top_logprobs"] {
+            assert!(body.get(field).is_none(), "unexpected {field} in {body}");
+        }
+    }
+
+    for (options, field) in [
+        ("  temperature: 0.7\n", "temperature"),
+        ("  top_p: 0.9\n", "top_p"),
+        ("  provider_options: {logprobs: false}\n", "logprobs"),
+        ("  extra_body: {top_logprobs: 0}\n", "top_logprobs"),
+        (
+            "  extra_body: {temperature: 0.7}\n  resilient: true\n",
+            "temperature",
+        ),
+    ] {
+        let output = run("openai", "gpt-6.2-sol", options, false);
+        let error = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            error.contains(&format!("does not support {field}"))
+                || stdout.contains(&format!("does not support {field}")),
+            "stdout: {stdout}\nstderr: {error}"
+        );
+        assert!(requests.lock().unwrap().is_empty());
+    }
+
+    for (model, effort, allowed) in [
+        ("gpt-6-astra", "low", false),
+        ("gpt-6.1-sol", "low", false),
+        ("gpt-6.1-terra", "none", true),
+        ("gpt-6-luna", "none", true),
+        ("gpt-6-sol", "high", false),
+        ("gpt-5.4", "none", true),
+        ("gpt-5.4", "high", false),
+        ("unregistered-model", "future-effort", true),
+    ] {
+        let options =
+            format!("  temperature: 0.3\n  provider_options: {{reasoning_effort: {effort}}}\n");
+        let output = run("openai", model, &options, false);
+        if allowed {
+            assert_exit(&output, 0);
+            let body = requests.lock().unwrap().pop().unwrap();
+            assert_eq!(body["temperature"], 0.3);
+            assert_eq!(body["reasoning_effort"], effort);
+        } else {
+            let diagnostic = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stderr),
+                String::from_utf8_lossy(&output.stdout)
+            );
+            assert!(
+                diagnostic.contains("does not support temperature"),
+                "{model}: {diagnostic}"
+            );
+            assert!(requests.lock().unwrap().is_empty());
+        }
+    }
+    let output = run("openai-compatible", "gpt-6.2-sol", "  top_p: 0.8\n", false);
+    assert_exit(&output, 0);
+    let body = requests.lock().unwrap().pop().unwrap();
+    assert_eq!(body["temperature"], 0.7);
+    assert_eq!(body["top_p"], 0.8);
+    assert!(requests.lock().unwrap().is_empty());
+}
+
 impl Drop for Fixture {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);

@@ -28,6 +28,33 @@ AI Agents supports 12 LLM providers out of the box - from cloud APIs like OpenAI
 
 ---
 
+## First-party Chat Completions (development)
+
+The development checkout sends ordinary `openai` and `openai-compatible` requests to the Chat Completions endpoint through `ai-agents-llm`. The base URL includes the API prefix. A compatible server can accept unauthenticated requests when its optional key is absent. An explicitly selected key variable for the official OpenAI preset must be available. Select credentials explicitly for an OpenAI preset with a custom origin. The direct client disables redirects.
+
+```yaml
+llm:
+  provider: openai-compatible
+  base_url: http://localhost:8000/v1
+  model: your-model
+  protocol: chat-completions
+  reasoning_effort: xhigh
+  provider_options:
+    logprobs: true
+```
+
+`protocol` is optional. The first-party codec sends an ordinary request's nonempty effort string verbatim and omits it when absent. Choose a value and extensions supported by your server. The adapter combines explicit `provider_options` and legacy `extra_body` on distinct JSON paths. Conflicting values and overrides of messages, tools, model, stream controls, output ceilings, credentials or other owned fields fail before sending a request. Hard-priced calls require the audited option set. An existing `extra_body.response_format` with `text`, `json_object`, or `json_schema` maps to the owned Chat response format. Direct SDK callers can set `ChatRequest::response_format`.
+
+For `provider: openai`, an omitted temperature stays absent from the HTTP request. Other framework presets, including `openai-compatible`, resolve an omitted temperature to their historical `0.7` at provider construction. Both shorthand and named YAML configurations preserve omission on save. The output token default is `2000`.
+
+The direct client on the official OpenAI origin and the framework OpenAI preset apply the same documented Chat restrictions to explicit sampling options and native tools. For example, GPT-6.2 Astra/Sol and GPT-6 Astra/6.1 Sol require Responses for native tools and reject explicit sampling. GPT-6 Sol/Luna allow Chat native tools and sampling with effort `none`. GPT-5.2/5.4 allow sampling with effort `none`, their default. Unknown model IDs pass through to the endpoint. A compatible server owns its own model rules. [GPT-6.2 guide](https://developers.openai.com/api/docs/guides/latest-model?model=gpt-6.2-astra) · [GPT-6 guide](https://developers.openai.com/api/docs/guides/latest-model?model=gpt-6-astra) · [GPT-5.4 guide](https://developers.openai.com/api/docs/guides/latest-model?model=gpt-5.4)
+
+Legacy transport settings such as resilience, deployment/API version and hosted web search select the upstream backend before dispatch. The same applies to legacy reasoning/budget and unsupported typed sampling overrides. Enabled legacy transport settings conflict with explicit SDK options. Disabled resilience and web search, including their inactive tuning fields, keep the SDK path. Other providers and the public legacy `build_llm()` continue to use their existing paths.
+
+The SDK reads text as it arrives. A successful stream requires a finish reason and a complete `[DONE]` event. A disconnect after visible text reports an error. The framework also reports explicit non-success text finishes such as `length` and `content_filter` as terminal errors. Previously published deltas remain provisional and cannot trigger tools or a successful final response. Native tool calls require distinct, nonempty IDs. Arguments are assembled by call index, parsed as JSON objects and checked against the requested function selection before delivery. Direct SDK consumers validate their application schema before acting on a call. Framework tool approval and execution use the existing executor. Incomplete calls never become executable. The direct client exposes the provider finish reason and complete token receipt. The framework continues to publish its own processed agent response.
+
+Rust applications can also send ordered text, image URL or image bytes, and WAV/MP3 audio bytes through the [direct Chat SDK](@/docs/rust-api.md#direct-chat-completions-sdk-development). Media support depends on the chosen server/model. The framework's YAML/CLI message input remains text-based.
+
 ## Declared-priced task capabilities (development only)
 
 Ordinary provider support is not hard-priced task support. The development standalone Rust task runner can use an immutable host-audited `DeclaredPricing` contract installed before provider handles are captured. The same object can be declared as `llm.declared_pricing` or on a named `llms` entry; it is optional and is not forwarded as provider JSON. It does not activate YAML task entry or change the published 1.1.2 task contract.
@@ -48,7 +75,7 @@ Model-generated child YAML cannot install an audited pricing contract. Inside a 
 
 The full input/output ceilings plus request fee are reserved for every possible internal attempt, with checked integer arithmetic and upward rounding. This intentionally trades utilization for a conservative bound without introducing an unproven generic tokenizer. Effective per-call output and reasoning settings must stay inside the contract. Unknown extras, arbitrary body overrides and native search/service fees without a complete adapter bound are rejected under hard pricing; no fallback may bypass that denial. Enabled internal resilience needs an explicit total-attempt count no larger than the installed contract. Multi-attempt results retain the full reservation because upstream may report only the final attempt.
 
-Only audited complete provider usage may release unused reservation. Google additionally requires an explicitly reported total rather than relying on a display total synthesized by normalization. Missing/partial usage retains the complete upper bound. Google streams can settle a complete explicitly reported terminal usage receipt only after normal EOF; early cumulative or later partial reports are not final billing evidence. Other adapters' streams currently retain their full bound because the upstream stream API does not preserve a complete billing receipt. Errors, cancellation after possible dispatch, drop and lost acknowledgements never imply a refund or cleanup. The guarantee covers declared prices for managed conforming model requests, not actual invoices, unrelated tool-service fees, arbitrary host I/O or exactly-once effects.
+Only audited complete provider usage may release unused reservation. Google additionally requires an explicitly reported total rather than relying on a display total synthesized by normalization. Missing/partial usage retains the complete upper bound. Google streams can settle a complete explicitly reported terminal usage receipt only after normal EOF; early cumulative or later partial reports are not final billing evidence. First-party Chat Completions streams can also settle after a verified finish, a complete matching token receipt and the end marker. Streams through legacy adapters retain the full bound when the upstream stream supplies no billing receipt. Errors, cancellation after possible dispatch, drop and lost acknowledgements never imply a refund or cleanup. The guarantee covers declared prices for managed conforming model requests, not actual invoices, unrelated tool-service fees, arbitrary host I/O or exactly-once effects.
 
 See [Rust task APIs](@/docs/rust-api.md#guarded-standalone-execution-development-only) and [YAML pricing fields](@/docs/yaml-reference.md#declared-pricing-development-only). Offline fixture acceptance is separate from live provider/billing validation; no live paid run is needed to use the tests.
 
@@ -87,7 +114,7 @@ llms:
   default:
     provider: openai
     model: gpt-5.4-mini
-    reasoning_effort: low    # low | medium | high
+    reasoning_effort: low    # Values depend on the endpoint and model
 llm:
   default: default
 ```
@@ -568,7 +595,7 @@ llm:
 
 | Parameter | Type | Default | Description |
 | --- | --- | --- | --- |
-| `temperature` | `f32` | `0.7` | Sampling temperature |
+| `temperature` | `f32` | omitted for OpenAI, `0.7` for other presets | Sampling temperature. |
 | `max_tokens` | `u32` | `2000` | Maximum response tokens |
 | `top_p` | `f32` | - | Nucleus sampling threshold |
 | `timeout_seconds` | `u64` | - | Request timeout in seconds |
@@ -592,7 +619,7 @@ llm:
 | Parameter | Type | Default | Description |
 | --- | --- | --- | --- |
 | `reasoning` | `bool` | - | Enable extended thinking / reasoning mode |
-| `reasoning_effort` | `string` | - | Reasoning effort: `low`, `medium`, or `high` |
+| `reasoning_effort` | `string` | - | Model-specific effort string on the first-party Chat path; legacy adapters can restrict values |
 | `reasoning_budget_tokens` | `u32` | - | Maximum token budget for reasoning |
 
 These work across any provider that supports reasoning. Use `timeout_seconds` alongside reasoning-heavy models since they can take longer to respond.

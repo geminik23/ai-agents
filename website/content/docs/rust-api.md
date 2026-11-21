@@ -911,7 +911,7 @@ if !terminal_seen {
 }
 ```
 
-`chat_stream_events()` emits no `Chunk(StreamChunk::Done {})`. A successful stream ends with exactly one `Final(AgentResponse)` after root-turn finalization. Provider failure, root-future or streaming-task abort, consumer drop, whole-turn timeout, and discarded speculative work do not produce a successful `Final`; consumers must treat EOF before `Final` or a terminal error as incomplete rather than promoting provisional chunks to a completed response. `RuntimeControlHandle::cancel_all()` is narrower: it stops or denies tool work, and the owning root turn may still recover and produce `Final`. Expected HITL rejection also finalizes an authoritative cancellation response such as `Operation cancelled: ...` because the turn completed normally with a rejected action.
+`chat_stream_events()` emits no `Chunk(StreamChunk::Done {})`. A successful stream ends with exactly one `Final(AgentResponse)` after root-turn finalization. An explicit non-success provider text finish, provider failure, root-future or streaming-task abort, consumer drop, whole-turn timeout, and discarded speculative work do not produce a successful `Final`; consumers must treat EOF before `Final` or a terminal error as incomplete rather than promoting provisional chunks to a completed response. `RuntimeControlHandle::cancel_all()` is narrower: it stops or denies tool work, and the owning root turn may still recover and produce `Final`. Expected HITL rejection also finalizes an authoritative cancellation response such as `Operation cancelled: ...` because the turn completed normally with a rejected action.
 
 Content chunks are provisional. Output processing, reflection, or a committed transition can replace them before `Final.content` is built. Final processing does not retroactively sanitize content chunks that a host already displayed; hosts that must hide provisional content need an appropriate buffering policy.
 
@@ -1740,3 +1740,26 @@ This page covers the most common patterns. For the complete API - every struct, 
 - **[LLM Providers](@/docs/providers.md)** - setup for all 12 supported providers
 - **[YAML Reference](@/docs/yaml-reference.md)** - the complete agent spec
 - **[Built-in Tools](@/docs/built-in-tools.md)** - built-in schemas, outputs, policy, and host requirements
+
+## Direct Chat Completions SDK (development)
+
+Use `ai_agents_llm::sdk` directly when your application owns the conversation and any tool execution. Provide the API base URL, credentials for that endpoint and a compatible model. An image URL is passed to the server. For image or audio bytes, the SDK builds the appropriate wire representation.
+
+The direct client leaves omitted sampling options unset. On the official origin, the provider validates known model and reasoning-effort combinations. With `https://api.openai.com/v1` and `gpt-6.2-astra` or `gpt-6.2-sol`, leave sampling fields and extensions `temperature`, `top_p`, `logprobs` and `top_logprobs` unset. The client rejects those options and native tool requests before sending HTTP. [Chat model and option support](@/docs/providers.md#first-party-chat-completions-development)
+
+```rust
+use ai_agents_llm::sdk::{ChatClient, ChatRequest, InputPart, Message};
+
+async fn describe(base_url: &str, key: Option<String>, model: &str, png: Vec<u8>)
+    -> Result<String, ai_agents_llm::sdk::Error>
+{
+    let client = ChatClient::new(base_url, key)?;
+    let input = Message::UserParts(vec![
+        InputPart::Text("Describe the image.".into()),
+        InputPart::ImageBytes { mime_type: "image/png".into(), data: png },
+    ]);
+    Ok(client.complete(&ChatRequest::new(model, vec![input])).await?.text)
+}
+```
+
+For audio use `InputPart::Audio` with `AudioFormat::Wav` or `AudioFormat::Mp3`. For plain text use `Message::User`. The client can be shared across requests; model, messages, options and function definitions belong to each request. `stream()` yields provisional `Event::Text` and then `Event::Finished` with assembled calls and optional final usage. Complete usage includes separate input/output token breakdowns when supplied by the endpoint. To continue a tool turn, carry the assistant calls in `Message::Assistant` and return each authorized result using `Message::ToolResult` with its original ID. Direct callers handle their own execution permissions and accounting. Framework hosts can use the existing YAML adapter for managed calls.
