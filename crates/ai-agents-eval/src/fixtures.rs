@@ -1457,10 +1457,9 @@ fn build_real_provider(
             .and_then(Value::as_str)
             .map(str::to_string)
     });
-    let api_key = config
-        .api_key_env
-        .as_ref()
-        .and_then(|env| std::env::var(env).ok());
+    let api_key = provider_type
+        .configured_api_key(config.api_key_env.as_deref())
+        .map_err(|error| EvalError::Config(error.to_string()))?;
     let mut provider = UnifiedLLMProvider::from_spec_config(
         provider_type,
         &config.model,

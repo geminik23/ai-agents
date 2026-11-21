@@ -384,7 +384,7 @@ impl Fixture {
                         "text/event-stream",
                         format!(
                             "data: {}\n\ndata: [DONE]\n\n",
-                            json!({"choices":[{"delta":{"content":reply},"finish_reason":null}]})
+                            json!({"choices":[{"delta":{"content":reply},"finish_reason":"stop"}]})
                         ),
                     )
                 } else {

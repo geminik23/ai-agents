@@ -3,6 +3,7 @@
 ## Unreleased
 
 ### Added
+- Chat Completions: call OpenAI-compatible endpoints from Rust with text, image and audio inputs, stream incremental text, and pass completed function calls through the framework adapter
 - Live task examples: run provider-backed analysis, synthetic corpus research, retained support confirmation and reviewed incident escalation through shared application and evaluation hosts, with evaluation budgets separate from ordinary application settings
 - Task invocation settings: development Rust and CLI callers can override one task or skill profile while preserving required reviews, host ceilings and settings across retained or explicitly prepared continuation
 - Workspace file protection: development Rust hosts can confine built-in file tools to one workspace root or selected entries, track created files and expose a cooperative mutation revision without adding write authority

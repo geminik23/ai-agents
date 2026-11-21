@@ -102,7 +102,7 @@ pub struct LLMConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<bool>,
 
-    /// Reasoning effort level: "low", "medium", or "high".
+    /// Provider reasoning effort. The first-party Chat path preserves the supplied string.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
 

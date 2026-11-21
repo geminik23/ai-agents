@@ -349,7 +349,9 @@ The simplest form: one LLM for everything. Use `llm` as a flat object.
 | `api_key_env` | `string` | `null` | Env var holding the API key (overrides provider default) |
 | `timeout_seconds` | `u64` | `null` | Request timeout in seconds |
 | `reasoning` | `bool` | `null` | Enable extended thinking / reasoning mode |
-| `reasoning_effort` | `string` | `null` | Reasoning effort: `low`, `medium`, or `high` |
+| `reasoning_effort` | `string` | `null` | Model-specific effort; the development first-party Chat adapter accepts open strings for ordinary calls |
+| `protocol` | `string` | omitted | Development OpenAI/compatible SDK selector: `chat-completions` |
+| `provider_options` | object | omitted | Explicit Chat request extensions; collisions and reserved fields are rejected |
 | `reasoning_budget_tokens` | `u32` | `null` | Max token budget for reasoning |
 | `function_calling` | `bool` | `null` | Override `supports(FunctionCalling)`; `false` disables native tool selection and `true` opts an OpenAI-compatible server into it |
 | `tool_choice` | `auto`, `required`, `none`, or `{ specific: ID }` | `null` | Opt in to native or runtime-enforced tool selection; omission preserves the legacy prompt protocol |

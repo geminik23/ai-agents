@@ -1,3 +1,4 @@
+mod chat_adapter;
 mod google;
 pub mod local;
 mod pricing;

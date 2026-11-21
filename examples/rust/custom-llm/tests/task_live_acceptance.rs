@@ -455,6 +455,7 @@ async fn application_fixture_child() {
     }
     for config in configs {
         config.base_url = Some(endpoint.clone());
+        config.api_key_env = Some("TASK_APPLICATION_FIXTURE_KEY".into());
     }
     task_live::run_application(ai_agents::spec::PreparedAgentSpec::new(spec, policy), &path)
         .await
@@ -552,7 +553,7 @@ async fn application_foreground_round_trips_use_native_loopback_without_eval_run
         });
         let mut child = tokio::process::Command::new(std::env::current_exe().unwrap())
             .env_clear()
-            .env("OPENAI_API_KEY", "loopback-fixture")
+            .env("TASK_APPLICATION_FIXTURE_KEY", "loopback-fixture")
             .env("TASK_APPLICATION_FIXTURE_CASE", case)
             .env("TASK_APPLICATION_FIXTURE_ENDPOINT", endpoint)
             .args([

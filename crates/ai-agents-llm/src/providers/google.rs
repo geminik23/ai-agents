@@ -15,7 +15,7 @@ use uuid::Uuid;
 const DEFAULT_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta/";
 const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_ERROR_BYTES: usize = 64 * 1024;
-const MAX_SSE_FRAME_BYTES: usize = 1024 * 1024;
+use crate::MAX_SSE_FRAME_BYTES;
 
 /// First-party GenerateContent adapter used only by the normal framework Google path.
 pub(crate) struct GoogleProvider {
