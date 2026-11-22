@@ -152,6 +152,7 @@ impl AutonomyRunner {
 
     /// Signals remain data; target freshness is checked before claim and after acknowledgements without weakening cleanup authority.
     /// Erasure prevents the optional controller driver from enlarging unrelated nested model resume frames.
+    /// Child approval intake checks its original deadline independently of the enclosing observation.
     pub(super) fn resume_controller(
         &self,
         snapshot: TaskRunSnapshot,
@@ -328,10 +329,10 @@ impl AutonomyRunner {
                         .copied();
                     drop(retained);
                     let expired = deadline
-                        .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+                        .is_some_and(|deadline| approval_clock::now() >= deadline)
                         || approval
                             .expires_at
-                            .is_some_and(|expiry| chrono::Utc::now() >= expiry);
+                            .is_some_and(|expiry| approval_clock::utc_now() >= expiry);
                     if let Some(saved) = &parked.executor {
                         cursor.push(serde_json::from_value::<TaskExecutorCursor>(saved.clone())?);
                     }

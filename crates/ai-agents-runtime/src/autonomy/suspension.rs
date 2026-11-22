@@ -941,6 +941,7 @@ impl RunExecution {
     }
 
     /// Captures a request before hooks or external interaction; no implementation slot has been admitted here.
+    /// Both forms of the approval deadline start here, before publishing the pause.
     pub(crate) fn park_approval(
         &self,
         runtime_id: &str,
@@ -952,7 +953,7 @@ impl RunExecution {
             .try_with(|request| request.call_id.clone())
             .map_err(|_| AgentError::Config("approval has no executable task request".into()))?;
         if let Some(timeout) = request.timeout {
-            let deadline = std::time::Instant::now()
+            let deadline = super::approval_clock::now()
                 .checked_add(timeout)
                 .ok_or_else(|| AgentError::Config("approval monotonic deadline overflow".into()))?;
             self.approval_deadlines
@@ -964,7 +965,7 @@ impl RunExecution {
             .map(|timeout| {
                 let duration = chrono::Duration::from_std(timeout)
                     .map_err(|_| AgentError::Config("approval deadline overflow".into()))?;
-                chrono::Utc::now()
+                super::approval_clock::utc_now()
                     .checked_add_signed(duration)
                     .ok_or_else(|| AgentError::Config("approval deadline overflow".into()))
             })

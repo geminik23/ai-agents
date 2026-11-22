@@ -21,7 +21,7 @@ pub(crate) fn now() -> Instant {
 pub(crate) fn utc_now() -> DateTime<Utc> {
     #[cfg(test)]
     if let Ok(clock) = MANUAL.try_with(Clone::clone) {
-        return clock.utc + chrono::Duration::from_std(*clock.elapsed.lock()).unwrap();
+        return clock.utc_now();
     }
     Utc::now()
 }
@@ -92,6 +92,11 @@ impl ManualClock {
     /// Returns the current manual instant without consulting elapsed host time.
     pub(crate) fn now(&self) -> Instant {
         self.monotonic + *self.elapsed.lock()
+    }
+
+    /// Projects the same controlled elapsed time onto UTC for wall-clock deadline checks.
+    pub(crate) fn utc_now(&self) -> DateTime<Utc> {
+        self.utc + chrono::Duration::from_std(*self.elapsed.lock()).unwrap()
     }
 
     /// Advancing is monotonic and wakes existing waits without changing their original deadlines.

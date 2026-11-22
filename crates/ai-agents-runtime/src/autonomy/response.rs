@@ -31,6 +31,7 @@ struct ResponseAdmission {
 }
 impl TaskFinalAdmission for ResponseAdmission {
     /// Only pre-body admission is restricted; already invoked effects retain their ordinary settlement and cancellation rules.
+    /// A response accepted before expiry can still expire while waiting for execution.
     fn validate(&self) -> Result<()> {
         if self.applied.load(Ordering::Acquire) {
             return Ok(());
@@ -46,8 +47,10 @@ impl TaskFinalAdmission for ResponseAdmission {
                 && !binding.applied.load(Ordering::Acquire)
                 && (binding
                     .expires_at
-                    .is_some_and(|at| chrono::Utc::now() >= at)
-                    || binding.deadline.is_some_and(|at| Instant::now() >= at))
+                    .is_some_and(|at| super::approval_clock::utc_now() >= at)
+                    || binding
+                        .deadline
+                        .is_some_and(|at| super::approval_clock::now() >= at))
             {
                 return Err(AgentError::HITLTimeout);
             }
