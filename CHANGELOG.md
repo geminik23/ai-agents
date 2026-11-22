@@ -3,6 +3,7 @@
 ## Unreleased
 
 ### Added
+- OpenAI Decisions: classify text into an exact label from Rust and opt in to structured agent routing from YAML with task continuation
 - Anthropic Messages: call official and explicitly configured compatible endpoints from Rust or YAML, stream text and resume approved native tools with their original signed history
 - OpenAI Responses: call the stateless Responses API from Rust or YAML, stream text, and resume approved native functions with their original call IDs and provider history
 - Chat Completions: call OpenAI-compatible endpoints from Rust with text, image and audio inputs, stream incremental text, and pass completed function calls through the framework adapter

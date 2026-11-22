@@ -343,14 +343,14 @@ The simplest form: one LLM for everything. Use `llm` as a flat object.
 | `provider` | `string` | `"openai"` | Provider identifier |
 | `model` | `string` | `"gpt-4"` | Model name |
 | `temperature` | `f32` | omitted for OpenAI and first-party Messages, `0.7` for existing compatible/legacy paths | Sampling temperature. Explicit values follow the selected endpoint and model. |
-| `max_tokens` | `u32` | omitted for Responses, required for Messages, `2000` for existing Chat and legacy paths | Maximum output tokens |
+| `max_tokens` | `u32` | omitted for Responses, required for Messages, `2000` for existing Chat and legacy paths | Maximum output tokens. Decisions accepts no output limit. |
 | `top_p` | `f32` | `null` | Nucleus sampling |
 | `base_url` | `string` | `null` | API endpoint override (required for `openai-compatible`) |
 | `api_key_env` | `string` | `null` | Env var holding the API key (overrides provider default) |
 | `timeout_seconds` | `u64` | `null` | Request timeout in seconds |
 | `reasoning` | `bool` | `null` | Enable extended thinking / reasoning mode |
 | `reasoning_effort` | `string` | `null` | Model-specific effort; the development first-party Chat adapter accepts open strings for ordinary calls |
-| `protocol` | `string` | omitted | Development OpenAI preset accepts `chat-completions` or `responses`. The Anthropic preset can select `messages`. Compatible presets choose their respective protocol. |
+| `protocol` | `string` | omitted | Development OpenAI presets use `chat-completions` or `responses` for generation and `decisions` for structured orchestration routing. The Anthropic preset can select `messages`. Compatible presets choose their respective protocol. |
 | `provider_options` | object | omitted | Chat request extensions, Responses `reasoning`, or Messages `thinking` / `output_config.effort`. Conflicts and reserved fields are rejected. |
 | `reasoning_budget_tokens` | `u32` | `null` | Max token budget for reasoning |
 | `function_calling` | `bool` | `null` | Override `supports(FunctionCalling)`; `false` disables native tool selection and `true` opts an OpenAI-compatible server into it |
@@ -3432,7 +3432,7 @@ spawner:
 
 | Tool | Description |
 |------|-------------|
-| `route_to_agent` | Route input to the best-matched agent from a set of candidates |
+| `route_to_agent` | Route input to one candidate agent. A routing role bound to an explicit `protocol: decisions` preset uses [structured choice](@/docs/providers.md#openai-decisions-development). |
 | `pipeline_process` | Chain agents sequentially with per-stage Jinja2 templates (`{{ user_input }}`, `{{ previous_output }}`, `{{ original_input }}`, `{{ stages.<agent_id> }}`) |
 | `concurrent_ask` | Ask multiple agents the same question in parallel and aggregate |
 | `group_discussion` | Run a multi-agent conversation on a topic |

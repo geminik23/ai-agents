@@ -1359,6 +1359,15 @@ pub fn build_llm_registry(
             .collect()
     };
 
+    if aliases.iter().any(|(_, config)| {
+        config.extra.get("protocol").and_then(Value::as_str)
+            == Some(ai_agents_llm::providers::unified::DECISIONS_PROTOCOL)
+    }) {
+        return Err(EvalError::Config(
+            "eval fixtures and scenario budgets do not support Decisions".into(),
+        ));
+    }
+
     let cassette_records = if fixtures.mode == LlmFixtureMode::Replay {
         load_cassette_records(fixtures, base_dir)?
     } else {

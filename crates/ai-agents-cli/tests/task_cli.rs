@@ -1450,6 +1450,168 @@ fn task_subprocess_task_owned_child_questions_keep_one_coordinating_request() {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
+fn decisions_task_restores_selected_child_without_reselection() {
+    let call = json!({"tool":"route_to_agent","arguments":{
+        "input":"Investigate the failed build","candidates":["ops","devops"],"method":"llm"
+    }});
+    let root = Fixture::new(&[&call.to_string(), "done"]);
+    let ops = Fixture::new(&[]);
+    let child_call =
+        r#"{"tool":"ask_user","arguments":{"question":"Confirm the build log","options":["yes"]}}"#;
+    let devops = Fixture::new(&[child_call, "done-devops"]);
+    let router = Fixture::serve(
+        &[],
+        |body| {
+            assert_eq!(body["model"], "fixture-decision");
+            assert_eq!(body["input"], "Investigate the failed build");
+            assert_eq!(
+                body["questions"][0]["choices"],
+                json!([{"value":"ops"},{"value":"devops"}])
+            );
+            assert!(body.get("max_tokens").is_none() && body.get("temperature").is_none());
+        },
+        |body, index, _| {
+            assert_eq!(index, 0, "decision must not replay");
+            Some(("application/json", json!({
+                "answers":[{"type":"choice","name":body["questions"][0]["name"],"choice":"devops"}],
+                "model":"fixture-decision","usage":{"input_tokens":19,"output_tokens":1,"total_tokens":20}
+            }).to_string()))
+        },
+    );
+    let child = |fixture: &Fixture, name: &str| {
+        let path = fixture.agent("tools: [ask_user]");
+        let yaml = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("name: Fixture", name);
+        std::fs::write(&path, yaml).unwrap();
+        path
+    };
+    let a = child(&ops, "name: Ops");
+    let b = child(&devops, "name: DevOps");
+    let db = root.dir.join("decisions.sqlite");
+    let task = TASK
+        .replace("tools: []", "tools: [route_to_agent, ask_user]")
+        .replace("max_llm_calls: 4", "max_llm_calls: 5");
+    let agent = root.dir.join("agent.yaml");
+    let yaml = format!(
+        r#"
+name: DecisionRoot
+system_prompt: Route to the right team.
+llm:
+  default: main
+  router:
+    orchestration:
+      routing: work_queue
+llms:
+  main:
+    provider: openai-compatible
+    model: fixture
+    base_url: {main}
+    api_key_env: TASK_FIXTURE_TOKEN
+  work_queue:
+    provider: openai
+    protocol: decisions
+    model: fixture-decision
+    base_url: {router}
+    api_key_env: TASK_FIXTURE_TOKEN
+{task}  max_wall_time_seconds: 600
+  restoration_timeout_ms: 5000
+  persistence: {{enabled: true}}
+  hitl: {{on_user_question: pause_run}}
+storage: {{type: sqlite, path: '{db}'}}
+spawner:
+  shared_llms: false
+  orchestration_tools: [route_to_agent]
+  allowed_tools: [ask_user]
+  auto_spawn:
+    - {{id: ops, agent: '{a}'}}
+    - {{id: devops, agent: '{b}'}}
+"#,
+        main = root.url,
+        router = router.url,
+        db = db.display(),
+        a = a.display(),
+        b = b.display()
+    );
+    std::fs::write(&agent, yaml).unwrap();
+    let path = agent.to_str().unwrap();
+    let seed = root.run(
+        &[
+            "task",
+            "run",
+            path,
+            "build help",
+            "--non-interactive",
+            "--json",
+        ],
+        "",
+    );
+    if !assert_configured_seed(&root, &seed, 3, &agent, &db) {
+        assert_eq!(router.calls.load(Ordering::SeqCst), 0);
+        return;
+    }
+    let result = |out: &Output| {
+        serde_json::from_str::<Value>(String::from_utf8_lossy(&out.stdout).lines().last().unwrap())
+            .unwrap()
+    };
+    let saved = result(&seed);
+    assert_eq!(saved["status"], "paused");
+    assert_eq!(saved["counters"]["llm_attempts"], 3);
+    assert_eq!(router.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(ops.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(devops.calls.load(Ordering::SeqCst), 1);
+    let resumed = root.run(
+        &[
+            "task",
+            "resume",
+            path,
+            saved["run_id"].as_str().unwrap(),
+            "--revision",
+            &saved["revision"].to_string(),
+            "--json",
+        ],
+        // Restoration review and the original child question are distinct host decisions.
+        "yes\n1\n",
+    );
+    assert_exit(&resumed, 0);
+    let done = result(&resumed);
+    assert_eq!(done["status"], "completed");
+    assert_eq!(done["run_id"], saved["run_id"]);
+    assert_eq!(done["counters"]["llm_attempts"], 5);
+    assert_eq!(router.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(ops.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(devops.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(root.calls.load(Ordering::SeqCst), 2);
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            use ai_agents::persistence::{AgentStorage, SqliteStorage};
+            let store = SqliteStorage::new(db.to_str().unwrap()).await.unwrap();
+            let key = ai_agents::autonomy::TaskRunKey {
+                agent_id: "DecisionRoot".into(),
+                run_id: saved["run_id"].as_str().unwrap().into(),
+            };
+            let snapshot = store.load_task_run(&key).await.unwrap().unwrap();
+            let choices: Vec<_> = snapshot.payload["reservations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|attempt| {
+                    let result = &attempt["result"];
+                    (result["choice_completed"] == true).then_some(&result["usage"])
+                })
+                .collect();
+            assert_eq!(
+                choices,
+                [&json!({"prompt_tokens":19,"completion_tokens":1,"total_tokens":20})]
+            );
+        });
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
 fn responses_task_approval_survives_process_restart_and_replays_only_the_result() {
     signed_tool_task_survives_restarts(ReplayProtocol::Responses);
 }

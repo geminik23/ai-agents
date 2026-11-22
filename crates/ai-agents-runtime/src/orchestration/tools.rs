@@ -25,14 +25,55 @@ pub struct RouteToAgentTool {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-#[allow(dead_code)]
 struct RouteToAgentInput {
     /// The message to route to the best-matched agent.
     input: String,
     /// Agent IDs to consider for routing.
     candidates: Vec<String>,
-    /// Routing method: "llm" or "round_robin". Defaults to "llm".
+    /// Routing method: "llm" uses the configured selector. "round_robin" is available with legacy routing.
     method: Option<String>,
+}
+
+impl RouteToAgentInput {
+    // Enforce structured arguments in both entry points while preserving legacy input interpretation.
+    fn from_tool_args(args: Value, structured: bool) -> ai_agents_core::Result<Self> {
+        use ai_agents_core::AgentError;
+        if structured {
+            let input: Self = serde_json::from_value(args)
+                .map_err(|_| AgentError::Tool("invalid structured routing arguments".into()))?;
+            if !matches!(input.method.as_deref(), None | Some("llm")) {
+                return Err(AgentError::Tool(
+                    "structured routing uses the configured selector".into(),
+                ));
+            }
+            return Ok(input);
+        }
+        let input = args
+            .get("input")
+            .and_then(Value::as_str)
+            .ok_or_else(|| AgentError::Tool("missing required field: input".into()))?;
+        let candidates = args
+            .get("candidates")
+            .and_then(Value::as_array)
+            .ok_or_else(|| AgentError::Tool("missing required field: candidates".into()))?;
+        Ok(Self {
+            input: input.into(),
+            candidates: candidates
+                .iter()
+                .filter_map(Value::as_str)
+                .map(String::from)
+                .collect(),
+            method: args.get("method").and_then(Value::as_str).map(String::from),
+        })
+    }
+
+    // Only a legacy route can reach round-robin selection.
+    fn routing_method(&self) -> RoutingMethod {
+        match self.method.as_deref() {
+            Some("round_robin") => RoutingMethod::RoundRobin,
+            _ => RoutingMethod::Llm,
+        }
+    }
 }
 
 impl RouteToAgentTool {
@@ -86,63 +127,35 @@ impl Tool for RouteToAgentTool {
         args: Value,
         _ctx: ai_agents_core::ToolExecutionContext,
     ) -> ai_agents_core::Result<ToolResult> {
-        let input = args.get("input").and_then(Value::as_str).ok_or_else(|| {
-            ai_agents_core::AgentError::Tool("missing required field: input".into())
-        })?;
-        let candidates = args
-            .get("candidates")
-            .and_then(Value::as_array)
-            .ok_or_else(|| {
-                ai_agents_core::AgentError::Tool("missing required field: candidates".into())
-            })?
-            .iter()
-            .filter_map(|candidate| candidate.as_str().map(String::from))
-            .collect::<Vec<_>>();
-        let method = if args.get("method").and_then(Value::as_str) == Some("round_robin") {
-            RoutingMethod::RoundRobin
-        } else {
-            RoutingMethod::Llm
-        };
         let Some(llm) = super::role_provider(&self.llm, LLMRole::OrchestrationRouting, None)?
         else {
             return Ok(ToolResult::error("no router LLM configured"));
         };
-        match Box::pin(super::route::route_task(&self.registry, llm.as_ref(), input, &candidates, method, Some(&self.counter))).await {
+        let args = RouteToAgentInput::from_tool_args(args, llm.uses_choice_for_routing())?;
+        match Box::pin(super::route::route_task(&self.registry, llm.as_ref(), &args.input, &args.candidates, args.routing_method(), Some(&self.counter))).await {
             Ok(result) => Ok(ToolResult::ok(json!({"selected_agent":result.selected_agent,"response":result.response.content,"reason":result.reason}).to_string())),
             Err(error @ ai_agents_core::AgentError::TaskSuspended(_)) => Err(error),
             Err(error) => Ok(ToolResult::error(format!("routing failed: {error}"))),
         }
     }
 
-    // Resolves captured auxiliary roles without widening tool grants or changing participant ownership.
+    // Resolves the captured selector before parsing the method so tool arguments cannot downgrade it.
     async fn execute(&self, args: Value, _ctx: ai_agents_core::ToolExecutionContext) -> ToolResult {
-        let input = match args.get("input").and_then(|v| v.as_str()) {
-            Some(s) => s,
-            None => return ToolResult::error("missing required field: input"),
-        };
-        let candidates: Vec<String> = match args.get("candidates").and_then(|v| v.as_array()) {
-            Some(arr) => arr
-                .iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect(),
-            None => return ToolResult::error("missing required field: candidates"),
-        };
-        let method = match args.get("method").and_then(|v| v.as_str()) {
-            Some("round_robin") => RoutingMethod::RoundRobin,
-            _ => RoutingMethod::Llm,
-        };
-
         let llm = match super::role_provider(&self.llm, LLMRole::OrchestrationRouting, None) {
             Ok(Some(p)) => p,
             _ => return ToolResult::error("no router LLM configured"),
+        };
+        let args = match RouteToAgentInput::from_tool_args(args, llm.uses_choice_for_routing()) {
+            Ok(args) => args,
+            Err(error) => return ToolResult::error(error.to_string()),
         };
 
         let route_future = super::route(
             &self.registry,
             llm.as_ref(),
-            input,
-            &candidates,
-            method,
+            &args.input,
+            &args.candidates,
+            args.routing_method(),
             Some(&self.counter),
         );
         let route_result = if let Some(context) = current_turn_actor_context() {

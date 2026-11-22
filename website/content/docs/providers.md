@@ -75,6 +75,27 @@ The direct SDK returns ordered output items, including private encrypted reasoni
 
 Text deltas are provisional. Function calls become available only on verified completion. Incomplete, failed or disconnected streams surface errors. Shared task accounting settles only complete matching final usage after consumption. Reasoning tokens are included in total output tokens. A declared pricing contract for Responses must name the actual endpoint ending in `/responses`. Reasoning-mode overrides are outside the audited hard-priced class. [Direct Rust API](@/docs/rust-api.md#direct-responses-sdk-development)
 
+## OpenAI Decisions (development)
+
+Use a choice-only preset for the orchestration routing role alongside a separate generation preset. This excerpt assumes `primary` is declared under `llms` for the main agent.
+
+```yaml
+llms:
+  dispatch:
+    provider: openai
+    protocol: decisions
+    model: gpt-6-luna
+llm:
+  default: primary
+  router:
+    orchestration:
+      routing: dispatch
+```
+
+Grant `route_to_agent` through the normal orchestration and tool configuration. The tool passes its input and candidate IDs to the selected provider. With a single registered candidate it can select directly. With multiple candidates it requires an exact ID from a complete answer. A refusal or invalid answer produces no child dispatch. The runtime retains the actual child binding across supported task resume and restoration. A tool call may omit `method` or use `llm` in this mode.
+
+The preset sends a single text classification question to `/v1/decisions`. It accepts a configured model, timeout, credential and API base URL. A custom origin requires an explicit credential. Generation settings, native tool requests, streaming and declared-priced task calls are unsupported for this preset. Scenario eval fixtures and budgets currently reject this protocol at setup. Use the [direct Rust SDK](@/docs/rust-api.md#direct-decisions-sdk-development) to classify text independently of an agent.
+
 ## Declared-priced task capabilities (development only)
 
 Ordinary provider support is not hard-priced task support. The development standalone Rust task runner can use an immutable host-audited `DeclaredPricing` contract installed before provider handles are captured. The same object can be declared as `llm.declared_pricing` or on a named `llms` entry; it is optional and is not forwarded as provider JSON. It does not activate YAML task entry or change the published 1.1.2 task contract.

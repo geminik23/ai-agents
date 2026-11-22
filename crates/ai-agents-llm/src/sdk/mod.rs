@@ -15,6 +15,7 @@
 //! # Ok(())
 //! # }
 //! ```
+pub mod decisions;
 pub mod messages;
 pub(crate) mod openai;
 pub mod responses;

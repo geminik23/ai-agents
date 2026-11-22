@@ -6,7 +6,29 @@ use std::collections::HashMap;
 use thiserror::Error;
 
 use crate::message::ChatMessage;
-use crate::types::{LLMChunk, LLMConfig, LLMFeature, LLMResponse, LLMToolRequest, ToolChoice};
+use crate::types::{
+    LLMChunk, LLMConfig, LLMFeature, LLMResponse, LLMToolRequest, TokenUsage, ToolChoice,
+};
+
+/// A caller-owned candidate label and its optional selection guidance.
+pub struct ChoiceCandidate<'a> {
+    pub id: &'a str,
+    pub description: Option<&'a str>,
+}
+
+/// A single selection operation, independent of the provider's wire format.
+pub struct ChoiceRequest<'a> {
+    pub input: &'a str,
+    pub question: &'a str,
+    pub candidates: &'a [ChoiceCandidate<'a>],
+}
+
+/// One exact label or a refusal, with usage when the backend supplies it.
+#[derive(Debug)]
+pub struct ChoiceDecision {
+    pub selected: Option<String>,
+    pub usage: Option<TokenUsage>,
+}
 
 /// Core LLM provider trait.
 ///
@@ -15,6 +37,35 @@ use crate::types::{LLMChunk, LLMConfig, LLMFeature, LLMResponse, LLMToolRequest,
 /// out of the box.
 #[async_trait]
 pub trait LLMProvider: Send + Sync {
+    /// Reports that this handle is explicitly configured for structured routing.
+    /// Transparent wrappers must preserve this selection even when they reject the call.
+    fn uses_choice_for_routing(&self) -> bool {
+        false
+    }
+
+    /// Checks any provider-specific choice limits before admission, without dispatching.
+    fn validate_choice(&self, _request: &ChoiceRequest<'_>) -> Result<(), LLMError> {
+        if self.uses_choice_for_routing() {
+            Ok(())
+        } else {
+            Err(LLMError::Config(
+                "provider is not configured for structured choice".into(),
+            ))
+        }
+    }
+
+    /// Returns a typed decision, with no fallback to text generation.
+    async fn choose(&self, _request: &ChoiceRequest<'_>) -> Result<ChoiceDecision, LLMError> {
+        Err(LLMError::Config(
+            "provider does not implement structured choice".into(),
+        ))
+    }
+
+    /// Reports an installed admission layer for this specific operation.
+    fn manages_choice_admission(&self) -> bool {
+        false
+    }
+
     /// Send messages and get a complete response.
     async fn complete(
         &self,

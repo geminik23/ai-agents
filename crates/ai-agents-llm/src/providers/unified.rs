@@ -1,8 +1,8 @@
 use ai_agents_core::autonomy::{ProviderCostBound, ProviderCostSettlement, ProviderRequest};
 use ai_agents_core::{
-    ChatMessage, FinishReason, LLMChunk, LLMConfig, LLMError, LLMFeature, LLMProvider, LLMResponse,
-    LLMToolDefinition, LLMToolRequest, Role, TokenUsage, ToolCall, ToolChoice,
-    native_readable_projection,
+    ChatMessage, ChoiceDecision, ChoiceRequest, FinishReason, LLMChunk, LLMConfig, LLMError,
+    LLMFeature, LLMProvider, LLMResponse, LLMToolDefinition, LLMToolRequest, Role, TokenUsage,
+    ToolCall, ToolChoice, native_readable_projection,
 };
 use async_trait::async_trait;
 use futures::stream::StreamExt;
@@ -19,6 +19,7 @@ use super::pricing::DeclaredPricing;
 use super::{messages_adapter, responses_adapter};
 use crate::sdk::{
     ChatClient,
+    decisions::{self, ChoiceOption, DecisionClient},
     messages::{self, MessagesClient},
     responses::ResponsesClient,
 };
@@ -27,7 +28,11 @@ enum SdkBackend {
     Chat(ChatClient),
     Responses(ResponsesClient),
     Messages(MessagesClient),
+    Decisions(DecisionClient),
 }
+
+/// The preset selector for the first-party OpenAI Decisions transport.
+pub const DECISIONS_PROTOCOL: &str = "decisions";
 
 #[cfg(test)]
 #[path = "pricing_tests.rs"]
@@ -631,6 +636,30 @@ impl UnifiedLLMProvider {
             ProviderType::OpenAI | ProviderType::OpenAICompatible
         );
         let protocol = default_config.extra.get("protocol");
+        let is_decisions = protocol.and_then(serde_json::Value::as_str) == Some(DECISIONS_PROTOCOL);
+        if is_decisions {
+            if provider_type != ProviderType::OpenAI || model.trim().is_empty() {
+                return Err(LLMError::Config(
+                    "Decisions requires the OpenAI preset and a model".into(),
+                ));
+            }
+            if default_config.temperature.is_some()
+                || default_config.max_tokens.is_some()
+                || default_config.top_p.is_some()
+                || default_config.top_k.is_some()
+                || default_config.frequency_penalty.is_some()
+                || default_config.presence_penalty.is_some()
+                || default_config.stop_sequences.is_some()
+                || default_config.reasoning.is_some()
+                || default_config.reasoning_effort.is_some()
+                || default_config.reasoning_budget_tokens.is_some()
+                || default_config.extra.len() != 1
+            {
+                return Err(LLMError::Config(
+                    "Decisions does not accept generation settings, extra options or declared pricing".into(),
+                ));
+            }
+        }
         let is_messages = provider_type.uses_messages(protocol.and_then(serde_json::Value::as_str))
             && protocol.is_none_or(|value| value.is_string());
         if provider_type == ProviderType::AnthropicCompatible && !is_messages {
@@ -696,7 +725,14 @@ impl UnifiedLLMProvider {
             ));
         }
 
-        let sdk = if is_chat {
+        let sdk = if is_decisions {
+            let base = actual_base_url
+                .as_deref()
+                .expect("OpenAI has a default base URL");
+            Some(SdkBackend::Decisions(
+                DecisionClient::new(base, actual_api_key.clone()).map_err(super::sdk_error)?,
+            ))
+        } else if is_chat {
             let base = actual_base_url
                 .as_deref()
                 .unwrap_or("https://api.openai.com/v1/");
@@ -808,11 +844,47 @@ impl UnifiedLLMProvider {
         self
     }
 
-    /// Applies a declared native tool choice while validating the Messages capability.
+    /// Applies a declared native tool choice only to a compatible generation protocol.
     pub fn with_validated_tool_choice(self, choice: ToolChoice) -> Result<Self, LLMError> {
+        self.require_generation()?;
         let provider = self.with_tool_choice(choice);
         provider.validate_messages_tool_choice()?;
         Ok(provider)
+    }
+
+    fn require_generation(&self) -> Result<(), LLMError> {
+        if self.uses_choice_for_routing() {
+            return Err(LLMError::Config(
+                "Decisions is a choice-only provider".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn decision_request<'a>(
+        &'a self,
+        request: &ChoiceRequest<'a>,
+        options: &'a [ChoiceOption<'a>],
+    ) -> decisions::ChoiceRequest<'a> {
+        decisions::ChoiceRequest {
+            model: &self.model,
+            input: request.input,
+            question: request.question,
+            options,
+            timeout: self
+                .default_config
+                .timeout_seconds
+                .map(std::time::Duration::from_secs),
+        }
+    }
+
+    fn decision_client(&self) -> Result<&DecisionClient, LLMError> {
+        match &self.sdk {
+            Some(SdkBackend::Decisions(client)) => Ok(client),
+            _ => Err(LLMError::Config(
+                "provider is not configured for structured choice".into(),
+            )),
+        }
     }
 
     fn messages_config<'a>(
@@ -1283,6 +1355,7 @@ impl UnifiedLLMProvider {
 
     // Only transports whose actual endpoint selection and request-class mapping are audited participate here.
     fn priced_endpoint(&self) -> Result<String, LLMError> {
+        self.require_generation()?;
         if let Some(SdkBackend::Responses(client)) = &self.sdk {
             return Ok(client.endpoint().into());
         }
@@ -1315,6 +1388,7 @@ impl UnifiedLLMProvider {
         &self,
         config: Option<&LLMConfig>,
     ) -> Result<Box<dyn llm::LLMProvider>, LLMError> {
+        self.require_generation()?;
         if matches!(
             self.sdk,
             Some(SdkBackend::Responses(_) | SdkBackend::Messages(_))
@@ -1355,13 +1429,56 @@ impl UnifiedLLMProvider {
     }
 }
 
+fn decision_options<'a>(request: &ChoiceRequest<'a>) -> Vec<ChoiceOption<'a>> {
+    request
+        .candidates
+        .iter()
+        .map(|option| ChoiceOption {
+            id: option.id,
+            description: option.description,
+        })
+        .collect()
+}
+
 #[async_trait]
 impl LLMProvider for UnifiedLLMProvider {
+    fn uses_choice_for_routing(&self) -> bool {
+        matches!(self.sdk, Some(SdkBackend::Decisions(_)))
+    }
+
+    fn validate_choice(&self, request: &ChoiceRequest<'_>) -> Result<(), LLMError> {
+        let options = decision_options(request);
+        self.decision_client()?
+            .validate(&self.decision_request(request, &options))
+            .map_err(super::sdk_error)
+    }
+
+    async fn choose(&self, request: &ChoiceRequest<'_>) -> Result<ChoiceDecision, LLMError> {
+        let options = decision_options(request);
+        let response = self
+            .decision_client()?
+            .choose(&self.decision_request(request, &options))
+            .await
+            .map_err(super::sdk_error)?;
+        Ok(ChoiceDecision {
+            selected: match response.outcome {
+                decisions::ChoiceOutcome::Selected { id, .. } => Some(id),
+                decisions::ChoiceOutcome::Refused => None,
+            },
+            usage: response.usage.map(|usage| TokenUsage {
+                prompt_tokens: usage.input_tokens,
+                completion_tokens: usage.output_tokens,
+                total_tokens: usage.total_tokens,
+            }),
+        })
+    }
+
     async fn complete(
         &self,
         messages: &[ChatMessage],
         config: Option<&LLMConfig>,
     ) -> Result<LLMResponse, LLMError> {
+        self.require_generation()?;
         if let Some(google) = &self.google {
             return google.complete(messages, config).await;
         }
@@ -1443,6 +1560,7 @@ impl LLMProvider for UnifiedLLMProvider {
         config: Option<&LLMConfig>,
         request: &LLMToolRequest,
     ) -> Result<LLMResponse, LLMError> {
+        self.require_generation()?;
         if let Some(google) = &self.google {
             return google.complete_with_tools(messages, config, request).await;
         }
@@ -1557,6 +1675,7 @@ impl LLMProvider for UnifiedLLMProvider {
         config: Option<&LLMConfig>,
     ) -> Result<Box<dyn futures::Stream<Item = Result<LLMChunk, LLMError>> + Unpin + Send>, LLMError>
     {
+        self.require_generation()?;
         if let Some(google) = &self.google {
             return google.complete_stream(messages, config).await;
         }
@@ -1807,7 +1926,8 @@ impl LLMProvider for UnifiedLLMProvider {
     }
 
     fn supports_tool_choice(&self, choice: &ToolChoice) -> bool {
-        self.supports_choice_for_provider(choice)
+        !self.uses_choice_for_routing()
+            && self.supports_choice_for_provider(choice)
             && match &self.sdk {
                 Some(SdkBackend::Messages(client)) => messages_adapter::supports_choice(
                     client,
@@ -1820,6 +1940,9 @@ impl LLMProvider for UnifiedLLMProvider {
     }
 
     fn supports(&self, feature: LLMFeature) -> bool {
+        if self.uses_choice_for_routing() {
+            return false;
+        }
         if matches!(feature, LLMFeature::FunctionCalling)
             && matches!(self.sdk, Some(SdkBackend::Messages(_)))
         {

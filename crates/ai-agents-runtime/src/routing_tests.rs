@@ -6,6 +6,147 @@ use crate::{
 use ai_agents_core::Tool;
 use ai_agents_llm::mock::MockLLMProvider;
 use ai_agents_llm::{LLMRole, RouterRolesConfig};
+use std::result::Result;
+
+struct ChoiceSelector {
+    result: Option<&'static str>,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl ai_agents_core::LLMProvider for ChoiceSelector {
+    // A custom provider supplies its own choice result without any OpenAI wire types.
+    fn uses_choice_for_routing(&self) -> bool {
+        true
+    }
+    // Counts selection separately from child completion.
+    async fn choose(
+        &self,
+        _: &ai_agents_core::ChoiceRequest<'_>,
+    ) -> Result<ai_agents_core::ChoiceDecision, ai_agents_core::LLMError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(ai_agents_core::ChoiceDecision {
+            selected: self.result.map(str::to_owned),
+            usage: None,
+        })
+    }
+    // Routing this handle through text completion would bypass the host's configured selection.
+    async fn complete(
+        &self,
+        _: &[ChatMessage],
+        _: Option<&ai_agents_core::LLMConfig>,
+    ) -> Result<ai_agents_core::LLMResponse, ai_agents_core::LLMError> {
+        panic!("unexpected legacy routing")
+    }
+    // A choice requires a completed response.
+    async fn complete_stream(
+        &self,
+        _: &[ChatMessage],
+        _: Option<&ai_agents_core::LLMConfig>,
+    ) -> Result<
+        Box<
+            dyn futures::Stream<Item = Result<ai_agents_core::LLMChunk, ai_agents_core::LLMError>>
+                + Unpin
+                + Send,
+        >,
+        ai_agents_core::LLMError,
+    > {
+        panic!("unexpected streaming")
+    }
+    // Distinguishes the custom provider from built-in presets.
+    fn provider_name(&self) -> &str {
+        "custom-choice"
+    }
+    // Choice routing is configured separately from generation features.
+    fn supports(&self, _: ai_agents_core::LLMFeature) -> bool {
+        false
+    }
+}
+
+// Reject invalid candidates and overrides before selection, and dispatch only an exact returned label.
+#[tokio::test]
+async fn structured_routing_accepts_an_independent_selector_and_rejects_failures() {
+    use crate::orchestration::tools::RouteToAgentTool;
+    use serde_json::json;
+    use std::sync::atomic::Ordering;
+    let children = Arc::new(crate::spawner::AgentRegistry::new());
+    let mut witnesses = Vec::new();
+    for id in ["ops", "devops"] {
+        let spec = AgentSpec {
+            name: id.into(),
+            ..Default::default()
+        };
+        let mut provider = MockLLMProvider::new(id);
+        provider.set_response(format!("{id} answer"));
+        let agent = AgentBuilder::from_spec(spec.clone())
+            .llm(Arc::new(provider.clone()))
+            .build()
+            .unwrap();
+        children
+            .register(crate::spawner::SpawnedAgent::from_runtime(
+                id.into(),
+                agent,
+                spec,
+            ))
+            .await
+            .unwrap();
+        witnesses.push(provider);
+    }
+    for (selected, candidates, method, success, calls) in [
+        (Some("devops"), json!(["ops", "devops"]), "llm", true, 1),
+        (None, json!(["ops", "devops"]), "llm", false, 1),
+        (
+            Some("devops or ops"),
+            json!(["ops", "devops"]),
+            "llm",
+            false,
+            1,
+        ),
+        (Some("ops"), json!(["ops", "ops"]), "llm", false, 0),
+        (Some("ops"), json!(["ops", 42]), "llm", false, 0),
+        (Some("ops"), json!(["ops", "missing"]), "llm", false, 0),
+        (
+            Some("ops"),
+            json!(["ops", "devops"]),
+            "round_robin",
+            false,
+            0,
+        ),
+        (Some("ops"), json!(["ops", "devops"]), "typo", false, 0),
+        (None, json!(["devops"]), "llm", true, 0),
+    ] {
+        let selector = Arc::new(ChoiceSelector {
+            result: selected,
+            calls: Default::default(),
+        });
+        let mut registry = LLMRegistry::new();
+        registry.register("router", ai_agents_llm::managed_provider(selector.clone()));
+        let before = witnesses[1].call_count();
+        let result = RouteToAgentTool::new(children.clone(), Arc::new(registry))
+            .execute(
+                json!({"input":"build issue","candidates":candidates,"method":method}),
+                ai_agents_core::ToolExecutionContext::test("structured-routing"),
+            )
+            .await;
+        assert_eq!(result.success, success, "{}", result.output);
+        assert_eq!(selector.calls.load(Ordering::SeqCst), calls);
+        assert_eq!(witnesses[0].call_count(), 0);
+        assert_eq!(witnesses[1].call_count(), before + usize::from(success));
+    }
+    let mut legacy = MockLLMProvider::new("legacy");
+    legacy.set_response("devops");
+    let mut registry = LLMRegistry::new();
+    registry.register("router", Arc::new(legacy));
+    let result = RouteToAgentTool::new(children, Arc::new(registry))
+        .execute(
+            json!({"input":"build issue","candidates":["ops","devops"],"method":"llm"}),
+            ai_agents_core::ToolExecutionContext::test("legacy-routing"),
+        )
+        .await;
+    assert!(result.success);
+    assert_eq!(witnesses[0].call_count(), 1);
+    assert_eq!(witnesses[1].call_count(), 2);
+}
 
 // Independent queues prove owning call selection without relying on model wording or tracing caches.
 fn fixture(

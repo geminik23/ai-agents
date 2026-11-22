@@ -1764,6 +1764,30 @@ async fn describe(base_url: &str, key: Option<String>, model: &str, png: Vec<u8>
 
 For audio use `InputPart::Audio` with `AudioFormat::Wav` or `AudioFormat::Mp3`. For plain text use `Message::User`. The client can be shared across requests; model, messages, options and function definitions belong to each request. `stream()` yields provisional `Event::Text` and then `Event::Finished` with assembled calls and optional final usage. Complete usage includes separate input/output token breakdowns when supplied by the endpoint. To continue a tool turn, carry the assistant calls in `Message::Assistant` and return each authorized result using `Message::ToolResult` with its original ID. Direct callers handle their own execution permissions and accounting. Framework hosts can use the existing YAML adapter for managed calls.
 
+## Direct Decisions SDK (development)
+
+```rust
+use ai_agents_llm::sdk::{Error, decisions::{ChoiceOption, ChoiceOutcome, ChoiceRequest, DecisionClient}};
+
+async fn classify(key: String, model: &str, input: &str) -> Result<ChoiceOutcome, Error> {
+    let client = DecisionClient::new("https://api.openai.com/v1", key)?;
+    let options = [
+        ChoiceOption { id: "billing", description: Some("Payments and invoices") },
+        ChoiceOption { id: "support", description: Some("Technical issues") },
+    ];
+    let request = ChoiceRequest {
+        model,
+        input,
+        question: "Which team should handle this request?",
+        options: &options,
+        timeout: None,
+    };
+    Ok(client.choose(&request).await?.outcome)
+}
+```
+
+The response distinguishes a selected ID from a refusal and includes reported usage when available. Provider confidence is exposed only when supplied. Custom framework providers can opt in through the defaulted `LLMProvider` choice methods and return the provider-neutral `ai_agents_core::ChoiceDecision`. The runtime validates the returned ID and owns child execution.
+
 ## Direct Responses SDK (development)
 
 ```rust

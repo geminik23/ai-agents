@@ -4,6 +4,7 @@ use crate::{
     ChatMessage, LLMChunk, LLMConfig, LLMError, LLMFeature, LLMProvider, LLMResponse,
     LLMToolRequest, ToolChoice,
 };
+use ai_agents_core::{ChoiceDecision, ChoiceRequest};
 use async_trait::async_trait;
 use std::future::Future;
 use std::sync::Arc;
@@ -47,6 +48,22 @@ impl Attempt {
         tools: Option<&LLMToolRequest>,
         streaming: bool,
     ) -> Result<Option<Self>, LLMError> {
+        Self::admit_with_quote(|request_id| {
+            provider.request_cost_bound(&ProviderRequest {
+                request_id,
+                messages,
+                config,
+                tools,
+                streaming,
+            })
+        })
+        .await
+    }
+
+    // Share the admission lifecycle while each operation owns its actual request quote.
+    async fn admit_with_quote(
+        quote: impl FnOnce(&str) -> Result<Option<ProviderCostBound>, LLMError>,
+    ) -> Result<Option<Self>, LLMError> {
         if crate::validate_invocation_evidence().is_err()
             || crate::current_invocation_bounds().is_some_and(|bounds| bounds.remaining().is_zero())
         {
@@ -59,15 +76,7 @@ impl Attempt {
         };
         let bound = if admission.requires_priced_llm() {
             let request_id = uuid::Uuid::new_v4().to_string();
-            let bound = provider
-                .request_cost_bound(&ProviderRequest {
-                    request_id: &request_id,
-                    messages,
-                    config,
-                    tools,
-                    streaming,
-                })
-                .inspect_err(|_| admission.reject_priced_request())?;
+            let bound = quote(&request_id).inspect_err(|_| admission.reject_priced_request())?;
             if let Some(bound) = &bound {
                 bound
                     .validate(&request_id)
@@ -294,6 +303,37 @@ pub async fn managed_completion(
     result
 }
 
+/// Executes one structured choice under the current authority without a completion-shaped quote.
+pub async fn managed_choice(
+    provider: &dyn LLMProvider,
+    request: &ChoiceRequest<'_>,
+) -> Result<ChoiceDecision, LLMError> {
+    if provider.manages_choice_admission() {
+        return provider.choose(request).await;
+    }
+    provider.validate_choice(request)?;
+    let mut attempt = Attempt::admit_with_quote(|_| {
+        Err(LLMError::Config(
+            "structured choice has no hard cost bound".into(),
+        ))
+    })
+    .await?;
+    let result = bounded_provider(attempt.as_mut(), provider.choose(request)).await?;
+    if let Some(attempt) = &mut attempt {
+        let evidence = match &result {
+            Ok(decision) => serde_json::json!({
+                "choice_completed": true,
+                "refused": decision.selected.is_none(),
+                "usage": decision.usage,
+            }),
+            Err(_) => serde_json::json!({"choice_failed":true}),
+        };
+        attempt.settle(evidence).await?;
+    }
+    check_provider_result(attempt.as_ref().map(|attempt| &attempt.admission))?;
+    result
+}
+
 struct ManagedProvider {
     inner: Arc<dyn LLMProvider>,
 }
@@ -309,6 +349,22 @@ pub fn managed_provider(provider: Arc<dyn LLMProvider>) -> Arc<dyn LLMProvider> 
 
 #[async_trait]
 impl LLMProvider for ManagedProvider {
+    fn uses_choice_for_routing(&self) -> bool {
+        self.inner.uses_choice_for_routing()
+    }
+
+    fn validate_choice(&self, request: &ChoiceRequest<'_>) -> Result<(), LLMError> {
+        self.inner.validate_choice(request)
+    }
+
+    fn manages_choice_admission(&self) -> bool {
+        true
+    }
+
+    async fn choose(&self, request: &ChoiceRequest<'_>) -> Result<ChoiceDecision, LLMError> {
+        managed_choice(self.inner.as_ref(), request).await
+    }
+
     /// Each retry/fallback call enters separately; cached provider configuration stays owned by the inner adapter.
     async fn complete(
         &self,

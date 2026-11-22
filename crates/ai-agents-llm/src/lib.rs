@@ -12,7 +12,8 @@ pub use invocation_bounds::{
     scope_invocation_bounds, scope_invocation_evidence, validate_invocation_evidence,
 };
 pub use managed::{
-    current_invocation_admission, managed_completion, managed_provider, scope_invocation_admission,
+    current_invocation_admission, managed_choice, managed_completion, managed_provider,
+    scope_invocation_admission,
 };
 pub mod mock;
 pub mod multi;
