@@ -58,7 +58,7 @@ pub(crate) async fn timeout<F: Future>(duration: Duration, work: F) -> Option<F:
 }
 
 #[cfg(test)]
-tokio::task_local! { static MANUAL: std::sync::Arc<ManualClock>; }
+tokio::task_local! { pub(super) static MANUAL: std::sync::Arc<ManualClock>; }
 
 #[cfg(test)]
 pub(crate) struct ManualClock {
@@ -86,7 +86,12 @@ impl ManualClock {
 
     /// Each scoped future owns its clock selection; concurrent tests and ordinary consumers remain independent.
     pub(crate) async fn scope<F: Future>(self: &std::sync::Arc<Self>, work: F) -> F::Output {
-        MANUAL.scope(self.clone(), work).await
+        MANUAL
+            .scope(
+                self.clone(),
+                ai_agents_llm::InvocationBounds::scope_test_clock(now, work),
+            )
+            .await
     }
 
     /// Returns the current manual instant without consulting elapsed host time.

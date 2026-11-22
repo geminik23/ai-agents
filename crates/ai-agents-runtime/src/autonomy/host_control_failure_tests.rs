@@ -182,6 +182,14 @@ impl TaskRunStore for FaultStore {
 /// Root and child executable plan reviews preserve authority and original deadlines through every acknowledgement wait.
 #[tokio::test]
 async fn host_control_failure_plan_adoption_rechecks_binding_and_deadline_at_root_and_child() {
+    let clock = crate::autonomy::invocation_clock::ManualClock::new(std::time::Duration::ZERO);
+    crate::autonomy::approval_clock::MANUAL
+        .scope(clock.clone(), check_plan_adoption(&clock))
+        .await;
+}
+
+// Cross only the original review deadline in expiry cases; binding changes run at a fixed approval time.
+async fn check_plan_adoption(clock: &crate::autonomy::invocation_clock::ManualClock) {
     for child in [false, true] {
         for phase in ["claim", "consume", "adopt"] {
             for expired in [false, true] {
@@ -263,7 +271,7 @@ async fn host_control_failure_plan_adoption_rechecks_binding_and_deadline_at_roo
                 let mut future = Box::pin(approve(&runner, &first.run));
                 tokio::select! { result = &mut future => panic!("returned before selected wait child={child} phase={phase}: {result:?}"), permit = tokio::time::timeout(std::time::Duration::from_secs(5), store.reached.acquire()) => { permit.unwrap().unwrap().forget(); } }
                 if expired {
-                    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+                    clock.advance_to(clock.now() + reviewed.task_review_timeout().unwrap());
                 } else {
                     reviewed.runtime_control().set_emergency_deny(true);
                 }

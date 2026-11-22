@@ -68,6 +68,8 @@ pub(crate) fn check_dispatched_invocation() -> ai_agents_core::Result<()> {
 #[derive(Clone, Default)]
 pub(crate) struct InvocationScope {
     bounds: Option<InvocationBounds>,
+    #[cfg(test)]
+    clock: Option<Arc<super::invocation_clock::ManualClock>>,
     mutations: Option<Arc<AtomicU64>>,
     evidence: Vec<Arc<dyn ai_agents_core::autonomy::TaskFinalAdmission>>,
     child_operation: Option<String>,
@@ -77,8 +79,15 @@ pub(crate) struct InvocationScope {
 
 impl InvocationScope {
     /// Captures the restriction tree and composition cut before a spawn without replacing ledger or fixed-operation authority.
+    /// Test captures retain the original clock along with its absolute composition deadline.
     pub(crate) fn capture() -> Self {
+        #[cfg(test)]
+        let clock = super::invocation_clock::MANUAL.try_with(Arc::clone).ok();
         let bounds = super::composition::current_composition_deadline().map(|deadline| {
+            #[cfg(test)]
+            if clock.is_some() {
+                return InvocationBounds::for_test_clock(deadline);
+            }
             let now = std::time::SystemTime::now();
             InvocationBounds::new(
                 now.checked_add(deadline.saturating_duration_since(std::time::Instant::now()))
@@ -92,6 +101,8 @@ impl InvocationScope {
         };
         Self {
             bounds,
+            #[cfg(test)]
+            clock,
             mutations: current_mutation_clock(),
             evidence: ai_agents_llm::current_invocation_evidence(),
             child_operation: super::current_child_operation(),
@@ -109,6 +120,7 @@ impl InvocationScope {
 
     /// Nested restrictions intersect; child attribution, host delivery and failure policy survive spawned callbacks without minting another operation.
     /// Inherited mutation tracking observes actual child/fallback hops rather than only the outer record.
+    /// A spawned task must install the captured clock before any child or provider can inspect the bound.
     pub(crate) async fn scope<F: std::future::Future>(self, future: F) -> F::Output {
         let future = Box::pin(future);
         let attributed = Box::pin(async {
@@ -131,14 +143,18 @@ impl InvocationScope {
                 future.await
             }
         };
-        Box::pin(ai_agents_llm::scope_invocation_evidence(
+        let scoped = Box::pin(ai_agents_llm::scope_invocation_evidence(
             self.evidence,
             scope_invocation_bounds(
                 self.bounds,
                 Box::pin(super::host_session::scope_session(self.host_session, work)),
             ),
-        ))
-        .await
+        ));
+        #[cfg(test)]
+        if let Some(clock) = self.clock {
+            return clock.scope(scoped).await;
+        }
+        scoped.await
     }
 }
 

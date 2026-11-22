@@ -29,5 +29,8 @@ reqwest = { workspace = true }
 uuid = { workspace = true }
 sha2 = { workspace = true }
 
+[features]
+test-util = []
+
 [dev-dependencies]
 chrono = { workspace = true }

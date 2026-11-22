@@ -54,6 +54,9 @@ jsonschema = { version = "0.62", default-features = false }
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 libc = "0.2"
 
+[dev-dependencies]
+ai-agents-llm = { workspace = true, features = ["test-util"] }
+
 [features]
 default = []
 sqlite = ["ai-agents-storage/sqlite"]

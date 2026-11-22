@@ -637,18 +637,18 @@ impl RuntimeAgent {
             .collect()
     }
 
-    /// Retained interactions keep both original clocks across claim, consumption and final application waits.
+    /// Recheck the original human-response clock across claim, consumption and final application waits.
     pub(super) fn task_response_expired(&self, batch: &TaskBatchState) -> bool {
         batch.approvals.first().is_some_and(|approval| {
             approval
                 .expires_at
-                .is_some_and(|expiry| chrono::Utc::now() >= expiry)
+                .is_some_and(|expiry| crate::autonomy::approval_clock::utc_now() >= expiry)
                 || crate::autonomy::current_execution().is_some_and(|execution| {
                     execution
                         .approval_deadlines
                         .lock()
                         .get(&approval.request_id)
-                        .is_some_and(|expiry| Instant::now() >= *expiry)
+                        .is_some_and(|expiry| crate::autonomy::approval_clock::now() >= *expiry)
                 })
         })
     }
