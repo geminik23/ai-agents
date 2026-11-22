@@ -5,6 +5,8 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::sync::LazyLock;
 
+pub(crate) const API_BASE: &str = "https://api.openai.com/v1/";
+
 #[derive(Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum Availability {

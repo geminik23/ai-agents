@@ -17,6 +17,7 @@
 //! ```
 pub mod decisions;
 pub mod messages;
+pub mod models;
 pub(crate) mod openai;
 pub mod responses;
 // Bound one unfinished SSE frame independently of total response length.
