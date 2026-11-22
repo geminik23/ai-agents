@@ -23,7 +23,7 @@ use crate::evidence::{
 };
 use crate::fixtures::{
     AttemptFixtureContext, AttemptWorkspace, LlmFixtureMode, RecordingToolLog,
-    WorkspacePolicyFixtureConfig, build_approval_handler, build_llm_registry,
+    WorkspacePolicyFixtureConfig, build_approval_handler, build_llm_registry_with,
     resolve_fixture_context, start_mock_server,
 };
 use crate::judge::{JudgeConfig, JudgeResolver};
@@ -1118,28 +1118,24 @@ impl EvalRunner {
             .map_err(|error| EvalError::Config(error.to_string()))?;
         self.suite.validate_agent(&spec)?;
         let llm_fixture = attempt_context.interpolate_llm_fixture(&self.suite.fixtures.llm)?;
-        let provider_configs = budget_provider_configs(&spec);
-        let (mut llm_registry, _judge_llm) = build_llm_registry(&spec, &llm_fixture, base_dir)?;
-        // Capture actual dispatch, including scripted skills and validation, after any enclosing budget has admitted it.
-        llm_registry = llm_registry.map_providers(|_, provider| {
-            Arc::new(RecordingProvider {
-                inner: provider,
-                log: llm_log.clone(),
-            })
-        });
-        if let Some(budget) = budget {
-            llm_registry =
-                llm_registry.map_providers(|alias, provider| {
-                    let config = provider_configs.get(alias).cloned().unwrap_or_else(|| {
-                        BudgetProviderConfig {
-                            provider: provider.provider_name().to_string(),
-                            model: alias.to_string(),
-                            max_output_tokens: Some(2_000),
-                        }
-                    });
-                    budget.wrap(provider, config)
+        let (llm_registry, _) =
+            build_llm_registry_with(&spec, &llm_fixture, base_dir, |config, provider| {
+                let observed: Arc<dyn ai_agents_core::LLMProvider> = Arc::new(RecordingProvider {
+                    inner: provider,
+                    log: llm_log.clone(),
                 });
-        }
+                match &budget {
+                    Some(budget) => budget.wrap(
+                        observed,
+                        BudgetProviderConfig {
+                            provider: config.provider.clone(),
+                            model: config.model.clone(),
+                            max_output_tokens: config.effective_max_tokens(),
+                        },
+                    ),
+                    None => observed,
+                }
+            })?;
 
         // Tool fixture values are typed JSON; LLM content keeps its dedicated JSON-aware interpolation path.
         let mut tool_fixtures = self.suite.fixtures.clone();
@@ -1964,33 +1960,6 @@ fn apply_eval_llm_settings(spec: &mut AgentSpec, settings: &crate::suite::EvalSe
     }
 }
 
-fn budget_provider_configs(spec: &AgentSpec) -> HashMap<String, BudgetProviderConfig> {
-    if spec.llms.is_empty() {
-        let config = spec.llm.as_config().cloned().unwrap_or_default();
-        return HashMap::from([(
-            "default".to_string(),
-            BudgetProviderConfig {
-                max_output_tokens: config.effective_max_tokens(),
-                provider: config.provider,
-                model: config.model,
-            },
-        )]);
-    }
-    spec.llms
-        .iter()
-        .map(|(alias, config)| {
-            (
-                alias.clone(),
-                BudgetProviderConfig {
-                    provider: config.provider.clone(),
-                    model: config.model.clone(),
-                    max_output_tokens: config.effective_max_tokens(),
-                },
-            )
-        })
-        .collect()
-}
-
 fn apply_llm_config_settings(
     config: &mut ai_agents_runtime::spec::LLMConfig,
     settings: &crate::suite::EvalSettings,
@@ -2808,6 +2777,126 @@ llm:
             .run()
             .await
             .unwrap()
+    }
+
+    #[test]
+    fn decisions_official_yaml_constructs_without_base_url() {
+        use ai_agents_core::LLMProvider;
+        use ai_agents_llm::providers::{ProviderType, UnifiedLLMProvider};
+        let spec = AgentSpec::from_yaml_strict(
+            "name: Route\nsystem_prompt: route\nllms:\n  dispatch: {provider: openai, protocol: decisions, model: chosen}\nllm: {default: dispatch}\n",
+        ).unwrap();
+        let config = &spec.llms["dispatch"];
+        let provider = UnifiedLLMProvider::from_spec_config(
+            ProviderType::OpenAI,
+            &config.model,
+            Some("test-credential".into()),
+            config.base_url.clone(),
+            config.to_provider_config(ProviderType::OpenAI),
+        )
+        .unwrap();
+        assert!(provider.uses_choice_for_routing());
+    }
+
+    #[tokio::test]
+    async fn decisions_eval_blocks_only_an_invoked_choice_alias() {
+        use ai_agents_core::{Tool, ToolExecutionContext};
+        use ai_agents_llm::mock::MockLLMProvider;
+        use ai_agents_runtime::{
+            orchestration::tools::RouteToAgentTool,
+            spawner::{AgentRegistry, SpawnedAgent},
+        };
+        let workspace = AttemptWorkspace::create(None).unwrap();
+        let path = workspace.workspace.join("agent.yaml");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        std::fs::write(&path, format!(r#"
+name: EvalChoice
+system_prompt: Help.
+llm: {{default: main, router: {{orchestration: {{routing: dispatch}}}}}}
+llms:
+  main: {{provider: openai-compatible, model: fixture, base_url: 'http://{address}/v1'}}
+  dispatch: {{provider: openai, model: decision, protocol: decisions, base_url: 'http://{address}/v1', api_key_env: EVAL_UNUSED_DECISION_KEY}}
+"#)).unwrap();
+        let children = Arc::new(AgentRegistry::new());
+        let child_calls = Arc::new(MockLLMProvider::new("child"));
+        for id in ["ops", "devops"] {
+            let spec = AgentSpec {
+                name: id.into(),
+                ..Default::default()
+            };
+            let runtime = AgentBuilder::from_spec(spec.clone())
+                .llm(child_calls.clone())
+                .build()
+                .unwrap();
+            children
+                .register(SpawnedAgent::from_runtime(id.into(), runtime, spec))
+                .await
+                .unwrap();
+        }
+        for mode in ["mock", "replay", "record", "real"] {
+            let yaml = format!(
+                "name: choose\nagent: agent.yaml\nfixtures:\n  llm:\n    mode: {mode}\n    cassette: test.jsonl\n    responses_by_alias: {{main: [ready], dispatch: [ops]}}\nscenarios:\n  - id: route\n    turns: [{{input: hello}}]\n"
+            );
+            let runner = EvalRunner {
+                suite_path: workspace.workspace.join("suite.yaml"),
+                host: None,
+                suite: parse_eval_suite_yaml(&yaml).unwrap(),
+                options: Default::default(),
+            };
+            for limited in [false, true] {
+                let budget = limited.then(|| {
+                    ScenarioBudgetTracker::new(
+                        crate::suite::ScenarioBudget {
+                            max_llm_calls: Some(1),
+                            ..Default::default()
+                        },
+                        None,
+                    )
+                });
+                let log = RecordingLlmLog::default();
+                let agent = runner
+                    .build_agent(BuildAgentParams {
+                        agent_path: &path,
+                        base_dir: &workspace.workspace,
+                        attempt_context: &workspace,
+                        tool_log: RecordingToolLog::new(),
+                        approval_log: Default::default(),
+                        llm_log: log.clone(),
+                        approval_handler: None,
+                        budget,
+                    })
+                    .await
+                    .unwrap();
+                let router = agent.llm_registry().get("dispatch").unwrap();
+                assert!(
+                    router.uses_choice_for_routing(),
+                    "{mode} lost the configured routing mode"
+                );
+                let tool = RouteToAgentTool::new(children.clone(), agent.llm_registry().clone());
+                let denied = tool
+                    .execute(
+                        json!({"input":"deploy","candidates":["ops","devops"]}),
+                        ToolExecutionContext::test("route_to_agent"),
+                    )
+                    .await;
+                assert!(
+                    !denied.success && denied.output.contains("does not support structured choice"),
+                    "{}",
+                    denied.output
+                );
+                assert_eq!(child_calls.call_count(), 0);
+                assert_eq!(log.len(), 0);
+                if mode == "mock" {
+                    let reply = agent.chat("hello").await.unwrap();
+                    assert!(reply.content.contains("ready"), "{}", reply.content);
+                }
+                assert!(
+                    matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock)
+                );
+            }
+        }
     }
 
     // Creating the heap-owned construction future must defer parsing and retain fail-closed preflight.

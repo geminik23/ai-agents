@@ -143,6 +143,10 @@ Schema 3 adds `Scenario.interactions` and `TurnResult.interactions`; initialize 
 
 Affected earlier Rust literals include `Assertion.task`, `TurnEvidence.task`, `TurnResult.task`, `TurnObservabilityEvidence.events`, and `FixturesConfig.files`; use constructors/defaults where available. `ScenarioStep` adds `Task`, `ToolExecutionSource` adds `Task`, and observation `EventType` adds `TaskLifecycle`; update exhaustive matches. Controller validation records use the `task` source label. Model-requested tools still use `llm` even while admitted inside a task; task ownership does not rewrite invocation origin. Existing JSONL compatibility rows remain chat-only: explicit `task` or `steps` fields now reject instead of being ignored, while unrelated legacy compatibility fields remain tolerated. YAML remains strict. See [task inspection and eval hosts](@/docs/rust-api.md#task-evaluation-inspection-development-only).
 
+## Development choice routing in evals
+
+The scenario registry keeps a declared choice-only alias available for role lookup in mock, replay, record and real modes. Other aliases run with their configured fixtures and scenario budgets. A route with one valid candidate can select locally. A multi-candidate route bound to Decisions returns a tool error before any HTTP request, text fixture consumption or child dispatch. [Provider configuration](@/docs/providers.md#openai-decisions-development)
+
 ## Hierarchical alias fixtures (1.1)
 
 Version 1.1 supports hierarchical auxiliary routing. Assign fixture responses independently with `fixtures.llm.responses_by_alias` for each named alias. `evaluation.response` selects response judges and `evaluation.facts` selects semantic fact judges; an explicit response assertion alias still wins. This does not activate the otherwise unused `JudgeConfig.llm` as a global selector.

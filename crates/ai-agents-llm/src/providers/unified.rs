@@ -33,6 +33,12 @@ enum SdkBackend {
 
 /// The preset selector for the first-party OpenAI Decisions transport.
 pub const DECISIONS_PROTOCOL: &str = "decisions";
+const OPENAI_API_BASE: &str = "https://api.openai.com/v1/";
+
+/// Classifies a declared protocol without constructing a provider or resolving credentials.
+pub fn is_choice_protocol(protocol: Option<&str>) -> bool {
+    matches!(protocol, Some(DECISIONS_PROTOCOL))
+}
 
 #[cfg(test)]
 #[path = "pricing_tests.rs"]
@@ -636,7 +642,7 @@ impl UnifiedLLMProvider {
             ProviderType::OpenAI | ProviderType::OpenAICompatible
         );
         let protocol = default_config.extra.get("protocol");
-        let is_decisions = protocol.and_then(serde_json::Value::as_str) == Some(DECISIONS_PROTOCOL);
+        let is_decisions = is_choice_protocol(protocol.and_then(serde_json::Value::as_str));
         if is_decisions {
             if provider_type != ProviderType::OpenAI || model.trim().is_empty() {
                 return Err(LLMError::Config(
@@ -725,32 +731,26 @@ impl UnifiedLLMProvider {
             ));
         }
 
-        let sdk = if is_decisions {
-            let base = actual_base_url
-                .as_deref()
-                .expect("OpenAI has a default base URL");
-            Some(SdkBackend::Decisions(
-                DecisionClient::new(base, actual_api_key.clone()).map_err(super::sdk_error)?,
-            ))
-        } else if is_chat {
-            let base = actual_base_url
-                .as_deref()
-                .unwrap_or("https://api.openai.com/v1/");
-            let key = Some(actual_api_key.clone());
+        let sdk = if is_chat {
+            let base = actual_base_url.as_deref().unwrap_or(OPENAI_API_BASE);
             Some(
                 match default_config.extra.get("protocol").map(|v| v.as_str()) {
                     None | Some(Some("chat-completions")) => SdkBackend::Chat(
-                        ChatClient::new(base, key)
+                        ChatClient::new(base, Some(actual_api_key.clone()))
                             .map_err(super::sdk_error)?
                             .with_openai_contract(provider_type == ProviderType::OpenAI),
                     ),
                     Some(Some("responses")) if provider_type == ProviderType::OpenAI => {
                         SdkBackend::Responses(
-                            ResponsesClient::new(base, key)
+                            ResponsesClient::new(base, Some(actual_api_key.clone()))
                                 .map_err(super::sdk_error)?
                                 .with_official_contract(),
                         )
                     }
+                    Some(Some(DECISIONS_PROTOCOL)) => SdkBackend::Decisions(
+                        DecisionClient::new(base, actual_api_key.clone())
+                            .map_err(super::sdk_error)?,
+                    ),
                     _ => return Err(LLMError::Config("unsupported protocol for provider".into())),
                 },
             )
@@ -1363,7 +1363,7 @@ impl UnifiedLLMProvider {
             return Ok(google.accounting_endpoint().to_owned());
         }
         let default = match self.provider_type {
-            ProviderType::OpenAI => "https://api.openai.com/v1/",
+            ProviderType::OpenAI => OPENAI_API_BASE,
             ProviderType::OpenAICompatible => "",
             ProviderType::Google => "https://generativelanguage.googleapis.com/v1beta/",
             ProviderType::Groq => "https://api.groq.com/openai/v1/",

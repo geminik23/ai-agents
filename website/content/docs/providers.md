@@ -94,7 +94,7 @@ llm:
 
 Grant `route_to_agent` through the normal orchestration and tool configuration. The tool passes its input and candidate IDs to the selected provider. With a single registered candidate it can select directly. With multiple candidates it requires an exact ID from a complete answer. A refusal or invalid answer produces no child dispatch. The runtime retains the actual child binding across supported task resume and restoration. A tool call may omit `method` or use `llm` in this mode.
 
-The preset sends a single text classification question to `/v1/decisions`. It accepts a configured model, timeout, credential and API base URL. A custom origin requires an explicit credential. Generation settings, native tool requests, streaming and declared-priced task calls are unsupported for this preset. Scenario eval fixtures and budgets currently reject this protocol at setup. Use the [direct Rust SDK](@/docs/rust-api.md#direct-decisions-sdk-development) to classify text independently of an agent.
+With `base_url` omitted, the OpenAI preset sends a single text classification question to `https://api.openai.com/v1/decisions`. It accepts a configured model, timeout, credential and API base URL. A custom origin requires an explicit credential. Generation settings, native tool requests, streaming and declared-priced task calls are unsupported for this preset. A scenario can declare an unused Decisions alias without its API key. If routing needs a model decision, the eval returns an unsupported-operation error before sending a request or using a text fixture. Use the [direct Rust SDK](@/docs/rust-api.md#direct-decisions-sdk-development) to classify text independently of an agent.
 
 ## Declared-priced task capabilities (development only)
 
