@@ -86,6 +86,11 @@ pub trait LLMProvider: Send + Sync {
         )))
     }
 
+    /// Whether the runtime may expose or parse the compatibility prompt tool protocol.
+    fn allows_prompt_tools(&self) -> bool {
+        true
+    }
+
     /// Returns a provider-level tool choice override when configured.
     fn configured_tool_choice(&self) -> Option<ToolChoice> {
         None

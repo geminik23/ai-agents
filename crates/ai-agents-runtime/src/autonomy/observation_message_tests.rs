@@ -398,9 +398,46 @@ async fn fixture_leaf_policy_membership(
     }
 }
 
+// This fixture keeps approval time fixed between explicit advances, including across store acknowledgements.
+fn advance_leaf_approval_to_expiry(f: &Fixture, clock: &invocation_clock::ManualClock) {
+    let seconds = f.worker_spec.hitl.as_ref().unwrap().default_timeout_seconds;
+    clock.advance_to(clock.now() + std::time::Duration::from_secs(seconds));
+}
+
+// Time out the first leaf by its own configured policy and retain its ID to detect any transfer to the next call.
+async fn first_leaf_timeout(
+    f: &Fixture,
+    clock: &invocation_clock::ManualClock,
+) -> (String, ai_agents_core::Result<TaskRunResult>) {
+    let first = f.runner.run("objective", None).await.unwrap();
+    assert_eq!(first.run.status, TaskRunStatus::Paused);
+    let id = first.run.pending.as_ref().unwrap().id.clone();
+    advance_leaf_approval_to_expiry(f, clock);
+    let outcome = f
+        .runner
+        .resume(
+            &first.run.key.run_id,
+            first.run.revision,
+            TaskResumeInput::Approval {
+                request_id: id.clone(),
+                result: ai_agents_hitl::ApprovalResult::Timeout,
+            },
+        )
+        .await;
+    (id, outcome)
+}
+
 // A validator's parent policy cannot approve a rejecting leaf or reject an approving leaf; the timeout receipt is single-request authority.
 #[tokio::test]
 async fn retained_boundary_validator_child_uses_leaf_timeout_policy_without_transfer() {
+    let clock = invocation_clock::ManualClock::new(std::time::Duration::ZERO);
+    approval_clock::MANUAL
+        .scope(clock.clone(), check_leaf_timeout_policies(&clock))
+        .await;
+}
+
+// All four parent/leaf policy pairs use the same clock for issuance, receipt and final admission.
+async fn check_leaf_timeout_policies(clock: &invocation_clock::ManualClock) {
     use ai_agents_hitl::ApprovalResult;
     for sqlite in super::continuation_test_support::backends() {
         for (root_policy, leaf_policy) in [
@@ -431,21 +468,7 @@ async fn retained_boundary_validator_child_uses_leaf_timeout_policy_without_tran
                 "observation-message.v1".into(),
             )
             .unwrap();
-            let first = f.runner.run("objective", None).await.unwrap();
-            assert_eq!(first.run.status, TaskRunStatus::Paused);
-            let id = first.run.pending.as_ref().unwrap().id.clone();
-            tokio::time::sleep(std::time::Duration::from_millis(2050)).await;
-            let outcome = f
-                .runner
-                .resume(
-                    &first.run.key.run_id,
-                    first.run.revision,
-                    TaskResumeInput::Approval {
-                        request_id: id.clone(),
-                        result: ApprovalResult::Timeout,
-                    },
-                )
-                .await;
+            let (id, outcome) = first_leaf_timeout(&f, clock).await;
             if leaf_policy == "approve" {
                 let next = outcome.unwrap();
                 assert_eq!(
@@ -488,6 +511,80 @@ async fn retained_boundary_validator_child_uses_leaf_timeout_policy_without_tran
             assert_eq!(f.main.calls.load(Ordering::SeqCst), 1);
         }
     }
+}
+
+// Hold the second claim acknowledgement after intake to expire exactly that approval before the leaf can execute.
+#[tokio::test]
+async fn retained_boundary_validator_child_rechecks_approval_after_intake() {
+    for &sqlite in super::continuation_test_support::backends() {
+        let clock = invocation_clock::ManualClock::new(std::time::Duration::ZERO);
+        approval_clock::MANUAL
+            .scope(clock.clone(), check_expiry_after_claim(sqlite, &clock))
+            .await;
+    }
+}
+
+// The backend has committed the second claim before the test advances time and releases its acknowledgement.
+async fn check_expiry_after_claim(sqlite: bool, clock: &invocation_clock::ManualClock) {
+    use super::continuation_test_support as support;
+    let mut f = Box::pin(fixture_leaf_policy(
+        true,
+        false,
+        None,
+        Some(("reject", "approve")),
+    ))
+    .await;
+    f.store = support::store(f.root.info().id, "observation-message.v1", sqlite).await;
+    let receipt =
+        support::ReceiptStore::checkpoint(f.store.clone(), "hold", json!({"claim": true}));
+    f.runner = AutonomyRunner::try_new(
+        f.root.clone(),
+        f.config.clone(),
+        Default::default(),
+        receipt.clone(),
+        "observation-message.v1".into(),
+    )
+    .unwrap();
+    let (first_id, outcome) = first_leaf_timeout(&f, clock).await;
+    let next = outcome.unwrap().run;
+    assert_eq!(next.status, TaskRunStatus::Paused);
+    let second_id = next.pending.unwrap().id;
+    assert_ne!(first_id, second_id);
+    receipt.armed.store(true, Ordering::SeqCst);
+    let resume = f.runner.resume(
+        &next.key.run_id,
+        next.revision,
+        TaskResumeInput::Approval {
+            request_id: second_id,
+            result: ai_agents_hitl::ApprovalResult::Approved,
+        },
+    );
+    tokio::pin!(resume);
+    tokio::select! {
+        result = &mut resume => panic!("resume returned before its claim acknowledgement: {result:?}"),
+        permit = receipt.reached.acquire() => permit.unwrap().forget(),
+    }
+    assert_eq!(f.leaf_calls.load(Ordering::SeqCst), 1);
+    advance_leaf_approval_to_expiry(&f, clock);
+    receipt.release.add_permits(1);
+
+    let done = resume.await.unwrap().run;
+    assert_eq!(done.status, TaskRunStatus::Failed);
+    let denied = &done
+        .evidence
+        .tool_calls
+        .iter()
+        .find(|call| call.record.call_id == "child-question-next")
+        .unwrap()
+        .record;
+    assert!(!denied.executed && !denied.success);
+    assert_eq!(
+        denied.output,
+        ai_agents_core::AgentError::HITLTimeout.to_string()
+    );
+    assert_eq!(f.leaf_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(f.child.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(f.main.calls.load(Ordering::SeqCst), 1);
 }
 
 // Child re-pauses and fixed host approval settle once before external delivery or host-controlled retirement.

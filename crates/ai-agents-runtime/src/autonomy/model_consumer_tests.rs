@@ -535,8 +535,15 @@ async fn model_consumer_broadcast_repause_preserves_results_and_rejects_obsolete
     assert_finished(&f, &result.run, false).await;
 }
 
+// The offset epoch exposes any child comparing a logical deadline with native time.
 #[tokio::test]
 async fn model_consumer_repeated_broadcast_and_declared_parent_keep_distinct_operations() {
+    let clock = super::invocation_clock::ManualClock::new(std::time::Duration::from_secs(60));
+    clock.scope(check_repeated_broadcast_operations()).await;
+}
+
+// Identity, history and counts are invariant under host scheduling between the eight acknowledged pauses.
+async fn check_repeated_broadcast_operations() {
     for mixed in [false, true] {
         let f = Box::pin(fixture(true, mixed)).await;
         let mut result = f.runner.run("objective", None).await.unwrap();

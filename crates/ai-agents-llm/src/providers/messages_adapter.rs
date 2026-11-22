@@ -114,7 +114,7 @@ fn choice(choice: &ToolChoice) -> Option<FunctionChoice> {
 }
 
 pub(super) fn supports_choice(
-    client: &MessagesClient,
+    official: bool,
     model: &str,
     config: &LLMConfig,
     selection: &ToolChoice,
@@ -122,12 +122,7 @@ pub(super) fn supports_choice(
     choice(selection)
         .zip(options(config).ok())
         .is_some_and(|(selection, options)| {
-            allows_choice(
-                client.official(),
-                model,
-                options.thinking.as_ref(),
-                &selection,
-            )
+            allows_choice(official, model, options.thinking.as_ref(), &selection)
         })
 }
 
@@ -412,15 +407,25 @@ mod tests {
             (&official, "claude-sonnet-5-5", &adaptive, false),
             (&compatible, "claude-sonnet-5-5", &manual, true),
         ] {
-            assert!(supports_choice(client, model, config, &ToolChoice::Auto));
-            assert!(supports_choice(client, model, config, &ToolChoice::None));
+            assert!(supports_choice(
+                client.official(),
+                model,
+                config,
+                &ToolChoice::Auto
+            ));
+            assert!(supports_choice(
+                client.official(),
+                model,
+                config,
+                &ToolChoice::None
+            ));
             assert_eq!(
-                supports_choice(client, model, config, &ToolChoice::Required),
+                supports_choice(client.official(), model, config, &ToolChoice::Required),
                 forced
             );
             assert_eq!(
                 supports_choice(
-                    client,
+                    client.official(),
                     model,
                     config,
                     &ToolChoice::Specific("lookup".into())

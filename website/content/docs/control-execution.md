@@ -41,6 +41,8 @@ Tool request → scope and policy checks → human approval when required
              → final admission → implementation → execution evidence
 ```
 
+The development runtime validates tool arguments against the registered implementation's JSON Schema before approval and checks the final arguments against the live implementation before invocation. Custom tools and MCP tools should publish self-contained input schemas. Local definitions and references are supported. An unresolved reference makes the tool unavailable.
+
 Approval is bound to the reviewed operation. Modified arguments are checked again, and changed state or policy can prevent a call before invocation. Resource locking protects operations that cannot safely run together. These checks matter even when a model repeats a previously approved request.
 
 A tool also needs its host implementation. Tools such as `command`, `diagnostics`, and `web_search` require explicit host support; registering their names in YAML cannot supply that support. The [built-in tool reference](@/docs/built-in-tools.md) describes each tool's requirements.

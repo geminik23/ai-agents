@@ -599,6 +599,7 @@ Hierarchy child session snapshots store the already-loaded skill definitions inl
 | Phind | `phind` | `PHIND_API_KEY` | |
 | OpenRouter | `openrouter` | `OPENROUTER_API_KEY` | Multi-provider gateway |
 | Ollama | `ollama` | - | Local models, no key needed |
+| Ollama Cloud | `ollama-cloud` | `OLLAMA_API_KEY` | Native text and opt-in single-tool calls |
 | OpenAI-Compatible | `openai-compatible` | via `api_key_env` | Any server speaking the OpenAI protocol |
 
 ### `openai-compatible` Example

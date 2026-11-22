@@ -8,29 +8,70 @@ use std::time::{Duration, Instant, SystemTime};
 /// Live time bounds restrict an invocation tree without granting execution, accounting or restart authority.
 #[derive(Debug, Clone, Copy)]
 pub struct InvocationBounds {
-    utc: SystemTime,
-    monotonic: Instant,
+    native: Option<(SystemTime, Instant)>,
+    #[cfg(feature = "test-util")]
+    controlled: Option<Instant>,
+}
+
+#[cfg(feature = "test-util")]
+tokio::task_local! {
+    static TEST_NOW: fn() -> Instant;
 }
 
 impl InvocationBounds {
     /// Retains the original wall and monotonic limits; neither clock can extend the other.
     pub fn new(utc: SystemTime, monotonic: Instant) -> Self {
-        Self { utc, monotonic }
+        Self {
+            native: Some((utc, monotonic)),
+            #[cfg(feature = "test-util")]
+            controlled: None,
+        }
     }
 
-    /// Returns the smaller remaining allowance, including expiry after a backwards wall-clock adjustment.
+    /// A test-only monotonic deadline, read inside the same scoped clock in every spawned task.
+    #[cfg(feature = "test-util")]
+    pub fn for_test_clock(at: Instant) -> Self {
+        Self {
+            native: None,
+            controlled: Some(at),
+        }
+    }
+
+    /// Installs the test clock for controlled deadlines only. Native bounds keep both independent clocks.
+    #[cfg(feature = "test-util")]
+    pub async fn scope_test_clock<F: Future>(now: fn() -> Instant, future: F) -> F::Output {
+        TEST_NOW.scope(now, future).await
+    }
+
+    /// Samples independent restrictions at the point of use, including after an acknowledgement.
     pub fn remaining(self) -> Duration {
-        self.utc
-            .duration_since(SystemTime::now())
-            .unwrap_or_default()
-            .min(self.monotonic.saturating_duration_since(Instant::now()))
+        let native = self.native.map(|(utc, monotonic)| {
+            utc.duration_since(SystemTime::now())
+                .unwrap_or_default()
+                .min(monotonic.saturating_duration_since(Instant::now()))
+        });
+        #[cfg(feature = "test-util")]
+        if let Some(test) = self.controlled {
+            let remaining = TEST_NOW
+                .try_with(|now| test.saturating_duration_since(now()))
+                .unwrap_or_default();
+            return native.map_or(remaining, |limit| limit.min(remaining));
+        }
+        native.unwrap_or_default()
     }
 
     /// Nested work can only narrow its parent's limits.
     pub fn intersect(self, other: Self) -> Self {
         Self {
-            utc: self.utc.min(other.utc),
-            monotonic: self.monotonic.min(other.monotonic),
+            native: match (self.native, other.native) {
+                (Some((a, b)), Some((c, d))) => Some((a.min(c), b.min(d))),
+                (a, b) => a.or(b),
+            },
+            #[cfg(feature = "test-util")]
+            controlled: match (self.controlled, other.controlled) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            },
         }
     }
 }

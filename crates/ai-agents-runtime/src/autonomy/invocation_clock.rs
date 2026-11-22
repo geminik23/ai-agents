@@ -21,7 +21,7 @@ pub(crate) fn now() -> Instant {
 pub(crate) fn utc_now() -> DateTime<Utc> {
     #[cfg(test)]
     if let Ok(clock) = MANUAL.try_with(Clone::clone) {
-        return clock.utc + chrono::Duration::from_std(*clock.elapsed.lock()).unwrap();
+        return clock.utc_now();
     }
     Utc::now()
 }
@@ -58,7 +58,7 @@ pub(crate) async fn timeout<F: Future>(duration: Duration, work: F) -> Option<F:
 }
 
 #[cfg(test)]
-tokio::task_local! { static MANUAL: std::sync::Arc<ManualClock>; }
+tokio::task_local! { pub(super) static MANUAL: std::sync::Arc<ManualClock>; }
 
 #[cfg(test)]
 pub(crate) struct ManualClock {
@@ -86,12 +86,22 @@ impl ManualClock {
 
     /// Each scoped future owns its clock selection; concurrent tests and ordinary consumers remain independent.
     pub(crate) async fn scope<F: Future>(self: &std::sync::Arc<Self>, work: F) -> F::Output {
-        MANUAL.scope(self.clone(), work).await
+        MANUAL
+            .scope(
+                self.clone(),
+                ai_agents_llm::InvocationBounds::scope_test_clock(now, work),
+            )
+            .await
     }
 
     /// Returns the current manual instant without consulting elapsed host time.
     pub(crate) fn now(&self) -> Instant {
         self.monotonic + *self.elapsed.lock()
+    }
+
+    /// Projects the same controlled elapsed time onto UTC for wall-clock deadline checks.
+    pub(crate) fn utc_now(&self) -> DateTime<Utc> {
+        self.utc + chrono::Duration::from_std(*self.elapsed.lock()).unwrap()
     }
 
     /// Advancing is monotonic and wakes existing waits without changing their original deadlines.

@@ -9,6 +9,7 @@ use ai_agents_hitl::ApprovalRequest;
 impl RuntimeAgent {
     /// A framework-selected interaction retains its return position before any host response or transition effect.
     /// Clarification questions use the configured HITL deadline so timeout settlement can retire the exact exchange without semantic replay.
+    /// The original human-response clock spans publication, claim and final application.
     pub(super) async fn park_task_interaction(
         &self,
         kind: TaskInteractionKind,
@@ -80,7 +81,7 @@ impl RuntimeAgent {
             )
         };
         let expires_at = if let Some(timeout) = timeout {
-            let expiry = chrono::Utc::now()
+            let expiry = crate::autonomy::approval_clock::utc_now()
                 .checked_add_signed(
                     chrono::Duration::from_std(timeout)
                         .map_err(|_| AgentError::Config("interaction deadline overflow".into()))?,
@@ -88,7 +89,7 @@ impl RuntimeAgent {
                 .ok_or_else(|| AgentError::Config("interaction deadline overflow".into()))?;
             execution.approval_deadlines.lock().insert(
                 request_id.clone(),
-                Instant::now()
+                crate::autonomy::approval_clock::now()
                     .checked_add(timeout)
                     .ok_or_else(|| AgentError::Config("interaction deadline overflow".into()))?,
             );
@@ -293,6 +294,7 @@ impl RuntimeAgent {
     }
 
     /// A frozen executable plan keeps its review binding and both original clocks through the final adoption write.
+    /// Adoption checks the same clock pair that issued the review, independently of the parent message deadline.
     pub(super) fn validate_task_plan_review(&self, state: &TaskInteraction) -> Result<()> {
         self.validate_task_interaction_response(
             state,
@@ -304,13 +306,13 @@ impl RuntimeAgent {
             .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
         let expired = state
             .expires_at
-            .is_some_and(|expiry| chrono::Utc::now() >= expiry)
+            .is_some_and(|expiry| crate::autonomy::approval_clock::utc_now() >= expiry)
             || crate::autonomy::current_execution().is_some_and(|execution| {
                 execution
                     .approval_deadlines
                     .lock()
                     .get(id)
-                    .is_some_and(|expiry| Instant::now() >= *expiry)
+                    .is_some_and(|expiry| crate::autonomy::approval_clock::now() >= *expiry)
             });
         if expired && !crate::autonomy::suspension::timeout_approved(id) {
             return Err(AgentError::HITLTimeout);

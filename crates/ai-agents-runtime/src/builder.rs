@@ -446,12 +446,13 @@ impl AgentBuilder {
 
                 // api_key: resolve from api_key_env if specified
                 let api_key = provider_type
-                    .configured_api_key_for_protocol(
+                    .configured_api_key_at(
                         config.api_key_env.as_deref(),
                         config
                             .extra
                             .get("protocol")
                             .and_then(serde_json::Value::as_str),
+                        base_url.as_deref(),
                     )
                     .map_err(|error| AgentError::LLM(error.to_string()))?;
 
@@ -499,12 +500,13 @@ impl AgentBuilder {
 
             // api_key: resolve from api_key_env if specified
             let api_key = provider_type
-                .configured_api_key_for_protocol(
+                .configured_api_key_at(
                     config.api_key_env.as_deref(),
                     config
                         .extra
                         .get("protocol")
                         .and_then(serde_json::Value::as_str),
+                    base_url.as_deref(),
                 )
                 .map_err(|error| AgentError::LLM(error.to_string()))?;
 

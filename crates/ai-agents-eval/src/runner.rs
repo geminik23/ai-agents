@@ -120,6 +120,10 @@ impl ai_agents_core::LLMProvider for RecordingProvider {
     fn supports(&self, feature: ai_agents_core::LLMFeature) -> bool {
         self.inner.supports(feature)
     }
+    fn allows_prompt_tools(&self) -> bool {
+        self.inner.allows_prompt_tools()
+    }
+
     fn configured_tool_choice(&self) -> Option<ai_agents_core::ToolChoice> {
         self.inner.configured_tool_choice()
     }

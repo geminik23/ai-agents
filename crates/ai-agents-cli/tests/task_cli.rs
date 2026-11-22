@@ -1635,6 +1635,206 @@ spawner:
         });
 }
 
+#[test]
+fn ollama_cloud_yaml_streams_without_catalog_and_keeps_legacy_local_ollama() {
+    for cloud in [true, false] {
+        let fixture = Fixture::serve(
+            &[],
+            |_| {},
+            move |body, _, _| {
+                assert_eq!(body["model"], "fixture:chosen");
+                assert_eq!(body["stream"], cloud);
+                // Exercise local Ollama's existing blocking contract and Cloud's native NDJSON path.
+                if !cloud {
+                    return Some((
+                        "application/json",
+                        json!({
+                            "model":"fixture:chosen","created_at":"2026-11-22T00:00:00Z",
+                            "message":{"role":"assistant","content":"verified reply"},"done":true
+                        })
+                        .to_string(),
+                    ));
+                }
+                assert!(body.get("options").is_none());
+                assert!(body.get("tools").is_none());
+                Some((
+                    "application/x-ndjson",
+                    format!(
+                        "{}\n{}\n",
+                        json!({"model":"fixture:chosen","created_at":"2026-11-22T00:00:00Z","message":{"role":"assistant","content":"verified reply","thinking":"private text"},"done":false}),
+                        json!({"model":"fixture:chosen","created_at":"2026-11-22T00:00:00Z","message":{"role":"assistant","content":""},"done":true,"done_reason":"stop","prompt_eval_count":5,"eval_count":2}),
+                    ),
+                ))
+            },
+        );
+        let agent = fixture.agent("");
+        let source = std::fs::read_to_string(&agent)
+            .unwrap()
+            .replace("model: fixture", "model: fixture:chosen")
+            .replace(
+                "provider: openai-compatible",
+                if cloud {
+                    "provider: ollama-cloud"
+                } else {
+                    "provider: ollama"
+                },
+            );
+        let source = if cloud {
+            source
+        } else {
+            source
+                .replace("  api_key_env: TASK_FIXTURE_TOKEN\n", "")
+                .replace(&fixture.url, fixture.url.trim_end_matches("/v1/"))
+        };
+        std::fs::write(&agent, source).unwrap();
+        let mut args = vec!["run", agent.to_str().unwrap(), "--plain"];
+        if cloud {
+            args.push("--stream");
+        }
+        let out = fixture.run(&args, "hello\n");
+        assert_exit(&out, 0);
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("verified reply"),
+            "{out:?}"
+        );
+        assert!(!String::from_utf8_lossy(&out.stdout).contains("private text"));
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.get_calls.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[test]
+fn ollama_cloud_task_omitted_tool_choice_keeps_granted_tools_out_of_the_prompt() {
+    let fixture = Fixture::serve(
+        &[],
+        |_| {},
+        |body, _, _| {
+            assert!(body.get("tools").is_none());
+            for message in body["messages"].as_array().unwrap() {
+                assert!(!message["content"].as_str().unwrap().contains("file_write"));
+            }
+            Some(("application/json", json!({"message":{"role":"assistant","content":"done"},"done":true,"done_reason":"stop","prompt_eval_count":5,"eval_count":1}).to_string()))
+        },
+    );
+    let agent = fixture.agent(&TASK.replace("tools: []", "tools: [file_write]"));
+    let source = std::fs::read_to_string(&agent)
+        .unwrap()
+        .replace("provider: openai-compatible", "provider: ollama-cloud");
+    std::fs::write(&agent, source).unwrap();
+    let out = fixture.run(
+        &["task", "run", agent.to_str().unwrap(), "answer", "--json"],
+        "",
+    );
+    assert_exit(&out, 0);
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn ollama_cloud_malformed_or_rejected_tool_turns_have_no_effect() {
+    for failure in [
+        "malformed",
+        "unknown",
+        "multiple",
+        "prompt-only",
+        "rejected",
+        "disconnect",
+    ] {
+        let files = Fixture::new(&[]);
+        let path = files.dir.join("result.txt");
+        let target = path.clone();
+        let provider = Fixture::serve(
+            &[],
+            |_| {},
+            move |_, index, _| {
+                if index != 0 {
+                    assert_eq!(failure, "disconnect");
+                    return None;
+                }
+                let args = if failure == "malformed" {
+                    json!("not an object")
+                } else {
+                    json!({"path":target,"content":"approved content"})
+                };
+                let call = json!({"function":{"name":if failure == "unknown" {"missing_tool"} else {"file_write"}, "arguments":args}});
+                let message = if failure == "prompt-only" {
+                    json!({"role":"assistant","content":json!({"tool":"file_write","arguments":{"path":target,"content":"forged"}}).to_string()})
+                } else {
+                    let calls = if failure == "multiple" {
+                        vec![call.clone(), call]
+                    } else {
+                        vec![call]
+                    };
+                    json!({"role":"assistant","content":"","tool_calls":calls})
+                };
+                Some((
+                    "application/json",
+                    json!({"message":message,"done":true,"done_reason":"stop"}).to_string(),
+                ))
+            },
+        );
+        let task = TASK.replace("tools: []", "tools: [file_write]");
+        let task = if failure == "prompt-only" {
+            task.replace("response_contains: done", "response_contains: forged")
+        } else {
+            task
+        };
+        let agent=provider.agent(&format!("{task}  hitl: {{on_approval_required: pause_run}}\nhitl: {{default_timeout_seconds: 60, on_timeout: reject}}\ntool_security:\n  enabled: true\n  fail_closed: true\n  tools:\n    file_write:\n      write_paths: ['{}']\n",files.dir.display()));
+        let source = std::fs::read_to_string(&agent).unwrap().replace(
+            "provider: openai-compatible",
+            "provider: ollama-cloud\n  tool_choice: auto",
+        );
+        std::fs::write(&agent, source).unwrap();
+        let args = [
+            "task",
+            "run",
+            agent.to_str().unwrap(),
+            "write report",
+            "--json",
+        ];
+        let needs_approval = matches!(failure, "rejected" | "disconnect");
+        let mut answered = false;
+        let result = if needs_approval {
+            provider.interact(&args, |events, _| {
+                // Keep stdin open until the CLI acknowledges the pending approval.
+                if !answered && events.contains("approval_required") {
+                    answered = true;
+                    return Some(
+                        if failure == "disconnect" {
+                            "yes\n"
+                        } else {
+                            "no\n"
+                        }
+                        .into(),
+                    );
+                }
+                None
+            })
+        } else {
+            provider.run(&args, "")
+        };
+        assert_eq!(answered, needs_approval, "{failure}: {result:?}");
+        let events = String::from_utf8_lossy(&result.stdout);
+        assert_eq!(
+            path.exists(),
+            failure == "disconnect",
+            "{failure}: {result:?}"
+        );
+        assert_eq!(
+            events.contains("approval_required"),
+            needs_approval,
+            "{failure}: {result:?}"
+        );
+        if failure == "disconnect" {
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "approved content");
+            assert!(!result.status.success(), "{result:?}");
+        }
+        assert_eq!(
+            provider.calls.load(Ordering::SeqCst),
+            if failure == "disconnect" { 2 } else { 1 }
+        );
+    }
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn responses_task_approval_survives_process_restart_and_replays_only_the_result() {
@@ -1654,11 +1854,20 @@ fn messages_compatible_task_approval_preserves_signed_replay() {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn ollama_cloud_task_approval_and_tool_result_survive_process_restarts() {
+    for with_wire_id in [false, true] {
+        signed_tool_task_survives_restarts(ReplayProtocol::OllamaCloud { with_wire_id });
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[derive(Clone, Copy)]
 enum ReplayProtocol {
     Responses,
     Messages,
     CompatibleMessages,
+    OllamaCloud { with_wire_id: bool },
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1670,6 +1879,49 @@ fn signed_tool_task_survives_restarts(protocol: ReplayProtocol) {
         &[],
         |_| {},
         move |body, index, _| {
+            if let ReplayProtocol::OllamaCloud { with_wire_id } = protocol {
+                assert_eq!(body["model"], "fixture");
+                assert_eq!(body["stream"], false);
+                assert!(body.get("options").is_none());
+                assert_eq!(body["tools"][0]["function"]["name"], "file_write");
+                let mut call = json!({"type":"function","function":{
+                    "index":0,"name":"file_write","arguments":{"path":target,"content":"verified"}
+                }});
+                if with_wire_id {
+                    call["id"] = json!("cloud_wire_id");
+                }
+                let first = json!({"role":"assistant","content":"","thinking":"fixture-private-thinking","tool_calls":[call]});
+                let message = if index == 0 {
+                    assert!(!target.exists());
+                    first
+                } else {
+                    assert!(index <= 2);
+                    let turns = body["messages"].as_array().unwrap();
+                    let at = turns
+                        .iter()
+                        .position(|message| message["tool_calls"].is_array())
+                        .unwrap();
+                    assert_eq!(turns[at], first);
+                    let result = &turns[at + 1];
+                    assert_eq!(result["role"], "tool");
+                    assert_eq!(result["tool_name"], "file_write");
+                    assert!(
+                        result["content"]
+                            .as_str()
+                            .is_some_and(|content| !content.is_empty())
+                    );
+                    if with_wire_id {
+                        assert_eq!(result["tool_call_id"], "cloud_wire_id");
+                    } else {
+                        assert!(result.get("tool_call_id").is_none());
+                    }
+                    assert_eq!(std::fs::read_to_string(&target).unwrap(), "verified");
+                    json!({"role":"assistant","content":if index == 1 {"draft"} else {"done"}})
+                };
+                return Some(("application/json", json!({
+                    "done":true,"done_reason":"stop","message":message,"prompt_eval_count":12,"eval_count":4
+                }).to_string()));
+            }
             if !matches!(protocol, ReplayProtocol::Responses) {
                 assert_eq!(body["model"], "claude-sonnet-4-6");
                 assert_eq!(body["max_tokens"], 256);
@@ -1752,6 +2004,9 @@ fn signed_tool_task_survives_restarts(protocol: ReplayProtocol) {
     let task=TASK.replace("tools: []","tools: [file_write]").replace("completion: {response_contains: done}","completion: {all: [{response_contains: done}, {tool_called: {id: file_write, count: 1, executed: true, success: true}}]}");
     let agent=provider.agent(&format!("{task}  premature_finish: {{action: ask_user, on_unavailable: stop}}\n  max_wall_time_seconds: 600\n  restoration_timeout_ms: 5000\n  persistence: {{enabled: true}}\n  hitl: {{on_approval_required: pause_run}}\nstorage: {{type: sqlite, path: '{}'}}\nhitl: {{default_timeout_seconds: 60, on_timeout: reject}}\ntool_security:\n  enabled: true\n  fail_closed: true\n  tools:\n    file_write:\n      write_paths: ['{}']\n      overwrite_existing: false\n",db.display(), files.dir.display()));
     let (preset, model) = match protocol {
+        ReplayProtocol::OllamaCloud { .. } => {
+            ("provider: ollama-cloud\n  tool_choice: auto", "fixture")
+        }
         ReplayProtocol::Messages => (
             "provider: anthropic\n  protocol: messages\n  tool_choice: auto\n  max_tokens: 256\n  provider_options: {thinking: {type: adaptive}}",
             "claude-sonnet-4-6",

@@ -5,7 +5,7 @@ template = "docs.html"
 description = "Setup guide for all supported LLM providers."
 +++
 
-AI Agents offers 13 provider presets - from cloud APIs like OpenAI and Anthropic to local servers like Ollama and any OpenAI-compatible endpoint. This page covers setup for each one with copy-paste-ready YAML snippets.
+The development checkout offers 14 provider presets - from cloud APIs like OpenAI and Anthropic to local servers like Ollama and any OpenAI-compatible endpoint. This page covers setup for each one with copy-paste-ready YAML snippets.
 
 ---
 
@@ -18,6 +18,7 @@ AI Agents offers 13 provider presets - from cloud APIs like OpenAI and Anthropic
 | Messages-compatible | `anthropic-compatible` | Optional explicit `api_key_env` | Server-supplied model IDs |
 | Google Gemini (first-party adapter) | `google` | `GOOGLE_API_KEY` | `gemini-2.5-flash`, `gemini-2.5-pro` |
 | Ollama | `ollama` | *(none)* | `llama3.1`, `qwen3:8b`, `mistral` |
+| Ollama Cloud | `ollama-cloud` | `OLLAMA_API_KEY` | Explicit Cloud model ID |
 | DeepSeek | `deepseek` | `DEEPSEEK_API_KEY` | `deepseek-chat`, `deepseek-reasoner` |
 | Groq | `groq` | `GROQ_API_KEY` | `llama-3.3-70b-versatile` |
 | Mistral | `mistral` | `MISTRAL_API_KEY` | `mistral-large-2512`, `mistral-small-2503` |
@@ -248,6 +249,22 @@ The first-party path reports thinking tokens as completion usage and rejects an 
 `UnifiedLLMProvider::build_llm()` remains a low-level compatibility escape hatch returning the upstream `llm` crate's provider type. Calling that method directly does not use the first-party adapter or its signed-history contract. Google's OpenAI-compatible endpoint also remains outside this fix because its `extra_content.google.thought_signature` representation requires a separate compatibility path.
 
 ---
+
+## Ollama Cloud (development)
+
+Set `OLLAMA_API_KEY` and explicitly select a model available on your Ollama account.
+
+```yaml
+llm:
+  provider: ollama-cloud
+  model: deepseek-v4.1-flash
+```
+
+The preset sends native requests to `https://ollama.com/api/chat` and preserves the configured model ID. The default key is bound to the official origin. A custom base URL requires an explicitly selected credential for that endpoint. Chat can run independently of catalog availability. Plain text uses the native NDJSON stream when streaming is requested and tool choice is omitted.
+
+Use `tool_choice: auto` for a tool-capable model and grant the function through the usual YAML configuration. The framework handles at most one call per response. It validates the requested function, passes arguments to the existing tool executor and retains the exact assistant message and result binding for supported continuation. `tool_choice: none` omits tool definitions. Requests for `required` or a specific tool are rejected. YAML tool turns use the existing buffered path. Tool-shaped text stays text in ordinary, speculative and resumed turns. A configured fallback can use this preset when the active tool request can be sent natively to both providers.
+
+Omit sampling and output options to use the provider defaults. An explicit `max_tokens` maps to `options.num_predict`. Use `provider_options.think` for a boolean or a model-defined level and `provider_options.options` for native generation options. Declare mapped options only once. Cloud token usage is provider-reported and strict task cost admission requires a separate audited pricing contract. The official endpoint was verified with `deepseek-v4.1-flash` for direct text and streaming, and `glm-5.3-flash` for a YAML tool round trip. CLI process restoration was verified with a local HTTP fixture. [Direct Rust SDK](@/docs/rust-api.md#direct-ollama-cloud-sdk-development)
 
 ## Ollama
 

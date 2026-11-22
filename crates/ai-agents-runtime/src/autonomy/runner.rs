@@ -387,6 +387,7 @@ impl AutonomyRunner {
     /// Claims an exact retained composition and resumes its child action before running the parent's saved finalization path.
     /// Only a fully returned, non-pending group can transfer a configured capacity wait to the controller; rejection still settles siblings.
     /// Message frame expiry shares invocation time; run and human-response clocks retain their separate ownership.
+    /// The pending human response keeps a separate clock from the enclosing message.
     async fn resume_group(
         &self,
         snapshot: TaskRunSnapshot,
@@ -451,10 +452,10 @@ impl AutonomyRunner {
         if whole_expiry.is_some_and(|expiry| std::time::Instant::now() >= expiry) {
             return Err(TaskRunStorageError::AdmissionExpired.into());
         }
-        let expired = request_deadline.is_some_and(|expiry| std::time::Instant::now() >= expiry)
+        let expired = request_deadline.is_some_and(|expiry| approval_clock::now() >= expiry)
             || group.batch.approvals[0]
                 .expires_at
-                .is_some_and(|expiry| chrono::Utc::now() >= expiry);
+                .is_some_and(|expiry| approval_clock::utc_now() >= expiry);
         let timeout_id = (expired
             && matches!(
                 &response,
@@ -547,11 +548,10 @@ impl AutonomyRunner {
                     ))
                     .await;
                 }
-                let late = request_deadline
-                    .is_some_and(|expiry| std::time::Instant::now() >= expiry)
+                let late = request_deadline.is_some_and(|expiry| approval_clock::now() >= expiry)
                     || group.batch.approvals[0]
                         .expires_at
-                        .is_some_and(|expiry| chrono::Utc::now() >= expiry);
+                        .is_some_and(|expiry| approval_clock::utc_now() >= expiry);
                 if late && !expired {
                     execution.stop("response_timeout");
                     return Box::pin(self.finish_stopped_group(
@@ -1298,6 +1298,7 @@ impl AutonomyRunner {
 
     // The retained gate is released before optional restart preparation reacquires it; pending work remains owner-protected throughout.
     // Only controller reentry after an acknowledged response uses entry's terminal settlement; interrupted interactions retain their exact live cursor for recovery.
+    // Use the human-response clock before and after the claim; aggregate run limits retain their own clock.
     async fn resume_inner(
         &self,
         run_id: &str,
@@ -1431,10 +1432,10 @@ impl AutonomyRunner {
             return Err(TaskRunStorageError::AdmissionExpired.into());
         }
         let original_expired = approval_deadline
-            .is_some_and(|expiry| std::time::Instant::now() >= expiry)
+            .is_some_and(|expiry| approval_clock::now() >= expiry)
             || batch.approvals[0]
                 .expires_at
-                .is_some_and(|expiry| chrono::Utc::now() >= expiry);
+                .is_some_and(|expiry| approval_clock::utc_now() >= expiry);
         let timeout_id = (original_expired
             && matches!(
                 &result,
@@ -1540,11 +1541,10 @@ impl AutonomyRunner {
             execution.clone(),
             Box::pin(async {
                 // A claim or active-clock acknowledgement may cross the original pending deadline without admitting the operation.
-                let late = approval_deadline
-                    .is_some_and(|expiry| std::time::Instant::now() >= expiry)
+                let late = approval_deadline.is_some_and(|expiry| approval_clock::now() >= expiry)
                     || batch.approvals[0]
                         .expires_at
-                        .is_some_and(|expiry| chrono::Utc::now() >= expiry);
+                        .is_some_and(|expiry| approval_clock::utc_now() >= expiry);
                 if late && !original_expired {
                     let runtime = self.agent.cancel_task_batch(&owner, batch.clone()).await?;
                     execution
