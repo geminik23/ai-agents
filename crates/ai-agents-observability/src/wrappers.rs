@@ -4,9 +4,10 @@ use crate::event::{
 use crate::manager::ObservabilityManager;
 use crate::span::SpanGuard;
 use ai_agents_core::{
-    ChatMessage, LLMChunk, LLMConfig, LLMError, LLMFeature, LLMProvider, LLMResponse,
-    LLMToolRequest, Tool, ToolCallClassification, ToolChoice, ToolExecutionContext,
-    ToolPolicyBindings, ToolResult, ToolSafetyMetadata, native_observation_projection,
+    ChatMessage, ChoiceDecision, ChoiceRequest, LLMChunk, LLMConfig, LLMError, LLMFeature,
+    LLMProvider, LLMResponse, LLMToolRequest, Tool, ToolCallClassification, ToolChoice,
+    ToolExecutionContext, ToolPolicyBindings, ToolResult, ToolSafetyMetadata,
+    native_observation_projection,
 };
 use async_trait::async_trait;
 use futures::Stream;
@@ -94,6 +95,45 @@ impl ObservedLLMProvider {
 
 #[async_trait]
 impl LLMProvider for ObservedLLMProvider {
+    fn uses_choice_for_routing(&self) -> bool {
+        self.inner.uses_choice_for_routing()
+    }
+
+    fn validate_choice(&self, request: &ChoiceRequest<'_>) -> Result<(), LLMError> {
+        self.inner.validate_choice(request)
+    }
+
+    fn manages_choice_admission(&self) -> bool {
+        self.inner.manages_choice_admission()
+    }
+
+    async fn choose(&self, request: &ChoiceRequest<'_>) -> Result<ChoiceDecision, LLMError> {
+        if !self.manager.config().latency.track_llm {
+            return self.inner.choose(request).await;
+        }
+        // Choice payloads may contain application-specific labels and user input.
+        let mut span = self
+            .manager
+            .start_span(self.event_type(false), current_purpose());
+        let result = self.inner.choose(request).await;
+        match &result {
+            Ok(decision) => {
+                if let Some(tokens) = decision.usage {
+                    span.set_tokens(ObservationTokenUsage::new(
+                        tokens.prompt_tokens.into(),
+                        tokens.completion_tokens.into(),
+                        TokenUsageSource::Provider,
+                    ));
+                }
+            }
+            Err(error) => span.set_error(ObservationError::new(
+                llm_error_kind(error),
+                error.to_string(),
+            )),
+        }
+        result
+    }
+
     async fn complete(
         &self,
         messages: &[ChatMessage],

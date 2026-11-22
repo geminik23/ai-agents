@@ -1346,6 +1346,19 @@ pub fn build_llm_registry(
     fixtures: &LlmFixtureConfig,
     base_dir: &Path,
 ) -> Result<(LLMRegistry, Option<Arc<dyn LLMProvider>>)> {
+    build_llm_registry_with(spec, fixtures, base_dir, |_, provider| provider)
+}
+
+// Install scenario recording and budget layers only around providers that can actually dispatch.
+pub(crate) fn build_llm_registry_with(
+    spec: &AgentSpec,
+    fixtures: &LlmFixtureConfig,
+    base_dir: &Path,
+    prepare_generation: impl Fn(
+        &ai_agents_runtime::spec::LLMConfig,
+        Arc<dyn LLMProvider>,
+    ) -> Arc<dyn LLMProvider>,
+) -> Result<(LLMRegistry, Option<Arc<dyn LLMProvider>>)> {
     let mut registry = LLMRegistry::new();
     let aliases = if spec.llms.is_empty() {
         vec![(
@@ -1377,6 +1390,13 @@ pub fn build_llm_registry(
     let mut judge_provider = None;
 
     for (alias, config) in aliases {
+        if ai_agents_llm::providers::unified::is_choice_protocol(
+            config.extra.get("protocol").and_then(Value::as_str),
+        ) {
+            // Keep role resolution exact without opening a paid client or consuming a text fixture.
+            registry.register(alias, Arc::new(UnavailableChoiceFixture));
+            continue;
+        }
         let fixture_delay_ms = fixtures.delays_by_alias.get(&alias).copied().unwrap_or(0);
         let provider = match fixtures.mode {
             LlmFixtureMode::Mock => {
@@ -1416,7 +1436,7 @@ pub fn build_llm_registry(
         if judge_provider.is_none() {
             judge_provider = Some(provider.clone());
         }
-        registry.register(alias, provider);
+        registry.register(alias, prepare_generation(&config, provider));
     }
 
     let default_alias = spec.llm.get_default_alias();
@@ -1428,6 +1448,60 @@ pub fn build_llm_registry(
     }
 
     Ok((registry, judge_provider))
+}
+
+/// Reserves a choice-only alias in every fixture mode until evaluation supports typed decisions.
+struct UnavailableChoiceFixture;
+
+impl UnavailableChoiceFixture {
+    fn error() -> LLMError {
+        LLMError::Config("scenario evaluation does not support structured choice calls".into())
+    }
+}
+
+#[async_trait]
+impl LLMProvider for UnavailableChoiceFixture {
+    fn uses_choice_for_routing(&self) -> bool {
+        true
+    }
+
+    fn validate_choice(
+        &self,
+        _: &ai_agents_core::ChoiceRequest<'_>,
+    ) -> std::result::Result<(), LLMError> {
+        Err(Self::error())
+    }
+
+    async fn complete(
+        &self,
+        _: &[ChatMessage],
+        _: Option<&LLMConfig>,
+    ) -> std::result::Result<LLMResponse, LLMError> {
+        Err(Self::error())
+    }
+
+    async fn complete_stream(
+        &self,
+        _: &[ChatMessage],
+        _: Option<&LLMConfig>,
+    ) -> std::result::Result<
+        Box<dyn Stream<Item = std::result::Result<LLMChunk, LLMError>> + Unpin + Send>,
+        LLMError,
+    > {
+        Err(Self::error())
+    }
+
+    fn is_terminal_error(&self, _: &LLMError) -> bool {
+        true
+    }
+
+    fn provider_name(&self) -> &str {
+        "eval-unavailable-choice"
+    }
+
+    fn supports(&self, _: LLMFeature) -> bool {
+        false
+    }
 }
 
 fn build_real_provider(

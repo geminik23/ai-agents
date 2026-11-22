@@ -22,7 +22,10 @@ pub use native_history::{
     native_observation_projection, native_readable_projection, response_provider_state,
     set_response_provider_state, take_response_provider_state,
 };
-pub use traits::llm::{LLMCapability, LLMError, LLMProvider, TaskContext, ToolSelection};
+pub use traits::llm::{
+    ChoiceCandidate, ChoiceDecision, ChoiceRequest, LLMCapability, LLMError, LLMProvider,
+    TaskContext, ToolSelection,
+};
 pub use traits::memory::{IncompleteNativeExchange, Memory, MemorySnapshot};
 pub use traits::storage::{
     AgentSnapshot, AgentStorage, NoopStorage, SpawnedAgentEntry, StorageCapability,
