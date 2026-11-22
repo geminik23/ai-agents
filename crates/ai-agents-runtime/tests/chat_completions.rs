@@ -26,6 +26,10 @@ async fn fixture() -> (TcpListener, String) {
 
 // Read exactly one complete HTTP request so malformed paths or missing bodies fail the test.
 async fn receive(listener: &TcpListener) -> (TcpStream, Value, String) {
+    receive_path(listener, "/tenant/v1/chat/completions").await
+}
+
+async fn receive_path(listener: &TcpListener, path: &str) -> (TcpStream, Value, String) {
     let (mut socket, _) = listener.accept().await.unwrap();
     let mut reader = BufReader::new(&mut socket);
     let mut head = String::new();
@@ -43,7 +47,7 @@ async fn receive(listener: &TcpListener) -> (TcpStream, Value, String) {
         }
         head.push_str(&line);
     }
-    assert!(head.starts_with("POST /tenant/v1/chat/completions HTTP/1.1\r\n"));
+    assert!(head.starts_with(&format!("POST {path} HTTP/1.1\r\n")));
     let mut body = vec![0; len.unwrap()];
     reader.read_exact(&mut body).await.unwrap();
     (
@@ -513,4 +517,46 @@ async fn review_legacy_response_formats_reach_chat_wire_as_owned_fields() {
         assert_eq!(agent.chat("sample").await.unwrap().content, "{}");
     }
     server.await.unwrap();
+}
+
+#[tokio::test]
+async fn responses_sdk_preserves_items_and_reasoning_options_for_both_models() {
+    use ai_agents_llm::sdk::responses::{ResponsesClient, ResponsesRequest};
+    for model in ["gpt-6.2-astra", "gpt-6.2-sol"] {
+        let (listener, base) = fixture().await;
+        let server = tokio::spawn(async move {
+            let (mut s, body, head) = receive_path(&listener, "/tenant/v1/responses").await;
+            assert!(head.contains("authorization: bearer fixture"));
+            assert_eq!(body["model"], model);
+            assert_eq!(
+                body["reasoning"],
+                json!({"mode":"standard","effort":"future-effort"})
+            );
+            assert_eq!(body["instructions"], "brief");
+            assert_eq!(body["max_output_tokens"], 100);
+            assert_eq!(body["store"], false);
+            assert!(body.get("temperature").is_none());
+            let raw=json!({"id":"resp","status":"completed","output":[{"type":"reasoning","id":"r","encrypted_content":"opaque","summary":[]},{"type":"message","id":"m","role":"assistant","content":[{"type":"output_text","text":"visible"}]}]}).to_string();
+            s.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{raw}",
+                    raw.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        });
+        let client = ResponsesClient::new(&base, Some("fixture".into())).unwrap();
+        let mut r = ResponsesRequest::new(model, vec![json!({"role":"user","content":"hello"})]);
+        r.reasoning_mode = Some("standard".into());
+        r.reasoning_effort = Some("future-effort".into());
+        r.instructions = Some("brief".into());
+        r.max_output_tokens = Some(100);
+        let out = client.complete(&r).await.unwrap();
+        assert_eq!(out.text, "visible");
+        assert_eq!(out.output[0]["encrypted_content"], "opaque");
+        assert!(out.usage.is_none());
+        server.await.unwrap();
+    }
 }

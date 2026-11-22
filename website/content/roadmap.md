@@ -27,6 +27,8 @@ The development task support boundaries and migration from published 1.1.2 are d
 
 ## Up Next
 
+The development provider SDK supports explicit OpenAI Responses text and native function requests through Rust and YAML. See [provider support](@/docs/providers.md#openai-responses-development).
+
 | Target | Focus | Summary |
 | --- | --- | --- |
 | **1.2 development** | Generalized Autonomy Runner | YAML-configured task runs with lifecycle stages, todos, completion gates, validation loops, pause/resume, and task-run events |

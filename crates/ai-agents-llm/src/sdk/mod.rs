@@ -15,12 +15,17 @@
 //! # Ok(())
 //! # }
 //! ```
+pub(crate) mod openai;
+pub mod responses;
+// Bound one unfinished SSE frame independently of total response length.
+pub(crate) const MAX_SSE_FRAME_BYTES: usize = 1024 * 1024;
 mod stream;
+mod transport;
 mod wire;
 
 use base64::{Engine, engine::general_purpose::STANDARD};
 use futures::Stream;
-use reqwest::{Client, Url};
+use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::{pin::Pin, time::Duration};
@@ -421,56 +426,32 @@ pub type ChatStream = Pin<Box<dyn Stream<Item = Result<Event, Error>> + Send>>;
 pub enum Error {
     #[error("provider refused completion")]
     Refused,
-    #[error("invalid chat configuration: {0}")]
+    #[error("invalid provider configuration: {0}")]
     Config(String),
-    #[error("chat protocol error: {0}")]
+    #[error("provider protocol error: {0}")]
     Protocol(&'static str),
-    #[error("chat transport failed")]
+    #[error("provider transport failed")]
     Transport,
-    #[error("chat endpoint returned HTTP {0}")]
+    #[error("provider endpoint returned HTTP {0}")]
     Http(u16),
 }
 
-/// Reusable transport. Each request supplies its own settings and conversation.
+/// Reusable Chat Completions client with request-local settings.
 #[derive(Clone)]
 pub struct ChatClient {
-    client: Client,
-    endpoint: Url,
-    key: Option<String>,
+    transport: transport::Transport,
     openai_contract: bool,
 }
 impl ChatClient {
-    /// The base URL includes the API prefix (for example `https://api.openai.com/v1`).
     pub fn new(base_url: &str, api_key: Option<String>) -> Result<Self, Error> {
-        let url = Url::parse(&format!("{}/", base_url.trim_end_matches('/')))
-            .map_err(|_| Error::Config("invalid base_url".into()))?;
-        if !matches!(url.scheme(), "http" | "https")
-            || url.host().is_none()
-            || !url.username().is_empty()
-            || url.password().is_some()
-            || url.query().is_some()
-            || url.fragment().is_some()
-        {
-            return Err(Error::Config(
-                "expected an HTTP base URL without credentials, query or fragment".into(),
-            ));
-        }
-        let endpoint = url
-            .join("chat/completions")
-            .map_err(|_| Error::Config("invalid base path".into()))?;
-        let client = Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .retry(reqwest::retry::never())
-            .build()
-            .map_err(|_| Error::Transport)?;
+        let transport = transport::Transport::new(base_url, api_key, "chat/completions")?;
+        let openai_contract =
+            transport.endpoint.origin().ascii_serialization() == "https://api.openai.com";
         Ok(Self {
-            client,
-            endpoint,
-            key: api_key.filter(|k| !k.is_empty()),
-            openai_contract: url.origin().ascii_serialization() == "https://api.openai.com",
+            transport,
+            openai_contract,
         })
     }
-
     // A framework preset explicitly selects the contract, including when it uses a custom origin.
     pub(crate) fn with_openai_contract(mut self, openai: bool) -> Self {
         self.openai_contract = openai;
@@ -479,23 +460,11 @@ impl ChatClient {
 
     async fn send(&self, request: &ChatRequest, stream: bool) -> Result<reqwest::Response, Error> {
         if self.openai_contract {
-            crate::providers::openai_chat::validate(request, false)?;
+            openai::validate(request, false)?;
         }
-        let mut http = self
-            .client
-            .post(self.endpoint.clone())
-            .json(&request.body(stream)?);
-        if let Some(key) = &self.key {
-            http = http.bearer_auth(key);
-        }
-        if let Some(timeout) = request.timeout {
-            http = http.timeout(timeout);
-        }
-        let response = http.send().await.map_err(|_| Error::Transport)?;
-        if !response.status().is_success() {
-            return Err(Error::Http(response.status().as_u16()));
-        }
-        Ok(response)
+        self.transport
+            .send(&request.body(stream)?, request.timeout)
+            .await
     }
 
     /// Send one non-streaming request and return the complete assistant turn.

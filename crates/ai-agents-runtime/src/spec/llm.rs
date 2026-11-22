@@ -79,13 +79,18 @@ pub struct LLMConfig {
     /// An explicit temperature, or no temperature for a preset that requires omission.
     #[serde(
         default,
-        deserialize_with = "deserialize_temperature",
+        deserialize_with = "deserialize_explicit",
         skip_serializing_if = "Option::is_none"
     )]
     pub temperature: Option<f32>,
 
-    #[serde(default = "default_max_tokens")]
-    pub max_tokens: u32,
+    /// Explicit output ceiling. Existing YAML transports apply their historical default at construction.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_explicit",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub max_tokens: Option<u32>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_p: Option<f32>,
@@ -142,10 +147,10 @@ fn default_temperature() -> f32 {
 }
 
 // Explicit null remains invalid in YAML; only an absent field means omission.
-fn deserialize_temperature<'de, D: Deserializer<'de>>(
-    deserializer: D,
-) -> Result<Option<f32>, D::Error> {
-    f32::deserialize(deserializer).map(Some)
+fn deserialize_explicit<'de, T: Deserialize<'de>, D: Deserializer<'de>>(
+    d: D,
+) -> Result<Option<T>, D::Error> {
+    T::deserialize(d).map(Some)
 }
 
 fn default_max_tokens() -> u32 {
@@ -159,7 +164,7 @@ impl Default for LLMConfig {
             provider: "openai".to_string(),
             model: "gpt-4".to_string(),
             temperature: None,
-            max_tokens: default_max_tokens(),
+            max_tokens: None,
             top_p: None,
             base_url: None,
             api_key_env: None,
@@ -177,6 +182,17 @@ impl Default for LLMConfig {
 }
 
 impl LLMConfig {
+    /// Resolves the historical output ceiling only on declarations using a legacy or Chat path.
+    /// Newly selected protocols preserve absence unless the caller declares a ceiling.
+    pub fn effective_max_tokens(&self) -> Option<u32> {
+        self.max_tokens
+            .or_else(|| match self.extra.get("protocol") {
+                None => Some(default_max_tokens()),
+                Some(protocol) if protocol == "chat-completions" => Some(default_max_tokens()),
+                _ => None,
+            })
+    }
+
     // Only framework presets with a historical sampling default materialize it for execution.
     fn effective_temperature(&self, provider: ProviderType) -> Option<f32> {
         self.temperature
@@ -188,7 +204,7 @@ impl LLMConfig {
         let temperature = self.effective_temperature(provider);
         ai_agents_core::LLMConfig {
             temperature,
-            max_tokens: Some(self.max_tokens),
+            max_tokens: self.effective_max_tokens(),
             top_p: self.top_p,
             top_k: None,
             frequency_penalty: None,
@@ -209,6 +225,9 @@ impl super::AgentSpec {
     pub(crate) fn identity_value(&self) -> ai_agents_core::Result<serde_json::Value> {
         let mut value = serde_json::to_value(self)?;
         let normalize = |config: &LLMConfig, target: &mut serde_json::Value| {
+            if let Some(limit) = config.effective_max_tokens() {
+                target["max_tokens"] = serde_json::json!(limit);
+            }
             if config.temperature.is_none()
                 && let Ok(provider) = config.provider.parse()
                 && let Some(temperature) = config.effective_temperature(provider)
@@ -217,11 +236,15 @@ impl super::AgentSpec {
             }
         };
         if let Some(config) = self.llm.as_config() {
-            // A named registry takes precedence over the inline provider; older saved specs still include its numeric default.
-            if !self.llms.is_empty() && config.temperature.is_none() {
-                value["llm"]["temperature"] = serde_json::json!(default_temperature());
-            } else {
+            if self.llms.is_empty() {
                 normalize(config, &mut value["llm"]);
+            } else {
+                // A named registry supplies the provider. Preserve the historical numeric defaults of its inactive inline declaration.
+                let inline = &mut value["llm"];
+                inline["temperature"] =
+                    serde_json::json!(config.temperature.unwrap_or_else(default_temperature));
+                inline["max_tokens"] =
+                    serde_json::json!(config.max_tokens.unwrap_or_else(default_max_tokens));
             }
         }
         for (alias, config) in &self.llms {
@@ -311,7 +334,7 @@ disable_builtin_commands: false
         assert_eq!(config.provider, "openai");
         assert_eq!(config.model, "gpt-4");
         assert_eq!(config.temperature, None);
-        assert_eq!(config.max_tokens, 2000);
+        assert_eq!(config.effective_max_tokens(), Some(2000));
         assert_eq!(config.base_url, None);
         assert_eq!(config.api_key_env, None);
     }
@@ -366,7 +389,7 @@ max_tokens: 1000
         assert_eq!(config.provider, "openai");
         assert_eq!(config.model, "gpt-3.5-turbo");
         assert_eq!(config.temperature, Some(0.5));
-        assert_eq!(config.max_tokens, 1000);
+        assert_eq!(config.max_tokens, Some(1000));
     }
 
     #[test]
@@ -398,7 +421,7 @@ model: gpt-4
             config.to_provider_config(ProviderType::OpenAI).temperature,
             None
         );
-        assert_eq!(config.max_tokens, 2000); // default
+        assert_eq!(config.effective_max_tokens(), Some(2000)); // default
     }
 
     #[test]
@@ -470,6 +493,7 @@ model: gpt-4
                     serde_json::to_value(&loaded).unwrap()
                 );
                 let explicit = declaration(LLMConfig {
+                    max_tokens: Some(default_max_tokens()),
                     temperature: Some(0.7),
                     ..config.clone()
                 });
@@ -486,6 +510,60 @@ model: gpt-4
                 );
             }
         }
+    }
+
+    #[test]
+    fn responses_output_limit_preserves_omission_and_an_explicit_historical_default() {
+        let source = "name: Test\nsystem_prompt: hi\nllm: {default: selected}\nllms:\n  selected:\n    provider: openai\n    model: model\n    protocol: responses\n";
+        let parse = |s: &str| crate::spec::AgentSpec::from_yaml_strict(s).unwrap();
+        let omitted = parse(source);
+        let explicit = parse(&format!("{source}    max_tokens: 2000\n"));
+        for (spec, limit) in [(&omitted, None), (&explicit, Some(2000))] {
+            let loaded = parse(&serde_yaml::to_string(spec).unwrap());
+            assert_eq!(
+                loaded.llms["selected"]
+                    .to_provider_config(ProviderType::OpenAI)
+                    .max_tokens,
+                limit
+            );
+            assert_eq!(
+                spec.identity_value().unwrap(),
+                loaded.identity_value().unwrap()
+            );
+        }
+        assert_ne!(
+            omitted.identity_value().unwrap(),
+            explicit.identity_value().unwrap()
+        );
+    }
+
+    #[test]
+    fn named_registry_preserves_legacy_scope_with_an_inactive_responses_declaration() {
+        use crate::autonomy::TaskHostScope;
+        use crate::spec::AgentSpec;
+
+        let source = "name: Test\nsystem_prompt: hello\nllm: {provider: openai, model: unused, protocol: responses}\nllms:\n  default: {provider: openai, model: active, protocol: responses}\n";
+        let scope = |source: &str| {
+            let spec = AgentSpec::from_yaml_strict(source).unwrap();
+            TaskHostScope::from_spec(&spec, std::path::Path::new("."), None)
+                .unwrap()
+                .identity()
+                .to_owned()
+        };
+        let original = scope(source);
+        let legacy_inline = source.replace("model: unused,", "model: unused, max_tokens: 2000,");
+        assert_eq!(original, scope(&legacy_inline));
+        let chat = source.replace("model: active, protocol: responses", "model: active");
+        let saved_chat = legacy_inline.replace(
+            "model: active, protocol: responses",
+            "model: active, max_tokens: 2000",
+        );
+        assert_eq!(scope(&chat), scope(&saved_chat));
+        assert_ne!(original, scope(&legacy_inline.replace("2000", "1000")));
+        assert_ne!(
+            original,
+            scope(&source.replace("model: active,", "model: active, max_tokens: 2000,"))
+        );
     }
 
     #[test]

@@ -1,8 +1,6 @@
-//! Documented constraints for the official OpenAI Chat Completions endpoint.
+//! Documented constraints for the official OpenAI protocol endpoints.
 //! Model IDs stay open. Entries describe known restrictions on individual request features.
-use super::ProviderType;
 use crate::sdk::{ChatRequest, Error, Message};
-use ai_agents_core::LLMConfig;
 use serde::Deserialize;
 use serde_json::Value;
 use std::sync::LazyLock;
@@ -34,37 +32,36 @@ struct Rule {
     allows_none: bool,
 }
 
-static RULES: LazyLock<Vec<Rule>> = LazyLock::new(|| {
+static CHAT_RULES: LazyLock<Vec<Rule>> = LazyLock::new(|| {
     serde_json::from_str(include_str!("openai_chat_models.json"))
         .expect("invalid bundled OpenAI Chat rules")
 });
 
-fn rule(model: &str) -> Option<&'static Rule> {
-    RULES.iter().find(|r| r.models.iter().any(|id| id == model))
+#[derive(Clone, Copy)]
+pub(crate) enum Protocol {
+    Chat,
+    Responses,
 }
 
-// Capability reporting uses the same effort sources as the request adapter.
-// Option collisions and invalid values are rejected when constructing the actual request.
-pub(super) fn allows_tools(provider: ProviderType, model: &str, config: &LLMConfig) -> bool {
-    if provider != ProviderType::OpenAI {
-        return true;
+impl Protocol {
+    fn rule(self, model: &str) -> Option<&'static Rule> {
+        let rules = match self {
+            Self::Chat => &CHAT_RULES,
+            Self::Responses => &RESPONSES_RULES,
+        };
+        rules
+            .iter()
+            .find(|rule| rule.models.iter().any(|id| id == model))
     }
-    let Some(rule) = rule(model) else { return true };
-    let effort = config
-        .reasoning_effort
-        .as_deref()
-        .or_else(|| config.extra.get("reasoning_effort").and_then(Value::as_str))
-        .or_else(|| {
-            ["extra_body", "provider_options"]
-                .iter()
-                .find_map(|key| config.extra.get(*key)?.get("reasoning_effort")?.as_str())
-        })
-        .unwrap_or(&rule.default_effort);
-    rule.tools.allows(effort)
+
+    pub(crate) fn allows_tools(self, model: &str, effort: Option<&str>) -> bool {
+        self.rule(model)
+            .is_none_or(|rule| rule.tools.allows(effort.unwrap_or(&rule.default_effort)))
+    }
 }
 
 pub(crate) fn validate(request: &ChatRequest, native_tools: bool) -> Result<(), Error> {
-    let Some(rule) = rule(&request.model) else {
+    let Some(rule) = Protocol::Chat.rule(&request.model) else {
         return Ok(());
     };
     let effort = request
@@ -111,6 +108,33 @@ pub(crate) fn validate(request: &ChatRequest, native_tools: bool) -> Result<(), 
             "{} requires the Responses API for native tool calls with reasoning_effort {effort}",
             request.model
         )));
+    }
+    Ok(())
+}
+
+static RESPONSES_RULES: LazyLock<Vec<Rule>> = LazyLock::new(|| {
+    serde_json::from_str(include_str!("openai_responses_models.json"))
+        .expect("invalid Responses rules")
+});
+
+pub(super) fn validate_responses(r: &super::responses::ResponsesRequest) -> Result<(), Error> {
+    if let Some(rule) = Protocol::Responses.rule(&r.model) {
+        let effort = r
+            .reasoning_effort
+            .as_deref()
+            .unwrap_or(&rule.default_effort);
+        if !rule.tools.allows(effort) && (!r.functions.is_empty() || r.tool_choice.is_some()) {
+            return Err(Error::Config(
+                "unsupported Responses native tools for the selected model and effort".into(),
+            ));
+        }
+        if (effort == "none" && !rule.allows_none)
+            || (!rule.sampling.allows(effort) && (r.temperature.is_some() || r.top_p.is_some()))
+        {
+            return Err(Error::Config(
+                "unsupported sampling or effort for the selected Responses model".into(),
+            ));
+        }
     }
     Ok(())
 }

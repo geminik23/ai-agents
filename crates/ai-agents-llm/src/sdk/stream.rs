@@ -136,7 +136,7 @@ impl Assembly {
 
 /// Pull from the HTTP body only as the consumer polls. CR/LF and UTF-8 may span network reads.
 pub(super) fn decode<B, E>(
-    mut bytes: impl futures::Stream<Item = Result<B, E>> + Unpin + Send + 'static,
+    bytes: impl futures::Stream<Item = Result<B, E>> + Unpin + Send + 'static,
     expected: super::ExpectedCalls,
 ) -> ChatStream
 where
@@ -144,43 +144,16 @@ where
     E: Send + 'static,
 {
     Box::pin(async_stream::try_stream! {
-        let mut line = Vec::new();
-        let mut data = String::new();
-        let mut skip_lf = false;
+        let mut frames = super::transport::frames(bytes);
         let mut assembly = Assembly::default();
-        while let Some(chunk) = bytes.next().await {
-            for &byte in chunk.map_err(|_| Error::Transport)?.as_ref() {
-                if std::mem::take(&mut skip_lf) && byte == b'\n' {
-                    continue;
+        while let Some(frame) = frames.next().await {
+            if let Some(event) = assembly.accept(&frame?)? {
+                if let Event::Finished { tool_calls, .. } = &event {
+                    expected.check(tool_calls)?;
+                    yield event;
+                    return;
                 }
-                if byte != b'\r' && byte != b'\n' {
-                    if data.len() + line.len() >= crate::MAX_SSE_FRAME_BYTES {
-                        Err(Error::Protocol("chat SSE frame exceeds the size limit"))?;
-                    }
-                    line.push(byte);
-                    continue;
-                }
-                skip_lf = byte == b'\r';
-                if line.is_empty() {
-                    if !data.is_empty() {
-                        if let Some(event) = assembly.accept(data.trim_end_matches('\n'))? {
-                            if let Event::Finished { tool_calls, .. } = &event {
-                                expected.check(tool_calls)?;
-                                yield event;
-                                return;
-                            }
-                            yield event;
-                        }
-                        data.clear();
-                    }
-                } else {
-                    let field = std::str::from_utf8(&line).map_err(|_| Error::Protocol("invalid UTF-8 in stream"))?;
-                    if let Some(value) = field.strip_prefix("data:") {
-                        data.push_str(value.strip_prefix(' ').unwrap_or(value));
-                        data.push('\n');
-                    }
-                    line.clear();
-                }
+                yield event;
             }
         }
         Err(Error::Protocol("chat stream disconnected before [DONE]"))?;

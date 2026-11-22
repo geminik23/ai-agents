@@ -55,13 +55,33 @@ The SDK reads text as it arrives. A successful stream requires a finish reason a
 
 Rust applications can also send ordered text, image URL or image bytes, and WAV/MP3 audio bytes through the [direct Chat SDK](@/docs/rust-api.md#direct-chat-completions-sdk-development). Media support depends on the chosen server/model. The framework's YAML/CLI message input remains text-based.
 
+## OpenAI Responses (development)
+
+Select the Responses endpoint explicitly for text or native functions on the OpenAI preset. The base URL includes the API prefix. Existing Chat configurations retain their selected endpoint.
+
+```yaml
+llm:
+  provider: openai
+  protocol: responses
+  model: gpt-6.2-sol
+  reasoning_effort: low
+  tool_choice: auto
+```
+
+The adapter sends ordered input items with `store: false`. An explicit YAML `max_tokens` sets `max_output_tokens`. Omission leaves the output ceiling to the endpoint. Token-limited or cost-limited evaluations require a declared output ceiling. An explicit `provider_options.reasoning.mode` or `effort` is passed through. Specify effort once. The adapter rejects unsupported options, including server conversation handles, legacy transport settings and overrides of tools, storage or output ceilings. GPT-6.2 Astra and Sol accept native functions here. Omitted sampling options stay absent. The framework uses its existing tool grants, approval and executor.
+
+The direct SDK returns ordered output items, including private encrypted reasoning when supplied. A trusted caller can append these items and its `function_call_output` with the original `call_id` to the next input. Managed tool turns retain the original items and call bindings across supported task continuation. Replay requires the same provider, API, endpoint and model. Ordinary tool-free framework turns continue from readable messages. Applications requiring encrypted reasoning continuity across tool-free turns must manage those items through the direct SDK.
+
+Text deltas are provisional. Function calls become available only on verified completion. Incomplete, failed or disconnected streams surface errors. Shared task accounting settles only complete matching final usage after consumption. Reasoning tokens are included in total output tokens. A declared pricing contract for Responses must name the actual endpoint ending in `/responses`. Reasoning-mode overrides are outside the audited hard-priced class. [Direct Rust API](@/docs/rust-api.md#direct-responses-sdk-development)
+
 ## Declared-priced task capabilities (development only)
 
 Ordinary provider support is not hard-priced task support. The development standalone Rust task runner can use an immutable host-audited `DeclaredPricing` contract installed before provider handles are captured. The same object can be declared as `llm.declared_pricing` or on a named `llms` entry; it is optional and is not forwarded as provider JSON. It does not activate YAML task entry or change the published 1.1.2 task contract.
 
 | Adapter | Priced request classes with an audited contract | Explicit limits |
 |---|---|---|
-| OpenAI | Completion, native tools, stream | Native choice follows existing adapter support |
+| OpenAI Chat Completions | Completion, native tools, stream | Native choice follows the Chat model and effort contract |
+| OpenAI Responses | Completion, native functions, text stream | Audit the full Responses endpoint separately. Complete terminal usage is required for final settlement. |
 | OpenAI-compatible | Completion, stream; native tools with explicit `function_calling: true` | The host must audit the actual server, model and reporting semantics; compatibility is not a price proof |
 | Google GenerateContent | Completion, native auto tool choice, stream | Signed native history and the normal first-party request builder are retained |
 | OpenRouter | Completion, native tools, stream | Routing and model-tier prices require a complete host contract; unknown native service options are rejected |

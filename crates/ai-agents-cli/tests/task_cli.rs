@@ -344,6 +344,27 @@ impl Fixture {
     }
 
     fn observe_requests(replies: &[&str], observe: impl Fn(&Value) + Send + 'static) -> Self {
+        Self::serve(replies, observe, |body, _, reply| {
+            let streaming = body["stream"] == true;
+            Some(if streaming {
+                (
+                    "text/event-stream",
+                    format!(
+                        "data: {}\n\ndata: [DONE]\n\n",
+                        json!({"choices":[{"delta":{"content":reply},"finish_reason":"stop"}]})
+                    ),
+                )
+            } else {
+                ("application/json",json!({"id":"fixture","choices":[{"index":0,"message":{"role":"assistant","content":reply},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}).to_string())
+            })
+        })
+    }
+
+    fn serve(
+        replies: &[&str],
+        observe: impl Fn(&Value) + Send + 'static,
+        response_body: impl Fn(&Value, usize, &str) -> Option<(&'static str, String)> + Send + 'static,
+    ) -> Self {
         let dir = std::env::temp_dir().join(format!(
             "task-cli-{}-{}",
             std::process::id(),
@@ -383,17 +404,8 @@ impl Fixture {
                 while held.load(Ordering::Acquire) && !stopped.load(Ordering::Acquire) {
                     thread::sleep(Duration::from_millis(2));
                 }
-                let streaming = body["stream"] == true;
-                let (kind, response) = if streaming {
-                    (
-                        "text/event-stream",
-                        format!(
-                            "data: {}\n\ndata: [DONE]\n\n",
-                            json!({"choices":[{"delta":{"content":reply},"finish_reason":"stop"}]})
-                        ),
-                    )
-                } else {
-                    ("application/json",json!({"id":"fixture","choices":[{"index":0,"message":{"role":"assistant","content":reply},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}).to_string())
+                let Some((kind, response)) = response_body(&body, index, &reply) else {
+                    continue;
                 };
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
@@ -1434,6 +1446,239 @@ fn task_subprocess_task_owned_child_questions_keep_one_coordinating_request() {
     assert_eq!(first.calls.load(Ordering::SeqCst), 2);
     assert_eq!(second.calls.load(Ordering::SeqCst), 2);
     assert_eq!(root.calls.load(Ordering::SeqCst), 0);
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn responses_task_approval_survives_process_restart_and_replays_only_the_result() {
+    let files = Fixture::new(&[]);
+    let path = files.dir.join("report.txt");
+    let target = path.clone();
+    let provider = Fixture::serve(
+        &[],
+        |_| {},
+        move |body, index, _| {
+            assert_eq!(body["store"], false);
+            assert!(body.get("max_output_tokens").is_none());
+            assert_eq!(body["model"], "gpt-6.2-sol");
+            let output = match index {
+                0 => {
+                    assert!(!target.exists());
+                    assert!(
+                        body["tools"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|t| t["name"] == "file_write")
+                    );
+                    json!([{"type":"reasoning","id":"rs_1","summary":[],"encrypted_content":"private-replay-fixture"},{"type":"function_call","id":"fc_item","call_id":"call_original","name":"file_write","arguments":json!({"path":target,"content":"verified"}).to_string(),"status":"completed"}])
+                }
+                1 | 2 => {
+                    let items = body["input"].as_array().unwrap();
+                    let start = items.iter().position(|x| x["id"] == "rs_1").unwrap();
+                    assert_eq!(items[start + 1]["id"], "fc_item");
+                    assert_eq!(items[start + 2]["type"], "function_call_output");
+                    assert_eq!(items[start + 2]["call_id"], "call_original");
+                    assert_eq!(std::fs::read_to_string(&target).unwrap(), "verified");
+                    json!([{"type":"message","id":format!("msg_{index}"),"role":"assistant","content":[{"type":"output_text","text":if index==1 {"draft"} else {"done"}}]}])
+                }
+                _ => panic!("unexpected provider replay"),
+            };
+            Some(("application/json",json!({"id":format!("resp_{index}"),"status":"completed","output":output,"usage":{"input_tokens":12,"output_tokens":4,"total_tokens":16}}).to_string()))
+        },
+    );
+    let db = provider.dir.join("responses.sqlite");
+    let task=TASK.replace("tools: []","tools: [file_write]").replace("completion: {response_contains: done}","completion: {all: [{response_contains: done}, {tool_called: {id: file_write, count: 1, executed: true, success: true}}]}");
+    let agent=provider.agent(&format!("{task}  premature_finish: {{action: ask_user, on_unavailable: stop}}\n  max_wall_time_seconds: 600\n  restoration_timeout_ms: 5000\n  persistence: {{enabled: true}}\n  hitl: {{on_approval_required: pause_run}}\nstorage: {{type: sqlite, path: '{}'}}\nhitl: {{default_timeout_seconds: 60, on_timeout: reject}}\ntool_security:\n  enabled: true\n  fail_closed: true\n  tools:\n    file_write:\n      write_paths: ['{}']\n      overwrite_existing: false\n",db.display(), files.dir.display()));
+    let source = std::fs::read_to_string(&agent)
+        .unwrap()
+        .replace(
+            "provider: openai-compatible",
+            "provider: openai\n  protocol: responses\n  tool_choice: auto",
+        )
+        .replace("model: fixture", "model: gpt-6.2-sol");
+    std::fs::write(&agent, source).unwrap();
+    let agent_path = agent.to_str().unwrap();
+    let seed = provider.run(
+        &[
+            "task",
+            "run",
+            agent_path,
+            "write report",
+            "--non-interactive",
+            "--json",
+        ],
+        "",
+    );
+    if !assert_configured_seed(&provider, &seed, 3, &agent, &db) {
+        return;
+    }
+    let saved: Value = serde_json::from_str(
+        String::from_utf8_lossy(&seed.stdout)
+            .lines()
+            .last()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(saved["status"], "paused");
+    assert_eq!(saved["counters"]["llm_attempts"], 1);
+    assert!(!path.exists());
+    assert!(!String::from_utf8_lossy(&seed.stdout).contains("private-replay-fixture"));
+    let id = saved["run_id"].as_str().unwrap();
+    let revision = saved["revision"].as_u64().unwrap().to_string();
+    let stale = (saved["revision"].as_u64().unwrap() - 1).to_string();
+    let rejected = provider.run(
+        &[
+            "task",
+            "resume",
+            agent_path,
+            id,
+            "--revision",
+            &stale,
+            "--json",
+        ],
+        "yes\nyes\n",
+    );
+    assert_exit(&rejected, 2);
+    assert!(!path.exists());
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    let resume = |rev: &str, input: &str| {
+        provider.run(
+            &[
+                "task",
+                "resume",
+                agent_path,
+                id,
+                "--revision",
+                rev,
+                "--json",
+            ],
+            input,
+        )
+    };
+    let between = resume(&revision, "yes\nyes\n");
+    assert_exit(&between, 3);
+    let last_result = |out: &Output| {
+        serde_json::from_str::<Value>(String::from_utf8_lossy(&out.stdout).lines().last().unwrap())
+            .unwrap()
+    };
+    let paused = last_result(&between);
+    assert_eq!(paused["status"], "paused");
+    assert_eq!(paused["counters"]["llm_attempts"], 2);
+    assert_eq!(paused["counters"]["tool_attempts"], 1);
+    let expiry = |out: &Output| {
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .find(|v| v["kind"] == "task_paused")
+            .unwrap()["data"]["clocks"]["expires_at"]
+            .clone()
+    };
+    assert!(expiry(&seed).is_string());
+    assert_eq!(expiry(&seed), expiry(&between));
+    let result = resume(&paused["revision"].to_string(), "yes\ncontinue\n");
+    assert_exit(&result, 0);
+    let done: Value = serde_json::from_str(
+        String::from_utf8_lossy(&result.stdout)
+            .lines()
+            .last()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(done["run_id"], id);
+    assert_eq!(done["status"], "completed");
+    assert_eq!(done["counters"]["llm_attempts"], 3);
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 3);
+    assert_eq!(done["counters"]["tool_attempts"], 1);
+    assert!(!String::from_utf8_lossy(&result.stdout).contains("private-replay-fixture"));
+}
+#[test]
+fn responses_task_failure_respects_tool_effects_and_never_replays() {
+    for failure in ["malformed", "rejected", "disconnect"] {
+        let files = Fixture::new(&[]);
+        let path = files.dir.join("result.txt");
+        let target = path.clone();
+        let provider = Fixture::serve(
+            &[],
+            |_| {},
+            move |_, index, _| {
+                if index > 0 && failure == "disconnect" {
+                    assert_eq!(
+                        std::fs::read_to_string(&target).unwrap(),
+                        "approved content"
+                    );
+                    return None; // Drop the HTTP connection after the tool effect.
+                }
+                let output = if index == 0 {
+                    let arguments = if failure == "malformed" {
+                        "{".to_owned()
+                    } else {
+                        json!({"path":target,"content":"approved content"}).to_string()
+                    };
+                    json!([{"type":"function_call","id":"item","call_id":"call","name":"file_write","arguments":arguments}])
+                } else {
+                    json!([{"type":"message","id":"m","role":"assistant","content":[{"type":"output_text","text":"done"}]}])
+                };
+                Some((
+                    "application/json",
+                    json!({"id":format!("r{index}"),"status":"completed","output":output})
+                        .to_string(),
+                ))
+            },
+        );
+        let task = TASK.replace("tools: []", "tools: [file_write]");
+        let agent=provider.agent(&format!("{task}  hitl: {{on_approval_required: pause_run}}\nhitl: {{default_timeout_seconds: 60, on_timeout: reject}}\ntool_security:\n  enabled: true\n  fail_closed: true\n  tools:\n    file_write:\n      write_paths: ['{}']\n",files.dir.display()));
+        let source = std::fs::read_to_string(&agent)
+            .unwrap()
+            .replace(
+                "provider: openai-compatible",
+                "provider: openai\n  protocol: responses\n  tool_choice: auto",
+            )
+            .replace("model: fixture", "model: gpt-6.2-astra");
+        let db = provider.dir.join("journal.sqlite");
+        std::fs::write(
+            &agent,
+            format!(
+                "{source}\nstorage: {{type: sqlite, path: '{}'}}\n",
+                db.display()
+            ),
+        )
+        .unwrap();
+        let result = provider.run(
+            &[
+                "task",
+                "run",
+                agent.to_str().unwrap(),
+                "write report",
+                "--json",
+            ],
+            if failure == "disconnect" {
+                "yes\n"
+            } else {
+                "no\n"
+            },
+        );
+        assert_eq!(path.exists(), failure == "disconnect");
+        let events = String::from_utf8_lossy(&result.stdout);
+        if failure == "disconnect" {
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+            let listed = provider.run(&["task", "list", agent.to_str().unwrap(), "--json"], "");
+            assert_exit(&listed, 0);
+            let runs: Value = serde_json::from_slice(&listed.stdout).unwrap();
+            let id = runs[0]["key"]["run_id"].as_str().unwrap();
+            let show = provider.run(&["task", "show", agent.to_str().unwrap(), id, "--json"], "");
+            assert_exit(&show, 0);
+            let view: Value = serde_json::from_slice(&show.stdout).unwrap();
+            assert_eq!(view["counters"]["tool_attempts"], 1);
+            assert_eq!(view["counters"]["llm_attempts"], 2);
+            assert_ne!(view["summary"]["status"], "completed");
+        } else if failure == "malformed" {
+            assert!(!events.contains("approval_required"));
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        } else {
+            assert!(events.contains("approval_required"), "{events}");
+        }
+    }
 }
 
 #[test]

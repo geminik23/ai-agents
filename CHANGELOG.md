@@ -3,6 +3,7 @@
 ## Unreleased
 
 ### Added
+- OpenAI Responses: call the stateless Responses API from Rust or YAML, stream text, and resume approved native functions with their original call IDs and provider history
 - Chat Completions: call OpenAI-compatible endpoints from Rust with text, image and audio inputs, stream incremental text, and pass completed function calls through the framework adapter
 - Live task examples: run provider-backed analysis, synthetic corpus research, retained support confirmation and reviewed incident escalation through shared application and evaluation hosts, with evaluation budgets separate from ordinary application settings
 - Task invocation settings: development Rust and CLI callers can override one task or skill profile while preserving required reviews, host ceilings and settings across retained or explicitly prepared continuation
@@ -45,6 +46,7 @@
 - Task validation: development-only tri-state checks, tool/fallback/child observation continuation and external signals preserve post-turn controller progress; fixed host permits and single logical journal charges survive re-pause, without adding a second executor or inferring completion from unavailable evidence
 
 ### Changed
+- Model output limits: Rust agent declarations use `Option<u32>` for `max_tokens` to preserve Responses omission and existing Chat limits
 - OpenAI Chat: preserve omitted sampling options, validate documented model and effort restrictions, and keep the compatible-server temperature default. Rust agent specifications use `Option<f32>` for `temperature`.
 - Rust command compatibility: command response literals include a defaulted execution state; legacy exited observations remain compatible while ambiguous interruptions retain recovery protection
 - Observation privacy: approval completion events retain decision states rather than free-form reasons, and tool arguments or copied failure bodies follow their respective disclosure opt-ins

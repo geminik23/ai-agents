@@ -1,0 +1,6 @@
+[
+  {
+    "models": ["gpt-6.2-astra", "gpt-6.2-sol"],
+    "sampling": "never", "tools": "always", "default_effort": "medium", "allows_none": false
+  }
+]
