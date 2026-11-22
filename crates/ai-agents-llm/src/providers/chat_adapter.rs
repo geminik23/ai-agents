@@ -12,19 +12,7 @@ use ai_agents_core::{
 use serde_json::Value;
 use std::time::Duration;
 
-pub(super) fn error(e: sdk::Error) -> LLMError {
-    match e {
-        sdk::Error::Config(msg) => LLMError::Config(msg),
-        sdk::Error::Protocol(msg) => LLMError::Serialization(msg.into()),
-        sdk::Error::Refused => LLMError::ContentFiltered("provider refused completion".into()),
-        sdk::Error::Transport => LLMError::Network("chat transport failed".into()),
-        sdk::Error::Http(429) => LLMError::RateLimit { retry_after: None },
-        sdk::Error::Http(code) => LLMError::API {
-            message: format!("chat endpoint returned HTTP {code}"),
-            status: Some(code),
-        },
-    }
-}
+use super::sdk_error as error;
 
 fn append_message(
     out: &mut Vec<sdk::Message>,
@@ -193,7 +181,7 @@ pub(super) fn request(
             .get("openai_enable_web_search")
             .and_then(Value::as_bool)
             == Some(true);
-        super::openai_chat::validate(&request, tools.is_some() || hosted_search).map_err(error)?;
+        super::openai::validate(&request, tools.is_some() || hosted_search).map_err(error)?;
     }
     if requires_legacy(cfg)? {
         if extra.contains_key("provider_options") || extra.contains_key("protocol") {

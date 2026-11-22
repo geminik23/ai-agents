@@ -1,3 +1,4 @@
+use ai_agents_core::autonomy::{ProviderCostBound, ProviderCostSettlement, ProviderRequest};
 use ai_agents_core::{
     ChatMessage, FinishReason, LLMChunk, LLMConfig, LLMError, LLMFeature, LLMProvider, LLMResponse,
     LLMToolDefinition, LLMToolRequest, Role, TokenUsage, ToolCall, ToolChoice,
@@ -15,8 +16,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use super::chat_adapter;
 use super::google::GoogleProvider;
 use super::pricing::DeclaredPricing;
-use crate::sdk::ChatClient;
-use ai_agents_core::autonomy::{ProviderCostBound, ProviderCostSettlement, ProviderRequest};
+use super::responses_adapter;
+use crate::sdk::{ChatClient, responses::ResponsesClient};
+#[derive(Clone)]
+enum OpenAiBackend {
+    Chat(ChatClient),
+    Responses(ResponsesClient),
+}
 
 #[cfg(test)]
 #[path = "pricing_tests.rs"]
@@ -162,7 +168,7 @@ pub struct UnifiedLLMProvider {
     tool_choice: Option<ToolChoice>,
     client: std::sync::Arc<tokio::sync::Mutex<Option<CachedClient>>>,
     google: Option<GoogleProvider>,
-    chat: Option<ChatClient>,
+    openai: Option<OpenAiBackend>,
     pricing: Option<DeclaredPricing>,
 }
 
@@ -526,6 +532,18 @@ fn map_provider_error(
 }
 
 impl UnifiedLLMProvider {
+    fn model_allows_tools(&self) -> bool {
+        if self.provider_type != ProviderType::OpenAI {
+            return true;
+        }
+        let protocol = match &self.openai {
+            Some(OpenAiBackend::Chat(_)) => crate::sdk::openai::Protocol::Chat,
+            Some(OpenAiBackend::Responses(_)) => crate::sdk::openai::Protocol::Responses,
+            None => return false,
+        };
+        super::openai::allows_tools(protocol, &self.model, &self.default_config)
+    }
+
     fn supports_choice_for_provider(&self, choice: &ToolChoice) -> bool {
         if self.feature_overrides.get(&LLMFeature::FunctionCalling) == Some(&false) {
             return false;
@@ -581,7 +599,7 @@ impl UnifiedLLMProvider {
                 || default_config.extra.contains_key("provider_options"))
         {
             return Err(LLMError::Config(
-                "SDK protocol/options require a Chat Completions provider".into(),
+                "SDK protocol/options require a supported provider preset".into(),
             ));
         }
         if provider_type == ProviderType::OpenAI
@@ -617,25 +635,27 @@ impl UnifiedLLMProvider {
             ));
         }
 
-        let chat = if is_chat {
-            if default_config
-                .extra
-                .get("protocol")
-                .is_some_and(|v| v.as_str() != Some("chat-completions"))
-            {
-                return Err(LLMError::Config(
-                    "unsupported Chat Completions protocol".into(),
-                ));
-            }
+        let openai = if is_chat {
+            let base = actual_base_url
+                .as_deref()
+                .unwrap_or("https://api.openai.com/v1/");
+            let key = Some(actual_api_key.clone());
             Some(
-                ChatClient::new(
-                    actual_base_url
-                        .as_deref()
-                        .unwrap_or("https://api.openai.com/v1/"),
-                    Some(actual_api_key.clone()),
-                )
-                .map_err(chat_adapter::error)?
-                .with_openai_contract(provider_type == ProviderType::OpenAI),
+                match default_config.extra.get("protocol").map(|v| v.as_str()) {
+                    None | Some(Some("chat-completions")) => OpenAiBackend::Chat(
+                        ChatClient::new(base, key)
+                            .map_err(super::sdk_error)?
+                            .with_openai_contract(provider_type == ProviderType::OpenAI),
+                    ),
+                    Some(Some("responses")) if provider_type == ProviderType::OpenAI => {
+                        OpenAiBackend::Responses(
+                            ResponsesClient::new(base, key)
+                                .map_err(super::sdk_error)?
+                                .with_official_contract(),
+                        )
+                    }
+                    _ => return Err(LLMError::Config("unsupported protocol for provider".into())),
+                },
             )
         } else {
             None
@@ -668,7 +688,7 @@ impl UnifiedLLMProvider {
             tool_choice: None,
             client: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
             google,
-            chat,
+            openai,
             pricing: None,
         };
         if let Some(pricing) = pricing {
@@ -1143,8 +1163,19 @@ impl UnifiedLLMProvider {
         Ok(self)
     }
 
+    fn accounting_adapter(&self) -> &str {
+        if matches!(self.openai, Some(OpenAiBackend::Responses(_))) {
+            "openai-responses"
+        } else {
+            self.provider_name()
+        }
+    }
+
     // Only transports whose actual endpoint selection and request-class mapping are audited participate here.
     fn priced_endpoint(&self) -> Result<String, LLMError> {
+        if let Some(OpenAiBackend::Responses(client)) = &self.openai {
+            return Ok(client.endpoint().into());
+        }
         if let Some(google) = &self.google {
             return Ok(google.accounting_endpoint().to_owned());
         }
@@ -1174,6 +1205,11 @@ impl UnifiedLLMProvider {
         &self,
         config: Option<&LLMConfig>,
     ) -> Result<Box<dyn llm::LLMProvider>, LLMError> {
+        if matches!(self.openai, Some(OpenAiBackend::Responses(_))) {
+            return Err(LLMError::Config(
+                "Responses requires the first-party SDK".into(),
+            ));
+        }
         let cfg = config.unwrap_or(&self.default_config);
         self.build_llm_with_system(cfg, None, None, None)
     }
@@ -1216,7 +1252,17 @@ impl LLMProvider for UnifiedLLMProvider {
         if let Some(google) = &self.google {
             return google.complete(messages, config).await;
         }
-        if let Some(chat) = &self.chat
+        if let Some(OpenAiBackend::Responses(client)) = &self.openai {
+            return responses_adapter::complete(
+                client,
+                &self.model,
+                messages,
+                config.unwrap_or(&self.default_config),
+                None,
+            )
+            .await;
+        }
+        if let Some(OpenAiBackend::Chat(chat)) = &self.openai
             && let Some(wire) = chat_adapter::request(
                 self.provider_type,
                 &self.model,
@@ -1226,7 +1272,7 @@ impl LLMProvider for UnifiedLLMProvider {
             )?
         {
             return chat_adapter::response(
-                chat.complete(&wire).await.map_err(chat_adapter::error)?,
+                chat.complete(&wire).await.map_err(super::sdk_error)?,
                 &self.model,
             );
         }
@@ -1299,7 +1345,17 @@ impl LLMProvider for UnifiedLLMProvider {
             )));
         }
 
-        if let Some(chat) = &self.chat
+        if let Some(OpenAiBackend::Responses(client)) = &self.openai {
+            return responses_adapter::complete(
+                client,
+                &self.model,
+                messages,
+                config.unwrap_or(&self.default_config),
+                Some(request),
+            )
+            .await;
+        }
+        if let Some(OpenAiBackend::Chat(chat)) = &self.openai
             && let Some(wire) = chat_adapter::request(
                 self.provider_type,
                 &self.model,
@@ -1309,7 +1365,7 @@ impl LLMProvider for UnifiedLLMProvider {
             )?
         {
             return chat_adapter::response(
-                chat.complete(&wire).await.map_err(chat_adapter::error)?,
+                chat.complete(&wire).await.map_err(super::sdk_error)?,
                 &self.model,
             );
         }
@@ -1369,7 +1425,16 @@ impl LLMProvider for UnifiedLLMProvider {
         if let Some(google) = &self.google {
             return google.complete_stream(messages, config).await;
         }
-        if let Some(chat) = &self.chat
+        if let Some(OpenAiBackend::Responses(client)) = &self.openai {
+            return responses_adapter::stream(
+                client,
+                &self.model,
+                messages,
+                config.unwrap_or(&self.default_config),
+            )
+            .await;
+        }
+        if let Some(OpenAiBackend::Chat(chat)) = &self.openai
             && let Some(wire) = chat_adapter::request(
                 self.provider_type,
                 &self.model,
@@ -1381,7 +1446,7 @@ impl LLMProvider for UnifiedLLMProvider {
             return Ok(Box::new(Box::pin(
                 chat.stream(&wire)
                     .await
-                    .map_err(chat_adapter::error)?
+                    .map_err(super::sdk_error)?
                     .map(chat_adapter::chunk),
             )));
         }
@@ -1427,7 +1492,7 @@ impl LLMProvider for UnifiedLLMProvider {
     fn priced_capability_identity(&self) -> Option<String> {
         self.pricing
             .as_ref()
-            .map(|pricing| pricing.identity(self.provider_name()))
+            .map(|pricing| pricing.identity(self.accounting_adapter()))
     }
 
     fn request_cost_bound(
@@ -1438,10 +1503,43 @@ impl LLMProvider for UnifiedLLMProvider {
             return Ok(None);
         };
         // Run the same conversion and local protocol validation used by dispatch before admitting any paid attempt.
+        if let Some(OpenAiBackend::Responses(client)) = &self.openai {
+            let cfg = request.config.unwrap_or(&self.default_config);
+            let wire = responses_adapter::request(
+                client,
+                &self.model,
+                request.messages,
+                cfg,
+                request.tools,
+            )?;
+            client
+                .body(&wire, request.streaming)
+                .map_err(super::sdk_error)?;
+            if wire.reasoning_mode.is_some()
+                || request
+                    .tools
+                    .is_some_and(|t| !self.supports_choice_for_provider(&t.choice))
+            {
+                return Err(LLMError::Config(
+                    "unsupported priced Responses request".into(),
+                ));
+            }
+            let mut effective = cfg.clone();
+            effective.extra.remove("protocol");
+            effective.extra.remove("provider_options");
+            effective.reasoning_effort = wire.reasoning_effort;
+            let priced = ProviderRequest {
+                config: Some(&effective),
+                ..*request
+            };
+            return pricing
+                .quote(self.accounting_adapter(), &priced, &effective)
+                .map(Some);
+        }
         if let Some(google) = &self.google {
             google.validate_priced_request(request)?;
         } else {
-            if self.chat.is_some() {
+            if self.openai.is_some() {
                 let cfg = request.config.unwrap_or(&self.default_config);
                 if let Some(wire) = chat_adapter::request(
                     self.provider_type,
@@ -1458,7 +1556,7 @@ impl LLMProvider for UnifiedLLMProvider {
                             "unsupported priced native tool choice".into(),
                         ));
                     }
-                    wire.body(request.streaming).map_err(chat_adapter::error)?;
+                    wire.body(request.streaming).map_err(super::sdk_error)?;
                     // Only extensions with the same audited semantics as a typed setting can be quoted.
                     let mut effective = cfg.clone();
                     effective.extra.remove("protocol");
@@ -1479,7 +1577,7 @@ impl LLMProvider for UnifiedLLMProvider {
                         ..*request
                     };
                     return pricing
-                        .quote(self.provider_name(), &priced, &effective)
+                        .quote(self.accounting_adapter(), &priced, &effective)
                         .map(Some);
                 }
             }
@@ -1503,7 +1601,7 @@ impl LLMProvider for UnifiedLLMProvider {
             }
         }
         pricing
-            .quote(self.provider_name(), request, &self.default_config)
+            .quote(self.accounting_adapter(), request, &self.default_config)
             .map(Some)
     }
 
@@ -1513,7 +1611,7 @@ impl LLMProvider for UnifiedLLMProvider {
         response: &LLMResponse,
     ) -> Result<Option<ProviderCostSettlement>, LLMError> {
         self.pricing.as_ref().map_or(Ok(None), |pricing| {
-            pricing.settle(self.provider_name(), bound, response)
+            pricing.settle(self.accounting_adapter(), bound, response)
         })
     }
 
@@ -1526,7 +1624,7 @@ impl LLMProvider for UnifiedLLMProvider {
             return Ok(None);
         };
         // First-party codecs attach complete usage only to an observed terminal event.
-        if self.google.is_none() && self.chat.is_none() {
+        if self.google.is_none() && self.openai.is_none() {
             return Ok(None);
         }
         let Some(usage) = usage else {
@@ -1538,7 +1636,7 @@ impl LLMProvider for UnifiedLLMProvider {
             "_ai_agents_complete_priced_usage".into(),
             serde_json::Value::Bool(true),
         );
-        pricing.settle(self.provider_name(), bound, &response)
+        pricing.settle(self.accounting_adapter(), bound, &response)
     }
 
     fn provider_name(&self) -> &str {
@@ -1563,18 +1661,16 @@ impl LLMProvider for UnifiedLLMProvider {
     }
 
     fn supports_tool_choice(&self, choice: &ToolChoice) -> bool {
-        super::openai_chat::allows_tools(self.provider_type, &self.model, &self.default_config)
-            && self.supports_choice_for_provider(choice)
+        self.model_allows_tools() && self.supports_choice_for_provider(choice)
     }
 
     fn supports(&self, feature: LLMFeature) -> bool {
-        if feature == LLMFeature::FunctionCalling
-            && !super::openai_chat::allows_tools(
-                self.provider_type,
-                &self.model,
-                &self.default_config,
-            )
+        if matches!(self.openai, Some(OpenAiBackend::Responses(_)))
+            && matches!(feature, LLMFeature::Vision | LLMFeature::JsonMode)
         {
+            return false; // The first framework Responses path accepts text and native functions.
+        }
+        if feature == LLMFeature::FunctionCalling && !self.model_allows_tools() {
             return false;
         }
         if let Some(enabled) = self.feature_overrides.get(&feature) {
@@ -1609,7 +1705,7 @@ impl LLMProvider for UnifiedLLMProvider {
     }
 
     fn is_terminal_error(&self, error: &LLMError) -> bool {
-        if self.chat.is_some() {
+        if self.openai.is_some() {
             return matches!(
                 error,
                 LLMError::Serialization(_) | LLMError::Config(_) | LLMError::ContentFiltered(_)

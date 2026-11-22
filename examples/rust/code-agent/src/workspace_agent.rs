@@ -700,7 +700,7 @@ impl WorkspaceSetup {
             return Err("maximum output tokens must be positive".into());
         }
         match &mut self.spec.llm {
-            LLMConfigOrSelector::Config(config) => config.max_tokens = tokens,
+            LLMConfigOrSelector::Config(config) => config.max_tokens = Some(tokens),
             _ => return Err("workspace example needs a direct provider configuration".into()),
         }
         self.spec.validate()?;
@@ -759,7 +759,9 @@ impl WorkspaceSetup {
 
     pub fn max_output_tokens(&self) -> u32 {
         match &self.spec.llm {
-            LLMConfigOrSelector::Config(config) => config.max_tokens,
+            LLMConfigOrSelector::Config(config) => config
+                .effective_max_tokens()
+                .expect("workspace setup uses the Chat protocol"),
             _ => unreachable!("workspace setup requires a direct provider configuration"),
         }
     }

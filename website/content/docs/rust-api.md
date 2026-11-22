@@ -1763,3 +1763,18 @@ async fn describe(base_url: &str, key: Option<String>, model: &str, png: Vec<u8>
 ```
 
 For audio use `InputPart::Audio` with `AudioFormat::Wav` or `AudioFormat::Mp3`. For plain text use `Message::User`. The client can be shared across requests; model, messages, options and function definitions belong to each request. `stream()` yields provisional `Event::Text` and then `Event::Finished` with assembled calls and optional final usage. Complete usage includes separate input/output token breakdowns when supplied by the endpoint. To continue a tool turn, carry the assistant calls in `Message::Assistant` and return each authorized result using `Message::ToolResult` with its original ID. Direct callers handle their own execution permissions and accounting. Framework hosts can use the existing YAML adapter for managed calls.
+
+## Direct Responses SDK (development)
+
+```rust
+use ai_agents_llm::sdk::responses::{ResponsesClient, ResponsesRequest};
+use serde_json::json;
+
+async fn ask(key: String, model: &str) -> Result<String, ai_agents_llm::sdk::Error> {
+    let client = ResponsesClient::new("https://api.openai.com/v1", Some(key))?;
+    let request = ResponsesRequest::new(model, vec![json!({"role":"user","content":"Hello"})]);
+    Ok(client.complete(&request).await?.text)
+}
+```
+
+The SDK's `ResponseFunction` carries a JSON Schema and optional strict flag. The caller owns tool execution and state. Use `ResponseOutput::output` for trusted replay and `text` for display. `stream()` yields provisional text followed by one finished output or an error. The framework adapter handles text and completed native calls. [Provider configuration and replay scope](@/docs/providers.md#openai-responses-development)

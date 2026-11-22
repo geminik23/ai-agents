@@ -1,7 +1,6 @@
 //! LLM providers for AI Agents framework
 
-// Bound the unfinished SSE event independently of the length of the stream.
-const MAX_SSE_FRAME_BYTES: usize = 1024 * 1024;
+use sdk::MAX_SSE_FRAME_BYTES;
 
 pub mod capability;
 mod invocation_bounds;

@@ -607,3 +607,74 @@ async fn chat_sdk_stream_billing_uses_only_a_complete_final_receipt() {
         }
     }
 }
+
+#[tokio::test]
+async fn responses_pricing_requires_its_own_endpoint_and_final_matching_usage() {
+    let added = serde_json::json!({"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"m"}});
+    let delta = serde_json::json!({"type":"response.output_text.delta","item_id":"m","output_index":0,"content_index":0,"delta":"ok"});
+    for mode in ["complete", "partial", "drop", "disconnect"] {
+        let mut terminal = serde_json::json!({"type":"response.completed","response":{"status":"completed","id":"r","output":[{"type":"message","id":"m","role":"assistant","content":[{"type":"output_text","text":"ok"}]}],"usage":{"input_tokens":10,"output_tokens":4,"total_tokens":14}}});
+        if mode == "partial" {
+            terminal["response"]["usage"]["output_tokens"] = serde_json::Value::Null;
+        }
+        let mut payload = format!("data: {added}\n\ndata: {delta}\n\n");
+        if mode != "disconnect" {
+            payload.push_str(&format!("data: {terminal}\n\n"));
+        }
+        let (base, _received) = fixture_stream(false, 1, false, Some(payload)).await;
+        let config = LLMConfig {
+            temperature: None,
+            top_p: None,
+            ..Default::default()
+        }
+        .with_extra("protocol", serde_json::json!("responses"));
+        let build = || {
+            UnifiedLLMProvider::from_spec_config(
+                ProviderType::OpenAI,
+                "fixture-model",
+                Some("fixture".into()),
+                Some(base.clone()),
+                config.clone(),
+            )
+            .unwrap()
+        };
+        assert!(build().with_declared_pricing(schedule(&base)).is_err());
+        let endpoint = format!("{}/responses", base.trim_end_matches('/'));
+        let provider = crate::managed_provider(Arc::new(
+            build().with_declared_pricing(schedule(&endpoint)).unwrap(),
+        ));
+        let ledger = Arc::new(Ledger::default());
+        let messages = [ChatMessage::user("stream")];
+        let mut stream = crate::scope_invocation_admission(
+            ledger.clone(),
+            provider.complete_stream(&messages, None),
+        )
+        .await
+        .unwrap();
+        assert!(!stream.next().await.unwrap().unwrap().is_final);
+        if mode == "drop" {
+            drop(stream);
+            assert_eq!(ledger.abandoned.load(Ordering::SeqCst), 1);
+            continue;
+        }
+        let mut failed = false;
+        while let Some(result) = stream.next().await {
+            failed |= result.is_err();
+        }
+        if mode == "disconnect" {
+            assert!(failed);
+            // The managed attempt acknowledges the error with the full reservation retained.
+            let receipts = ledger.settlements.lock();
+            assert_eq!(receipts.len(), 1);
+            assert!(receipts[0].is_none());
+        } else {
+            assert!(!failed);
+            assert_eq!(
+                ledger.settlements.lock()[0]
+                    .as_ref()
+                    .map(|r| r.charged_micro_usd),
+                (mode == "complete").then_some(16)
+            );
+        }
+    }
+}

@@ -1134,7 +1134,7 @@ impl EvalRunner {
                         BudgetProviderConfig {
                             provider: provider.provider_name().to_string(),
                             model: alias.to_string(),
-                            max_output_tokens: 2_000,
+                            max_output_tokens: Some(2_000),
                         }
                     });
                     budget.wrap(provider, config)
@@ -1970,9 +1970,9 @@ fn budget_provider_configs(spec: &AgentSpec) -> HashMap<String, BudgetProviderCo
         return HashMap::from([(
             "default".to_string(),
             BudgetProviderConfig {
+                max_output_tokens: config.effective_max_tokens(),
                 provider: config.provider,
                 model: config.model,
-                max_output_tokens: config.max_tokens,
             },
         )]);
     }
@@ -1984,7 +1984,7 @@ fn budget_provider_configs(spec: &AgentSpec) -> HashMap<String, BudgetProviderCo
                 BudgetProviderConfig {
                     provider: config.provider.clone(),
                     model: config.model.clone(),
-                    max_output_tokens: config.max_tokens,
+                    max_output_tokens: config.effective_max_tokens(),
                 },
             )
         })
