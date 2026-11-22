@@ -1,6 +1,6 @@
 use super::{Error, Value};
 use reqwest::{
-    Client, Url,
+    Client, RequestBuilder, Url,
     header::{AUTHORIZATION, HeaderMap, HeaderValue},
 };
 use std::time::Duration;
@@ -46,11 +46,21 @@ impl Transport {
         body: &Value,
         timeout: Option<Duration>,
     ) -> Result<reqwest::Response, Error> {
-        let mut http = self
-            .client
-            .post(self.endpoint.clone())
-            .headers(self.headers.clone())
-            .json(body);
+        let request = self.client.post(self.endpoint.clone()).json(body);
+        self.execute(request, timeout).await
+    }
+
+    pub(super) async fn get(&self, query: &[(&str, &str)]) -> Result<reqwest::Response, Error> {
+        let request = self.client.get(self.endpoint.clone()).query(query);
+        self.execute(request, None).await
+    }
+
+    async fn execute(
+        &self,
+        request: RequestBuilder,
+        timeout: Option<Duration>,
+    ) -> Result<reqwest::Response, Error> {
+        let mut http = request.headers(self.headers.clone());
         if let Some(timeout) = timeout {
             http = http.timeout(timeout);
         }

@@ -269,9 +269,17 @@ fn task_store_commands_manage_legacy_finite_namespace() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+#[derive(Debug, PartialEq)]
+enum FixtureRequest {
+    Generation(Value),
+    Get,
+}
+
 // Accepted sockets have platform-dependent modes; request parsing requires bounded blocking reads on every platform.
 // EOF/reset ends only this connection, while timeouts and malformed requests remain visible test failures.
-fn read_fixture_request(socket: &mut std::net::TcpStream) -> std::io::Result<Option<Value>> {
+fn read_fixture_request(
+    socket: &mut std::net::TcpStream,
+) -> std::io::Result<Option<FixtureRequest>> {
     use std::io::{Error, ErrorKind};
 
     socket.set_nonblocking(false)?;
@@ -307,9 +315,13 @@ fn read_fixture_request(socket: &mut std::net::TcpStream) -> std::io::Result<Opt
             break i + 4;
         }
     };
-    let len = std::str::from_utf8(&bytes[..end])
-        .map_err(|error| Error::new(ErrorKind::InvalidData, error))?
-        .lines()
+    let headers = std::str::from_utf8(&bytes[..end])
+        .map_err(|error| Error::new(ErrorKind::InvalidData, error))?;
+    let mut lines = headers.lines();
+    if lines.next().is_some_and(|line| line.starts_with("GET ")) {
+        return Ok(Some(FixtureRequest::Get));
+    }
+    let len = lines
         .find_map(|line| {
             line.split_once(':')
                 .filter(|(key, _)| key.eq_ignore_ascii_case("content-length"))
@@ -324,7 +336,7 @@ fn read_fixture_request(socket: &mut std::net::TcpStream) -> std::io::Result<Opt
         }
     }
     serde_json::from_slice(&bytes[end..end + len])
-        .map(Some)
+        .map(|body| Some(FixtureRequest::Generation(body)))
         .map_err(|error| Error::new(ErrorKind::InvalidData, error))
 }
 
@@ -333,6 +345,7 @@ struct Fixture {
     dir: PathBuf,
     url: String,
     calls: Arc<AtomicUsize>,
+    get_calls: Arc<AtomicUsize>,
     stop: Arc<AtomicBool>,
     gate: Arc<AtomicBool>,
     slow_output: bool,
@@ -376,6 +389,8 @@ impl Fixture {
         let url = format!("http://{}/v1/", listener.local_addr().unwrap());
         let calls = Arc::new(AtomicUsize::new(0));
         let count = calls.clone();
+        let get_calls = Arc::new(AtomicUsize::new(0));
+        let get_count = get_calls.clone();
         let stop = Arc::new(AtomicBool::new(false));
         let stopped = stop.clone();
         let gate = Arc::new(AtomicBool::new(false));
@@ -392,10 +407,18 @@ impl Fixture {
                     Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
                     Err(error) => panic!("fixture accept failed: {error}"),
                 };
-                let Some(body) =
+                let Some(request) =
                     read_fixture_request(&mut socket).expect("fixture request read failed")
                 else {
                     // A client may disconnect before sending a request; it does not stop the listener or consume a reply.
+                    continue;
+                };
+                let FixtureRequest::Generation(body) = request else {
+                    // Discovery is unavailable on this generation fixture.
+                    get_count.fetch_add(1, Ordering::SeqCst);
+                    let _ = socket.write_all(
+                        b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    );
                     continue;
                 };
                 observe(&body);
@@ -418,6 +441,7 @@ impl Fixture {
             dir,
             url,
             calls,
+            get_calls,
             stop,
             gate,
             slow_output: false,
@@ -693,6 +717,7 @@ fn chat_sampling_respects_the_yaml_provider_model_and_option_presence() {
     assert_eq!(body["temperature"], 0.7);
     assert_eq!(body["top_p"], 0.8);
     assert!(requests.lock().unwrap().is_empty());
+    assert_eq!(fixture.get_calls.load(Ordering::SeqCst), 0);
 }
 
 impl Drop for Fixture {
@@ -744,7 +769,7 @@ fn fixture_request_waits_for_fragmented_data_on_a_nonblocking_socket() {
             .recv_timeout(Duration::from_secs(5))
             .unwrap()
             .unwrap(),
-        Some(json!({}))
+        Some(FixtureRequest::Generation(json!({})))
     );
     worker.join().unwrap();
 }

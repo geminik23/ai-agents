@@ -37,7 +37,7 @@ A Rust framework for building AI agents from a single YAML specification. No cod
 
 Ordinary model-callable tools are fail-closed through explicit grants. Optional tool security adds path, command, domain, approval, timeout, and result-limit enforcement. These controls are not an OS sandbox; hosts remain responsible for deployment isolation, filesystem ownership, network egress, credentials, custom integrations, and provider-internal I/O.
 
-The development checkout includes a direct Rust Chat Completions client with ordered text, image and audio inputs, streamed text and assembled function calls. The OpenAI preset can also select the Responses API for stateless text and native function calls. Anthropic Messages supports explicit native selection, text streaming and signed tool replay. OpenAI Decisions supports typed single-choice classification in Rust and opt-in selection in `route_to_agent`. See the [provider guide](https://ai-agents.rs/docs/providers/) for framework integration.
+The development checkout includes a direct Rust Chat Completions client with ordered text, image and audio inputs, streamed text and assembled function calls. The OpenAI preset can also select the Responses API for stateless text and native function calls. Anthropic Messages supports explicit native selection, text streaming and signed tool replay. OpenAI Decisions supports typed single-choice classification in Rust and opt-in selection in `route_to_agent`. Rust applications can also list models from OpenAI, Anthropic, and Ollama Cloud without creating an agent. See the [provider guide](https://ai-agents.rs/docs/providers/) for framework integration.
 
 ## Feature Status
 

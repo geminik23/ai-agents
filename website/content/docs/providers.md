@@ -75,6 +75,10 @@ The direct SDK returns ordered output items, including private encrypted reasoni
 
 Text deltas are provisional. Function calls become available only on verified completion. Incomplete, failed or disconnected streams surface errors. Shared task accounting settles only complete matching final usage after consumption. Reasoning tokens are included in total output tokens. A declared pricing contract for Responses must name the actual endpoint ending in `/responses`. Reasoning-mode overrides are outside the audited hard-priced class. [Direct Rust API](@/docs/rust-api.md#direct-responses-sdk-development)
 
+## SDK model catalogs (development)
+
+The [direct Rust SDK](@/docs/rust-api.md#direct-model-catalog-sdk-development) lists models from the official OpenAI, Anthropic, and Ollama Cloud endpoints. Applications can use the reported IDs and metadata in a configuration interface or an inventory tool. YAML uses the explicitly configured model and runs independently of catalog availability.
+
 ## OpenAI Decisions (development)
 
 Use a choice-only preset for the orchestration routing role alongside a separate generation preset. This excerpt assumes `primary` is declared under `llms` for the main agent.
