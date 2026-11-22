@@ -1122,6 +1122,7 @@ impl RuntimeAgent {
     /// Ordinary chat retains numeric defaults, while task loops enforce only source-proven or explicitly configured limits.
     /// Legacy cursors without provenance remain finite, and a new cursor cannot resume under a different prepared policy.
     /// A completed feedback hook survives provider-capacity pauses without replaying its effects or advancing the provider iteration.
+    /// A resumed model turn derives its tool prompt from the same live protocol as a fresh turn.
     pub(super) async fn run_committed_task_loop(
         &self,
         mut state: TaskLoopState,
@@ -1176,7 +1177,7 @@ impl RuntimeAgent {
                 AgentError::Config("model loop iteration counter overflow".into())
             })?;
             *self.iteration_count.write() = state.iterations;
-            let protocol = self.main_tool_protocol(llm.as_ref(), false).await?;
+            let mut protocol = self.main_tool_protocol(llm.as_ref(), false).await?;
             let instructions = match state.prepared_instructions.take() {
                 Some(snapshot) => Some(snapshot),
                 None => self.load_work_instructions().await?,
@@ -1185,7 +1186,7 @@ impl RuntimeAgent {
                 .build_messages_with_instructions(
                     true,
                     None,
-                    protocol.choice.is_none(),
+                    protocol.uses_legacy_tool_prompt(),
                     state.iterations == 1,
                     instructions.as_deref(),
                 )
@@ -1247,7 +1248,7 @@ impl RuntimeAgent {
                 .await?
             } else {
                 self.hooks.on_llm_start(&messages).await;
-                self.complete_main_llm_with_recovery(llm.clone(), &messages, &protocol)
+                self.complete_main_llm_with_recovery(llm.clone(), &messages, &mut protocol)
                     .await?
             };
             self.hooks

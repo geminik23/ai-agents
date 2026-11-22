@@ -78,6 +78,8 @@ Propagate or handle the error, for example with `?` in a fallible host operation
 
 The original required methods of `LLMProvider`, core and extended `Memory`, `Tool`, `AgentStorage`, `AgentHooks` and `ApprovalHandler` remain available. New defaulted methods allow ordinary implementations to compile without immediately implementing task capabilities. This does not make literals of the changed message, memory, tool-context or result types source-compatible.
 
+Custom tool authors should check that `Tool::input_schema()` accepts the inputs their implementation supports, including optional fields and local references. The development runtime enforces this schema before approval and rechecks the final arguments before execution. Bundle referenced definitions with the schema. See [Control execution](@/docs/control-execution.md).
+
 Task participation requires the corresponding real capability. A custom memory implementation must preserve provenance and managed provider accounting; an ordinary storage backend does not acquire `TaskRuns` from snapshot support. Keep unsupported capability errors visible. Do not opt in merely to make admission succeed.
 
 ## YAML, stored data and reports

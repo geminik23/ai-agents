@@ -3,6 +3,7 @@
 ## Unreleased
 
 ### Added
+- Tool execution: validate arguments against the registered input schema before approval and recheck the final arguments before invocation
 - Ollama Cloud: use native chat, text streaming and single native tool calls from Rust and YAML, with approval and supported task restoration
 - Model catalogs: list models from OpenAI, Anthropic, and Ollama Cloud from the Rust SDK with provider-reported metadata and Anthropic pagination
 - OpenAI Decisions: classify text into an exact label from Rust and opt in to structured agent routing from YAML with task continuation. Scenario evals can use other providers alongside an unused Decisions alias

@@ -93,6 +93,103 @@ pub enum ProviderType {
 }
 
 impl ProviderType {
+    /// Whether this preset participates in the framework's compatibility text tool protocol.
+    pub fn allows_prompt_tools(self) -> bool {
+        self != Self::OllamaCloud
+    }
+
+    fn model_allows_tools(self, model: &str, config: &LLMConfig) -> bool {
+        if self != Self::OpenAI {
+            return true;
+        }
+        let protocol = match config.extra.get("protocol").map(serde_json::Value::as_str) {
+            None | Some(Some("chat-completions")) => crate::sdk::openai::Protocol::Chat,
+            Some(Some("responses")) => crate::sdk::openai::Protocol::Responses,
+            _ => return false,
+        };
+        super::openai::allows_tools(protocol, model, config)
+    }
+
+    /// Resolves native tool capability from declarations alone, including endpoint and model restrictions.
+    pub fn supports_native_tool_choice(
+        self,
+        model: &str,
+        config: &LLMConfig,
+        enabled: Option<bool>,
+        choice: &ToolChoice,
+    ) -> bool {
+        if !self.supports_preset_choice(enabled, choice) {
+            return false;
+        }
+        if self.uses_messages(
+            config
+                .extra
+                .get("protocol")
+                .and_then(serde_json::Value::as_str),
+        ) {
+            return messages_adapter::supports_choice(
+                self == Self::Anthropic,
+                model,
+                config,
+                choice,
+            );
+        }
+        self.model_allows_tools(model, config)
+    }
+
+    /// Checks a configured choice before opening a live client or selecting an offline fixture.
+    pub fn validate_declared_tool_choice(
+        self,
+        model: &str,
+        config: &LLMConfig,
+        enabled: Option<bool>,
+        choice: &ToolChoice,
+    ) -> Result<(), LLMError> {
+        if self.supports_native_tool_choice(model, config, enabled, choice) {
+            return Ok(());
+        }
+        if !self.allows_prompt_tools() {
+            return Err(LLMError::Config(
+                "configured choice requires native tool support".into(),
+            ));
+        }
+        if self.uses_messages(
+            config
+                .extra
+                .get("protocol")
+                .and_then(serde_json::Value::as_str),
+        ) && matches!(choice, ToolChoice::Required | ToolChoice::Specific(_))
+        {
+            return Err(LLMError::Config(
+                "configured Messages tool choice is unsupported".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn supports_preset_choice(self, enabled: Option<bool>, choice: &ToolChoice) -> bool {
+        if self == Self::OllamaCloud && matches!(choice, ToolChoice::None) {
+            return true;
+        }
+        if enabled == Some(false) {
+            return false;
+        }
+        let known_choice = matches!(
+            choice,
+            ToolChoice::Auto | ToolChoice::Required | ToolChoice::Specific(_) | ToolChoice::None
+        );
+        match self {
+            ProviderType::OpenAI | ProviderType::Anthropic | ProviderType::OpenRouter => {
+                known_choice
+            }
+            ProviderType::Google | ProviderType::OllamaCloud => matches!(choice, ToolChoice::Auto),
+            ProviderType::OpenAICompatible | ProviderType::AnthropicCompatible => {
+                enabled.unwrap_or(false) && known_choice
+            }
+            _ => false,
+        }
+    }
+
     pub fn api_key_env_var(&self) -> Option<&'static str> {
         match self {
             Self::OpenAI => Some("OPENAI_API_KEY"),
@@ -610,42 +707,17 @@ fn map_provider_error(
 
 impl UnifiedLLMProvider {
     fn model_allows_tools(&self) -> bool {
-        if self.provider_type != ProviderType::OpenAI {
-            return true;
-        }
-        let protocol = match &self.sdk {
-            Some(SdkBackend::Chat(_)) => crate::sdk::openai::Protocol::Chat,
-            Some(SdkBackend::Responses(_)) => crate::sdk::openai::Protocol::Responses,
-            _ => return false,
-        };
-        super::openai::allows_tools(protocol, &self.model, &self.default_config)
+        self.provider_type
+            .model_allows_tools(&self.model, &self.default_config)
     }
 
     fn supports_choice_for_provider(&self, choice: &ToolChoice) -> bool {
-        if self.provider_type == ProviderType::OllamaCloud && matches!(choice, ToolChoice::None) {
-            return true;
-        }
-        if self.feature_overrides.get(&LLMFeature::FunctionCalling) == Some(&false) {
-            return false;
-        }
-        let known_choice = matches!(
+        self.provider_type.supports_preset_choice(
+            self.feature_overrides
+                .get(&LLMFeature::FunctionCalling)
+                .copied(),
             choice,
-            ToolChoice::Auto | ToolChoice::Required | ToolChoice::Specific(_) | ToolChoice::None
-        );
-        match self.provider_type {
-            ProviderType::OpenAI | ProviderType::Anthropic | ProviderType::OpenRouter => {
-                known_choice
-            }
-            ProviderType::Google | ProviderType::OllamaCloud => matches!(choice, ToolChoice::Auto),
-            ProviderType::OpenAICompatible | ProviderType::AnthropicCompatible => {
-                self.feature_overrides
-                    .get(&LLMFeature::FunctionCalling)
-                    .copied()
-                    .unwrap_or(false)
-                    && known_choice
-            }
-            _ => false,
-        }
+        )
     }
 
     pub fn new(
@@ -977,24 +1049,15 @@ impl UnifiedLLMProvider {
     }
 
     fn validate_configured_tool_choice(&self) -> Result<(), LLMError> {
-        if matches!(self.sdk, Some(SdkBackend::OllamaCloud(_)))
-            && self
-                .tool_choice
-                .as_ref()
-                .is_some_and(|choice| !self.supports_choice_for_provider(choice))
-        {
-            return Err(LLMError::Config(
-                "unsupported Ollama Cloud tool choice".into(),
-            ));
-        }
-        if let Some(SdkBackend::Messages(_)) = &self.sdk
-            && let Some(choice @ (ToolChoice::Required | ToolChoice::Specific(_))) =
-                &self.tool_choice
-            && !self.supports_tool_choice(choice)
-        {
-            return Err(LLMError::Config(
-                "configured Messages tool choice is unsupported".into(),
-            ));
+        if let Some(choice) = &self.tool_choice {
+            self.provider_type.validate_declared_tool_choice(
+                &self.model,
+                &self.default_config,
+                self.feature_overrides
+                    .get(&LLMFeature::FunctionCalling)
+                    .copied(),
+                choice,
+            )?;
         }
         Ok(())
     }
@@ -2035,7 +2098,7 @@ impl LLMProvider for UnifiedLLMProvider {
     }
 
     fn allows_prompt_tools(&self) -> bool {
-        self.provider_type != ProviderType::OllamaCloud
+        self.provider_type.allows_prompt_tools()
     }
 
     fn configured_tool_choice(&self) -> Option<ToolChoice> {
@@ -2043,17 +2106,14 @@ impl LLMProvider for UnifiedLLMProvider {
     }
 
     fn supports_tool_choice(&self, choice: &ToolChoice) -> bool {
-        !self.uses_choice_for_routing()
-            && self.supports_choice_for_provider(choice)
-            && match &self.sdk {
-                Some(SdkBackend::Messages(client)) => messages_adapter::supports_choice(
-                    client,
-                    &self.model,
-                    &self.default_config,
-                    choice,
-                ),
-                _ => self.model_allows_tools(),
-            }
+        self.provider_type.supports_native_tool_choice(
+            &self.model,
+            &self.default_config,
+            self.feature_overrides
+                .get(&LLMFeature::FunctionCalling)
+                .copied(),
+            choice,
+        )
     }
 
     fn supports(&self, feature: LLMFeature) -> bool {

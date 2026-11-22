@@ -1704,6 +1704,32 @@ fn ollama_cloud_yaml_streams_without_catalog_and_keeps_legacy_local_ollama() {
 }
 
 #[test]
+fn ollama_cloud_task_omitted_tool_choice_keeps_granted_tools_out_of_the_prompt() {
+    let fixture = Fixture::serve(
+        &[],
+        |_| {},
+        |body, _, _| {
+            assert!(body.get("tools").is_none());
+            for message in body["messages"].as_array().unwrap() {
+                assert!(!message["content"].as_str().unwrap().contains("file_write"));
+            }
+            Some(("application/json", json!({"message":{"role":"assistant","content":"done"},"done":true,"done_reason":"stop","prompt_eval_count":5,"eval_count":1}).to_string()))
+        },
+    );
+    let agent = fixture.agent(&TASK.replace("tools: []", "tools: [file_write]"));
+    let source = std::fs::read_to_string(&agent)
+        .unwrap()
+        .replace("provider: openai-compatible", "provider: ollama-cloud");
+    std::fs::write(&agent, source).unwrap();
+    let out = fixture.run(
+        &["task", "run", agent.to_str().unwrap(), "answer", "--json"],
+        "",
+    );
+    assert_exit(&out, 0);
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
 fn ollama_cloud_malformed_or_rejected_tool_turns_have_no_effect() {
     for failure in [
         "malformed",

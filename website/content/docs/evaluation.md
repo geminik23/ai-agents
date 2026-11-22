@@ -197,6 +197,8 @@ Evaluation configuration is strict where a silent mistake could create false evi
 
 Use `--dry-config-check` to validate the complete non-empty suite, deferred mock routes, and referenced agent without selecting scenarios, constructing providers, or writing reports. Use `--real-llm` or `--record <FILE>` to explicitly authorize provider-backed execution. Record destinations are created and opened before a provider is constructed or called, and aliases targeting the same cassette share one synchronized writer. Record-mode streaming is rejected before the provider call because atomic stream recording is not implemented.
 
+Mock and replay use the configured preset's tool capabilities without opening a provider connection. For native-only presets, a JSON string in a text fixture remains text. Replay uses the recorded native tool request and response.
+
 Scenario env overlays mutate the process environment only while holding an exclusive guard and restore all values before releasing it. Attempts without env overlays share a read guard, so they can run together but cannot observe another attempt's temporary env values.
 
 Compatibility JSONL rows and persisted cassette records may contain additional fields so newer producers can remain readable; the human-authored suite schema remains strict.
