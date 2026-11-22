@@ -361,6 +361,10 @@ impl LLMProvider for BudgetedLlmProvider {
         }
     }
 
+    fn allows_prompt_tools(&self) -> bool {
+        self.inner.allows_prompt_tools()
+    }
+
     fn configured_tool_choice(&self) -> Option<ToolChoice> {
         self.inner.configured_tool_choice()
     }

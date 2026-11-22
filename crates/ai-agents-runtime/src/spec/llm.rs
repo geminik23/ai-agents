@@ -183,9 +183,9 @@ impl Default for LLMConfig {
 
 impl LLMConfig {
     /// Resolves the historical output ceiling only on declarations using a legacy or Chat path.
-    /// Newly selected protocols preserve absence unless the caller declares a ceiling.
+    /// Native non-Chat presets preserve absence unless the caller declares a ceiling.
     pub fn effective_max_tokens(&self) -> Option<u32> {
-        if self.uses_messages() {
+        if self.uses_messages() || self.provider.parse() == Ok(ProviderType::OllamaCloud) {
             return self.max_tokens;
         }
         self.max_tokens
@@ -210,7 +210,9 @@ impl LLMConfig {
     // Only framework presets with a historical sampling default materialize it for execution.
     fn effective_temperature(&self, provider: ProviderType) -> Option<f32> {
         self.temperature.or_else(|| {
-            (provider != ProviderType::OpenAI && !self.uses_messages()).then(default_temperature)
+            (!matches!(provider, ProviderType::OpenAI | ProviderType::OllamaCloud)
+                && !self.uses_messages())
+            .then(default_temperature)
         })
     }
 
@@ -316,6 +318,37 @@ impl LLMSelector {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A Cloud task round trip must not inject the legacy Ollama sampling and token defaults.
+    #[test]
+    fn ollama_cloud_omitted_config_and_identity_survive_yaml_round_trip() {
+        let spec = super::super::AgentSpec::from_yaml_strict(
+            "name: Cloud\nsystem_prompt: test\nllm: {provider: ollama-cloud, model: chosen}",
+        )
+        .unwrap();
+        let before = spec.identity_value().unwrap();
+        let loaded =
+            super::super::AgentSpec::from_yaml_strict(&serde_yaml::to_string(&spec).unwrap())
+                .unwrap();
+        assert_eq!(before, loaded.identity_value().unwrap());
+        assert!(before["llm"].get("temperature").is_none());
+        assert!(before["llm"].get("max_tokens").is_none());
+        let cfg = loaded
+            .llm
+            .as_config()
+            .unwrap()
+            .to_provider_config(ProviderType::OllamaCloud);
+        assert!(cfg.temperature.is_none() && cfg.max_tokens.is_none());
+        let legacy = LLMConfig {
+            provider: "ollama".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            legacy.to_provider_config(ProviderType::Ollama).temperature,
+            Some(0.7)
+        );
+        assert_eq!(legacy.effective_max_tokens(), Some(2000));
+    }
 
     #[test]
     fn test_cli_metadata_deserialize() {

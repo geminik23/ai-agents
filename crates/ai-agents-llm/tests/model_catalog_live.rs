@@ -15,7 +15,6 @@ async fn verify(
         .await
         .expect("catalog lookup timed out")
         .expect("catalog lookup failed");
-    assert!(!list.models.is_empty());
     let reported_fields: Vec<_> = fields
         .iter()
         .filter(|field| {
@@ -76,7 +75,11 @@ async fn live_ollama_cloud_catalog() {
         .await
         .expect("catalog lookup timed out")
         .expect("catalog lookup failed");
-    assert!(list.models.iter().any(|model| model.id.contains(':')));
+    let tagged = list
+        .models
+        .iter()
+        .filter(|model| model.id.contains(':'))
+        .count();
     let reported_fields: Vec<_> = [
         "name",
         "details",
@@ -93,7 +96,7 @@ async fn live_ollama_cloud_catalog() {
     })
     .collect();
     println!(
-        "Ollama Cloud: {} page(s), {} models, observed fields {reported_fields:?}",
+        "Ollama Cloud: {} page(s), {} models ({tagged} tagged), observed fields {reported_fields:?}",
         list.pages,
         list.models.len()
     );

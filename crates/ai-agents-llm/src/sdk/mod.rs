@@ -18,6 +18,7 @@
 pub mod decisions;
 pub mod messages;
 pub mod models;
+pub mod ollama;
 pub(crate) mod openai;
 pub mod responses;
 // Bound one unfinished SSE frame independently of total response length.
@@ -368,7 +369,7 @@ impl ChatRequest {
 }
 
 // Keep the decimal representation of the original f32 rather than widening it on the wire.
-fn decimal(value: f32) -> Result<Value, Error> {
+pub(crate) fn decimal(value: f32) -> Result<Value, Error> {
     value
         .to_string()
         .parse()

@@ -1764,6 +1764,23 @@ async fn describe(base_url: &str, key: Option<String>, model: &str, png: Vec<u8>
 
 For audio use `InputPart::Audio` with `AudioFormat::Wav` or `AudioFormat::Mp3`. For plain text use `Message::User`. The client can be shared across requests; model, messages, options and function definitions belong to each request. `stream()` yields provisional `Event::Text` and then `Event::Finished` with assembled calls and optional final usage. Complete usage includes separate input/output token breakdowns when supplied by the endpoint. To continue a tool turn, carry the assistant calls in `Message::Assistant` and return each authorized result using `Message::ToolResult` with its original ID. Direct callers handle their own execution permissions and accounting. Framework hosts can use the existing YAML adapter for managed calls.
 
+## Direct Ollama Cloud SDK (development)
+
+```rust
+use ai_agents_llm::sdk::{
+    Error,
+    ollama::{ChatRequest, Message, OllamaCloudClient},
+};
+
+async fn ask(key: String, model: &str) -> Result<String, Error> {
+    let client = OllamaCloudClient::new(key)?;
+    let request = ChatRequest::new(model, vec![Message::text("user", "Hello")]);
+    Ok(client.complete(&request).await?.message.content)
+}
+```
+
+Callers own the request history and tool execution. An SDK request can expose functions for automatic selection. The final assistant message contains at most one call and can be retained with its correlated tool result. `stream()` returns incremental text and a terminal event carrying the final assistant message, completion reason and reported usage. The terminal message keeps thinking separate from the text deltas. [Framework configuration](@/docs/providers.md#ollama-cloud-development)
+
 ## Direct model catalog SDK (development)
 
 `ai_agents_llm::sdk::models` provides `OpenAiCatalog`, `AnthropicCatalog`, and `OllamaCloudCatalog`. Each `list_models()` call returns the complete list in service order and the number of pages read. Each entry has the exact service model ID and provider metadata under its original JSON field names. The metadata map preserves explicit nulls and allows new fields and values.

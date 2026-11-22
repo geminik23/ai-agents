@@ -1519,12 +1519,13 @@ fn build_real_provider(
             .map(str::to_string)
     });
     let api_key = provider_type
-        .configured_api_key_for_protocol(
+        .configured_api_key_at(
             config.api_key_env.as_deref(),
             config
                 .extra
                 .get("protocol")
                 .and_then(serde_json::Value::as_str),
+            base_url.as_deref(),
         )
         .map_err(|error| EvalError::Config(error.to_string()))?;
     let mut provider = UnifiedLLMProvider::from_spec_config(
@@ -2060,6 +2061,10 @@ impl LLMProvider for RecordingLLMProvider {
         };
         self.writer.append(&record)?;
         Ok(response)
+    }
+
+    fn allows_prompt_tools(&self) -> bool {
+        self.inner.allows_prompt_tools()
     }
 
     fn configured_tool_choice(&self) -> Option<ToolChoice> {

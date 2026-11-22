@@ -16,11 +16,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use super::chat_adapter;
 use super::google::GoogleProvider;
 use super::pricing::DeclaredPricing;
-use super::{messages_adapter, responses_adapter};
+use super::{messages_adapter, ollama_adapter, responses_adapter};
 use crate::sdk::{
     ChatClient,
     decisions::{self, ChoiceOption, DecisionClient},
     messages::{self, MessagesClient},
+    ollama::OllamaCloudClient,
     responses::ResponsesClient,
 };
 #[derive(Clone)]
@@ -28,6 +29,7 @@ enum SdkBackend {
     Chat(ChatClient),
     Responses(ResponsesClient),
     Messages(MessagesClient),
+    OllamaCloud(OllamaCloudClient),
     Decisions(DecisionClient),
 }
 
@@ -65,6 +67,9 @@ pub enum ProviderType {
     AnthropicCompatible,
     /// Ollama (local models)
     Ollama,
+    /// Native Ollama Cloud chat.
+    #[serde(rename = "ollama-cloud")]
+    OllamaCloud,
     /// DeepSeek
     DeepSeek,
     /// xAI (Grok)
@@ -100,6 +105,7 @@ impl ProviderType {
             Self::Cohere => Some("COHERE_API_KEY"),
             Self::Mistral => Some("MISTRAL_API_KEY"),
             Self::OpenRouter => Some("OPENROUTER_API_KEY"),
+            Self::OllamaCloud => Some("OLLAMA_API_KEY"),
             Self::Ollama => None, // Ollama doesn't need an API key
             Self::OpenAICompatible | Self::AnthropicCompatible => None, // User specifies via api_key_env or it's optional
         }
@@ -117,18 +123,48 @@ impl ProviderType {
         variable: Option<&str>,
         protocol: Option<&str>,
     ) -> Result<Option<String>, LLMError> {
+        self.configured_api_key_at(variable, protocol, None)
+    }
+
+    /// Resolves a credential after checking provider-owned endpoint restrictions.
+    pub fn configured_api_key_at(
+        &self,
+        variable: Option<&str>,
+        protocol: Option<&str>,
+        base_url: Option<&str>,
+    ) -> Result<Option<String>, LLMError> {
+        self.check_credential_destination(variable, base_url)?;
         let Some(name) = variable else {
             return Ok(None);
         };
         match std::env::var(name) {
             Ok(key) => Ok(Some(key)),
-            Err(_) if *self == Self::OpenAI || self.uses_messages(protocol) => {
+            Err(_)
+                if matches!(*self, Self::OpenAI | Self::OllamaCloud)
+                    || self.uses_messages(protocol) =>
+            {
                 Err(LLMError::Config(format!(
                     "API key not found in configured environment variable {name}"
                 )))
             }
             Err(_) => Ok(None),
         }
+    }
+
+    fn check_credential_destination(
+        &self,
+        variable: Option<&str>,
+        base_url: Option<&str>,
+    ) -> Result<(), LLMError> {
+        if *self == Self::OllamaCloud
+            && variable == self.api_key_env_var()
+            && base_url.is_some_and(|base| !ollama_adapter::official_origin(base))
+        {
+            return Err(LLMError::Config(
+                "OLLAMA_API_KEY is bound to the official Ollama Cloud origin".into(),
+            ));
+        }
+        Ok(())
     }
 
     pub fn default_base_url(&self) -> Option<&'static str> {
@@ -163,7 +199,7 @@ impl ProviderType {
             Self::Mistral => llm::builder::LLMBackend::Mistral,
             Self::OpenAICompatible => llm::builder::LLMBackend::OpenAI, // Reuse OpenAI's OpenAI-compatible implementation
             Self::OpenRouter => llm::builder::LLMBackend::OpenRouter,
-            Self::AnthropicCompatible => return None,
+            Self::AnthropicCompatible | Self::OllamaCloud => return None,
         })
     }
 }
@@ -177,6 +213,7 @@ impl FromStr for ProviderType {
             "anthropic" => Ok(Self::Anthropic),
             "anthropic-compatible" => Ok(Self::AnthropicCompatible),
             "ollama" => Ok(Self::Ollama),
+            "ollama-cloud" => Ok(Self::OllamaCloud),
             "deepseek" => Ok(Self::DeepSeek),
             "xai" => Ok(Self::XAI),
             "phind" => Ok(Self::Phind),
@@ -585,6 +622,9 @@ impl UnifiedLLMProvider {
     }
 
     fn supports_choice_for_provider(&self, choice: &ToolChoice) -> bool {
+        if self.provider_type == ProviderType::OllamaCloud && matches!(choice, ToolChoice::None) {
+            return true;
+        }
         if self.feature_overrides.get(&LLMFeature::FunctionCalling) == Some(&false) {
             return false;
         }
@@ -596,7 +636,7 @@ impl UnifiedLLMProvider {
             ProviderType::OpenAI | ProviderType::Anthropic | ProviderType::OpenRouter => {
                 known_choice
             }
-            ProviderType::Google => matches!(choice, ToolChoice::Auto),
+            ProviderType::Google | ProviderType::OllamaCloud => matches!(choice, ToolChoice::Auto),
             ProviderType::OpenAICompatible | ProviderType::AnthropicCompatible => {
                 self.feature_overrides
                     .get(&LLMFeature::FunctionCalling)
@@ -621,9 +661,15 @@ impl UnifiedLLMProvider {
             ));
         }
         let mut config = LLMConfig::default();
-        if provider_type == ProviderType::OpenAI {
+        if matches!(
+            provider_type,
+            ProviderType::OpenAI | ProviderType::OllamaCloud
+        ) {
             config.temperature = None;
             config.top_p = None;
+        }
+        if provider_type == ProviderType::OllamaCloud {
+            config.max_tokens = None;
         }
         Self::from_spec_config(provider_type, &model, api_key, base_url, config)
     }
@@ -672,8 +718,26 @@ impl UnifiedLLMProvider {
                 "anthropic-compatible requires the Messages protocol".into(),
             ));
         }
+        let is_ollama_cloud = provider_type == ProviderType::OllamaCloud;
+        if is_ollama_cloud {
+            if protocol.is_some() {
+                return Err(LLMError::Config(
+                    "ollama-cloud selects the native chat protocol".into(),
+                ));
+            }
+            if api_key.is_none()
+                && base_url
+                    .as_deref()
+                    .is_some_and(|base| !ollama_adapter::official_origin(base))
+            {
+                return Err(LLMError::Config(
+                    "custom Ollama Cloud origin requires explicitly selected credentials".into(),
+                ));
+            }
+        }
         if !is_chat
             && !is_messages
+            && !is_ollama_cloud
             && (default_config.extra.contains_key("protocol")
                 || default_config.extra.contains_key("provider_options"))
         {
@@ -730,7 +794,12 @@ impl UnifiedLLMProvider {
             ));
         }
 
-        let sdk = if is_chat {
+        let sdk = if is_ollama_cloud {
+            Some(SdkBackend::OllamaCloud(ollama_adapter::connect(
+                actual_base_url.as_deref(),
+                actual_api_key.clone(),
+            )?))
+        } else if is_chat {
             let base = actual_base_url
                 .as_deref()
                 .unwrap_or(crate::sdk::openai::API_BASE);
@@ -849,7 +918,7 @@ impl UnifiedLLMProvider {
     pub fn with_validated_tool_choice(self, choice: ToolChoice) -> Result<Self, LLMError> {
         self.require_generation()?;
         let provider = self.with_tool_choice(choice);
-        provider.validate_messages_tool_choice()?;
+        provider.validate_configured_tool_choice()?;
         Ok(provider)
     }
 
@@ -907,7 +976,17 @@ impl UnifiedLLMProvider {
         Ok(config)
     }
 
-    fn validate_messages_tool_choice(&self) -> Result<(), LLMError> {
+    fn validate_configured_tool_choice(&self) -> Result<(), LLMError> {
+        if matches!(self.sdk, Some(SdkBackend::OllamaCloud(_)))
+            && self
+                .tool_choice
+                .as_ref()
+                .is_some_and(|choice| !self.supports_choice_for_provider(choice))
+        {
+            return Err(LLMError::Config(
+                "unsupported Ollama Cloud tool choice".into(),
+            ));
+        }
         if let Some(SdkBackend::Messages(_)) = &self.sdk
             && let Some(choice @ (ToolChoice::Required | ToolChoice::Specific(_))) =
                 &self.tool_choice
@@ -1392,7 +1471,7 @@ impl UnifiedLLMProvider {
         self.require_generation()?;
         if matches!(
             self.sdk,
-            Some(SdkBackend::Responses(_) | SdkBackend::Messages(_))
+            Some(SdkBackend::Responses(_) | SdkBackend::Messages(_) | SdkBackend::OllamaCloud(_))
         ) {
             return Err(LLMError::Config(
                 "configured protocol requires the first-party SDK".into(),
@@ -1483,8 +1562,19 @@ impl LLMProvider for UnifiedLLMProvider {
         if let Some(google) = &self.google {
             return google.complete(messages, config).await;
         }
+        if let Some(SdkBackend::OllamaCloud(client)) = &self.sdk {
+            self.validate_configured_tool_choice()?;
+            return ollama_adapter::complete(
+                client,
+                &self.model,
+                messages,
+                config.unwrap_or(&self.default_config),
+                None,
+            )
+            .await;
+        }
         if let Some(SdkBackend::Messages(client)) = &self.sdk {
-            self.validate_messages_tool_choice()?;
+            self.validate_configured_tool_choice()?;
             return messages_adapter::complete(
                 client,
                 &self.model,
@@ -1588,8 +1678,19 @@ impl LLMProvider for UnifiedLLMProvider {
             )));
         }
 
+        if let Some(SdkBackend::OllamaCloud(client)) = &self.sdk {
+            self.validate_configured_tool_choice()?;
+            return ollama_adapter::complete(
+                client,
+                &self.model,
+                messages,
+                config.unwrap_or(&self.default_config),
+                Some(request),
+            )
+            .await;
+        }
         if let Some(SdkBackend::Messages(client)) = &self.sdk {
-            self.validate_messages_tool_choice()?;
+            self.validate_configured_tool_choice()?;
             return messages_adapter::complete(
                 client,
                 &self.model,
@@ -1680,8 +1781,18 @@ impl LLMProvider for UnifiedLLMProvider {
         if let Some(google) = &self.google {
             return google.complete_stream(messages, config).await;
         }
+        if let Some(SdkBackend::OllamaCloud(client)) = &self.sdk {
+            self.validate_configured_tool_choice()?;
+            return ollama_adapter::stream(
+                client,
+                &self.model,
+                messages,
+                config.unwrap_or(&self.default_config),
+            )
+            .await;
+        }
         if let Some(SdkBackend::Messages(client)) = &self.sdk {
-            self.validate_messages_tool_choice()?;
+            self.validate_configured_tool_choice()?;
             return messages_adapter::stream(
                 client,
                 &self.model,
@@ -1910,6 +2021,7 @@ impl LLMProvider for UnifiedLLMProvider {
             ProviderType::Anthropic => "anthropic",
             ProviderType::AnthropicCompatible => "anthropic-compatible",
             ProviderType::Ollama => "ollama",
+            ProviderType::OllamaCloud => ollama_adapter::PROVIDER,
             ProviderType::DeepSeek => "deepseek",
             ProviderType::XAI => "xai",
             ProviderType::Phind => "phind",
@@ -1920,6 +2032,10 @@ impl LLMProvider for UnifiedLLMProvider {
             ProviderType::OpenAICompatible => "openai-compatible",
             ProviderType::OpenRouter => "openrouter",
         }
+    }
+
+    fn allows_prompt_tools(&self) -> bool {
+        self.provider_type != ProviderType::OllamaCloud
     }
 
     fn configured_tool_choice(&self) -> Option<ToolChoice> {
@@ -1941,6 +2057,13 @@ impl LLMProvider for UnifiedLLMProvider {
     }
 
     fn supports(&self, feature: LLMFeature) -> bool {
+        if self.provider_type == ProviderType::OllamaCloud {
+            return match feature {
+                LLMFeature::FunctionCalling => self.supports_tool_choice(&ToolChoice::Auto),
+                LLMFeature::Streaming | LLMFeature::SystemMessages => true,
+                _ => false,
+            };
+        }
         if self.uses_choice_for_routing() {
             return false;
         }
@@ -1991,6 +2114,10 @@ impl LLMProvider for UnifiedLLMProvider {
     }
 
     fn is_terminal_error(&self, error: &LLMError) -> bool {
+        // A failed Cloud exchange can have reached the remote service.
+        if self.provider_type == ProviderType::OllamaCloud {
+            return true;
+        }
         if self.sdk.is_some() {
             return matches!(
                 error,
@@ -2059,6 +2186,7 @@ impl ProviderBuilder {
         let api_key = if let Some(key) = self.api_key {
             Some(key)
         } else if let Some(env_var) = self.api_key_env {
+            provider_type.check_credential_destination(Some(&env_var), self.base_url.as_deref())?;
             Some(std::env::var(env_var).map_err(|_| {
                 LLMError::Config("API key environment variable not found".to_string())
             })?)
@@ -2081,6 +2209,32 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    #[test]
+    fn ollama_cloud_default_credential_never_resolves_at_a_custom_origin() {
+        let base = "http://127.0.0.1:1/api";
+        let error = ProviderType::OllamaCloud
+            .configured_api_key_at(Some("OLLAMA_API_KEY"), None, Some(base))
+            .unwrap_err();
+        assert!(error.to_string().contains("bound to the official"));
+        let error = UnifiedLLMProvider::new(
+            ProviderType::OllamaCloud,
+            "fixture".into(),
+            None,
+            Some(base.into()),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("explicitly selected"));
+        assert!(
+            UnifiedLLMProvider::new(
+                ProviderType::OllamaCloud,
+                "fixture".into(),
+                Some("placeholder".into()),
+                None,
+            )
+            .is_ok()
+        );
+    }
 
     #[test]
     fn test_builder() {

@@ -410,8 +410,16 @@ enum ToolCallOutcome {
 #[derive(Clone)]
 struct MainToolProtocol {
     choice: Option<ToolChoice>,
+    allow_prompt_tools: bool,
     tool_ids: Vec<String>,
     definitions: Vec<LLMToolDefinition>,
+}
+
+impl MainToolProtocol {
+    // Omitted choice uses the legacy prompt only for providers that support that protocol.
+    fn uses_legacy_tool_prompt(&self) -> bool {
+        self.choice.is_none() && self.allow_prompt_tools
+    }
 }
 
 struct MainProviderResponse {
@@ -5813,15 +5821,20 @@ impl RuntimeAgent {
         Ok(messages)
     }
 
+    // Freeze the provider's tool protocol and effective grants for the current turn.
     async fn main_tool_protocol(
         &self,
         llm: &dyn LLMProvider,
         ephemeral_new_turn: bool,
     ) -> Result<MainToolProtocol> {
         let mut choice = llm.configured_tool_choice();
-        if matches!(choice.as_ref(), Some(ToolChoice::None)) {
+        let allow_prompt_tools = llm.allows_prompt_tools();
+        if matches!(choice.as_ref(), Some(ToolChoice::None))
+            || (!allow_prompt_tools && choice.is_none())
+        {
             return Ok(MainToolProtocol {
                 choice,
+                allow_prompt_tools,
                 tool_ids: Vec::new(),
                 definitions: Vec::new(),
             });
@@ -5893,6 +5906,7 @@ impl RuntimeAgent {
         //
         Ok(MainToolProtocol {
             choice,
+            allow_prompt_tools,
             tool_ids,
             definitions,
         })
@@ -6046,6 +6060,7 @@ impl RuntimeAgent {
         }
     }
 
+    // Native-only providers cannot fall back to executable prompt JSON if definitions are unsupported.
     async fn invoke_main_provider(
         &self,
         llm: Arc<dyn LLMProvider>,
@@ -6054,6 +6069,11 @@ impl RuntimeAgent {
         corrective: bool,
     ) -> std::result::Result<MainProviderResponse, LLMError> {
         let use_native = self.provider_can_use_native_tools(llm.as_ref(), protocol);
+        if !use_native && !llm.allows_prompt_tools() && !protocol.definitions.is_empty() {
+            return Err(LLMError::Config(
+                "provider cannot accept the effective native tool definitions".into(),
+            ));
+        }
         let response = if use_native {
             let request = LLMToolRequest {
                 tools: protocol.definitions.clone(),
@@ -6082,6 +6102,7 @@ impl RuntimeAgent {
         })
     }
 
+    // Retry eligible failures without changing the active tool contract on fallback.
     async fn complete_main_attempt_with_recovery(
         &self,
         llm: Arc<dyn LLMProvider>,
@@ -6121,6 +6142,15 @@ impl RuntimeAgent {
                                 "Fallback LLM '{fallback_llm}' not found: {error}"
                             ))
                         })?;
+                        if protocol.allow_prompt_tools
+                            && !protocol.tool_ids.is_empty()
+                            && !fallback.allows_prompt_tools()
+                        {
+                            return Err(AgentError::Config(
+                                "fallback provider cannot use the active prompt tool protocol"
+                                    .into(),
+                            ));
+                        }
                         self.validate_main_work_budget(
                             fallback.as_ref(),
                             messages,
@@ -6152,6 +6182,7 @@ impl RuntimeAgent {
         }
     }
 
+    // Normalize provider calls before dispatch while keeping native-only text inert.
     fn normalize_main_provider_response(
         &self,
         mut response: LLMResponse,
@@ -6174,8 +6205,17 @@ impl RuntimeAgent {
                     "Provider returned replay state without native tool calls".to_string(),
                 ));
             }
-            None if !matches!(protocol.choice.as_ref(), Some(ToolChoice::None)) => {
+            None if protocol.allow_prompt_tools
+                && !matches!(protocol.choice.as_ref(), Some(ToolChoice::None)) =>
+            {
                 self.parse_tool_calls(response.content.trim())?
+            }
+            None if !protocol.allow_prompt_tools
+                && Self::is_native_tool_call_content(response.content.trim())? =>
+            {
+                return Err(AgentError::LLM(
+                    "provider returned reserved tool markers as text".into(),
+                ));
             }
             None => None,
         };
@@ -6311,6 +6351,15 @@ impl RuntimeAgent {
                                 "Fallback LLM '{fallback_llm}' not found: {error}"
                             ))
                         })?;
+                        if protocol.allow_prompt_tools
+                            && !protocol.tool_ids.is_empty()
+                            && !fallback.allows_prompt_tools()
+                        {
+                            return Err(AgentError::Config(
+                                "fallback provider cannot use the active prompt tool protocol"
+                                    .into(),
+                            ));
+                        }
                         if fallback.supports(LLMFeature::Streaming) {
                             let stream = self
                                 .observe_purpose(
@@ -6484,14 +6533,20 @@ impl RuntimeAgent {
         Ok(messages)
     }
 
-    /// Applies tool-choice visibility before parsing validated native markers or legacy prompt JSON.
+    /// Applies tool-choice visibility and permits prompt JSON only for providers using that protocol.
     fn parse_main_tool_calls(
         &self,
         content: &str,
         protocol: &MainToolProtocol,
     ) -> Result<Option<Vec<ToolCall>>> {
-        if matches!(protocol.choice.as_ref(), Some(ToolChoice::None)) {
+        if matches!(protocol.choice.as_ref(), Some(ToolChoice::None))
+            || (!protocol.allow_prompt_tools && protocol.choice.is_none())
+        {
             Ok(None)
+        } else if !protocol.allow_prompt_tools {
+            Ok(decode_native_tool_call_markers(content)
+                .map_err(|error| AgentError::LLM(error.to_string()))?
+                .map(|batch| batch.into_parts().0))
         } else {
             self.parse_tool_calls(content)
         }
@@ -13281,7 +13336,7 @@ Respond in JSON format:
             .build_messages_internal(
                 false,
                 Some(processed_input),
-                protocol.choice.is_none(),
+                protocol.uses_legacy_tool_prompt(),
                 false,
             )
             .await?;
@@ -13941,7 +13996,7 @@ Respond in JSON format:
         for post_iter in 0..self.max_iterations {
             let protocol = self.main_tool_protocol(new_llm.as_ref(), false).await?;
             let new_messages = self
-                .build_messages_internal(true, None, protocol.choice.is_none(), false)
+                .build_messages_internal(true, None, protocol.uses_legacy_tool_prompt(), false)
                 .await?;
             if post_iter == 0
                 && let Some(system_msg) = new_messages.first()
@@ -15948,7 +16003,7 @@ Respond in JSON format:
                     }
                 };
                 let mut messages = match self
-                    .build_messages_internal(true, None, protocol.choice.is_none(), false)
+                    .build_messages_internal(true, None, protocol.uses_legacy_tool_prompt(), false)
                     .await
                 {
                     Ok(m) => m,

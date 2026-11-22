@@ -1,7 +1,7 @@
 //! Direct model catalogs for the official OpenAI, Anthropic, and Ollama Cloud endpoints.
 //! Catalog metadata describes what the service reports for this request.
 
-use super::{Error, messages, openai, transport};
+use super::{Error, messages, ollama, openai, transport};
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Map, Value};
@@ -120,7 +120,7 @@ pub struct OllamaCloudCatalog {
 impl OllamaCloudCatalog {
     /// Creates a catalog client for the official public endpoint.
     pub fn new() -> Result<Self, Error> {
-        Self::at_base("https://ollama.com/api")
+        Self::at_base(ollama::CLOUD_API_BASE)
     }
 
     fn at_base(base: &str) -> Result<Self, Error> {

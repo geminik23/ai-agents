@@ -251,6 +251,10 @@ impl LLMProvider for ObservedLLMProvider {
         self.inner.settle_stream_request_cost(bound, usage)
     }
 
+    fn allows_prompt_tools(&self) -> bool {
+        self.inner.allows_prompt_tools()
+    }
+
     fn configured_tool_choice(&self) -> Option<ToolChoice> {
         self.inner.configured_tool_choice()
     }

@@ -551,6 +551,10 @@ impl LLMProvider for ManagedProvider {
     }
 
     /// Tool choice remains a provider selection contract, never an execution grant.
+    fn allows_prompt_tools(&self) -> bool {
+        self.inner.allows_prompt_tools()
+    }
+
     fn configured_tool_choice(&self) -> Option<ToolChoice> {
         self.inner.configured_tool_choice()
     }
