@@ -446,7 +446,13 @@ impl AgentBuilder {
 
                 // api_key: resolve from api_key_env if specified
                 let api_key = provider_type
-                    .configured_api_key(config.api_key_env.as_deref())
+                    .configured_api_key_for_protocol(
+                        config.api_key_env.as_deref(),
+                        config
+                            .extra
+                            .get("protocol")
+                            .and_then(serde_json::Value::as_str),
+                    )
                     .map_err(|error| AgentError::LLM(error.to_string()))?;
 
                 let mut provider = UnifiedLLMProvider::from_spec_config(
@@ -459,7 +465,9 @@ impl AgentBuilder {
                 .map_err(|e| AgentError::LLM(e.to_string()))?
                 .with_feature_overrides(feature_overrides_from_config(config));
                 if let Some(choice) = config.tool_choice.clone() {
-                    provider = provider.with_tool_choice(choice);
+                    provider = provider
+                        .with_validated_tool_choice(choice)
+                        .map_err(|error| AgentError::LLM(error.to_string()))?;
                 }
 
                 registry.register(alias, ai_agents_llm::managed_provider(Arc::new(provider)));
@@ -491,7 +499,13 @@ impl AgentBuilder {
 
             // api_key: resolve from api_key_env if specified
             let api_key = provider_type
-                .configured_api_key(config.api_key_env.as_deref())
+                .configured_api_key_for_protocol(
+                    config.api_key_env.as_deref(),
+                    config
+                        .extra
+                        .get("protocol")
+                        .and_then(serde_json::Value::as_str),
+                )
                 .map_err(|error| AgentError::LLM(error.to_string()))?;
 
             let mut provider = UnifiedLLMProvider::from_spec_config(
@@ -504,7 +518,9 @@ impl AgentBuilder {
             .map_err(|e| AgentError::LLM(e.to_string()))?
             .with_feature_overrides(feature_overrides_from_config(config));
             if let Some(choice) = config.tool_choice.clone() {
-                provider = provider.with_tool_choice(choice);
+                provider = provider
+                    .with_validated_tool_choice(choice)
+                    .map_err(|error| AgentError::LLM(error.to_string()))?;
             }
 
             self.llm = Some(ai_agents_llm::managed_provider(Arc::new(provider)));

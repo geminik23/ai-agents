@@ -44,6 +44,7 @@ For struct construction, prefer existing constructors or `..Default::default()` 
 | `AgentSpec` | `autonomy: AutonomyConfig::default()` preserves an ordinary agent |
 | `ai_agents::spec::LLMConfig` | `temperature` is now `Option<f32>`. Wrap explicit values in `Some(value)`. Rust and YAML preserve omission through serialization. OpenAI omits the option on the wire. Other presets apply the historical `0.7` when constructing the provider. Previously saved numeric values remain explicit. When moving an existing OpenAI declaration to provider defaults, its effective configuration and task namespace may change. |
 | `ai_agents::spec::LLMConfig::max_tokens` | Wrap a numeric Rust declaration in `Some(limit)` or use `None` for omission. Existing Chat and legacy declarations retain their effective default of 2000 and equivalent task identity. Explicit Responses requests omit the output ceiling unless configured. |
+| `ProviderType` | Rust consumers with exhaustive matches must handle `AnthropicCompatible`. Existing official Anthropic YAML selects Messages with `protocol: messages` and an explicit positive output ceiling. |
 | `StateDefinition`, `SkillDefinition` | `autonomy: None` preserves the previous scope |
 | `ChatMessage` | `provenance: None` for ordinary messages; preserve actual task provenance when processing task history |
 | `MemorySnapshot`, `ConversationContext` | `incomplete_native_exchanges: Vec::new()` for legacy data with no such observations; preserve real observations when present |

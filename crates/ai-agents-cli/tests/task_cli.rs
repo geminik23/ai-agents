@@ -1451,6 +1451,31 @@ fn task_subprocess_task_owned_child_questions_keep_one_coordinating_request() {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn responses_task_approval_survives_process_restart_and_replays_only_the_result() {
+    signed_tool_task_survives_restarts(ReplayProtocol::Responses);
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn messages_task_approval_survives_process_restart_and_replays_only_the_result() {
+    signed_tool_task_survives_restarts(ReplayProtocol::Messages);
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn messages_compatible_task_approval_preserves_signed_replay() {
+    signed_tool_task_survives_restarts(ReplayProtocol::CompatibleMessages);
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Clone, Copy)]
+enum ReplayProtocol {
+    Responses,
+    Messages,
+    CompatibleMessages,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn signed_tool_task_survives_restarts(protocol: ReplayProtocol) {
     let files = Fixture::new(&[]);
     let path = files.dir.join("report.txt");
     let target = path.clone();
@@ -1458,6 +1483,55 @@ fn responses_task_approval_survives_process_restart_and_replays_only_the_result(
         &[],
         |_| {},
         move |body, index, _| {
+            if !matches!(protocol, ReplayProtocol::Responses) {
+                assert_eq!(body["model"], "claude-sonnet-4-6");
+                assert_eq!(body["max_tokens"], 256);
+                assert!(body.get("temperature").is_none());
+                assert_eq!(body["thinking"]["type"], "adaptive");
+                let signed = json!({"type":"thinking","thinking":"fixture-private-thinking","signature":"private-replay-fixture"});
+                let redacted =
+                    json!({"type":"redacted_thinking","data":"private-redacted-fixture"});
+                let call = json!({
+                    "type":"tool_use","id":"call_original","name":"file_write",
+                    "input":{"path":target,"content":"verified"}
+                });
+                let (content, stop_reason) = if index == 0 {
+                    assert!(!target.exists());
+                    assert_eq!(body["tool_choice"]["type"], "auto");
+                    assert!(
+                        body["tools"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|tool| tool["name"] == "file_write")
+                    );
+                    (json!([signed, redacted, call]), "tool_use")
+                } else {
+                    assert!(index <= 2, "unexpected provider replay");
+                    let turns = body["messages"].as_array().unwrap();
+                    let replay = turns
+                        .iter()
+                        .position(|turn| {
+                            turn["role"] == "assistant" && turn["content"][0] == signed
+                        })
+                        .unwrap();
+                    assert_eq!(turns[replay]["content"], json!([signed, redacted, call]));
+                    assert_eq!(turns[replay + 1]["role"], "user");
+                    assert_eq!(turns[replay + 1]["content"][0]["type"], "tool_result");
+                    assert_eq!(
+                        turns[replay + 1]["content"][0]["tool_use_id"],
+                        "call_original"
+                    );
+                    assert_eq!(std::fs::read_to_string(&target).unwrap(), "verified");
+                    (
+                        json!([{"type":"text","text":if index==1 {"draft"} else {"done"}}]),
+                        "end_turn",
+                    )
+                };
+                let reply = json!({"id":format!("msg_{index}"),"role":"assistant","stop_reason":stop_reason,
+                    "content":content,"usage":{"input_tokens":12,"output_tokens":4}});
+                return Some(("application/json", reply.to_string()));
+            }
             assert_eq!(body["store"], false);
             assert!(body.get("max_output_tokens").is_none());
             assert_eq!(body["model"], "gpt-6.2-sol");
@@ -1490,13 +1564,24 @@ fn responses_task_approval_survives_process_restart_and_replays_only_the_result(
     let db = provider.dir.join("responses.sqlite");
     let task=TASK.replace("tools: []","tools: [file_write]").replace("completion: {response_contains: done}","completion: {all: [{response_contains: done}, {tool_called: {id: file_write, count: 1, executed: true, success: true}}]}");
     let agent=provider.agent(&format!("{task}  premature_finish: {{action: ask_user, on_unavailable: stop}}\n  max_wall_time_seconds: 600\n  restoration_timeout_ms: 5000\n  persistence: {{enabled: true}}\n  hitl: {{on_approval_required: pause_run}}\nstorage: {{type: sqlite, path: '{}'}}\nhitl: {{default_timeout_seconds: 60, on_timeout: reject}}\ntool_security:\n  enabled: true\n  fail_closed: true\n  tools:\n    file_write:\n      write_paths: ['{}']\n      overwrite_existing: false\n",db.display(), files.dir.display()));
+    let (preset, model) = match protocol {
+        ReplayProtocol::Messages => (
+            "provider: anthropic\n  protocol: messages\n  tool_choice: auto\n  max_tokens: 256\n  provider_options: {thinking: {type: adaptive}}",
+            "claude-sonnet-4-6",
+        ),
+        ReplayProtocol::CompatibleMessages => (
+            "provider: anthropic-compatible\n  function_calling: true\n  tool_choice: auto\n  max_tokens: 256\n  provider_options: {thinking: {type: adaptive}}",
+            "claude-sonnet-4-6",
+        ),
+        ReplayProtocol::Responses => (
+            "provider: openai\n  protocol: responses\n  tool_choice: auto",
+            "gpt-6.2-sol",
+        ),
+    };
     let source = std::fs::read_to_string(&agent)
         .unwrap()
-        .replace(
-            "provider: openai-compatible",
-            "provider: openai\n  protocol: responses\n  tool_choice: auto",
-        )
-        .replace("model: fixture", "model: gpt-6.2-sol");
+        .replace("provider: openai-compatible", preset)
+        .replace("model: fixture", &format!("model: {model}"));
     std::fs::write(&agent, source).unwrap();
     let agent_path = agent.to_str().unwrap();
     let seed = provider.run(
@@ -1525,6 +1610,32 @@ fn responses_task_approval_survives_process_restart_and_replays_only_the_result(
     assert!(!path.exists());
     assert!(!String::from_utf8_lossy(&seed.stdout).contains("private-replay-fixture"));
     let id = saved["run_id"].as_str().unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let read_usage = || {
+        runtime.block_on(async {
+            use ai_agents::persistence::{AgentStorage, SqliteStorage};
+            let store = SqliteStorage::new(db.to_str().unwrap()).await.unwrap();
+            let key = ai_agents::autonomy::TaskRunKey {
+                agent_id: "Fixture".into(),
+                run_id: id.to_owned(),
+            };
+            let snapshot = store.load_task_run(&key).await.unwrap().unwrap();
+            snapshot.payload["reservations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|attempt| {
+                    attempt
+                        .pointer("/result/response/usage")
+                        .map(|usage| usage["total_tokens"].as_u64().unwrap())
+                })
+                .collect::<Vec<_>>()
+        })
+    };
+    assert_eq!(read_usage(), vec![16]);
     let revision = saved["revision"].as_u64().unwrap().to_string();
     let stale = (saved["revision"].as_u64().unwrap() - 1).to_string();
     let rejected = provider.run(
@@ -1566,6 +1677,7 @@ fn responses_task_approval_survives_process_restart_and_replays_only_the_result(
     assert_eq!(paused["status"], "paused");
     assert_eq!(paused["counters"]["llm_attempts"], 2);
     assert_eq!(paused["counters"]["tool_attempts"], 1);
+    assert_eq!(read_usage(), vec![16, 16]);
     let expiry = |out: &Output| {
         String::from_utf8_lossy(&out.stdout)
             .lines()
@@ -1590,10 +1702,28 @@ fn responses_task_approval_survives_process_restart_and_replays_only_the_result(
     assert_eq!(done["counters"]["llm_attempts"], 3);
     assert_eq!(provider.calls.load(Ordering::SeqCst), 3);
     assert_eq!(done["counters"]["tool_attempts"], 1);
-    assert!(!String::from_utf8_lossy(&result.stdout).contains("private-replay-fixture"));
+    for output in [&seed, &between, &result] {
+        for private in [
+            "private-replay-fixture",
+            "fixture-private-thinking",
+            "private-redacted-fixture",
+        ] {
+            assert!(!String::from_utf8_lossy(&output.stdout).contains(private));
+            assert!(!String::from_utf8_lossy(&output.stderr).contains(private));
+        }
+    }
 }
 #[test]
 fn responses_task_failure_respects_tool_effects_and_never_replays() {
+    signed_tool_task_failure_respects_effects(false);
+}
+
+#[test]
+fn messages_task_failure_respects_tool_effects_and_never_replays() {
+    signed_tool_task_failure_respects_effects(true);
+}
+
+fn signed_tool_task_failure_respects_effects(messages: bool) {
     for failure in ["malformed", "rejected", "disconnect"] {
         let files = Fixture::new(&[]);
         let path = files.dir.join("result.txt");
@@ -1608,6 +1738,23 @@ fn responses_task_failure_respects_tool_effects_and_never_replays() {
                         "approved content"
                     );
                     return None; // Drop the HTTP connection after the tool effect.
+                }
+                if messages {
+                    let (content, stop_reason) = if index == 0 {
+                        let input = if failure == "malformed" {
+                            json!("{")
+                        } else {
+                            json!({"path":target,"content":"approved content"})
+                        };
+                        (
+                            json!([{"type":"tool_use","id":"call","name":"file_write","input":input}]),
+                            "tool_use",
+                        )
+                    } else {
+                        (json!([{"type":"text","text":"done"}]), "end_turn")
+                    };
+                    let response = json!({"id":format!("m{index}"),"role":"assistant","content":content,"stop_reason":stop_reason});
+                    return Some(("application/json", response.to_string()));
                 }
                 let output = if index == 0 {
                     let arguments = if failure == "malformed" {
@@ -1628,13 +1775,21 @@ fn responses_task_failure_respects_tool_effects_and_never_replays() {
         );
         let task = TASK.replace("tools: []", "tools: [file_write]");
         let agent=provider.agent(&format!("{task}  hitl: {{on_approval_required: pause_run}}\nhitl: {{default_timeout_seconds: 60, on_timeout: reject}}\ntool_security:\n  enabled: true\n  fail_closed: true\n  tools:\n    file_write:\n      write_paths: ['{}']\n",files.dir.display()));
+        let (preset, model) = if messages {
+            (
+                "provider: anthropic\n  protocol: messages\n  tool_choice: auto\n  max_tokens: 256",
+                "claude-sonnet-4-6",
+            )
+        } else {
+            (
+                "provider: openai\n  protocol: responses\n  tool_choice: auto",
+                "gpt-6.2-astra",
+            )
+        };
         let source = std::fs::read_to_string(&agent)
             .unwrap()
-            .replace(
-                "provider: openai-compatible",
-                "provider: openai\n  protocol: responses\n  tool_choice: auto",
-            )
-            .replace("model: fixture", "model: gpt-6.2-astra");
+            .replace("provider: openai-compatible", preset)
+            .replace("model: fixture", &format!("model: {model}"));
         let db = provider.dir.join("journal.sqlite");
         std::fs::write(
             &agent,

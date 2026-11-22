@@ -661,4 +661,4 @@ RUST_LOG=ai_agents=debug ai-agents-cli run agent.yaml
 
 - **[YAML Reference](@/docs/yaml-reference.md)** — full spec for agent definition files
 - **[Rust API](@/docs/rust-api.md)** — embed agents in your own Rust application
-- **[LLM Providers](@/docs/providers.md)** — detailed setup for all 12 providers
+- **[LLM Providers](@/docs/providers.md)** — detailed setup for the provider presets

@@ -16,12 +16,17 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use super::chat_adapter;
 use super::google::GoogleProvider;
 use super::pricing::DeclaredPricing;
-use super::responses_adapter;
-use crate::sdk::{ChatClient, responses::ResponsesClient};
+use super::{messages_adapter, responses_adapter};
+use crate::sdk::{
+    ChatClient,
+    messages::{self, MessagesClient},
+    responses::ResponsesClient,
+};
 #[derive(Clone)]
-enum OpenAiBackend {
+enum SdkBackend {
     Chat(ChatClient),
     Responses(ResponsesClient),
+    Messages(MessagesClient),
 }
 
 #[cfg(test)]
@@ -45,6 +50,9 @@ pub enum ProviderType {
     OpenAI,
     /// Anthropic (Claude models)
     Anthropic,
+    /// An explicitly configured Messages endpoint.
+    #[serde(rename = "anthropic-compatible")]
+    AnthropicCompatible,
     /// Ollama (local models)
     Ollama,
     /// DeepSeek
@@ -82,22 +90,33 @@ impl ProviderType {
             Self::Cohere => Some("COHERE_API_KEY"),
             Self::Mistral => Some("MISTRAL_API_KEY"),
             Self::OpenRouter => Some("OPENROUTER_API_KEY"),
-            Self::Ollama => None,           // Ollama doesn't need an API key
-            Self::OpenAICompatible => None, // User specifies via api_key_env or it's optional
+            Self::Ollama => None, // Ollama doesn't need an API key
+            Self::OpenAICompatible | Self::AnthropicCompatible => None, // User specifies via api_key_env or it's optional
         }
     }
 
     /// Resolves an explicitly selected credential source at provider construction time.
     /// The official preset must not fall back to another key. Compatible servers can operate without credentials.
     pub fn configured_api_key(&self, variable: Option<&str>) -> Result<Option<String>, LLMError> {
+        self.configured_api_key_for_protocol(variable, None)
+    }
+
+    /// Resolves the declared key for the selected protocol without changing legacy preset fallback.
+    pub fn configured_api_key_for_protocol(
+        &self,
+        variable: Option<&str>,
+        protocol: Option<&str>,
+    ) -> Result<Option<String>, LLMError> {
         let Some(name) = variable else {
             return Ok(None);
         };
         match std::env::var(name) {
             Ok(key) => Ok(Some(key)),
-            Err(_) if *self == Self::OpenAI => Err(LLMError::Config(format!(
-                "API key not found in configured environment variable {name}"
-            ))),
+            Err(_) if *self == Self::OpenAI || self.uses_messages(protocol) => {
+                Err(LLMError::Config(format!(
+                    "API key not found in configured environment variable {name}"
+                )))
+            }
             Err(_) => Ok(None),
         }
     }
@@ -111,8 +130,17 @@ impl ProviderType {
         }
     }
 
-    fn to_llm_backend(self) -> llm::builder::LLMBackend {
+    /// Whether this preset and protocol select the first-party Messages client.
+    pub fn uses_messages(self, protocol: Option<&str>) -> bool {
         match self {
+            Self::Anthropic => protocol == Some("messages"),
+            Self::AnthropicCompatible => matches!(protocol, None | Some("messages")),
+            _ => false,
+        }
+    }
+
+    fn to_llm_backend(self) -> Option<llm::builder::LLMBackend> {
+        Some(match self {
             Self::OpenAI => llm::builder::LLMBackend::OpenAI,
             Self::Anthropic => llm::builder::LLMBackend::Anthropic,
             Self::Ollama => llm::builder::LLMBackend::Ollama,
@@ -125,7 +153,8 @@ impl ProviderType {
             Self::Mistral => llm::builder::LLMBackend::Mistral,
             Self::OpenAICompatible => llm::builder::LLMBackend::OpenAI, // Reuse OpenAI's OpenAI-compatible implementation
             Self::OpenRouter => llm::builder::LLMBackend::OpenRouter,
-        }
+            Self::AnthropicCompatible => return None,
+        })
     }
 }
 
@@ -136,6 +165,7 @@ impl FromStr for ProviderType {
         match s.to_lowercase().as_str() {
             "openai" => Ok(Self::OpenAI),
             "anthropic" => Ok(Self::Anthropic),
+            "anthropic-compatible" => Ok(Self::AnthropicCompatible),
             "ollama" => Ok(Self::Ollama),
             "deepseek" => Ok(Self::DeepSeek),
             "xai" => Ok(Self::XAI),
@@ -168,7 +198,7 @@ pub struct UnifiedLLMProvider {
     tool_choice: Option<ToolChoice>,
     client: std::sync::Arc<tokio::sync::Mutex<Option<CachedClient>>>,
     google: Option<GoogleProvider>,
-    openai: Option<OpenAiBackend>,
+    sdk: Option<SdkBackend>,
     pricing: Option<DeclaredPricing>,
 }
 
@@ -536,10 +566,10 @@ impl UnifiedLLMProvider {
         if self.provider_type != ProviderType::OpenAI {
             return true;
         }
-        let protocol = match &self.openai {
-            Some(OpenAiBackend::Chat(_)) => crate::sdk::openai::Protocol::Chat,
-            Some(OpenAiBackend::Responses(_)) => crate::sdk::openai::Protocol::Responses,
-            None => return false,
+        let protocol = match &self.sdk {
+            Some(SdkBackend::Chat(_)) => crate::sdk::openai::Protocol::Chat,
+            Some(SdkBackend::Responses(_)) => crate::sdk::openai::Protocol::Responses,
+            _ => return false,
         };
         super::openai::allows_tools(protocol, &self.model, &self.default_config)
     }
@@ -557,7 +587,7 @@ impl UnifiedLLMProvider {
                 known_choice
             }
             ProviderType::Google => matches!(choice, ToolChoice::Auto),
-            ProviderType::OpenAICompatible => {
+            ProviderType::OpenAICompatible | ProviderType::AnthropicCompatible => {
                 self.feature_overrides
                     .get(&LLMFeature::FunctionCalling)
                     .copied()
@@ -574,6 +604,12 @@ impl UnifiedLLMProvider {
         api_key: Option<String>,
         base_url: Option<String>,
     ) -> Result<Self, LLMError> {
+        // This convenience constructor has no caller-supplied output limit.
+        if provider_type.uses_messages(None) {
+            return Err(LLMError::Config(
+                "Messages requires explicit max_tokens in from_spec_config".into(),
+            ));
+        }
         let mut config = LLMConfig::default();
         if provider_type == ProviderType::OpenAI {
             config.temperature = None;
@@ -594,7 +630,16 @@ impl UnifiedLLMProvider {
             provider_type,
             ProviderType::OpenAI | ProviderType::OpenAICompatible
         );
+        let protocol = default_config.extra.get("protocol");
+        let is_messages = provider_type.uses_messages(protocol.and_then(serde_json::Value::as_str))
+            && protocol.is_none_or(|value| value.is_string());
+        if provider_type == ProviderType::AnthropicCompatible && !is_messages {
+            return Err(LLMError::Config(
+                "anthropic-compatible requires the Messages protocol".into(),
+            ));
+        }
         if !is_chat
+            && !is_messages
             && (default_config.extra.contains_key("protocol")
                 || default_config.extra.contains_key("provider_options"))
         {
@@ -610,6 +655,22 @@ impl UnifiedLLMProvider {
         {
             return Err(LLMError::Config(
                 "custom OpenAI origin requires explicitly selected credentials".into(),
+            ));
+        }
+        if is_messages
+            && provider_type == ProviderType::Anthropic
+            && api_key.is_none()
+            && let Some(base) = base_url.as_deref()
+            && !reqwest::Url::parse(base)
+                .is_ok_and(|url| url.origin().ascii_serialization() == messages::OFFICIAL_ORIGIN)
+        {
+            return Err(LLMError::Config(
+                "custom Anthropic origin requires explicitly selected credentials".into(),
+            ));
+        }
+        if is_messages && !default_config.max_tokens.is_some_and(|limit| limit > 0) {
+            return Err(LLMError::Config(
+                "Messages requires explicit positive max_tokens".into(),
             ));
         }
         let actual_api_key = if let Some(key) = api_key {
@@ -635,20 +696,20 @@ impl UnifiedLLMProvider {
             ));
         }
 
-        let openai = if is_chat {
+        let sdk = if is_chat {
             let base = actual_base_url
                 .as_deref()
                 .unwrap_or("https://api.openai.com/v1/");
             let key = Some(actual_api_key.clone());
             Some(
                 match default_config.extra.get("protocol").map(|v| v.as_str()) {
-                    None | Some(Some("chat-completions")) => OpenAiBackend::Chat(
+                    None | Some(Some("chat-completions")) => SdkBackend::Chat(
                         ChatClient::new(base, key)
                             .map_err(super::sdk_error)?
                             .with_openai_contract(provider_type == ProviderType::OpenAI),
                     ),
                     Some(Some("responses")) if provider_type == ProviderType::OpenAI => {
-                        OpenAiBackend::Responses(
+                        SdkBackend::Responses(
                             ResponsesClient::new(base, key)
                                 .map_err(super::sdk_error)?
                                 .with_official_contract(),
@@ -657,6 +718,13 @@ impl UnifiedLLMProvider {
                     _ => return Err(LLMError::Config("unsupported protocol for provider".into())),
                 },
             )
+        } else if is_messages {
+            Some(SdkBackend::Messages(messages_adapter::connect(
+                provider_type,
+                actual_base_url.as_deref(),
+                actual_api_key.clone(),
+                &default_config,
+            )?))
         } else {
             None
         };
@@ -688,7 +756,7 @@ impl UnifiedLLMProvider {
             tool_choice: None,
             client: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
             google,
-            openai,
+            sdk,
             pricing: None,
         };
         if let Some(pricing) = pricing {
@@ -738,6 +806,45 @@ impl UnifiedLLMProvider {
             google.set_tool_choice(choice);
         }
         self
+    }
+
+    /// Applies a declared native tool choice while validating the Messages capability.
+    pub fn with_validated_tool_choice(self, choice: ToolChoice) -> Result<Self, LLMError> {
+        let provider = self.with_tool_choice(choice);
+        provider.validate_messages_tool_choice()?;
+        Ok(provider)
+    }
+
+    fn messages_config<'a>(
+        &'a self,
+        config: Option<&'a LLMConfig>,
+    ) -> Result<&'a LLMConfig, LLMError> {
+        let config = config.unwrap_or(&self.default_config);
+        for key in ["messages_auth", "anthropic_version"] {
+            if config
+                .extra
+                .get(key)
+                .is_some_and(|value| self.default_config.extra.get(key) != Some(value))
+            {
+                return Err(LLMError::Config(format!(
+                    "{key} is fixed at Messages client construction"
+                )));
+            }
+        }
+        Ok(config)
+    }
+
+    fn validate_messages_tool_choice(&self) -> Result<(), LLMError> {
+        if let Some(SdkBackend::Messages(_)) = &self.sdk
+            && let Some(choice @ (ToolChoice::Required | ToolChoice::Specific(_))) =
+                &self.tool_choice
+            && !self.supports_tool_choice(choice)
+        {
+            return Err(LLMError::Config(
+                "configured Messages tool choice is unsupported".into(),
+            ));
+        }
+        Ok(())
     }
 
     fn map_llm_crate_error(&self, err: impl std::fmt::Display) -> LLMError {
@@ -918,9 +1025,12 @@ impl UnifiedLLMProvider {
         tool_choice: Option<&ToolChoice>,
         tools: Option<&[LLMToolDefinition]>,
     ) -> Result<Box<dyn llm::LLMProvider>, LLMError> {
-        let mut builder = llm::builder::LLMBuilder::new()
-            .backend(self.provider_type.to_llm_backend())
-            .model(&self.model);
+        let mut builder =
+            llm::builder::LLMBuilder::new()
+                .backend(self.provider_type.to_llm_backend().ok_or_else(|| {
+                    LLMError::Config("provider requires the first-party SDK".into())
+                })?)
+                .model(&self.model);
 
         if let Some(tools) = tools {
             for tool in tools {
@@ -1164,7 +1274,7 @@ impl UnifiedLLMProvider {
     }
 
     fn accounting_adapter(&self) -> &str {
-        if matches!(self.openai, Some(OpenAiBackend::Responses(_))) {
+        if matches!(self.sdk, Some(SdkBackend::Responses(_))) {
             "openai-responses"
         } else {
             self.provider_name()
@@ -1173,7 +1283,7 @@ impl UnifiedLLMProvider {
 
     // Only transports whose actual endpoint selection and request-class mapping are audited participate here.
     fn priced_endpoint(&self) -> Result<String, LLMError> {
-        if let Some(OpenAiBackend::Responses(client)) = &self.openai {
+        if let Some(SdkBackend::Responses(client)) = &self.sdk {
             return Ok(client.endpoint().into());
         }
         if let Some(google) = &self.google {
@@ -1205,9 +1315,12 @@ impl UnifiedLLMProvider {
         &self,
         config: Option<&LLMConfig>,
     ) -> Result<Box<dyn llm::LLMProvider>, LLMError> {
-        if matches!(self.openai, Some(OpenAiBackend::Responses(_))) {
+        if matches!(
+            self.sdk,
+            Some(SdkBackend::Responses(_) | SdkBackend::Messages(_))
+        ) {
             return Err(LLMError::Config(
-                "Responses requires the first-party SDK".into(),
+                "configured protocol requires the first-party SDK".into(),
             ));
         }
         let cfg = config.unwrap_or(&self.default_config);
@@ -1252,7 +1365,18 @@ impl LLMProvider for UnifiedLLMProvider {
         if let Some(google) = &self.google {
             return google.complete(messages, config).await;
         }
-        if let Some(OpenAiBackend::Responses(client)) = &self.openai {
+        if let Some(SdkBackend::Messages(client)) = &self.sdk {
+            self.validate_messages_tool_choice()?;
+            return messages_adapter::complete(
+                client,
+                &self.model,
+                messages,
+                self.messages_config(config)?,
+                None,
+            )
+            .await;
+        }
+        if let Some(SdkBackend::Responses(client)) = &self.sdk {
             return responses_adapter::complete(
                 client,
                 &self.model,
@@ -1262,7 +1386,7 @@ impl LLMProvider for UnifiedLLMProvider {
             )
             .await;
         }
-        if let Some(OpenAiBackend::Chat(chat)) = &self.openai
+        if let Some(SdkBackend::Chat(chat)) = &self.sdk
             && let Some(wire) = chat_adapter::request(
                 self.provider_type,
                 &self.model,
@@ -1345,7 +1469,18 @@ impl LLMProvider for UnifiedLLMProvider {
             )));
         }
 
-        if let Some(OpenAiBackend::Responses(client)) = &self.openai {
+        if let Some(SdkBackend::Messages(client)) = &self.sdk {
+            self.validate_messages_tool_choice()?;
+            return messages_adapter::complete(
+                client,
+                &self.model,
+                messages,
+                self.messages_config(config)?,
+                Some(request),
+            )
+            .await;
+        }
+        if let Some(SdkBackend::Responses(client)) = &self.sdk {
             return responses_adapter::complete(
                 client,
                 &self.model,
@@ -1355,7 +1490,7 @@ impl LLMProvider for UnifiedLLMProvider {
             )
             .await;
         }
-        if let Some(OpenAiBackend::Chat(chat)) = &self.openai
+        if let Some(SdkBackend::Chat(chat)) = &self.sdk
             && let Some(wire) = chat_adapter::request(
                 self.provider_type,
                 &self.model,
@@ -1425,7 +1560,17 @@ impl LLMProvider for UnifiedLLMProvider {
         if let Some(google) = &self.google {
             return google.complete_stream(messages, config).await;
         }
-        if let Some(OpenAiBackend::Responses(client)) = &self.openai {
+        if let Some(SdkBackend::Messages(client)) = &self.sdk {
+            self.validate_messages_tool_choice()?;
+            return messages_adapter::stream(
+                client,
+                &self.model,
+                messages,
+                self.messages_config(config)?,
+            )
+            .await;
+        }
+        if let Some(SdkBackend::Responses(client)) = &self.sdk {
             return responses_adapter::stream(
                 client,
                 &self.model,
@@ -1434,7 +1579,7 @@ impl LLMProvider for UnifiedLLMProvider {
             )
             .await;
         }
-        if let Some(OpenAiBackend::Chat(chat)) = &self.openai
+        if let Some(SdkBackend::Chat(chat)) = &self.sdk
             && let Some(wire) = chat_adapter::request(
                 self.provider_type,
                 &self.model,
@@ -1503,7 +1648,7 @@ impl LLMProvider for UnifiedLLMProvider {
             return Ok(None);
         };
         // Run the same conversion and local protocol validation used by dispatch before admitting any paid attempt.
-        if let Some(OpenAiBackend::Responses(client)) = &self.openai {
+        if let Some(SdkBackend::Responses(client)) = &self.sdk {
             let cfg = request.config.unwrap_or(&self.default_config);
             let wire = responses_adapter::request(
                 client,
@@ -1539,7 +1684,7 @@ impl LLMProvider for UnifiedLLMProvider {
         if let Some(google) = &self.google {
             google.validate_priced_request(request)?;
         } else {
-            if self.openai.is_some() {
+            if self.sdk.is_some() {
                 let cfg = request.config.unwrap_or(&self.default_config);
                 if let Some(wire) = chat_adapter::request(
                     self.provider_type,
@@ -1624,7 +1769,7 @@ impl LLMProvider for UnifiedLLMProvider {
             return Ok(None);
         };
         // First-party codecs attach complete usage only to an observed terminal event.
-        if self.google.is_none() && self.openai.is_none() {
+        if self.google.is_none() && self.sdk.is_none() {
             return Ok(None);
         }
         let Some(usage) = usage else {
@@ -1643,6 +1788,7 @@ impl LLMProvider for UnifiedLLMProvider {
         match self.provider_type {
             ProviderType::OpenAI => "openai",
             ProviderType::Anthropic => "anthropic",
+            ProviderType::AnthropicCompatible => "anthropic-compatible",
             ProviderType::Ollama => "ollama",
             ProviderType::DeepSeek => "deepseek",
             ProviderType::XAI => "xai",
@@ -1661,12 +1807,28 @@ impl LLMProvider for UnifiedLLMProvider {
     }
 
     fn supports_tool_choice(&self, choice: &ToolChoice) -> bool {
-        self.model_allows_tools() && self.supports_choice_for_provider(choice)
+        self.supports_choice_for_provider(choice)
+            && match &self.sdk {
+                Some(SdkBackend::Messages(client)) => messages_adapter::supports_choice(
+                    client,
+                    &self.model,
+                    &self.default_config,
+                    choice,
+                ),
+                _ => self.model_allows_tools(),
+            }
     }
 
     fn supports(&self, feature: LLMFeature) -> bool {
-        if matches!(self.openai, Some(OpenAiBackend::Responses(_)))
-            && matches!(feature, LLMFeature::Vision | LLMFeature::JsonMode)
+        if matches!(feature, LLMFeature::FunctionCalling)
+            && matches!(self.sdk, Some(SdkBackend::Messages(_)))
+        {
+            return self.supports_tool_choice(&ToolChoice::Auto);
+        }
+        if matches!(
+            self.sdk,
+            Some(SdkBackend::Responses(_) | SdkBackend::Messages(_))
+        ) && matches!(feature, LLMFeature::Vision | LLMFeature::JsonMode)
         {
             return false; // The first framework Responses path accepts text and native functions.
         }
@@ -1705,7 +1867,7 @@ impl LLMProvider for UnifiedLLMProvider {
     }
 
     fn is_terminal_error(&self, error: &LLMError) -> bool {
-        if self.openai.is_some() {
+        if self.sdk.is_some() {
             return matches!(
                 error,
                 LLMError::Serialization(_) | LLMError::Config(_) | LLMError::ContentFiltered(_)
@@ -1807,6 +1969,16 @@ mod tests {
 
         assert_eq!(provider.provider_name(), "openai");
         assert_eq!(provider.model_name(), "gpt-4");
+    }
+
+    #[test]
+    fn messages_review_compatible_builder_requires_an_explicit_ceiling() {
+        let result = ProviderBuilder::new()
+            .provider(ProviderType::AnthropicCompatible)
+            .base_url("http://localhost/v1")
+            .model("local")
+            .build();
+        assert!(matches!(result, Err(LLMError::Config(message)) if message.contains("max_tokens")));
     }
 
     #[test]

@@ -5,7 +5,7 @@ template = "docs.html"
 description = "Setup guide for all supported LLM providers."
 +++
 
-AI Agents supports 12 LLM providers out of the box - from cloud APIs like OpenAI and Anthropic to local servers like Ollama and any OpenAI-compatible endpoint. This page covers setup for each one with copy-paste-ready YAML snippets.
+AI Agents offers 13 provider presets - from cloud APIs like OpenAI and Anthropic to local servers like Ollama and any OpenAI-compatible endpoint. This page covers setup for each one with copy-paste-ready YAML snippets.
 
 ---
 
@@ -14,7 +14,8 @@ AI Agents supports 12 LLM providers out of the box - from cloud APIs like OpenAI
 | Provider | YAML `provider:` value | Environment Variable | Example Models |
 | --- | --- | --- | --- |
 | OpenAI | `openai` | `OPENAI_API_KEY` | `gpt-5.4-nano`, `gpt-5.4-mini`, `gpt-5.4` |
-| Anthropic | `anthropic` | `ANTHROPIC_API_KEY` | `claude-sonnet-4.6`, `claude-haiku-4.5` |
+| Anthropic | `anthropic` | `ANTHROPIC_API_KEY` | `claude-sonnet-4-6`, `claude-haiku-4-5-20251001` |
+| Messages-compatible | `anthropic-compatible` | Optional explicit `api_key_env` | Server-supplied model IDs |
 | Google Gemini (first-party adapter) | `google` | `GOOGLE_API_KEY` | `gemini-2.5-flash`, `gemini-2.5-pro` |
 | Ollama | `ollama` | *(none)* | `llama3.1`, `qwen3:8b`, `mistral` |
 | DeepSeek | `deepseek` | `DEEPSEEK_API_KEY` | `deepseek-chat`, `deepseek-reasoner` |
@@ -45,7 +46,7 @@ llm:
 
 `protocol` is optional. The first-party codec sends an ordinary request's nonempty effort string verbatim and omits it when absent. Choose a value and extensions supported by your server. The adapter combines explicit `provider_options` and legacy `extra_body` on distinct JSON paths. Conflicting values and overrides of messages, tools, model, stream controls, output ceilings, credentials or other owned fields fail before sending a request. Hard-priced calls require the audited option set. An existing `extra_body.response_format` with `text`, `json_object`, or `json_schema` maps to the owned Chat response format. Direct SDK callers can set `ChatRequest::response_format`.
 
-For `provider: openai`, an omitted temperature stays absent from the HTTP request. Other framework presets, including `openai-compatible`, resolve an omitted temperature to their historical `0.7` at provider construction. Both shorthand and named YAML configurations preserve omission on save. The output token default is `2000`.
+For `provider: openai`, an omitted temperature stays absent from the HTTP request. Existing legacy presets and `openai-compatible` resolve an omitted temperature to their historical `0.7` at provider construction. First-party Messages preserves omission. Both shorthand and named YAML configurations preserve omission on save. The output token default is `2000`.
 
 The direct client on the official OpenAI origin and the framework OpenAI preset apply the same documented Chat restrictions to explicit sampling options and native tools. For example, GPT-6.2 Astra/Sol and GPT-6 Astra/6.1 Sol require Responses for native tools and reject explicit sampling. GPT-6 Sol/Luna allow Chat native tools and sampling with effort `none`. GPT-5.2/5.4 allow sampling with effort `none`, their default. Unknown model IDs pass through to the endpoint. A compatible server owns its own model rules. [GPT-6.2 guide](https://developers.openai.com/api/docs/guides/latest-model?model=gpt-6.2-astra) · [GPT-6 guide](https://developers.openai.com/api/docs/guides/latest-model?model=gpt-6-astra) · [GPT-5.4 guide](https://developers.openai.com/api/docs/guides/latest-model?model=gpt-5.4)
 
@@ -86,7 +87,7 @@ Ordinary provider support is not hard-priced task support. The development stand
 | Google GenerateContent | Completion, native auto tool choice, stream | Signed native history and the normal first-party request builder are retained |
 | OpenRouter | Completion, native tools, stream | Routing and model-tier prices require a complete host contract; unknown native service options are rejected |
 | Groq, Cohere, Mistral | Completion, stream | Native tool requests retain their existing unsupported status |
-| Anthropic, DeepSeek, xAI, Phind, Ollama | Unsupported for the built-in hard-priced capability | The current upstream-specific dispatch/accounting contracts are not audited by this adapter; ordinary use is unchanged |
+| Anthropic, Messages-compatible, DeepSeek, xAI, Phind, Ollama | Unsupported for the built-in hard-priced capability | The current upstream-specific dispatch/accounting contracts are not audited by this adapter; ordinary use is unchanged |
 | Custom/local Rust providers | Explicit host implementation of request bounds and settlement | Neither local execution nor a provider label implies free or conforming execution |
 
 `DeclaredPricing` binds `schedule_id`, exact `model`, normalized HTTP(S) `endpoint`, `server_input_token_limit`, `server_output_token_limit`, integer `input_micro_usd_per_million` and `output_micro_usd_per_million`. Optional fields are `request_fee_micro_usd` (default `0`), `max_internal_attempts` (default `1`, including the initial upstream call) and `complete_usage` (default `false`). Token ceilings are audited server-enforced maxima, not desired client limits or token estimates. Rates must cover the highest applicable input/output tiers, cached input and reasoning classes. A false host declaration is not made true by parsing it; hosts are responsible for verifying that external contract.
@@ -152,7 +153,7 @@ export ANTHROPIC_API_KEY=sk-ant-...
 ```yaml
 llm:
   provider: anthropic
-  model: claude-sonnet-4.6
+  model: claude-sonnet-4-6
 ```
 
 Other models:
@@ -161,8 +162,33 @@ Other models:
 # Fast and affordable
 llm:
   provider: anthropic
-  model: claude-haiku-4.5
+  model: claude-haiku-4-5-20251001
 ```
+
+
+### First-party Messages (development)
+
+Select the native Messages endpoint explicitly. The official preset uses the Anthropic API key and version headers. The SDK sends the configured model ID as supplied.
+
+```yaml
+llm:
+  provider: anthropic
+  protocol: messages
+  model: claude-sonnet-4-6
+  max_tokens: 2048
+  tool_choice: auto
+  provider_options:
+    thinking: {type: adaptive}
+    output_config: {effort: low}
+```
+
+Messages requires an explicit positive `max_tokens` for generation. An omitted temperature stays absent. For API-supported manual thinking, use `thinking: {type: enabled, budget_tokens: 1024}` with a budget below `max_tokens` on the official endpoint. Declare thinking and effort once. Forced selection is checked against the selected official model and thinking mode. An unsupported configured `required` or `specific` choice returns a configuration error. Omitting `protocol` on the official preset continues to select the legacy adapter and its existing defaults.
+
+Use `provider: anthropic-compatible` with an explicit `base_url` that includes the API prefix, a server-specific model ID and `max_tokens`. A compatible endpoint can run without credentials or use a server-specific `api_key_env`. With a key, the compatible preset uses Bearer authentication by default. Set `messages_auth: api-key` for servers expecting `x-api-key`. Set `anthropic_version` when a server requires a different API version. Native choices on a compatible endpoint require `function_calling: true`.
+
+The framework displays text and manages complete native tool calls through its existing tool grants, approval and execution path. Explicit tool choice uses the buffered framework path. The direct SDK can stream a native function response and returns complete calls on verified termination. It retains ordered private thinking blocks for the active tool exchange and replays them only to the matching provider, endpoint, API version and model. Direct SDK consumers retain tool-free thinking themselves. Stream text stays provisional until `message_stop` and successful completion. The SDK accounts for cumulative output usage and records cache input separately. Hard-priced task admission rejects Messages before dispatch. [Direct Rust API](@/docs/rust-api.md#direct-messages-sdk-development)
+
+The official endpoint was tested with Claude Sonnet 4.6 for signed thinking replay, native functions and streaming. The compatible codec was tested against a local HTTP fixture. vLLM has no verified server/version/model combination in this checkout.
 
 ---
 
@@ -466,7 +492,8 @@ Use them when you know a model/server supports more or less than the provider de
 | Provider | Native `auto` | Native `required` / `specific` | Behavior when native choice is unavailable |
 | --- | --- | --- | --- |
 | OpenAI | Yes | Yes | Not applicable |
-| Anthropic | Yes | Yes | Not applicable |
+| Anthropic | Yes | Depends on the Messages model and thinking mode. Legacy retains its existing path. | Messages reports an error for an unsupported explicit forced choice. |
+| Messages-compatible | Opt in with `function_calling: true` | Requires opt-in and server support | Prompt tools remain available for ordinary auto selection. |
 | OpenRouter | Yes | Yes | Not applicable |
 | Google first-party GenerateContent | Yes | No | One bounded prompt corrective retry |
 | OpenAI-compatible | With `function_calling: true` | With `function_calling: true` | Prompt fallback when not enabled |
@@ -486,7 +513,7 @@ You can define multiple LLM providers and assign roles to each one. This is usef
 llms:
   primary:
     provider: anthropic
-    model: claude-sonnet-4.6
+    model: claude-sonnet-4-6
     temperature: 0.7
     max_tokens: 4096
 
@@ -531,7 +558,7 @@ system_prompt: "You are a research assistant."
 llms:
   smart:
     provider: anthropic
-    model: claude-sonnet-4.6
+    model: claude-sonnet-4-6
     temperature: 0.7
     max_tokens: 4096
 
@@ -615,8 +642,8 @@ llm:
 
 | Parameter | Type | Default | Description |
 | --- | --- | --- | --- |
-| `temperature` | `f32` | omitted for OpenAI, `0.7` for other presets | Sampling temperature. |
-| `max_tokens` | `u32` | `2000` | Maximum response tokens |
+| `temperature` | `f32` | omitted for OpenAI and first-party Messages, `0.7` for existing compatible/legacy paths | Sampling temperature |
+| `max_tokens` | `u32` | required for Messages, omitted for Responses, `2000` on existing paths | Maximum response tokens |
 | `top_p` | `f32` | - | Nucleus sampling threshold |
 | `timeout_seconds` | `u64` | - | Request timeout in seconds |
 

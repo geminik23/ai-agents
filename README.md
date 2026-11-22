@@ -21,7 +21,7 @@ A Rust framework for building AI agents from a single YAML specification. No cod
 
 ## Features
 
-- **Multi-LLM with fallback** - 12 providers (OpenAI, Anthropic, Google, Ollama, DeepSeek, Groq, Mistral, Cohere, xAI, Phind, OpenRouter, any OpenAI-compatible); first-party Google GenerateContent preserves signed native tool history; named aliases (default, router); auto-fallback on failure
+- **Multi-LLM with fallback** - 13 provider presets (OpenAI, Anthropic, Google, Ollama, DeepSeek, Groq, Mistral, Cohere, xAI, Phind, OpenRouter, any OpenAI-compatible and explicitly configured Messages-compatible endpoints); first-party Google GenerateContent preserves signed native tool history; named aliases (default, router); auto-fallback on failure
 - **State machine + skills** - hierarchical states, LLM-evaluated transitions, guard-based routing, entry/exit actions, reusable multi-step skills
 - **Built-in tools + MCP** - 30 canonical built-in IDs: `calculator`, `echo`, `datetime`, `json`, `random`, `file`, `glob`, `grep`, `file_read`, `file_write`, `file_edit`, `patch`, `copy_path`, `move_path`, `delete_path`, `file_list`, `file_info`, `git_status`, `git_diff`, `diagnostics`, `ask_user`, `todo`, `sleep`, `web_fetch`, `web_search`, `command`, `text`, `template`, `math`, and `http`; connect any MCP server for hundreds more
 - **Tool scoping, selection, policy, and context** - explicit top-level grants, state-level narrowing, opt-in `auto`/`required`/`specific`/`none` tool choice, policy bindings, review modes for filesystem mutation, post-approval final authorization, atomic rate admission, conservative mutation locking, read-before-write guards, command allowlists, and context-aware custom tools
@@ -37,7 +37,7 @@ A Rust framework for building AI agents from a single YAML specification. No cod
 
 Ordinary model-callable tools are fail-closed through explicit grants. Optional tool security adds path, command, domain, approval, timeout, and result-limit enforcement. These controls are not an OS sandbox; hosts remain responsible for deployment isolation, filesystem ownership, network egress, credentials, custom integrations, and provider-internal I/O.
 
-The development checkout includes a direct Rust Chat Completions client with ordered text, image and audio inputs, streamed text and assembled function calls. The OpenAI preset can also select the Responses API for stateless text and native function calls. See the [provider guide](https://ai-agents.rs/docs/providers/) for framework integration.
+The development checkout includes a direct Rust Chat Completions client with ordered text, image and audio inputs, streamed text and assembled function calls. The OpenAI preset can also select the Responses API for stateless text and native function calls. Anthropic Messages supports explicit native selection, text streaming and signed tool replay. See the [provider guide](https://ai-agents.rs/docs/providers/) for framework integration.
 
 ## Feature Status
 
@@ -183,7 +183,7 @@ See the [full roadmap](https://ai-agents.rs/roadmap/) for what's shipped, what's
 | [Task hosting and evaluation](https://ai-agents.rs/docs/task-autonomy/) | Development YAML profiles, domain integration, typed control and the same eval host |
 | [Support and compatibility](https://ai-agents.rs/docs/compatibility/) | Development support boundaries and migration from 1.1.2 |
 | [Rust API](https://ai-agents.rs/docs/rust-api/) | Embedding agents in your Rust application |
-| [Providers](https://ai-agents.rs/docs/providers/) | Setup for all 12 LLM providers |
+| [Providers](https://ai-agents.rs/docs/providers/) | Setup for the provider presets |
 | [Concepts](https://ai-agents.rs/docs/concepts/) | Architecture, lifecycle, and core ideas |
 | [Examples](https://ai-agents.rs/examples/) | YAML and Rust examples for every feature |
 | [Developer MCP checks](xtask/tests/mcp/README.md) | Explicit YAML integration against a local Rust MCP server |

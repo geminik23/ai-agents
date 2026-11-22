@@ -234,7 +234,8 @@ pub struct ResponsesClient {
 }
 impl ResponsesClient {
     pub fn new(base_url: &str, key: Option<String>) -> Result<Self, Error> {
-        let transport = transport::Transport::new(base_url, key, "responses")?;
+        let transport =
+            transport::Transport::new(base_url, "responses", transport::bearer_headers(key)?)?;
         let official =
             transport.endpoint.origin().ascii_serialization() == "https://api.openai.com";
         Ok(Self {

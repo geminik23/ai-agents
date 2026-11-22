@@ -342,16 +342,16 @@ The simplest form: one LLM for everything. Use `llm` as a flat object.
 |-------|------|---------|-------------|
 | `provider` | `string` | `"openai"` | Provider identifier |
 | `model` | `string` | `"gpt-4"` | Model name |
-| `temperature` | `f32` | omitted for OpenAI, `0.7` for other presets | Sampling temperature. Explicit values follow the selected endpoint and model. |
-| `max_tokens` | `u32` | omitted for Responses, `2000` for existing Chat and legacy paths | Maximum output tokens |
+| `temperature` | `f32` | omitted for OpenAI and first-party Messages, `0.7` for existing compatible/legacy paths | Sampling temperature. Explicit values follow the selected endpoint and model. |
+| `max_tokens` | `u32` | omitted for Responses, required for Messages, `2000` for existing Chat and legacy paths | Maximum output tokens |
 | `top_p` | `f32` | `null` | Nucleus sampling |
 | `base_url` | `string` | `null` | API endpoint override (required for `openai-compatible`) |
 | `api_key_env` | `string` | `null` | Env var holding the API key (overrides provider default) |
 | `timeout_seconds` | `u64` | `null` | Request timeout in seconds |
 | `reasoning` | `bool` | `null` | Enable extended thinking / reasoning mode |
 | `reasoning_effort` | `string` | `null` | Model-specific effort; the development first-party Chat adapter accepts open strings for ordinary calls |
-| `protocol` | `string` | omitted | Development OpenAI preset accepts `chat-completions` or `responses`. Compatible servers use Chat Completions. |
-| `provider_options` | object | omitted | Chat request extensions or Responses `reasoning.mode` / `reasoning.effort`. Conflicts and reserved fields are rejected. |
+| `protocol` | `string` | omitted | Development OpenAI preset accepts `chat-completions` or `responses`. The Anthropic preset can select `messages`. Compatible presets choose their respective protocol. |
+| `provider_options` | object | omitted | Chat request extensions, Responses `reasoning`, or Messages `thinking` / `output_config.effort`. Conflicts and reserved fields are rejected. |
 | `reasoning_budget_tokens` | `u32` | `null` | Max token budget for reasoning |
 | `function_calling` | `bool` | `null` | Override `supports(FunctionCalling)`; `false` disables native tool selection and `true` opts an OpenAI-compatible server into it |
 | `tool_choice` | `auto`, `required`, `none`, or `{ specific: ID }` | `null` | Opt in to native or runtime-enforced tool selection; omission preserves the legacy prompt protocol |
@@ -487,7 +487,9 @@ tools:
   - random
 ```
 
-OpenAI, Anthropic, and OpenRouter use native `auto`, `required`, and `specific` selection. Google currently enables native `auto` only; its `required` and `specific` choices retain one bounded prompt corrective retry. OpenAI-compatible servers use native selection only with `function_calling: true`. Other and custom providers use prompt fallback unless they implement the additive native request methods. `none` is enforced by the runtime without exposing definitions or prompt instructions. A second non-compliant prompt response fails the turn.
+OpenAI, Anthropic, and OpenRouter offer native `auto`, `required`, and `specific` selection subject to the selected protocol and model. Google currently enables native `auto` only; its `required` and `specific` choices retain one bounded prompt corrective retry. OpenAI-compatible servers use native selection only with `function_calling: true`. Other and custom providers use prompt fallback unless they implement the additive native request methods. `none` is enforced by the runtime without exposing definitions or prompt instructions. A second non-compliant prompt response fails the turn.
+
+First-party Messages checks native choice against the selected model and thinking mode. Messages-compatible uses native tools after explicit `function_calling: true`. See [Messages configuration](@/docs/providers.md#first-party-messages-development).
 
 The normal Google path is a first-party GenerateContent adapter. With native `auto`, it retains Gemini's opaque `thoughtSignature`, original model-part order, and call/result correlation across the current tool loop. Signed history does not grant tools and is never parsed recursively as additional calls. Current signed exchanges are kept as an atomic memory group; if that group cannot fit the configured memory or context budget, the turn fails instead of truncating the signature or silently expanding the limit.
 
@@ -587,6 +589,7 @@ Hierarchy child session snapshots store the already-loaded skill definitions inl
 |----------|-----------------|-----------------|-------|
 | OpenAI | `openai` | `OPENAI_API_KEY` | GPT models |
 | Anthropic | `anthropic` | `ANTHROPIC_API_KEY` | Claude models |
+| Messages-compatible | `anthropic-compatible` | Optional via `api_key_env` | Explicit Messages base URL |
 | Google | `google` | `GOOGLE_API_KEY` | Gemini models |
 | Groq | `groq` | `GROQ_API_KEY` | Fast inference |
 | DeepSeek | `deepseek` | `DEEPSEEK_API_KEY` | |

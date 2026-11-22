@@ -1,15 +1,18 @@
 use super::{Error, Value};
-use reqwest::{Client, Url};
+use reqwest::{
+    Client, Url,
+    header::{AUTHORIZATION, HeaderMap, HeaderValue},
+};
 use std::time::Duration;
 #[derive(Clone)]
 pub(super) struct Transport {
     client: Client,
     pub(super) endpoint: Url,
-    key: Option<String>,
+    headers: HeaderMap,
 }
 impl Transport {
     /// The base URL includes the API prefix (for example `https://api.openai.com/v1`).
-    pub(super) fn new(base_url: &str, api_key: Option<String>, path: &str) -> Result<Self, Error> {
+    pub(super) fn new(base_url: &str, path: &str, headers: HeaderMap) -> Result<Self, Error> {
         let url = Url::parse(&format!("{}/", base_url.trim_end_matches('/')))
             .map_err(|_| Error::Config("invalid base_url".into()))?;
         if !matches!(url.scheme(), "http" | "https")
@@ -34,7 +37,7 @@ impl Transport {
         Ok(Self {
             client,
             endpoint,
-            key: api_key.filter(|k| !k.is_empty()),
+            headers,
         })
     }
 
@@ -43,10 +46,11 @@ impl Transport {
         body: &Value,
         timeout: Option<Duration>,
     ) -> Result<reqwest::Response, Error> {
-        let mut http = self.client.post(self.endpoint.clone()).json(body);
-        if let Some(key) = &self.key {
-            http = http.bearer_auth(key);
-        }
+        let mut http = self
+            .client
+            .post(self.endpoint.clone())
+            .headers(self.headers.clone())
+            .json(body);
         if let Some(timeout) = timeout {
             http = http.timeout(timeout);
         }
@@ -56,6 +60,21 @@ impl Transport {
         }
         Ok(response)
     }
+}
+
+pub(super) fn secret(value: &str) -> Result<HeaderValue, Error> {
+    let mut value = HeaderValue::from_str(value)
+        .map_err(|_| Error::Config("invalid credential header".into()))?;
+    value.set_sensitive(true);
+    Ok(value)
+}
+
+pub(super) fn bearer_headers(key: Option<String>) -> Result<HeaderMap, Error> {
+    let mut headers = HeaderMap::new();
+    if let Some(key) = key.filter(|k| !k.is_empty()) {
+        headers.insert(AUTHORIZATION, secret(&format!("Bearer {key}"))?);
+    }
+    Ok(headers)
 }
 
 pub(super) fn frames<B, E>(

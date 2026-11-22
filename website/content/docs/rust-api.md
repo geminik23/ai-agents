@@ -1737,7 +1737,7 @@ This page covers the most common patterns. For the complete API - every struct, 
 
 - **[Getting Started](@/docs/getting-started.md)** - quick install and first agent
 - **[CLI Guide](@/docs/cli.md)** - run agents from the command line
-- **[LLM Providers](@/docs/providers.md)** - setup for all 12 supported providers
+- **[LLM Providers](@/docs/providers.md)** - setup for the supported provider presets
 - **[YAML Reference](@/docs/yaml-reference.md)** - the complete agent spec
 - **[Built-in Tools](@/docs/built-in-tools.md)** - built-in schemas, outputs, policy, and host requirements
 
@@ -1778,3 +1778,20 @@ async fn ask(key: String, model: &str) -> Result<String, ai_agents_llm::sdk::Err
 ```
 
 The SDK's `ResponseFunction` carries a JSON Schema and optional strict flag. The caller owns tool execution and state. Use `ResponseOutput::output` for trusted replay and `text` for display. `stream()` yields provisional text followed by one finished output or an error. The framework adapter handles text and completed native calls. [Provider configuration and replay scope](@/docs/providers.md#openai-responses-development)
+
+## Direct Messages SDK (development)
+
+```rust
+use ai_agents_llm::sdk::messages::{MessagesClient, MessagesRequest};
+use serde_json::json;
+
+async fn ask(key: String, model: &str) -> Result<String, ai_agents_llm::sdk::Error> {
+    let client = MessagesClient::new(key)?;
+    let request = MessagesRequest::new(model, vec![json!({"role":"user","content":"Hello"})], 512);
+    Ok(client.complete(&request).await?.text)
+}
+```
+
+For a framework-managed Rust provider with the `AnthropicCompatible` preset, use `UnifiedLLMProvider::from_spec_config` with a positive `max_tokens`. The convenience builder has no parameter for this required ceiling. A direct SDK caller supplies it to `MessagesRequest::new`.
+
+The caller owns tool execution. Send `MessageOutput::blocks` back in an assistant message before the corresponding user `tool_result` blocks. Keep the original `tool_use_id`, thinking signatures, block order and replay destination. Display `text` rather than private blocks. `stream()` yields text and then the completed message or an error. [Messages configuration and verified scope](@/docs/providers.md#first-party-messages-development)
