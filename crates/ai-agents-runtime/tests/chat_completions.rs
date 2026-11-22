@@ -560,3 +560,163 @@ async fn responses_sdk_preserves_items_and_reasoning_options_for_both_models() {
         server.await.unwrap();
     }
 }
+
+#[tokio::test]
+async fn messages_compatible_yaml_stream_and_endpoint_credentials_are_explicit() {
+    use ai_agents_llm::sdk::messages::{MessagesAuth, MessagesClient, MessagesRequest};
+    let (listener, base) = fixture().await;
+    let server = tokio::spawn(async move {
+        let (mut socket, body, head) = receive_path(&listener, "/tenant/v1/messages").await;
+        assert!(!head.contains("authorization:") && !head.contains("x-api-key:"));
+        assert!(head.contains("anthropic-version: 2023-06-01"));
+        assert!(body["system"].as_str().unwrap().starts_with("top level"));
+        assert_eq!(body["max_tokens"], 80);
+        assert!(body.get("temperature").is_none());
+        assert!(body.get("tools").is_none());
+        assert_eq!(body["stream"], true);
+        let frames = [
+            json!({"type":"message_start","message":{"id":"msg","role":"assistant","content":[],"usage":{"input_tokens":2}}}),
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ready"}}),
+            json!({"type":"content_block_stop","index":0}),
+            json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}),
+            json!({"type":"message_stop"}),
+        ];
+        open_stream(&mut socket).await;
+        for event in frames {
+            socket
+                .write_all(format!("data: {event}\n\n").as_bytes())
+                .await
+                .unwrap();
+        }
+        drop(socket);
+        let (mut socket, body, head) = receive_path(&listener, "/tenant/v1/messages").await;
+        assert!(!head.contains("authorization:") && !head.contains("x-api-key:"));
+        assert_eq!(body["stream"], false);
+        assert!(body.get("tools").is_none());
+        assert!(body["system"].as_str().unwrap().contains("echo"));
+        let payload = json!({"id":"prompt-mode","role":"assistant","content":[{"type":"text","text":"prompt-mode"}],"stop_reason":"end_turn"}).to_string();
+        socket
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                    payload.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        drop(socket);
+        let (mut socket, _, head) = receive_path(&listener, "/tenant/v1/messages").await;
+        assert!(head.contains("authorization: bearer local-fixture"));
+        assert!(head.contains("anthropic-version: fixture-version"));
+        let payload = json!({"id":"m","role":"assistant","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn"}).to_string();
+        socket
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                    payload.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+    });
+    let source = format!(
+        "name: Compatible\nsystem_prompt: top level\nllm:\n  provider: anthropic-compatible\n  model: local-fixture\n  base_url: {base}\n  max_tokens: 80\n"
+    );
+    let agent = AgentBuilder::from_yaml(&source)
+        .unwrap()
+        .auto_configure_llms()
+        .unwrap()
+        .auto_configure_features()
+        .unwrap()
+        .build()
+        .unwrap();
+    let mut events = agent.chat_stream_events("hello").await.unwrap();
+    let mut completed = false;
+    while let Some(event) = events.next().await {
+        match event {
+            AgentStreamEvent::Final(result) => {
+                assert_eq!(result.content, "ready");
+                completed = true;
+            }
+            AgentStreamEvent::Chunk(StreamChunk::Error { message }) => panic!("{message}"),
+            _ => {}
+        }
+    }
+    assert!(completed);
+    // An explicit tool choice uses the buffered framework path. Compatible tool support is opt-in.
+    let fallback = format!("{source}  tool_choice: auto\ntools: [echo]\n");
+    let agent = AgentBuilder::from_yaml(&fallback)
+        .unwrap()
+        .auto_configure_llms()
+        .unwrap()
+        .auto_configure_features()
+        .unwrap()
+        .build()
+        .unwrap();
+    assert_eq!(agent.chat("hello").await.unwrap().content, "prompt-mode");
+
+    let client = MessagesClient::compatible(
+        &base,
+        MessagesAuth::Bearer("local-fixture".into()),
+        "fixture-version",
+    )
+    .unwrap();
+    let mut request = MessagesRequest::new(
+        "local-fixture",
+        vec![json!({"role":"user","content":"hi"})],
+        5,
+    );
+    request.timeout = Some(std::time::Duration::from_secs(5));
+    assert_eq!(client.complete(&request).await.unwrap().text, "ok");
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn messages_custom_origin_and_missing_limit_fail_before_dispatch() {
+    let (listener, base) = fixture().await;
+    let source = format!(
+        "name: Official\nsystem_prompt: hi\nllm:\n  provider: anthropic\n  protocol: messages\n  model: claude-sonnet-4-6\n  base_url: {base}\n  max_tokens: 2048\n"
+    );
+    let result = AgentBuilder::from_yaml(&source)
+        .unwrap()
+        .auto_configure_llms();
+    assert!(
+        matches!(result, Err(error) if error.to_string().contains("explicitly selected credentials"))
+    );
+    let compatible = "name: Compatible\nsystem_prompt: hi\nllm:\n  provider: anthropic-compatible\n  model: fixture\n";
+    let result = AgentBuilder::from_yaml(compatible)
+        .unwrap()
+        .auto_configure_llms();
+    assert!(matches!(result, Err(error) if error.to_string().contains("max_tokens")));
+    assert!(futures::poll!(Box::pin(listener.accept())).is_pending());
+}
+
+#[tokio::test]
+async fn messages_sdk_rejects_cross_origin_redirect_with_api_key() {
+    use ai_agents_llm::sdk::messages::{
+        API_VERSION, MessagesAuth, MessagesClient, MessagesRequest,
+    };
+    let (listener, base) = fixture().await;
+    let (foreign, target) = fixture().await;
+    let server = tokio::spawn(async move {
+        let (mut socket, _, head) = receive_path(&listener, "/tenant/v1/messages").await;
+        assert!(head.contains("x-api-key: endpoint-only"));
+        socket.write_all(format!("HTTP/1.1 307 Temporary Redirect\r\nLocation: {target}/messages\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+    });
+    let client = MessagesClient::compatible(
+        &base,
+        MessagesAuth::ApiKey("endpoint-only".into()),
+        API_VERSION,
+    )
+    .unwrap();
+    let request = MessagesRequest::new("fixture", vec![json!({"role":"user","content":"hi"})], 10);
+    assert!(matches!(
+        client.complete(&request).await,
+        Err(Error::Http(307))
+    ));
+    server.await.unwrap();
+    assert!(futures::poll!(Box::pin(foreign.accept())).is_pending());
+}

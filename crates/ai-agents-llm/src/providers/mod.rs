@@ -1,6 +1,7 @@
 mod chat_adapter;
 mod google;
 pub mod local;
+mod messages_adapter;
 pub(crate) mod openai;
 mod pricing;
 mod responses_adapter;

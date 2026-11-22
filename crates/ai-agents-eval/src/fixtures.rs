@@ -1445,7 +1445,13 @@ fn build_real_provider(
             .map(str::to_string)
     });
     let api_key = provider_type
-        .configured_api_key(config.api_key_env.as_deref())
+        .configured_api_key_for_protocol(
+            config.api_key_env.as_deref(),
+            config
+                .extra
+                .get("protocol")
+                .and_then(serde_json::Value::as_str),
+        )
         .map_err(|error| EvalError::Config(error.to_string()))?;
     let mut provider = UnifiedLLMProvider::from_spec_config(
         provider_type,
@@ -1459,7 +1465,9 @@ fn build_real_provider(
         provider = provider.with_feature_override(LLMFeature::FunctionCalling, value);
     }
     if let Some(choice) = config.tool_choice.clone() {
-        provider = provider.with_tool_choice(choice);
+        provider = provider
+            .with_validated_tool_choice(choice)
+            .map_err(|error| EvalError::Config(error.to_string()))?;
     }
     if let Some(value) = config.vision {
         provider = provider.with_feature_override(LLMFeature::Vision, value);

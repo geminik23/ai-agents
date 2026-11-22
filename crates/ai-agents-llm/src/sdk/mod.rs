@@ -15,6 +15,7 @@
 //! # Ok(())
 //! # }
 //! ```
+pub mod messages;
 pub(crate) mod openai;
 pub mod responses;
 // Bound one unfinished SSE frame independently of total response length.
@@ -444,7 +445,11 @@ pub struct ChatClient {
 }
 impl ChatClient {
     pub fn new(base_url: &str, api_key: Option<String>) -> Result<Self, Error> {
-        let transport = transport::Transport::new(base_url, api_key, "chat/completions")?;
+        let transport = transport::Transport::new(
+            base_url,
+            "chat/completions",
+            transport::bearer_headers(api_key)?,
+        )?;
         let openai_contract =
             transport.endpoint.origin().ascii_serialization() == "https://api.openai.com";
         Ok(Self {

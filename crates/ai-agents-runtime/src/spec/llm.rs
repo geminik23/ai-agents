@@ -185,6 +185,9 @@ impl LLMConfig {
     /// Resolves the historical output ceiling only on declarations using a legacy or Chat path.
     /// Newly selected protocols preserve absence unless the caller declares a ceiling.
     pub fn effective_max_tokens(&self) -> Option<u32> {
+        if self.uses_messages() {
+            return self.max_tokens;
+        }
         self.max_tokens
             .or_else(|| match self.extra.get("protocol") {
                 None => Some(default_max_tokens()),
@@ -193,10 +196,22 @@ impl LLMConfig {
             })
     }
 
+    // Keep Messages declaration defaults independent of legacy provider defaults.
+    fn uses_messages(&self) -> bool {
+        self.provider.parse::<ProviderType>().is_ok_and(|provider| {
+            provider.uses_messages(
+                self.extra
+                    .get("protocol")
+                    .and_then(serde_json::Value::as_str),
+            )
+        })
+    }
+
     // Only framework presets with a historical sampling default materialize it for execution.
     fn effective_temperature(&self, provider: ProviderType) -> Option<f32> {
-        self.temperature
-            .or_else(|| (provider != ProviderType::OpenAI).then(default_temperature))
+        self.temperature.or_else(|| {
+            (provider != ProviderType::OpenAI && !self.uses_messages()).then(default_temperature)
+        })
     }
 
     /// Resolves declaration defaults for both runtime and eval without modifying the saved spec.
@@ -564,6 +579,28 @@ model: gpt-4
             original,
             scope(&source.replace("model: active,", "model: active, max_tokens: 2000,"))
         );
+    }
+
+    #[test]
+    fn messages_omits_sampling_and_requires_a_limit_without_changing_legacy_identity() {
+        let source = "name: Test\nsystem_prompt: hello\nllm: {provider: anthropic, model: claude-sonnet-4-6}";
+        let parse = |yaml: &str| crate::spec::AgentSpec::from_yaml_strict(yaml).unwrap();
+        let legacy = parse(source);
+        let saved = parse(&source.replace('}', ", temperature: 0.7, max_tokens: 2000}"));
+        assert_eq!(
+            legacy.identity_value().unwrap(),
+            saved.identity_value().unwrap()
+        );
+        for yaml in [
+            source.replace('}', ", protocol: messages}"),
+            source.replace("provider: anthropic,", "provider: anthropic-compatible,"),
+        ] {
+            let messages = parse(&yaml);
+            let config = messages.llm.as_config().unwrap();
+            let effective = config.to_provider_config(config.provider.parse().unwrap());
+            assert_eq!(effective.temperature, None);
+            assert_eq!(effective.max_tokens, None);
+        }
     }
 
     #[test]
