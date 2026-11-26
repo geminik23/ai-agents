@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "fixtures/provider-consumer",
     "rust/basic-api",
     "rust/state-machine",
     "rust/storage",

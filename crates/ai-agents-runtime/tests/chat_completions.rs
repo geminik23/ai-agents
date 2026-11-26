@@ -720,3 +720,108 @@ async fn messages_sdk_rejects_cross_origin_redirect_with_api_key() {
     server.await.unwrap();
     assert!(futures::poll!(Box::pin(foreign.accept())).is_pending());
 }
+
+#[tokio::test]
+async fn local_ollama_yaml_distinguishes_declared_settings_from_transmitted_options() {
+    use ai_agents_llm::providers::{ProviderType, UnifiedLLMProvider};
+    use ai_agents_llm::{ChatMessage, LLMConfig, LLMProvider};
+
+    let (listener, base) = fixture().await;
+    let top_k = 23;
+    let yaml = format!(
+        r#"name: Local
+system_prompt: Answer briefly.
+llm:
+  provider: ollama
+  model: fixture
+  base_url: {base}
+  top_k: {top_k}
+  top_p: 0.5
+  num_ctx: 4096
+  num_gpu: -1
+  keep_alive: 5m
+  max_tokens: 99
+  temperature: 0.25
+  extra_body: {{options: {{seed: 17}}}}
+"#
+    );
+    let server = tokio::spawn(async move {
+        for expected_top_k in [Value::Null, json!(top_k)] {
+            let (mut socket, body, _) = receive_path(&listener, "/tenant/v1/api/chat").await;
+            assert_eq!(body["model"], "fixture");
+            assert_eq!(body["options"]["top_p"], 0.5);
+            assert_eq!(body["options"].get("top_k"), Some(&expected_top_k));
+            for name in ["num_ctx", "num_gpu", "num_predict", "temperature", "seed"] {
+                assert!(body["options"].get(name).is_none(), "{name}: {body}");
+            }
+            assert!(body.get("keep_alive").is_none());
+            let payload = r#"{"message":{"role":"assistant","content":"local reply"},"done":true}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                payload.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        }
+    });
+    let agent = AgentBuilder::from_yaml(&yaml)
+        .unwrap()
+        .auto_configure_llms()
+        .unwrap()
+        .build()
+        .unwrap();
+    assert_eq!(agent.chat("hello").await.unwrap().content, "local reply");
+
+    let provider = UnifiedLLMProvider::from_spec_config(
+        ProviderType::Ollama,
+        "fixture",
+        None,
+        Some(base),
+        LLMConfig::default().with_top_p(0.5).with_top_k(top_k),
+    )
+    .unwrap();
+    let reply = provider
+        .complete(&[ChatMessage::user("hello")], None)
+        .await
+        .unwrap();
+    assert_eq!(reply.content, "local reply");
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn legacy_deployment_and_search_settings_keep_the_ordinary_chat_request() {
+    for option in [
+        "  api_version: fixture-version\n  deployment_id: fixture-deployment",
+        "  openai_enable_web_search: true\n  openai_web_search_context_size: medium",
+    ] {
+        let (listener, base) = fixture().await;
+        let server = tokio::spawn(async move {
+            let (mut socket, body, _) = receive(&listener).await;
+            assert_eq!(body["model"], "fixture");
+            for key in [
+                "deployment_id",
+                "api_version",
+                "tools",
+                "web_search_options",
+            ] {
+                assert!(body.get(key).is_none(), "{key}: {body}");
+            }
+            reply(
+                &mut socket,
+                json!({"role":"assistant","content":"ordinary chat"}),
+                "stop",
+            )
+            .await;
+        });
+        let yaml = format!(
+            "name: Legacy\nsystem_prompt: Test\nllm:\n  provider: openai-compatible\n  base_url: {base}\n  model: fixture\n{option}\n"
+        );
+        let agent = AgentBuilder::from_yaml(&yaml)
+            .unwrap()
+            .auto_configure_llms()
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(agent.chat("test").await.unwrap().content, "ordinary chat");
+        server.await.unwrap();
+    }
+}
