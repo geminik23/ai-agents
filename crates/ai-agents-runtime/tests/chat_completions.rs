@@ -723,41 +723,67 @@ async fn messages_sdk_rejects_cross_origin_redirect_with_api_key() {
 
 #[tokio::test]
 async fn local_ollama_yaml_distinguishes_declared_settings_from_transmitted_options() {
+    use ai_agents_llm::providers::{ProviderType, UnifiedLLMProvider};
+    use ai_agents_llm::{ChatMessage, LLMConfig, LLMProvider};
+
     let (listener, base) = fixture().await;
-    let source = include_str!("../../../examples/yaml/basic/ollama_chat.yaml");
-    let mut spec: serde_yaml::Value = serde_yaml::from_str(source).unwrap();
-    let config = &mut spec["llm"];
-    let model = config["model"].as_str().unwrap().to_owned();
-    config["base_url"] = base.into();
-    config["num_ctx"] = 4096.into();
-    config["num_gpu"] = (-1).into();
-    config["keep_alive"] = "5m".into();
-    config["top_p"] = 0.5.into();
-    config["max_tokens"] = 99.into();
-    config["temperature"] = 0.25.into();
-    config["extra_body"] = serde_yaml::from_str("{options: {seed: 17}}").unwrap();
+    let top_k = 23;
+    let yaml = format!(
+        r#"name: Local
+system_prompt: Answer briefly.
+llm:
+  provider: ollama
+  model: fixture
+  base_url: {base}
+  top_k: {top_k}
+  top_p: 0.5
+  num_ctx: 4096
+  num_gpu: -1
+  keep_alive: 5m
+  max_tokens: 99
+  temperature: 0.25
+  extra_body: {{options: {{seed: 17}}}}
+"#
+    );
     let server = tokio::spawn(async move {
-        let (mut socket, body, _) = receive_path(&listener, "/tenant/v1/api/chat").await;
-        assert_eq!(body["model"], model);
-        assert_eq!(body["options"]["top_p"], 0.5);
-        for name in ["num_ctx", "num_gpu", "num_predict", "temperature", "seed"] {
-            assert!(body["options"].get(name).is_none(), "{name}: {body}");
+        for expected_top_k in [Value::Null, json!(top_k)] {
+            let (mut socket, body, _) = receive_path(&listener, "/tenant/v1/api/chat").await;
+            assert_eq!(body["model"], "fixture");
+            assert_eq!(body["options"]["top_p"], 0.5);
+            assert_eq!(body["options"].get("top_k"), Some(&expected_top_k));
+            for name in ["num_ctx", "num_gpu", "num_predict", "temperature", "seed"] {
+                assert!(body["options"].get(name).is_none(), "{name}: {body}");
+            }
+            assert!(body.get("keep_alive").is_none());
+            let payload = r#"{"message":{"role":"assistant","content":"local reply"},"done":true}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                payload.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
         }
-        assert!(body.get("keep_alive").is_none());
-        let payload = r#"{"message":{"role":"assistant","content":"local reply"},"done":true}"#;
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
-            payload.len()
-        );
-        socket.write_all(response.as_bytes()).await.unwrap();
     });
-    let agent = AgentBuilder::from_yaml(&serde_yaml::to_string(&spec).unwrap())
+    let agent = AgentBuilder::from_yaml(&yaml)
         .unwrap()
         .auto_configure_llms()
         .unwrap()
         .build()
         .unwrap();
     assert_eq!(agent.chat("hello").await.unwrap().content, "local reply");
+
+    let provider = UnifiedLLMProvider::from_spec_config(
+        ProviderType::Ollama,
+        "fixture",
+        None,
+        Some(base),
+        LLMConfig::default().with_top_p(0.5).with_top_k(top_k),
+    )
+    .unwrap();
+    let reply = provider
+        .complete(&[ChatMessage::user("hello")], None)
+        .await
+        .unwrap();
+    assert_eq!(reply.content, "local reply");
     server.await.unwrap();
 }
 

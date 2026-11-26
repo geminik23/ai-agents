@@ -292,7 +292,7 @@ llm:
   base_url: "http://192.168.1.100:11434"
 ```
 
-The current local chat backend sends `top_p` under `options`. It accepts YAML declarations for `num_ctx`, `num_gpu`, `keep_alive`, `temperature`, `max_tokens` and `extra_body`, but omits them from the local chat request. Configure the required context window on the Ollama server or model. The native Ollama Cloud preset has its own option mapping.
+The local chat backend sends YAML `top_p` as `options.top_p`. A top-level YAML `top_k` stays in the extra settings and the request contains `"top_k": null` under `options`. Rust callers can set `LLMConfig::with_top_k` to send a numeric `options.top_k`. It accepts YAML declarations for `num_ctx`, `num_gpu`, `keep_alive`, `temperature`, `max_tokens` and `extra_body`, but omits them from the local chat request. Configure the required context window on the Ollama server or model. The native Ollama Cloud preset has its own option mapping.
 
 To access Ollama through its OpenAI-compatible endpoint instead, use `provider: openai-compatible` and include `/v1` in the URL:
 
