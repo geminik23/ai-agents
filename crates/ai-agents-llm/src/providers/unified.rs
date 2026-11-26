@@ -1283,18 +1283,9 @@ impl UnifiedLLMProvider {
             Role::Assistant => llm::chat::ChatMessage::assistant()
                 .content(&msg.content)
                 .build(),
-            Role::Function => {
-                let name = msg.name.as_deref().unwrap_or("tool");
-                llm::chat::ChatMessage::user()
-                    .content(format!("[{} result]: {}", name, msg.content))
-                    .build()
-            }
-            Role::Tool => {
-                let name = msg.name.as_deref().unwrap_or("tool");
-                llm::chat::ChatMessage::user()
-                    .content(format!("[{} result]: {}", name, msg.content))
-                    .build()
-            }
+            Role::Tool | Role::Function => llm::chat::ChatMessage::user()
+                .content(super::prompt_tool_result(msg.name.as_deref(), &msg.content))
+                .build(),
             Role::System => {
                 // System messages should have been extracted before calling convert_message.
                 // If one slips through, convert it as a user message to avoid losing content.

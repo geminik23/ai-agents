@@ -357,8 +357,7 @@ fn history(
     client: &MessagesClient,
     model: &str,
     input: &[ChatMessage],
-    system_separator: &str,
-    require_signed: bool,
+    settings: RequestConfig<'_>,
 ) -> Result<(Option<String>, Vec<Value>), LLMError> {
     let native = inspect_native_history(input)?;
     if native.has_incomplete_unsigned()
@@ -369,6 +368,12 @@ fn history(
     {
         return Err(invalid("incomplete Messages tool history"));
     }
+    let (system_separator, require_signed) = match settings {
+        RequestConfig::DefaultAnthropic(config) => {
+            ("\n", !allows_legacy_unsigned_replay(model, config))
+        }
+        RequestConfig::Explicit(_) => ("\n\n", false),
+    };
     let mut system = Vec::new();
     let mut messages: Vec<Value> = Vec::new();
     for message in input {
@@ -408,6 +413,11 @@ fn history(
                         let content = output.as_str().map_or_else(|| output.to_string(), str::to_owned);
                         json!({"type":"tool_result","tool_use_id":result.id(),"content":content})
                     }).collect()
+                } else if matches!(settings, RequestConfig::DefaultAnthropic(_)) {
+                    let content = native_readable_projection(&message.content)?;
+                    vec![
+                        json!({"type":"text","text":super::prompt_tool_result(message.name.as_deref(), &content)}),
+                    ]
                 } else {
                     vec![text_block(message)?]
                 };
@@ -476,13 +486,7 @@ fn request(
         }
     };
     let default = matches!(settings, RequestConfig::DefaultAnthropic(_));
-    let (system, messages) = history(
-        client,
-        model,
-        messages,
-        if default { "\n" } else { "\n\n" },
-        default && !allows_legacy_unsigned_replay(model, config),
-    )?;
+    let (system, messages) = history(client, model, messages, settings)?;
     let mut request = MessagesRequest::new(model, messages, limit);
     request.system = if default {
         Some(
@@ -701,10 +705,12 @@ mod tests {
         assert!(futures::poll!(Box::pin(destination.accept())).is_pending());
     }
 
-    #[tokio::test]
-    async fn only_default_blocking_messages_join_text_blocks_with_newlines() {
+    // Capture both HTTP bodies so follow-up assertions exercise serialization through the SDK.
+    async fn two_messages_requests(
+        content: Value,
+    ) -> (MessagesClient, tokio::task::JoinHandle<Vec<Value>>) {
         use tokio::{
-            io::{AsyncReadExt, AsyncWriteExt},
+            io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
             net::TcpListener,
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -716,17 +722,42 @@ mod tests {
         )
         .unwrap();
         let server = tokio::spawn(async move {
+            let reply = json!({"id":"msg_fixture","type":"message","role":"assistant",
+                "stop_reason":"end_turn","content":content})
+            .to_string();
+            let mut bodies = Vec::new();
             for _ in 0..2 {
-                let (mut stream, _) = listener.accept().await.unwrap();
-                let mut buffer = [0; 4096];
-                assert!(stream.read(&mut buffer).await.unwrap() > 0);
-                let data = json!({"id":"msg_fixture","type":"message","role":"assistant", "stop_reason":"end_turn","content":[
-                    {"type":"text","text":"first"}, {"type":"thinking","thinking":"hidden","signature":"fixture"},
-                    {"type":"text","text":""},{"type":"text","text":"second"}
-                ]}).to_string();
-                stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{data}",data.len()).as_bytes()).await.unwrap();
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut socket = BufReader::new(socket);
+                let mut length = None;
+                loop {
+                    let mut line = String::new();
+                    assert_ne!(socket.read_line(&mut line).await.unwrap(), 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some((key, value)) = line.split_once(':')
+                        && key.eq_ignore_ascii_case("content-length")
+                    {
+                        length = Some(value.trim().parse::<usize>().unwrap());
+                    }
+                }
+                let mut body = vec![0; length.unwrap()];
+                socket.read_exact(&mut body).await.unwrap();
+                bodies.push(serde_json::from_slice(&body).unwrap());
+                socket.get_mut().write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}", reply.len()).as_bytes()).await.unwrap();
             }
+            bodies
         });
+        (client, server)
+    }
+
+    #[tokio::test]
+    async fn only_default_blocking_messages_join_text_blocks_with_newlines() {
+        let (client, server) = two_messages_requests(json!([
+            {"type":"text","text":"first"}, {"type":"thinking","thinking":"hidden","signature":"fixture"},
+            {"type":"text","text":""},{"type":"text","text":"second"}
+        ])).await;
         let cfg = LLMConfig::default();
         for (settings, expected) in [
             (RequestConfig::DefaultAnthropic(&cfg), "first\n\nsecond"),
@@ -744,6 +775,49 @@ mod tests {
             assert_eq!(result.content, expected);
         }
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn messages_second_request_labels_plain_tool_results_only_for_default_anthropic() {
+        let cfg = LLMConfig::default();
+        let prompt_call = r#"{"tool":"echo","arguments":{"message":"ok"}}"#;
+        for (settings, expected) in [
+            (
+                RequestConfig::DefaultAnthropic(&cfg),
+                [
+                    "[echo result]: ok",
+                    "[count result]: 2",
+                    "[tool result]: unnamed",
+                ],
+            ),
+            (RequestConfig::Explicit(&cfg), ["ok", "2", "unnamed"]),
+        ] {
+            let (client, server) =
+                two_messages_requests(json!([{"type":"text","text":prompt_call}])).await;
+            let mut history = vec![ChatMessage::user("run tools")];
+            let reply = complete(&client, "fixture", &history, settings, None)
+                .await
+                .unwrap();
+            history.push(ChatMessage::assistant(reply.content));
+            history.push(ChatMessage::tool("echo", "ok"));
+            history.push(ChatMessage::function("count", "2"));
+            let mut unnamed = ChatMessage::tool("tool", "unnamed");
+            unnamed.name = None;
+            history.push(unnamed);
+            complete(&client, "fixture", &history, settings, None)
+                .await
+                .unwrap();
+            let bodies = server.await.unwrap();
+            assert_eq!(bodies[0]["messages"].as_array().unwrap().len(), 1);
+            assert_eq!(
+                bodies[1]["messages"],
+                json!([
+                    {"role":"user","content":[{"type":"text","text":"run tools"}]},
+                    {"role":"assistant","content":[{"type":"text","text":prompt_call}]},
+                    {"role":"user","content":expected.map(|text| json!({"type":"text","text":text}))}
+                ])
+            );
+        }
     }
 
     #[test]
@@ -897,7 +971,12 @@ mod tests {
                     encode_native_tool_result_marker(&call, json!("found")).unwrap(),
                 ),
             ];
-            let result = history(&client, "test", &messages, "\n\n", false);
+            let result = history(
+                &client,
+                "test",
+                &messages,
+                RequestConfig::Explicit(&LLMConfig::default()),
+            );
             if valid {
                 let (_, messages) = result.unwrap();
                 assert_eq!(messages[1]["content"], blocks);
