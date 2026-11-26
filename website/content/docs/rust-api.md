@@ -1797,7 +1797,7 @@ let output = client.complete(&request).await?;
 println!("{}", output.message.content);
 ```
 
-Pass `Some(server_root)` for a different daemon. `stream` yields text and then a single `LocalChatEvent::Finished` after verified completion. An older daemon or compatible server can omit the finish reason. Direct callers receive it as `None`. The response exposes the model and token usage reported by the server when available. Direct calls omit unconfigured sampling and output options. `build_llm()` continues to support existing raw Ollama consumers, including model listing.
+Pass `Some(server_root)` for a different daemon. `stream` yields text and then a single `LocalChatEvent::Finished` after verified completion. An older daemon or compatible server can omit the finish reason. Direct callers receive it as `None`. The response exposes the model and token usage reported by the server when available. Direct calls omit unconfigured sampling and output options. `build_llm()` accepts legacy local Ollama settings for raw operations such as `list_models(None)`. If its effective config contains `provider_options`, construction returns a configuration error. Use the native client for chat with those options.
 
 ## Direct Ollama Cloud SDK (development)
 

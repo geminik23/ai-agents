@@ -170,6 +170,7 @@ impl LocalChatRequest {
     }
 
     fn body(&self, stream: bool) -> Result<Value, Error> {
+        validate_local_options(&self.chat.options)?;
         let mut body = self.chat.body(stream)?;
         if let Some(keep_alive) = &self.keep_alive {
             if matches!(keep_alive, KeepAlive::Duration(value) if value.trim().is_empty()) {
@@ -181,6 +182,32 @@ impl LocalChatRequest {
         }
         Ok(body)
     }
+}
+
+// Type-check the local options we document and forward daemon-specific extensions verbatim.
+fn validate_local_options(options: &Map<String, Value>) -> Result<(), Error> {
+    for (name, value) in options {
+        let expected = match name.as_str() {
+            // Existing framework requests encode absent sampling values as explicit nulls.
+            "top_k" | "top_p" if value.is_null() => continue,
+            "temperature" | "top_p" if !value.is_number() => "a number",
+            "num_predict" | "num_ctx" | "num_gpu" | "top_k" | "seed" if !value.is_i64() => {
+                "an integer"
+            }
+            "stop"
+                if !value
+                    .as_array()
+                    .is_some_and(|items| items.iter().all(Value::is_string)) =>
+            {
+                "an array of strings"
+            }
+            _ => continue,
+        };
+        return Err(Error::Config(format!(
+            "Ollama options.{name} must be {expected}"
+        )));
+    }
+    Ok(())
 }
 
 /// Completed Local chat with optional metadata from the daemon.

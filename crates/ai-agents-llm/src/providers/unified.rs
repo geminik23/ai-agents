@@ -623,6 +623,28 @@ fn marked_json_values(content: &str, marker: &str) -> Option<Vec<serde_json::Val
     }
 }
 
+// Preserve typed-over-extra precedence and the accepted spellings of the upstream builder.
+fn legacy_reasoning_effort(config: &LLMConfig) -> Result<Option<ReasoningEffort>, LLMError> {
+    let effort = config.reasoning_effort.as_deref().or_else(|| {
+        config
+            .extra
+            .get("reasoning_effort")
+            .and_then(serde_json::Value::as_str)
+    });
+    let Some(effort) = effort else {
+        return Ok(None);
+    };
+    match effort.to_ascii_lowercase().as_str() {
+        "low" => Ok(Some(ReasoningEffort::Low)),
+        "medium" => Ok(Some(ReasoningEffort::Medium)),
+        "high" => Ok(Some(ReasoningEffort::High)),
+        other => Err(LLMError::Config(format!(
+            "Invalid reasoning_effort '{}'. Expected: low, medium, high",
+            other
+        ))),
+    }
+}
+
 fn merged_ollama_extra_body(config: &LLMConfig) -> Result<Option<serde_json::Value>, LLMError> {
     let has_named_fields = config.extra.contains_key("num_ctx")
         || config.extra.contains_key("num_gpu")
@@ -1145,6 +1167,8 @@ impl UnifiedLLMProvider {
         if ollama_local::uses_legacy(cfg)? {
             return Ok(None);
         }
+        // The legacy Ollama builder validated effort but never sent it to the daemon.
+        legacy_reasoning_effort(cfg)?;
         let legacy_body = merged_ollama_extra_body(cfg)?;
         let messages = Self::project_foreign_messages(messages)?;
         ollama_local::request(&self.model, &messages, cfg, legacy_body.as_ref()).map(Some)
@@ -1398,26 +1422,8 @@ impl UnifiedLLMProvider {
             builder = builder.reasoning(r);
         }
 
-        // --- Reasoning effort (first-class, fallback to extra) ---
-        let reasoning_effort = config.reasoning_effort.as_deref().or_else(|| {
-            config
-                .extra
-                .get("reasoning_effort")
-                .and_then(|v| v.as_str())
-        });
-        if let Some(effort) = reasoning_effort {
-            let re = match effort.to_lowercase().as_str() {
-                "low" => ReasoningEffort::Low,
-                "medium" => ReasoningEffort::Medium,
-                "high" => ReasoningEffort::High,
-                other => {
-                    return Err(LLMError::Config(format!(
-                        "Invalid reasoning_effort '{}'. Expected: low, medium, high",
-                        other
-                    )));
-                }
-            };
-            builder = builder.reasoning_effort(re);
+        if let Some(effort) = legacy_reasoning_effort(config)? {
+            builder = builder.reasoning_effort(effort);
         }
 
         // --- Reasoning budget (first-class, fallback to extra) ---
@@ -1608,6 +1614,12 @@ impl UnifiedLLMProvider {
             ));
         }
         let cfg = config.unwrap_or(&self.default_config);
+        if self.provider_type == ProviderType::Ollama && cfg.extra.contains_key("provider_options")
+        {
+            return Err(LLMError::Config(
+                "Local Ollama provider_options require native chat; build_llm() only accepts legacy settings".into()
+            ));
+        }
         self.build_llm_with_system(cfg, None, None, None)
     }
 
@@ -2486,6 +2498,29 @@ mod tests {
                 .to_string()
                 .contains("Provider type not set")
         );
+    }
+
+    #[test]
+    fn ollama_local_raw_builder_checks_effective_native_options() {
+        let raw = LLMConfig::default();
+        let native = raw.clone().with_extra(
+            "provider_options",
+            serde_json::json!({"options": {"num_predict": 7}}),
+        );
+        let provider = UnifiedLLMProvider::from_spec_config(
+            ProviderType::Ollama,
+            "fixture",
+            None,
+            None,
+            native.clone(),
+        )
+        .unwrap();
+        for cfg in [None, Some(&native)] {
+            assert!(
+                matches!(provider.build_llm(cfg), Err(LLMError::Config(message)) if message.contains("provider_options"))
+            );
+        }
+        assert!(provider.build_llm(Some(&raw)).is_ok());
     }
 
     #[test]

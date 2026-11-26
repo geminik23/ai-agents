@@ -308,6 +308,8 @@ llm:
     keep_alive: 5m
 ```
 
+The local SDK checks documented option types before sending a request. Use integers for `num_ctx`, `num_gpu`, `num_predict`, `top_k` and `seed`, numbers for `temperature` and `top_p`, and a string array for `stop`. Daemon-specific extensions inside `options` pass through. The legacy `reasoning_effort` field accepts `low`, `medium` or `high` case-insensitively and leaves the daemon’s thinking mode at its default.
+
 Use `options.num_predict` for the output limit and `keep_alive` for model retention on the daemon. Remove any old declaration for the same setting before adding its native equivalent. `resilient: true` selects the existing upstream transport before generation and cannot be combined with native options. Ollama reports token usage when available. Hard-priced task admission remains unavailable for this preset.
 
 To access Ollama through its OpenAI-compatible endpoint instead, use `provider: openai-compatible` and include `/v1` in the URL:

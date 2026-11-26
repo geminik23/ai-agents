@@ -163,3 +163,38 @@ async fn ollama_drop_releases_a_partial_stream_without_a_final_record() {
     drop(events);
     assert!(dropped.load(Ordering::SeqCst));
 }
+
+#[test]
+fn ollama_local_native_option_types_and_extensions() {
+    let mut request = LocalChatRequest::new(ChatRequest::new("fixture", Vec::new()));
+    for (name, invalid) in [
+        ("temperature", json!({"value": 1})),
+        ("top_p", json!("0.9")),
+        ("top_k", json!(0.5)),
+        ("num_predict", json!(true)),
+        ("num_ctx", json!("4096")),
+        ("num_gpu", json!([1])),
+        ("stop", json!(["end", 1])),
+        ("seed", json!("1")),
+    ] {
+        request.chat.options.insert(name.into(), invalid);
+        for stream in [false, true] {
+            assert!(
+                matches!(request.body(stream), Err(Error::Config(msg)) if msg.contains(name)),
+                "{name}"
+            );
+        }
+        request.chat.options.clear();
+    }
+    request.chat.options = json!({"num_predict": -1, "num_gpu": -1, "stop": ["end"],
+        "top_p": null, "top_k": null, "future_option": {"level": "custom"}})
+    .as_object()
+    .unwrap()
+    .clone();
+    for stream in [false, true] {
+        assert_eq!(
+            request.body(stream).unwrap()["options"],
+            json!(request.chat.options)
+        );
+    }
+}

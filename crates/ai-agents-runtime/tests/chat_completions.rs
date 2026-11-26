@@ -735,6 +735,7 @@ llm:
   provider: ollama
   model: fixture
   base_url: {base}
+  reasoning_effort: HIGH
   top_k: {top_k}
   top_p: 0.5
   num_ctx: 4096
@@ -755,6 +756,7 @@ llm:
             assert!(!headers.contains("authorization:"));
             assert_eq!(body["model"], "fixture");
             assert_eq!(body["stream"], streaming);
+            assert!(body.get("think").is_none());
             assert_eq!(body["options"]["top_p"], 0.5);
             assert_eq!(body["options"].get("top_k"), Some(&expected_top_k));
             for name in ["num_ctx", "num_gpu", "num_predict", "temperature", "seed"] {
@@ -796,7 +798,11 @@ llm:
         "fixture",
         None,
         Some(base),
-        LLMConfig::default().with_top_p(0.5).with_top_k(top_k),
+        LLMConfig::default()
+            .with_top_p(0.5)
+            .with_top_k(top_k)
+            .with_extra("reasoning_effort", json!("superseded"))
+            .with_reasoning_effort("Medium"),
     )
     .unwrap();
     let reply = provider
@@ -818,7 +824,7 @@ async fn local_ollama_named_yaml_sends_native_options_and_streams_authoritative_
         assert_eq!(
             body["options"],
             json!({"num_ctx": 4096, "num_gpu": -1, "top_p": null,
-            "top_k": 23, "temperature": 0.25, "num_predict": 99})
+            "top_k": 23, "temperature": 0.25, "num_predict": 99, "future_option": {"level": "custom"}})
         );
         assert!(body.get("tools").is_none());
         let records = concat!(
@@ -839,7 +845,7 @@ llms:
     api_key_env: OLLAMA_API_KEY
     provider_options:
       keep_alive: 5m
-      options: {{num_ctx: 4096, num_gpu: -1, top_k: 23, temperature: 0.25, num_predict: 99}}
+      options: {{num_ctx: 4096, num_gpu: -1, top_k: 23, temperature: 0.25, num_predict: 99, future_option: {{level: custom}}}}
 "#
     );
     let agent = AgentBuilder::from_yaml(&yaml)
@@ -890,6 +896,15 @@ async fn local_ollama_sdk_never_follows_a_redirect() {
 async fn local_ollama_rejects_conflicts_and_invalid_options_before_connecting() {
     let (listener, base) = fixture().await;
     for (settings, diagnostic) in [
+        ("reasoning_effort: invalid", "Invalid reasoning_effort"),
+        (
+            "provider_options: {options: {num_ctx: oops}}",
+            "options.num_ctx",
+        ),
+        (
+            "provider_options: {options: {temperature: {value: 1}}}",
+            "options.temperature",
+        ),
         (
             "temperature: 0.5\n  provider_options: {options: {temperature: 0.25}}",
             "both temperature and provider_options.options.temperature",
@@ -922,19 +937,37 @@ async fn local_ollama_rejects_conflicts_and_invalid_options_before_connecting() 
         let yaml = format!(
             "name: Local\nsystem_prompt: Test.\nllm:\n  provider: ollama\n  model: fixture\n  base_url: {base}\n  {settings}\n"
         );
-        let builder = AgentBuilder::from_yaml(&yaml).unwrap();
-        let error = match builder.auto_configure_llms() {
-            Ok(builder) => builder
-                .build()
-                .unwrap()
-                .chat("hello")
-                .await
-                .unwrap_err()
-                .to_string(),
-            Err(error) => error.to_string(),
-        };
-        assert!(error.contains(diagnostic), "{error}");
-        assert!(futures::poll!(Box::pin(listener.accept())).is_pending());
+        for streaming in [false, true] {
+            let call = async {
+                let builder = AgentBuilder::from_yaml(&yaml).unwrap();
+                let agent = match builder.auto_configure_llms() {
+                    Ok(builder) => builder.build().unwrap(),
+                    Err(error) => return error.to_string(),
+                };
+                if streaming {
+                    let mut events = match agent.chat_stream_events("hello").await {
+                        Ok(events) => events,
+                        Err(error) => return error.to_string(),
+                    };
+                    while let Some(event) = events.next().await {
+                        match event {
+                            AgentStreamEvent::Chunk(StreamChunk::Error { message }) => {
+                                return message;
+                            }
+                            AgentStreamEvent::Final(_) => panic!("unexpected success: {settings}"),
+                            _ => {}
+                        }
+                    }
+                    panic!("missing stream error: {settings}");
+                }
+                agent.chat("hello").await.unwrap_err().to_string()
+            };
+            tokio::select! {
+                error = call => assert!(error.contains(diagnostic), "{error}"),
+                _ = listener.accept() => panic!("invalid options opened a connection: {settings}, stream={streaming}"),
+            }
+            assert!(futures::poll!(Box::pin(listener.accept())).is_pending());
+        }
     }
 }
 
