@@ -1862,9 +1862,16 @@ fn ollama_cloud_task_approval_and_tool_result_survive_process_restarts() {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn openrouter_task_approval_and_reasoning_survive_process_restarts() {
+    signed_tool_task_survives_restarts(ReplayProtocol::OpenRouter);
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[derive(Clone, Copy)]
 enum ReplayProtocol {
     Responses,
+    OpenRouter,
     Messages,
     CompatibleMessages,
     OllamaCloud { with_wire_id: bool },
@@ -1879,6 +1886,53 @@ fn signed_tool_task_survives_restarts(protocol: ReplayProtocol) {
         &[],
         |_| {},
         move |body, index, _| {
+            if matches!(protocol, ReplayProtocol::OpenRouter) {
+                assert_eq!(body["model"], "vendor/fixture");
+                assert_eq!(body["provider"]["only"], json!(["fixture-provider"]));
+                assert_eq!(body["provider"]["allow_fallbacks"], false);
+                assert_eq!(body["reasoning"], json!({"effort":"fixture-effort"}));
+                assert_eq!(body["max_tokens"], 2000);
+                let first = json!({
+                    "role":"assistant","content":null,
+                    "reasoning_details":[
+                        {"type":"reasoning.encrypted","index":0,"data":"private-replay-fixture"},
+                        {"type":"reasoning.summary","index":1,"summary":"private-redacted-fixture","signature":"fixture-private-thinking"}
+                    ],
+                    "tool_calls":[{"id":"call_original","type":"function","function":{
+                        "name":"file_write","arguments":json!({"path":target,"content":"verified"}).to_string()
+                    }}]
+                });
+                let (message, reason) = if index == 0 {
+                    assert!(!target.exists());
+                    assert_eq!(body["tool_choice"], "auto");
+                    (first, "tool_calls")
+                } else {
+                    assert!(index <= 2);
+                    let messages = body["messages"].as_array().unwrap();
+                    let at = messages
+                        .iter()
+                        .position(|m| m["tool_calls"].is_array())
+                        .unwrap();
+                    assert_eq!(messages[at], first);
+                    assert_eq!(messages[at + 1]["role"], "tool");
+                    assert_eq!(messages[at + 1]["tool_call_id"], "call_original");
+                    assert!(
+                        messages[at + 1]["content"]
+                            .as_str()
+                            .is_some_and(|c| !c.is_empty())
+                    );
+                    assert_eq!(std::fs::read_to_string(&target).unwrap(), "verified");
+                    (
+                        json!({"role":"assistant","content":if index == 1 {"draft"} else {"done"}}),
+                        "stop",
+                    )
+                };
+                return Some(("application/json", json!({
+                    "id":format!("gen_{index}"), "model":"vendor/fixture", "provider":"Fixture Provider",
+                    "choices":[{"message":message,"finish_reason":reason}],
+                    "usage":{"prompt_tokens":12,"completion_tokens":4,"total_tokens":16,"cost":0.01}
+                }).to_string()));
+            }
             if let ReplayProtocol::OllamaCloud { with_wire_id } = protocol {
                 assert_eq!(body["model"], "fixture");
                 assert_eq!(body["stream"], false);
@@ -2004,6 +2058,10 @@ fn signed_tool_task_survives_restarts(protocol: ReplayProtocol) {
     let task=TASK.replace("tools: []","tools: [file_write]").replace("completion: {response_contains: done}","completion: {all: [{response_contains: done}, {tool_called: {id: file_write, count: 1, executed: true, success: true}}]}");
     let agent=provider.agent(&format!("{task}  premature_finish: {{action: ask_user, on_unavailable: stop}}\n  max_wall_time_seconds: 600\n  restoration_timeout_ms: 5000\n  persistence: {{enabled: true}}\n  hitl: {{on_approval_required: pause_run}}\nstorage: {{type: sqlite, path: '{}'}}\nhitl: {{default_timeout_seconds: 60, on_timeout: reject}}\ntool_security:\n  enabled: true\n  fail_closed: true\n  tools:\n    file_write:\n      write_paths: ['{}']\n      overwrite_existing: false\n",db.display(), files.dir.display()));
     let (preset, model) = match protocol {
+        ReplayProtocol::OpenRouter => (
+            "provider: openrouter\n  tool_choice: auto\n  provider_options: {provider: {only: [fixture-provider], allow_fallbacks: false}, reasoning: {effort: fixture-effort}}",
+            "vendor/fixture",
+        ),
         ReplayProtocol::OllamaCloud { .. } => {
             ("provider: ollama-cloud\n  tool_choice: auto", "fixture")
         }
@@ -2024,7 +2082,7 @@ fn signed_tool_task_survives_restarts(protocol: ReplayProtocol) {
         .unwrap()
         .replace("provider: openai-compatible", preset)
         .replace("model: fixture", &format!("model: {model}"));
-    std::fs::write(&agent, source).unwrap();
+    std::fs::write(&agent, &source).unwrap();
     let agent_path = agent.to_str().unwrap();
     let seed = provider.run(
         &[
@@ -2109,6 +2167,14 @@ fn signed_tool_task_survives_restarts(protocol: ReplayProtocol) {
             input,
         )
     };
+    if matches!(protocol, ReplayProtocol::OpenRouter) {
+        std::fs::write(&agent, source.replace("fixture-provider", "other-provider")).unwrap();
+        let changed = resume(&revision, "yes\nyes\n");
+        assert!(!changed.status.success());
+        assert!(!path.exists());
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        std::fs::write(&agent, source).unwrap();
+    }
     let between = resume(&revision, "yes\nyes\n");
     assert_exit(&between, 3);
     let last_result = |out: &Output| {
@@ -3423,4 +3489,60 @@ llms:
         }
     }
     assert_eq!(fixture.get_calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn openrouter_yaml_preserves_parallel_tool_calls_and_rejects_duplicates() {
+    let bodies = Arc::new(Mutex::new(Vec::new()));
+    let observed = bodies.clone();
+    let fixture =
+        Fixture::observe_requests(&[], move |body| observed.lock().unwrap().push(body.clone()));
+    let path = fixture.dir.join("agent.yaml");
+    let run = |options: &str| {
+        std::fs::write(&path, format!(
+            "name: Router\nsystem_prompt: Test\nllm:\n  provider: openrouter\n  base_url: {}\n  api_key_env: TASK_FIXTURE_TOKEN\n  model: test/model\n{options}", fixture.url
+        )).unwrap();
+        fixture.run(&["run", path.to_str().unwrap(), "--plain"], "hello\n")
+    };
+    for (options, expected) in [
+        ("", None),
+        ("  extra_body: {parallel_tool_calls: false}\n", Some(false)),
+        (
+            "  provider_options: {parallel_tool_calls: true}\n",
+            Some(true),
+        ),
+        (
+            "  normalize_response: true\n  extra_body: {parallel_tool_calls: false}\n",
+            Some(false),
+        ),
+    ] {
+        let output = run(options);
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("done"),
+            "{output:?}"
+        );
+        let requests = std::mem::take(&mut *bodies.lock().unwrap());
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].get("parallel_tool_calls"),
+            expected.map(Value::Bool).as_ref()
+        );
+    }
+    for (invalid, diagnostic) in [
+        (
+            "  extra_body: {parallel_tool_calls: false}\n  provider_options: {parallel_tool_calls: false}\n",
+            "declare OpenRouter parallel_tool_calls only once",
+        ),
+        (
+            "  extra_body: {parallel_tool_calls: 'false'}\n",
+            "extra_body.parallel_tool_calls must be a boolean",
+        ),
+    ] {
+        let output = run(invalid);
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(diagnostic),
+            "{output:?}"
+        );
+        assert!(bodies.lock().unwrap().is_empty());
+    }
 }

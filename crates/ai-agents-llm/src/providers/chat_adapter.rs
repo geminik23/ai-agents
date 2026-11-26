@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use super::sdk_error as error;
 
-fn append_message(
+pub(super) fn append_message(
     out: &mut Vec<sdk::Message>,
     msg: &ChatMessage,
     native: bool,
@@ -119,6 +119,47 @@ fn requires_legacy(cfg: &LLMConfig) -> Result<bool, LLMError> {
             .any(|key| cfg.extra.contains_key(*key)))
 }
 
+pub(super) fn request_options(
+    cfg: &LLMConfig,
+    mut apply: impl FnMut(&str, &str, &Value) -> Result<(), LLMError>,
+) -> Result<(), LLMError> {
+    for field in ["extra_body", "provider_options"] {
+        if let Some(value) = cfg.extra.get(field) {
+            let options = value
+                .as_object()
+                .ok_or_else(|| LLMError::Config(format!("{field} must be an object")))?;
+            for (key, value) in options {
+                apply(field, key, value)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn apply_option(
+    request: &mut sdk::ChatRequest,
+    field: &str,
+    key: &str,
+    value: &Value,
+) -> Result<(), LLMError> {
+    if field == "extra_body" && key == "response_format" {
+        // Migrate the legacy wire shape into the owned request field.
+        request.response_format = serde_json::from_value(value.clone()).map_err(|error| {
+            LLMError::Config(format!("invalid extra_body.response_format: {error}"))
+        })?;
+        return Ok(());
+    }
+    if sdk::reserved(key) {
+        return Err(LLMError::Config(format!("reserved option {field}.{key}")));
+    }
+    merge_option(
+        &mut request.provider_options,
+        key,
+        value,
+        &format!("{field}.{key}"),
+    )
+}
+
 pub(super) fn request(
     provider: ProviderType,
     model: &str,
@@ -155,27 +196,9 @@ pub(super) fn request(
         .timeout_seconds
         .or_else(|| extra.get("timeout_seconds").and_then(Value::as_u64))
         .map(Duration::from_secs);
-    for field in ["extra_body", "provider_options"] {
-        if let Some(value) = extra.get(field) {
-            let options = value
-                .as_object()
-                .ok_or_else(|| LLMError::Config(format!("{field} must be an object")))?;
-            for (k, v) in options {
-                if field == "extra_body" && k == "response_format" {
-                    // Migrate the legacy wire shape into the owned request field.
-                    request.response_format =
-                        serde_json::from_value(v.clone()).map_err(|error| {
-                            LLMError::Config(format!("invalid extra_body.response_format: {error}"))
-                        })?;
-                    continue;
-                }
-                if sdk::reserved(k) {
-                    return Err(LLMError::Config(format!("reserved option {field}.{k}")));
-                }
-                merge_option(&mut request.provider_options, k, v, &format!("{field}.{k}"))?;
-            }
-        }
-    }
+    request_options(cfg, |field, key, value| {
+        apply_option(&mut request, field, key, value)
+    })?;
     if provider == ProviderType::OpenAI {
         let hosted_search = extra
             .get("openai_enable_web_search")
@@ -222,6 +245,14 @@ pub(super) fn request(
         });
         append_message(&mut request.messages, msg, native)?;
     }
+    request_tools(&mut request, tools)?;
+    Ok(Some(request))
+}
+
+pub(super) fn request_tools(
+    request: &mut sdk::ChatRequest,
+    tools: Option<&LLMToolRequest>,
+) -> Result<(), LLMError> {
     if let Some(tools) = tools {
         request.functions = tools
             .tools
@@ -240,10 +271,10 @@ pub(super) fn request(
             _ => return Err(LLMError::Config("unsupported tool choice".into())),
         });
     }
-    Ok(Some(request))
+    Ok(())
 }
 
-fn finish(reason: &str) -> FinishReason {
+pub(super) fn finish(reason: &str) -> FinishReason {
     match reason {
         "stop" => FinishReason::Stop,
         "length" => FinishReason::Length,
@@ -252,7 +283,7 @@ fn finish(reason: &str) -> FinishReason {
         _ => FinishReason::Other,
     }
 }
-fn usage(u: sdk::Usage) -> TokenUsage {
+pub(super) fn usage(u: sdk::Usage) -> TokenUsage {
     TokenUsage {
         prompt_tokens: u.prompt_tokens,
         completion_tokens: u.completion_tokens,

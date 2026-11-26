@@ -825,3 +825,272 @@ async fn legacy_deployment_and_search_settings_keep_the_ordinary_chat_request() 
         server.await.unwrap();
     }
 }
+
+#[tokio::test]
+async fn openrouter_sdk_replays_streamed_reasoning_and_raw_tool_arguments() {
+    use ai_agents_llm::sdk::{FunctionChoice, openrouter};
+    let (listener, base) = fixture().await;
+    let server = tokio::spawn(async move {
+        let (mut socket, body, head) = receive(&listener).await;
+        assert!(head.contains("authorization: bearer fixture-key"));
+        assert_eq!(body["provider"]["require_parameters"], true);
+        assert_eq!(body["max_tokens"], 300);
+        assert!(body.get("max_completion_tokens").is_none());
+        assert!(body.get("temperature").is_none());
+        assert!(body.get("stream_options").is_none());
+        open_stream(&mut socket).await;
+        let first = json!({"id":"fixture","model":"vendor/model","provider":"Fixture Provider","choices":[{"index":0,"delta":{
+            "content":"한",
+            "reasoning_details":[{"type":"reasoning.encrypted","index":0,"data":"opaque-"}],
+            "tool_calls":[{"index":0,"id":"call_1","function":{"name":"probe","arguments":"{ \"value\":"}}]
+        }}]});
+        let second = json!({"id":"fixture","model":"vendor/model","provider":"Fixture Provider","choices":[{"index":0,"finish_reason":"tool_calls","delta":{
+            "reasoning_details":[{"index":0,"data":"blob"},{"type":"reasoning.summary","index":1,"summary":"second"}],
+            "tool_calls":[{"index":0,"function":{"arguments":" 3 }"}}]
+        }}]});
+        let usage = json!({
+            "choices":[{"index":0,"delta":{"content":"","role":"assistant","reasoning_details":[]}, "finish_reason":"tool_calls"}],
+            "usage":{"prompt_tokens":8,"completion_tokens":4,"total_tokens":12,"cost":0.001}
+        });
+        let payload = format!(
+            ": keepalive\r\n\r\ndata: {first}\r\n\r\ndata: {second}\r\n\r\ndata: {usage}\r\n\r\ndata: [DONE]\r\n\r\n"
+        );
+        let split = payload.find('한').unwrap() + 1;
+        socket
+            .write_all(&payload.as_bytes()[..split])
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+        socket
+            .write_all(&payload.as_bytes()[split..])
+            .await
+            .unwrap();
+        drop(socket);
+        let (mut socket, body, _) = receive(&listener).await;
+        assert_eq!(body["messages"][1]["content"], "한");
+        assert_eq!(
+            body["messages"][1]["reasoning_details"],
+            json!([
+                {"type":"reasoning.encrypted","index":0,"data":"opaque-blob"},
+                {"type":"reasoning.summary","index":1,"summary":"second"}
+            ])
+        );
+        assert_eq!(
+            body["messages"][1]["tool_calls"][0]["function"]["arguments"],
+            "{ \"value\": 3 }"
+        );
+        assert_eq!(
+            body["messages"][2],
+            json!({"role":"tool","tool_call_id":"call_1","content":"observed"})
+        );
+        let payload =
+            json!({"id":"next","model":"vendor/model","provider":"Fixture Provider","choices":[
+                {"message":{"role":"assistant","content":"verified"},"finish_reason":"stop"}
+            ]})
+            .to_string();
+        socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}", payload.len()).as_bytes()).await.unwrap();
+        listener
+    });
+    let client = openrouter::OpenRouterClient::at_endpoint(&base, "fixture-key".into()).unwrap();
+    let mut chat = ChatRequest::new("vendor/model", vec![Message::User("probe".into())]);
+    chat.max_completion_tokens = Some(300);
+    chat.provider_options.insert(
+        "provider".into(),
+        json!({"only":["fixture-provider"],"allow_fallbacks":false}),
+    );
+    chat.functions.push(Function {
+        name: "probe".into(),
+        description: "Check a value".into(),
+        parameters: json!({"type":"object"}),
+    });
+    chat.tool_choice = Some(FunctionChoice::Named("probe".into()));
+    let mut request = openrouter::Request::new(chat);
+    let mut stream = client.stream(&request).await.unwrap();
+    assert!(
+        matches!(stream.next().await.unwrap().unwrap(), openrouter::StreamEvent::Text(text) if text == "한")
+    );
+    let openrouter::StreamEvent::Finished(output) = stream.next().await.unwrap().unwrap() else {
+        panic!("expected final")
+    };
+    assert_eq!(output.finish_reason, "tool_calls");
+    assert_eq!(output.usage.unwrap().total_tokens, 12);
+    assert_eq!(output.cost, Some(json!(0.001)));
+    assert_eq!(output.tool_calls[0].arguments, json!({"value":3}));
+    assert!(output.assistant.has_reasoning());
+    request.push_assistant(&output.assistant).unwrap();
+    request.chat.messages.push(Message::ToolResult {
+        id: "call_1".into(),
+        content: "observed".into(),
+    });
+    request.chat.tool_choice = Some(FunctionChoice::None);
+    request.chat.model = "different/model".into();
+    assert!(matches!(
+        client.complete(&request).await,
+        Err(Error::Protocol(_))
+    ));
+    request.chat.model = "vendor/model".into();
+    assert_eq!(client.complete(&request).await.unwrap().text, "verified");
+    let listener = server.await.unwrap();
+    let accept = listener.accept();
+    tokio::pin!(accept);
+    assert!(futures::poll!(accept).is_pending());
+}
+
+#[tokio::test]
+async fn openrouter_router_constraints_reject_before_io() {
+    use ai_agents_llm::sdk::{FunctionChoice, openrouter};
+    let (listener, base) = fixture().await;
+    let client = openrouter::OpenRouterClient::at_endpoint(&base, "fixture-key".into()).unwrap();
+    let mut request = openrouter::Request::new(ChatRequest::new(
+        "vendor/model",
+        vec![Message::User("probe".into())],
+    ));
+    request.chat.functions.push(Function {
+        name: "probe".into(),
+        description: "probe".into(),
+        parameters: json!({"type":"object"}),
+    });
+    request.chat.tool_choice = Some(FunctionChoice::Required);
+    request
+        .chat
+        .provider_options
+        .insert("provider".into(), json!({"require_parameters":false}));
+    assert!(matches!(
+        client.stream(&request).await,
+        Err(Error::Config(_))
+    ));
+    let accept = listener.accept();
+    tokio::pin!(accept);
+    assert!(futures::poll!(accept).is_pending());
+}
+
+#[tokio::test]
+async fn openrouter_stream_failures_never_finalize_or_run_partial_tools() {
+    for ending in [
+        "data: {\"choices\":[],\"error\":{\"code\":502}}\n\ndata: [DONE]\n\n",
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"error\"}]}\n\ndata: [DONE]\n\n",
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n",
+        "",
+    ] {
+        let (listener, base) = fixture().await;
+        let server = tokio::spawn(async move {
+            let (mut socket, body, _) = receive(&listener).await;
+            assert_eq!(body["stream"], true);
+            assert!(body.get("provider").is_none());
+            open_stream(&mut socket).await;
+            frame(&mut socket, json!({"content":"provisional","tool_calls":[{"index":0,"id":"call","function":{"name":"probe","arguments":"{"}}]}), None).await;
+            socket.write_all(ending.as_bytes()).await.unwrap();
+            listener
+        });
+        let yaml = format!(
+            "name: Router\nsystem_prompt: Test\nllm:\n  provider: openrouter\n  base_url: {base}\n  model: fixture\n  api_key_env: OPENROUTER_LOCAL_TEST_KEY\ntools: [probe]\n"
+        );
+        // Explicit Rust credential keeps this package-local test independent of process environment.
+        let model = ai_agents_llm::providers::UnifiedLLMProvider::new(
+            ai_agents_llm::providers::ProviderType::OpenRouter,
+            "fixture".into(),
+            Some("fixture-key".into()),
+            Some(base),
+        )
+        .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let agent = AgentBuilder::from_yaml(&yaml)
+            .unwrap()
+            .llm(Arc::new(model))
+            .tool(Arc::new(Probe(calls.clone())))
+            .build()
+            .unwrap();
+        let events = agent
+            .chat_stream_events("sample")
+            .await
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await;
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, AgentStreamEvent::Chunk(StreamChunk::Error { .. })))
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentStreamEvent::Final(_)))
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let listener = server.await.unwrap();
+        let accept = listener.accept();
+        tokio::pin!(accept);
+        assert!(futures::poll!(accept).is_pending());
+    }
+}
+
+#[tokio::test]
+async fn openrouter_stream_cancellation_closes_the_loopback_response() {
+    use ai_agents_llm::sdk::openrouter;
+    let (listener, base) = fixture().await;
+    let server = tokio::spawn(async move {
+        let (mut socket, _, _) = receive(&listener).await;
+        open_stream(&mut socket).await;
+        frame(&mut socket, json!({"content":"pending"}), None).await;
+        let mut next = [0];
+        assert_eq!(socket.read(&mut next).await.unwrap(), 0);
+        listener
+    });
+    let client = openrouter::OpenRouterClient::at_endpoint(&base, "fixture-key".into()).unwrap();
+    let request = openrouter::Request::new(ChatRequest::new(
+        "fixture",
+        vec![Message::User("hello".into())],
+    ));
+    let mut stream = client.stream(&request).await.unwrap();
+    assert!(
+        matches!(stream.next().await.unwrap().unwrap(), openrouter::StreamEvent::Text(text) if text == "pending")
+    );
+    drop(stream);
+    let listener = tokio::time::timeout(std::time::Duration::from_secs(5), server)
+        .await
+        .unwrap()
+        .unwrap();
+    let accept = listener.accept();
+    tokio::pin!(accept);
+    assert!(futures::poll!(accept).is_pending());
+}
+
+#[tokio::test]
+async fn openrouter_credential_stays_on_the_explicit_origin() {
+    use ai_agents_llm::providers::{ProviderType, UnifiedLLMProvider};
+    use ai_agents_llm::sdk::openrouter;
+    let (listener, base) = fixture().await;
+    let (other, other_base) = fixture().await;
+    assert!(
+        ProviderType::OpenRouter
+            .configured_api_key_at(Some("OPENROUTER_API_KEY"), None, Some(&base))
+            .is_err()
+    );
+    assert!(
+        UnifiedLLMProvider::new(
+            ProviderType::OpenRouter,
+            "fixture".into(),
+            None,
+            Some(base.clone())
+        )
+        .is_err()
+    );
+    let server = tokio::spawn(async move {
+        let (mut socket, _, head) = receive(&listener).await;
+        assert!(head.contains("authorization: bearer fixture-key"));
+        socket.write_all(format!("HTTP/1.1 307 Temporary Redirect\r\nLocation: {other_base}/chat/completions\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+    });
+    let client = openrouter::OpenRouterClient::at_endpoint(&base, "fixture-key".into()).unwrap();
+    let request = openrouter::Request::new(ChatRequest::new(
+        "fixture",
+        vec![Message::User("hello".into())],
+    ));
+    assert!(matches!(
+        client.stream(&request).await,
+        Err(Error::Http(307))
+    ));
+    server.await.unwrap();
+    let accept = other.accept();
+    tokio::pin!(accept);
+    assert!(futures::poll!(accept).is_pending());
+}

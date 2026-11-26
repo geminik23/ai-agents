@@ -53,7 +53,7 @@ For `provider: openai`, an omitted temperature stays absent from the HTTP reques
 
 The direct client on the official OpenAI origin and the framework OpenAI preset apply the same documented Chat restrictions to explicit sampling options and native tools. For example, GPT-6.2 Astra/Sol and GPT-6 Astra/6.1 Sol require Responses for native tools and reject explicit sampling. GPT-6 Sol/Luna allow Chat native tools and sampling with effort `none`. GPT-5.2/5.4 allow sampling with effort `none`, their default. Unknown model IDs pass through to the endpoint. A compatible server owns its own model rules. [GPT-6.2 guide](https://developers.openai.com/api/docs/guides/latest-model?model=gpt-6.2-astra) · [GPT-6 guide](https://developers.openai.com/api/docs/guides/latest-model?model=gpt-6-astra) · [GPT-5.4 guide](https://developers.openai.com/api/docs/guides/latest-model?model=gpt-5.4)
 
-Legacy transport settings such as resilience, deployment/API version and hosted web search select the upstream backend before dispatch. The same applies to legacy reasoning/budget and unsupported typed sampling overrides. Enabled legacy transport settings conflict with explicit SDK options. Disabled resilience and web search, including their inactive tuning fields, keep the SDK path. Other providers and the public legacy `build_llm()` continue to use their existing paths.
+Legacy transport settings such as resilience, deployment/API version and hosted web search select the upstream backend before dispatch. The same applies to legacy reasoning/budget and unsupported typed sampling overrides. Enabled legacy transport settings conflict with explicit SDK options. Disabled resilience and web search, including their inactive tuning fields, keep the SDK path. The public legacy `build_llm()` continues to use the upstream backend. The OpenRouter preset has its own Chat contract.
 
 The SDK reads text as it arrives. A successful stream requires a finish reason and a complete `[DONE]` event. A disconnect after visible text reports an error. The framework also reports explicit non-success text finishes such as `length` and `content_filter` as terminal errors. Previously published deltas remain provisional and cannot trigger tools or a successful final response. Native tool calls require distinct, nonempty IDs. Arguments are assembled by call index, parsed as JSON objects and checked against the requested function selection before delivery. Direct SDK consumers validate their application schema before acting on a call. Framework tool approval and execution use the existing executor. Incomplete calls never become executable. The direct client exposes the provider finish reason and complete token receipt. The framework continues to publish its own processed agent response.
 
@@ -406,7 +406,7 @@ llm:
 
 ## OpenRouter
 
-The current OpenRouter backend forwards `extra_body` on ordinary chat requests. It accepts the legacy named `reasoning_effort` values during configuration and omits that field when sending the request. The same named-field behavior applies to Groq, Cohere and Mistral.
+The development checkout uses its own Chat adapter for ordinary OpenRouter requests. Existing YAML keeps its model ID, temperature default of `0.7`, output ceiling of `2000` sent as `max_tokens`, and supported `extra_body` extensions. The legacy top-level `reasoning_effort` accepts `low`, `medium`, and `high` and stays off the wire. Use `provider_options.reasoning.effort` to enable reasoning explicitly.
 
 OpenRouter acts as a gateway to many providers through a single API key. Use the full `provider/model` string as the model name:
 
@@ -425,6 +425,29 @@ llm:
   provider: openrouter
   model: openai/gpt-5.4-mini
 ```
+
+Existing YAML can set `extra_body: {parallel_tool_calls: false}` to send an explicit boolean. The OpenRouter SDK also accepts `provider_options.parallel_tool_calls` in YAML and `Request::parallel_tool_calls` in Rust. Omission uses the gateway default. Declare the field once across the two YAML maps.
+
+The SDK sends one generation request with no automatic retry or model list lookup. Ordinary calls use the gateway's default routing unless you specify options. Required and specific native tool choices enforce `provider.require_parameters: true` and validate the returned function. An explicit `false` conflicts with those choices. Separate gateway routing from framework fallback aliases. Pin a route before inviting a reasoning model to return native tools that must resume.
+
+```yaml
+llm:
+  provider: openrouter
+  model: anthropic/claude-haiku-4.5
+  tool_choice: auto
+  provider_options:
+    provider:
+      only: [anthropic]
+      allow_fallbacks: false
+    reasoning:
+      effort: low
+```
+
+The adapter needs one explicit provider route and the exact resolved model to accept a native tool response carrying private reasoning for replay. It preserves the assistant blocks and tool IDs through the existing approval and restart path. Gateway aliases, model fallbacks, and a changed destination can make a reasoning turn ineligible for replay. The regular text stream treats partial output as provisional. HTTP 200 followed by an SSE error or disconnection before `[DONE]` fails the turn.
+
+`provider.max_price` filters unit rates. A hard-priced task uses the host's `DeclaredPricing` contract, which must cover every eligible gateway route and internal attempt. Arbitrary routing overrides, extra billable services and model fallback options require their own audit. The current priced SDK request path rejects explicit gateway extensions before sending a request, including when a route and reasoning are configured for private replay. Final settlement requires one audited attempt and a complete token receipt for the exact model in the pricing contract. A missing or different reported model retains the full reservation, as do missing usage and stream interruption. A framework stream with declared pricing exposes final token usage only for a matching model. The direct SDK returns the gateway’s reported model and usage.
+
+For a custom API origin, select a dedicated `api_key_env` or pass an explicit Rust credential for that destination. Existing `resilient: true` or explicit `normalize_response` select the legacy backend before dispatch and conflict with new SDK options. The low-level `build_llm()` API still exposes the upstream provider. [Direct OpenRouter Rust SDK](@/docs/rust-api.md#direct-openrouter-chat-sdk-development)
 
 ---
 

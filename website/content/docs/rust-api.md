@@ -1764,6 +1764,24 @@ async fn describe(base_url: &str, key: Option<String>, model: &str, png: Vec<u8>
 
 For audio use `InputPart::Audio` with `AudioFormat::Wav` or `AudioFormat::Mp3`. For plain text use `Message::User`. The client can be shared across requests; model, messages, options and function definitions belong to each request. `stream()` yields provisional `Event::Text` and then `Event::Finished` with assembled calls and optional final usage. Complete usage includes separate input/output token breakdowns when supplied by the endpoint. To continue a tool turn, carry the assistant calls in `Message::Assistant` and return each authorized result using `Message::ToolResult` with its original ID. Direct callers handle their own execution permissions and accounting. Framework hosts can use the existing YAML adapter for managed calls.
 
+## Direct OpenRouter Chat SDK (development)
+
+`ai_agents_llm::sdk::openrouter` provides Chat Completions without creating an agent. Supply the credential and full model ID. The OpenRouter request encodes the shared `ChatRequest::max_completion_tokens` field as `max_tokens`.
+
+```rust,ignore
+use ai_agents_llm::sdk::{ChatRequest, Message, openrouter};
+
+let client = openrouter::OpenRouterClient::new(std::env::var("OPENROUTER_API_KEY")?)?;
+let request = openrouter::Request::new(ChatRequest::new(
+    "anthropic/claude-haiku-4.5",
+    vec![Message::User("Give an example of a prime number.".into())],
+));
+let reply = client.complete(&request).await?;
+println!("{}", reply.text);
+```
+
+The stream yields text followed by a completed response with validated function calls, token usage when reported, and the gateway's optional cost. Keep the returned `AssistantTurn` private. For a pinned route, call `Request::push_assistant` with that turn and append the corresponding `Message::ToolResult` before the next request. The SDK checks the original target before sending replay data. Framework approvals and execution live in the [OpenRouter adapter](@/docs/providers.md#openrouter).
+
 ## Direct Ollama Cloud SDK (development)
 
 ```rust

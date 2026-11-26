@@ -16,17 +16,19 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use super::chat_adapter;
 use super::google::GoogleProvider;
 use super::pricing::DeclaredPricing;
-use super::{messages_adapter, ollama_adapter, responses_adapter};
+use super::{messages_adapter, ollama_adapter, openrouter, responses_adapter};
 use crate::sdk::{
     ChatClient,
     decisions::{self, ChoiceOption, DecisionClient},
     messages::{self, MessagesClient},
     ollama::OllamaCloudClient,
+    openrouter::OpenRouterClient,
     responses::ResponsesClient,
 };
 #[derive(Clone)]
 enum SdkBackend {
     Chat(ChatClient),
+    OpenRouter(OpenRouterClient),
     Responses(ResponsesClient),
     Messages(MessagesClient),
     OllamaCloud(OllamaCloudClient),
@@ -237,7 +239,7 @@ impl ProviderType {
         match std::env::var(name) {
             Ok(key) => Ok(Some(key)),
             Err(_)
-                if matches!(*self, Self::OpenAI | Self::OllamaCloud)
+                if matches!(*self, Self::OpenAI | Self::OllamaCloud | Self::OpenRouter)
                     || self.uses_messages(protocol) =>
             {
                 Err(LLMError::Config(format!(
@@ -261,6 +263,14 @@ impl ProviderType {
                 "OLLAMA_API_KEY is bound to the official Ollama Cloud origin".into(),
             ));
         }
+        if *self == Self::OpenRouter
+            && variable == self.api_key_env_var()
+            && base_url.is_some_and(|base| !openrouter::official_origin(base))
+        {
+            return Err(LLMError::Config(
+                "OPENROUTER_API_KEY is bound to the official OpenRouter origin".into(),
+            ));
+        }
         Ok(())
     }
 
@@ -268,8 +278,8 @@ impl ProviderType {
         match self {
             Self::Ollama => Some("http://localhost:11434"),
             Self::OpenAICompatible => None, // MUST be provided by user via base_url
-            Self::OpenRouter => None,       // llm crate handles default
-            _ => None,                      // Most providers use their default URLs
+            Self::OpenRouter => Some(crate::sdk::openrouter::API_BASE),
+            _ => None, // Most providers use their default URLs
         }
     }
 
@@ -758,6 +768,7 @@ impl UnifiedLLMProvider {
             provider_type,
             ProviderType::OpenAI | ProviderType::OpenAICompatible
         );
+        let is_openrouter = provider_type == ProviderType::OpenRouter;
         let protocol = default_config.extra.get("protocol");
         let is_decisions = is_choice_protocol(protocol.and_then(serde_json::Value::as_str));
         if is_decisions {
@@ -807,7 +818,24 @@ impl UnifiedLLMProvider {
                 ));
             }
         }
+        if is_openrouter {
+            if protocol.is_some_and(|p| p != "chat-completions") {
+                return Err(LLMError::Config(
+                    "OpenRouter requires Chat Completions".into(),
+                ));
+            }
+            if api_key.is_none()
+                && base_url
+                    .as_deref()
+                    .is_some_and(|base| !openrouter::official_origin(base))
+            {
+                return Err(LLMError::Config(
+                    "custom OpenRouter origin requires explicitly selected credentials".into(),
+                ));
+            }
+        }
         if !is_chat
+            && !is_openrouter
             && !is_messages
             && !is_ollama_cloud
             && (default_config.extra.contains_key("protocol")
@@ -866,7 +894,17 @@ impl UnifiedLLMProvider {
             ));
         }
 
-        let sdk = if is_ollama_cloud {
+        let sdk = if is_openrouter {
+            Some(SdkBackend::OpenRouter(
+                OpenRouterClient::at_endpoint(
+                    actual_base_url
+                        .as_deref()
+                        .unwrap_or(crate::sdk::openrouter::API_BASE),
+                    actual_api_key.clone(),
+                )
+                .map_err(super::sdk_error)?,
+            ))
+        } else if is_ollama_cloud {
             Some(SdkBackend::OllamaCloud(ollama_adapter::connect(
                 actual_base_url.as_deref(),
                 actual_api_key.clone(),
@@ -1418,6 +1456,8 @@ impl UnifiedLLMProvider {
         // --- Extra body (universal escape hatch for arbitrary provider JSON) ---
         let extra_body = if self.provider_type == ProviderType::Ollama {
             merged_ollama_extra_body(config)?
+        } else if self.provider_type == ProviderType::OpenRouter {
+            openrouter::legacy_extra_body(config, tool_choice)?
         } else {
             config.extra.get("extra_body").cloned()
         };
@@ -1657,6 +1697,17 @@ impl LLMProvider for UnifiedLLMProvider {
             )
             .await;
         }
+        if let Some(SdkBackend::OpenRouter(client)) = &self.sdk
+            && let Some(wire) = openrouter::request(
+                client,
+                &self.model,
+                messages,
+                config.unwrap_or(&self.default_config),
+                None,
+            )?
+        {
+            return openrouter::complete(client, &wire).await;
+        }
         if let Some(SdkBackend::Chat(chat)) = &self.sdk
             && let Some(wire) = chat_adapter::request(
                 self.provider_type,
@@ -1773,6 +1824,17 @@ impl LLMProvider for UnifiedLLMProvider {
             )
             .await;
         }
+        if let Some(SdkBackend::OpenRouter(client)) = &self.sdk
+            && let Some(wire) = openrouter::request(
+                client,
+                &self.model,
+                messages,
+                config.unwrap_or(&self.default_config),
+                Some(request),
+            )?
+        {
+            return openrouter::complete(client, &wire).await;
+        }
         if let Some(SdkBackend::Chat(chat)) = &self.sdk
             && let Some(wire) = chat_adapter::request(
                 self.provider_type,
@@ -1870,6 +1932,22 @@ impl LLMProvider for UnifiedLLMProvider {
                 &self.model,
                 messages,
                 config.unwrap_or(&self.default_config),
+            )
+            .await;
+        }
+        if let Some(SdkBackend::OpenRouter(client)) = &self.sdk
+            && let Some(wire) = openrouter::request(
+                client,
+                &self.model,
+                messages,
+                config.unwrap_or(&self.default_config),
+                None,
+            )?
+        {
+            return openrouter::stream(
+                client,
+                &wire,
+                self.pricing.as_ref().map(|pricing| pricing.model.clone()),
             )
             .await;
         }
@@ -1975,10 +2053,41 @@ impl LLMProvider for UnifiedLLMProvider {
                 .quote(self.accounting_adapter(), &priced, &effective)
                 .map(Some);
         }
+        if let Some(SdkBackend::OpenRouter(client)) = &self.sdk {
+            let cfg = request.config.unwrap_or(&self.default_config);
+            if let Some(wire) =
+                openrouter::request(client, &self.model, request.messages, cfg, request.tools)?
+            {
+                if request
+                    .tools
+                    .is_some_and(|tools| !self.supports_choice_for_provider(&tools.choice))
+                    || wire.parallel_tool_calls.is_some()
+                    || !wire.chat.provider_options.is_empty()
+                    || wire.chat.response_format.is_some()
+                {
+                    return Err(LLMError::Config(
+                        "unbounded OpenRouter request under declared pricing".into(),
+                    ));
+                }
+                client
+                    .body(&wire, request.streaming)
+                    .map_err(super::sdk_error)?;
+                let mut effective = cfg.clone();
+                effective.extra.remove("protocol");
+                effective.extra.remove("provider_options");
+                let priced = ProviderRequest {
+                    config: Some(&effective),
+                    ..*request
+                };
+                return pricing
+                    .quote(self.accounting_adapter(), &priced, &effective)
+                    .map(Some);
+            }
+        }
         if let Some(google) = &self.google {
             google.validate_priced_request(request)?;
         } else {
-            if self.sdk.is_some() {
+            if matches!(self.sdk, Some(SdkBackend::Chat(_))) {
                 let cfg = request.config.unwrap_or(&self.default_config);
                 if let Some(wire) = chat_adapter::request(
                     self.provider_type,
@@ -2049,9 +2158,19 @@ impl LLMProvider for UnifiedLLMProvider {
         bound: &ProviderCostBound,
         response: &LLMResponse,
     ) -> Result<Option<ProviderCostSettlement>, LLMError> {
-        self.pricing.as_ref().map_or(Ok(None), |pricing| {
-            pricing.settle(self.accounting_adapter(), bound, response)
-        })
+        let Some(pricing) = &self.pricing else {
+            return Ok(None);
+        };
+        if self.provider_type == ProviderType::OpenRouter
+            && response
+                .metadata
+                .get(openrouter::REPORTED_MODEL)
+                .and_then(serde_json::Value::as_str)
+                != Some(pricing.model.as_str())
+        {
+            return Ok(None);
+        }
+        pricing.settle(self.accounting_adapter(), bound, response)
     }
 
     fn settle_stream_request_cost(

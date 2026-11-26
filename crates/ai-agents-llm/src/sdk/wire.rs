@@ -12,6 +12,7 @@ pub(super) struct Envelope<T> {
 
 #[derive(Deserialize)]
 pub(super) struct UsageReceipt {
+    pub cost: Option<Value>,
     prompt_tokens: Option<u32>,
     completion_tokens: Option<u32>,
     total_tokens: Option<u32>,
@@ -113,7 +114,7 @@ pub(super) fn complete(response: Envelope<Choice>) -> Result<Completion, Error> 
         .map_err(|_| Error::Protocol("expected one choice"))?;
     if choice.message.role != "assistant"
         || choice.message.function_call.is_some()
-        || choice.finish_reason.is_empty()
+        || matches!(choice.finish_reason.as_str(), "" | "error")
     {
         return Err(Error::Protocol("invalid assistant choice"));
     }

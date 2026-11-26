@@ -4,6 +4,7 @@ pub mod local;
 mod messages_adapter;
 mod ollama_adapter;
 pub(crate) mod openai;
+mod openrouter;
 mod pricing;
 mod responses_adapter;
 pub mod unified;

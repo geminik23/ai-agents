@@ -20,6 +20,7 @@ pub mod messages;
 pub mod models;
 pub mod ollama;
 pub(crate) mod openai;
+pub mod openrouter;
 pub mod responses;
 // Bound one unfinished SSE frame independently of total response length.
 pub(crate) const MAX_SSE_FRAME_BYTES: usize = 1024 * 1024;
