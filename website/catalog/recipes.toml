@@ -23,7 +23,7 @@ setup = "Local model"
 source = "examples/yaml/basic/ollama_chat.yaml"
 prerequisites = ["Install Ollama and start its server with `ollama serve`.", "Pull the configured model with `ollama pull llama3.2`. No hosted provider key is needed."]
 flow = ["Send the conversation to the local Ollama server.", "Generate with llama3.2 and the configured context window.", "Keep recent messages in memory during this process."]
-customize = ["Choose a model you have pulled locally.", "Tune num_ctx, keep_alive, and num_gpu for your machine."]
+customize = ["Choose a model you have pulled locally.", "Set the context window on the local server or model."]
 docs = ["providers", "getting-started"]
 
 [[recipes]]

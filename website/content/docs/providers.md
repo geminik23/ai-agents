@@ -30,6 +30,8 @@ The development checkout offers 14 provider presets - from cloud APIs like OpenA
 
 ---
 
+The default upstream Anthropic, DeepSeek, xAI and Phind clients use fixed service endpoints for chat, even if the configuration supplies a `base_url`. For a custom Anthropic Messages server, select `anthropic-compatible` and supply its API base explicitly.
+
 ## First-party Chat Completions (development)
 
 The development checkout sends ordinary `openai` and `openai-compatible` requests to the Chat Completions endpoint through `ai-agents-llm`. The base URL includes the API prefix. A compatible server can accept unauthenticated requests when its optional key is absent. An explicitly selected key variable for the official OpenAI preset must be available. Select credentials explicitly for an OpenAI preset with a custom origin. The direct client disables redirects.
@@ -290,18 +292,7 @@ llm:
   base_url: "http://192.168.1.100:11434"
 ```
 
-For agent workloads, set the context window explicitly. Ollama defaults can vary by server, model, and version.
-
-```yaml
-llm:
-  provider: ollama
-  model: llama3.1
-  num_ctx: 8192       # context window passed under Ollama options
-  keep_alive: 5m      # keep the model loaded after the request
-  num_gpu: -1         # optional GPU layers; -1 means all supported layers
-```
-
-These named fields are merged into the Ollama request body: `num_ctx` and `num_gpu` go under `options`, while `keep_alive` stays at the top level. If you also use `extra_body`, the framework merges the values and the named fields win on conflict.
+The current local chat backend sends `top_p` under `options`. It accepts YAML declarations for `num_ctx`, `num_gpu`, `keep_alive`, `temperature`, `max_tokens` and `extra_body`, but omits them from the local chat request. Configure the required context window on the Ollama server or model. The native Ollama Cloud preset has its own option mapping.
 
 To access Ollama through its OpenAI-compatible endpoint instead, use `provider: openai-compatible` and include `/v1` in the URL:
 
@@ -315,6 +306,8 @@ llm:
 ---
 
 ## DeepSeek
+
+The current backend supports blocking chat at its fixed service endpoint. It sends the model, messages and temperature. A YAML output limit does not reach the request, and the streaming method returns an unsupported-operation error.
 
 ```sh
 export DEEPSEEK_API_KEY=sk-...
@@ -395,6 +388,8 @@ llm:
 
 ## Phind
 
+The legacy backend reads the service response into one text result. Its framework streaming method returns an unsupported-operation error.
+
 > **Note:** The Phind hosted API endpoint may have limited availability. Verify the endpoint is accessible before relying on this provider in production.
 
 ```sh
@@ -410,6 +405,8 @@ llm:
 ---
 
 ## OpenRouter
+
+The current OpenRouter backend forwards `extra_body` on ordinary chat requests. It accepts the legacy named `reasoning_effort` values during configuration and omits that field when sending the request. The same named-field behavior applies to Groq, Cohere and Mistral.
 
 OpenRouter acts as a gateway to many providers through a single API key. Use the full `provider/model` string as the model name:
 
@@ -670,7 +667,7 @@ The compatibility `llm.on_rate_limit` field is parsed but does not currently add
 
 ## Tuning Parameters
 
-Every provider accepts these optional parameters in the `llm:` or `llms:` block:
+Use these fields in the `llm:` or `llms:` block. The selected backend determines which fields reach the service.
 
 ```yaml
 llm:
@@ -684,8 +681,8 @@ llm:
 
 | Parameter | Type | Default | Description |
 | --- | --- | --- | --- |
-| `temperature` | `f32` | omitted for OpenAI and first-party Messages, `0.7` for existing compatible/legacy paths | Sampling temperature |
-| `max_tokens` | `u32` | required for Messages, omitted for Responses, `2000` on existing paths | Maximum response tokens |
+| `temperature` | `f32` | omitted for OpenAI, first-party Messages and Ollama Cloud, `0.7` for existing compatible/legacy paths | Sampling temperature |
+| `max_tokens` | `u32` | required for first-party Messages, omitted for Responses and Ollama Cloud, `2000` on existing paths | Maximum response tokens |
 | `top_p` | `f32` | - | Nucleus sampling threshold |
 | `timeout_seconds` | `u64` | - | Request timeout in seconds |
 
@@ -748,36 +745,17 @@ llm:
 
 ### Azure OpenAI
 
-To use Azure OpenAI endpoints, pass `api_version` and `deployment_id` as extra parameters:
-
-```yaml
-llm:
-  provider: openai
-  model: gpt-5.4-mini
-  base_url: "https://my-resource.openai.azure.com"
-  api_version: "2024-06-01"
-  deployment_id: my-gpt-5-4-mini-deployment
-```
-
-> **Note:** Full Azure support (dedicated `azure-openai` provider type) is planned for a future release. The extra-based approach above works today.
+The legacy fields `api_version` and `deployment_id` select the upstream Chat backend. It appends `chat/completions` to the configured base URL and omits the deployment path and version query. A resource root plus those two fields is insufficient for a versioned Azure deployment request.
 
 ### OpenAI provider-native web search
 
-Provider-native search options modify the LLM provider request. They do not call the canonical `web_search` tool, do not produce tool-execution evidence, and do not pass through built-in tool grants, `WebSearchProvider`, tool policy, or HITL. Use the separately granted built-in when you need the shared tool-execution contract; see [Built-in Tools](@/docs/built-in-tools.md#web-search-versus-web-fetch).
+Provider-native search runs on the service. The separately granted `web_search` tool runs through `WebSearchProvider`, framework tool policy, HITL and tool-execution evidence. [Built-in Tools](@/docs/built-in-tools.md#web-search-versus-web-fetch)
 
-For OpenAI models that support provider-native web search:
-
-```yaml
-llm:
-  provider: openai
-  model: gpt-5.4-mini
-  openai_enable_web_search: true
-  openai_web_search_context_size: medium
-```
+On the OpenAI and OpenAI-compatible presets, `openai_enable_web_search: true` selects the upstream backend. Ordinary framework chat still sends a Chat Completions request without a hosted search tool. The upstream Rust client exposes a separate `chat_with_web_search` operation.
 
 ### xAI provider-native search
 
-For xAI (Grok) models with provider-native search capabilities:
+The current upstream xAI backend sends search parameters on blocking chat and omits them from streaming requests:
 
 ```yaml
 llm:
@@ -789,7 +767,7 @@ llm:
 
 ### `extra_body` (Escape Hatch)
 
-For any parameter not modeled by the framework, inject raw JSON into the request body:
+On backends that support `extra_body`, use it for additional request fields. For example, the Chat adapter accepts the following options:
 
 ```yaml
 llm:

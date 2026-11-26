@@ -342,8 +342,8 @@ The simplest form: one LLM for everything. Use `llm` as a flat object.
 |-------|------|---------|-------------|
 | `provider` | `string` | `"openai"` | Provider identifier |
 | `model` | `string` | `"gpt-4"` | Model name |
-| `temperature` | `f32` | omitted for OpenAI and first-party Messages, `0.7` for existing compatible/legacy paths | Sampling temperature. Explicit values follow the selected endpoint and model. |
-| `max_tokens` | `u32` | omitted for Responses, required for Messages, `2000` for existing Chat and legacy paths | Maximum output tokens. Decisions accepts no output limit. |
+| `temperature` | `f32` | omitted for OpenAI, first-party Messages and Ollama Cloud, `0.7` for existing compatible/legacy paths | Sampling temperature. Explicit values follow the selected endpoint and model. |
+| `max_tokens` | `u32` | omitted for Responses and Ollama Cloud, required for first-party Messages, `2000` for existing Chat and legacy paths | Maximum output tokens. Decisions accepts no output limit. |
 | `top_p` | `f32` | `null` | Nucleus sampling |
 | `base_url` | `string` | `null` | API endpoint override (required for `openai-compatible`) |
 | `api_key_env` | `string` | `null` | Env var holding the API key (overrides provider default) |
@@ -357,11 +357,11 @@ The simplest form: one LLM for everything. Use `llm` as a flat object.
 | `tool_choice` | `auto`, `required`, `none`, or `{ specific: ID }` | `null` | Opt in to native or runtime-enforced tool selection; omission preserves the legacy prompt protocol |
 | `vision` | `bool` | `null` | Override `supports(Vision)` for this provider |
 | `json_mode` | `bool` | `null` | Override `supports(JsonMode)` for this provider |
-| `num_ctx` | `u32` | `null` | Ollama context window; merged under request `options` |
-| `keep_alive` | `string` or `number` | `null` | Ollama keep-alive duration; top-level request body field |
-| `num_gpu` | `i32` | `null` | Ollama GPU layer count; merged under request `options` |
+| `num_ctx` | `u32` | `null` | Local Ollama context window declaration, currently omitted from chat requests |
+| `keep_alive` | `string` or `number` | `null` | Local Ollama keep-alive declaration, currently omitted from chat requests |
+| `num_gpu` | `i32` | `null` | Local Ollama GPU layer declaration, currently omitted from chat requests |
 | `declared_pricing` | object | `null` | Development-only, host-audited priced capability for the explicit Rust task API; omitted means no built-in hard-priced binding |
-| *(any other key)* | | | Passed through as provider-specific extra parameter |
+| *(any other key)* | | | Captured as a provider extra. Transmission depends on the selected backend. |
 
 ```yaml
 llm:
@@ -371,7 +371,7 @@ llm:
   max_tokens: 4000
 ```
 
-Capability override fields (`function_calling`, `vision`, `json_mode`) are not sent as model parameters. They control framework capability checks; `function_calling: false` also disables native tool selection, while `function_calling: true` opts an OpenAI-compatible server into the native path. The GPT-6.2 OpenAI Chat models require Responses for native tools. Ollama named fields (`num_ctx`, `keep_alive`, `num_gpu`) are captured as provider extras and merged into the Ollama request body. [Chat model and option support](@/docs/providers.md#first-party-chat-completions-development)
+Capability override fields (`function_calling`, `vision`, `json_mode`) are not sent as model parameters. They control framework capability checks; `function_calling: false` also disables native tool selection, while `function_calling: true` opts an OpenAI-compatible server into the native path. The GPT-6.2 OpenAI Chat models require Responses for native tools. The local Ollama backend accepts the named fields `num_ctx`, `num_gpu` and `keep_alive` at configuration time and omits them from its chat requests. [Chat model and option support](@/docs/providers.md#first-party-chat-completions-development)
 
 Any field not listed above is captured in an `extra` map via `#[serde(flatten)]` and forwarded to the LLM client when a matching builder method exists. This includes transport-level resilience (`resilient`, `resilient_attempts`, etc.), Azure settings (`api_version`, `deployment_id`), and provider-native search (`openai_enable_web_search`, `xai_search_mode`, etc.). Provider-native search changes the LLM request and is separate from the granted built-in `web_search` tool, its `WebSearchProvider`, shared policy/HITL path, and tool evidence. See [LLM Providers > Extra Parameters](@/docs/providers.md#extra-parameters) for the full list.
 
@@ -387,13 +387,11 @@ llm:
 ```
 
 ```yaml
-# Local Ollama with explicit context window
+# Local Ollama with explicit nucleus sampling
 llm:
   provider: ollama
   model: llama3.1
-  num_ctx: 8192
-  keep_alive: 5m
-  num_gpu: -1
+  top_p: 0.9
 ```
 
 ```yaml

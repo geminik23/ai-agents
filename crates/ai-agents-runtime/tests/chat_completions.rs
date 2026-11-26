@@ -720,3 +720,82 @@ async fn messages_sdk_rejects_cross_origin_redirect_with_api_key() {
     server.await.unwrap();
     assert!(futures::poll!(Box::pin(foreign.accept())).is_pending());
 }
+
+#[tokio::test]
+async fn local_ollama_yaml_distinguishes_declared_settings_from_transmitted_options() {
+    let (listener, base) = fixture().await;
+    let source = include_str!("../../../examples/yaml/basic/ollama_chat.yaml");
+    let mut spec: serde_yaml::Value = serde_yaml::from_str(source).unwrap();
+    let config = &mut spec["llm"];
+    let model = config["model"].as_str().unwrap().to_owned();
+    config["base_url"] = base.into();
+    config["num_ctx"] = 4096.into();
+    config["num_gpu"] = (-1).into();
+    config["keep_alive"] = "5m".into();
+    config["top_p"] = 0.5.into();
+    config["max_tokens"] = 99.into();
+    config["temperature"] = 0.25.into();
+    config["extra_body"] = serde_yaml::from_str("{options: {seed: 17}}").unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, body, _) = receive_path(&listener, "/tenant/v1/api/chat").await;
+        assert_eq!(body["model"], model);
+        assert_eq!(body["options"]["top_p"], 0.5);
+        for name in ["num_ctx", "num_gpu", "num_predict", "temperature", "seed"] {
+            assert!(body["options"].get(name).is_none(), "{name}: {body}");
+        }
+        assert!(body.get("keep_alive").is_none());
+        let payload = r#"{"message":{"role":"assistant","content":"local reply"},"done":true}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+            payload.len()
+        );
+        socket.write_all(response.as_bytes()).await.unwrap();
+    });
+    let agent = AgentBuilder::from_yaml(&serde_yaml::to_string(&spec).unwrap())
+        .unwrap()
+        .auto_configure_llms()
+        .unwrap()
+        .build()
+        .unwrap();
+    assert_eq!(agent.chat("hello").await.unwrap().content, "local reply");
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn legacy_deployment_and_search_settings_keep_the_ordinary_chat_request() {
+    for option in [
+        "  api_version: fixture-version\n  deployment_id: fixture-deployment",
+        "  openai_enable_web_search: true\n  openai_web_search_context_size: medium",
+    ] {
+        let (listener, base) = fixture().await;
+        let server = tokio::spawn(async move {
+            let (mut socket, body, _) = receive(&listener).await;
+            assert_eq!(body["model"], "fixture");
+            for key in [
+                "deployment_id",
+                "api_version",
+                "tools",
+                "web_search_options",
+            ] {
+                assert!(body.get(key).is_none(), "{key}: {body}");
+            }
+            reply(
+                &mut socket,
+                json!({"role":"assistant","content":"ordinary chat"}),
+                "stop",
+            )
+            .await;
+        });
+        let yaml = format!(
+            "name: Legacy\nsystem_prompt: Test\nllm:\n  provider: openai-compatible\n  base_url: {base}\n  model: fixture\n{option}\n"
+        );
+        let agent = AgentBuilder::from_yaml(&yaml)
+            .unwrap()
+            .auto_configure_llms()
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(agent.chat("test").await.unwrap().content, "ordinary chat");
+        server.await.unwrap();
+    }
+}

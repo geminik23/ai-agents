@@ -3363,3 +3363,64 @@ fn task_subprocess_configured_cancelled_pause_cleans_up_without_model_work() {
     assert_eq!(done["counters"]["llm_attempts"], 1);
     assert_eq!(f.calls.load(Ordering::SeqCst), 1);
 }
+
+#[test]
+fn named_yaml_preserves_legacy_chat_options_and_unused_provider_aliases() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let captured = requests.clone();
+    let fixture = Fixture::observe_requests(&[], move |body| {
+        captured.lock().unwrap().push(body.clone());
+    });
+    let path = fixture.dir.join("aliases.yaml");
+    for provider in [
+        "openrouter",
+        "mistral",
+        "groq",
+        "cohere",
+        "openai_compatible",
+    ] {
+        let yaml = format!(
+            r#"name: Aliases
+system_prompt: Answer briefly.
+llm:
+  default: primary
+llms:
+  primary:
+    provider: {provider}
+    model: selected/model
+    api_key_env: TASK_FIXTURE_TOKEN
+    base_url: {url}
+    reasoning_effort: high
+    extra_body: {{logprobs: true}}
+  spare:
+    provider: groq
+    model: unused/model
+    api_key_env: TASK_FIXTURE_TOKEN
+    base_url: {url}
+"#,
+            url = fixture.url
+        );
+        std::fs::write(&path, yaml).unwrap();
+        let output = fixture.run(&["run", path.to_str().unwrap(), "--plain"], "hello\n");
+        assert_exit(&output, 0);
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("done"),
+            "{provider}"
+        );
+        let bodies = std::mem::take(&mut *requests.lock().unwrap());
+        let [body] = bodies.as_slice() else {
+            panic!("expected one generation for {provider}: {bodies:?}")
+        };
+        assert_eq!(body["model"], "selected/model");
+        assert_eq!(body["logprobs"], true);
+        assert_eq!(body["temperature"], 0.7);
+        if provider == "openai_compatible" {
+            assert_eq!(body["reasoning_effort"], "high");
+            assert_eq!(body["max_completion_tokens"], 2000);
+        } else {
+            assert!(body.get("reasoning_effort").is_none(), "{provider}: {body}");
+            assert_eq!(body["max_tokens"], 2000, "{provider}");
+        }
+    }
+    assert_eq!(fixture.get_calls.load(Ordering::SeqCst), 0);
+}
