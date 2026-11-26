@@ -14,6 +14,11 @@ pub use pricing::DeclaredPricing;
 pub use local::{LocalModelAdapter, LocalModelProvider, ModelInfo};
 pub use unified::{ProviderBuilder, ProviderType, UnifiedLLMProvider};
 
+// Prompt-tool history identifies the tool in user-visible text when the wire protocol has no native result.
+fn prompt_tool_result(name: Option<&str>, content: &str) -> String {
+    format!("[{} result]: {content}", name.unwrap_or("tool"))
+}
+
 pub(super) fn sdk_error(e: crate::sdk::Error) -> ai_agents_core::LLMError {
     use crate::sdk;
     use ai_agents_core::LLMError;

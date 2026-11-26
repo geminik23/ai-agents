@@ -547,6 +547,78 @@ impl ConfiguredTaskRestoreHost {
         Ok(json!({"host": self.configuration, "definition": definition, "base_dir": base_dir}))
     }
 
+    // Resolve the inherited provider declarations from the same spawner binding used during reconstruction.
+    fn restore_provider_spec(
+        &self,
+        manifest: &TaskRestoreManifest,
+        prepared: PreparedAgentSpec,
+        membership: Option<&(String, String)>,
+    ) -> Result<PreparedAgentSpec> {
+        let Some((spawner, _)) = membership else {
+            return Ok(prepared);
+        };
+        if manifest
+            .spawners
+            .get(spawner)
+            .ok_or(TaskRunStorageError::InvalidCheckpoint)?["shared"]
+            .as_bool()
+            != Some(true)
+        {
+            return Ok(prepared);
+        }
+        let (owner, _) = manifest
+            .nodes
+            .iter()
+            .find(|(_, node)| node.spawner.as_ref() == Some(spawner))
+            .ok_or(TaskRunStorageError::InvalidCheckpoint)?;
+        self.source(manifest, owner).map(|(spec, _, _)| spec)
+    }
+
+    // An old tool batch does not record the selected alias or discarded thinking blocks.
+    // Refuse unsigned continuation when any configured candidate could have produced a signed exchange.
+    fn validate_anthropic_continuation(
+        spec: &crate::spec::AgentSpec,
+        runtime: &TaskRuntimeCheckpoint,
+    ) -> Result<()> {
+        let TaskContinuation::Suspended {
+            batch: Some(batch), ..
+        } = &runtime.continuation
+        else {
+            return Ok(());
+        };
+        let needs_signature = |config: &crate::spec::LLMConfig| {
+            let Ok(provider) = config
+                .provider
+                .parse::<ai_agents_llm::providers::ProviderType>()
+            else {
+                return false;
+            };
+            provider.requires_signed_default_anthropic_history(
+                &config.model,
+                &config.to_provider_config(provider),
+            )
+        };
+        let requires_signature = if spec.llms.is_empty() {
+            spec.llm.as_config().is_some_and(needs_signature)
+        } else {
+            spec.llms.values().any(needs_signature)
+        };
+        if requires_signature {
+            for message in &batch.messages {
+                if message.role == ai_agents_core::Role::Assistant
+                    && let Some(calls) =
+                        ai_agents_core::decode_native_tool_call_markers(&message.content)?
+                    && calls.provider_state().is_none()
+                {
+                    return Err(AgentError::Config(
+                        "cannot restore unsigned legacy tool history for an Anthropic model that may require signed thinking blocks".into()
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     // Resolves recorded child declarations through the saved topology, then checks any current declarative source against them.
     fn source(&self, manifest: &TaskRestoreManifest, id: &str) -> Result<NodeSource> {
         if id == manifest.root {
@@ -734,7 +806,7 @@ impl TaskRestoreHost for ConfiguredTaskRestoreHost {
             ));
         }
         for (id, node) in &manifest.nodes {
-            let (prepared, base_dir, _) = self.source(manifest, id)?;
+            let (prepared, base_dir, membership) = self.source(manifest, id)?;
             if node.binding.id != "configured-yaml-runtime"
                 || node.binding.contract_version != 1
                 || node.binding.configuration != self.binding_configuration(&prepared, &base_dir)?
@@ -743,6 +815,9 @@ impl TaskRestoreHost for ConfiguredTaskRestoreHost {
                     "configured runtime definition differs".into(),
                 ));
             }
+            let providers =
+                self.restore_provider_spec(manifest, prepared.clone(), membership.as_ref())?;
+            Self::validate_anthropic_continuation(providers.spec(), &node.runtime)?;
             let state: ConfiguredTaskState = serde_json::from_value(node.binding.state.clone())?;
             match (&self.components, &state.components) {
                 (Some(factory), Some(binding)) => {

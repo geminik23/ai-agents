@@ -30,7 +30,7 @@ The development checkout offers 14 provider presets - from cloud APIs like OpenA
 
 ---
 
-The default upstream Anthropic, DeepSeek, xAI and Phind clients use fixed service endpoints for chat, even if the configuration supplies a `base_url`. For a custom Anthropic Messages server, select `anthropic-compatible` and supply its API base explicitly.
+The default Anthropic preset accepts the official Messages endpoint. For a custom Messages server, select `anthropic-compatible` and supply its API base explicitly. The upstream DeepSeek, xAI and Phind clients use fixed service endpoints for chat.
 
 ## First-party Chat Completions (development)
 
@@ -196,7 +196,11 @@ llm:
 
 ### First-party Messages (development)
 
-Select the native Messages endpoint explicitly. The official preset uses the Anthropic API key and version headers. The SDK sends the configured model ID as supplied.
+The default Anthropic preset uses the native Messages SDK and the official API with `x-api-key` and `anthropic-version: 2023-06-01`. Existing YAML sends a default temperature of 0.7 and a maximum of 2000 output tokens. An omitted `top_p` stays absent. An alternate `base_url` requires the `anthropic-compatible` preset. With `resilient: true`, the framework validates the effective thinking budget and tool choice before dispatch. Its retry policy applies to attempts at the official endpoint. The SDK, resilient transport and raw Rust client all refuse to follow HTTP redirects.
+
+With the default preset, `reasoning: true` sends manual thinking on ordinary and buffered tool requests. Set a compatible model, a thinking budget of at least 1024, and a larger `max_tokens`. The historical omitted budget is 16000. Ordinary text streams omit the thinking field. Blocking replies in the default preset join text blocks with a newline. Explicit Messages and native text streaming concatenate the text as received. The SDK stream requires `message_stop` before yielding a final response.
+
+Choose `protocol: messages` for native thinking and effort options. The SDK sends the configured model ID as supplied.
 
 ```yaml
 llm:
@@ -210,7 +214,7 @@ llm:
     output_config: {effort: low}
 ```
 
-Messages requires an explicit positive `max_tokens` for generation. An omitted temperature stays absent. For API-supported manual thinking, use `thinking: {type: enabled, budget_tokens: 1024}` with a budget below `max_tokens` on the official endpoint. Declare thinking and effort once. Forced selection is checked against the selected official model and thinking mode. An unsupported configured `required` or `specific` choice returns a configuration error. Omitting `protocol` on the official preset continues to select the legacy adapter and its existing defaults.
+Messages requires an explicit positive `max_tokens` for generation. An omitted temperature stays absent. For API-supported manual thinking, use `thinking: {type: enabled, budget_tokens: 1024}` with a budget below `max_tokens` on the official endpoint. Declare thinking and effort once. Forced selection is checked against the selected official model and thinking mode. An unsupported configured `required` or `specific` choice returns a configuration error.
 
 Use `provider: anthropic-compatible` with an explicit `base_url` that includes the API prefix, a server-specific model ID and `max_tokens`. A compatible endpoint can run without credentials or use a server-specific `api_key_env`. With a key, the compatible preset uses Bearer authentication by default. Set `messages_auth: api-key` for servers expecting `x-api-key`. Set `anthropic_version` when a server requires a different API version. Native choices on a compatible endpoint require `function_calling: true`.
 
@@ -572,7 +576,7 @@ Use them when you know a model/server supports more or less than the provider de
 | Provider | Native `auto` | Native `required` / `specific` | Behavior when native choice is unavailable |
 | --- | --- | --- | --- |
 | OpenAI | Yes | Yes | Not applicable |
-| Anthropic | Yes | Depends on the Messages model and thinking mode. Legacy retains its existing path. | Messages reports an error for an unsupported explicit forced choice. |
+| Anthropic | Yes | Depends on the Messages model and thinking mode. | Messages reports an error for an unsupported explicit forced choice. |
 | Messages-compatible | Opt in with `function_calling: true` | Requires opt-in and server support | Prompt tools remain available for ordinary auto selection. |
 | OpenRouter | Yes | Yes | Not applicable |
 | Google first-party GenerateContent | Yes | No | One bounded prompt corrective retry |
@@ -722,8 +726,8 @@ llm:
 
 | Parameter | Type | Default | Description |
 | --- | --- | --- | --- |
-| `temperature` | `f32` | omitted for OpenAI, first-party Messages and Ollama Cloud, `0.7` for existing compatible/legacy paths | Sampling temperature |
-| `max_tokens` | `u32` | required for first-party Messages, omitted for Responses and Ollama Cloud, `2000` on existing paths | Maximum response tokens |
+| `temperature` | `f32` | omitted for OpenAI, explicit Messages, Messages-compatible and Ollama Cloud, `0.7` for default Anthropic and existing compatible/legacy paths | Sampling temperature |
+| `max_tokens` | `u32` | required for explicit Messages and Messages-compatible, omitted for Responses and Ollama Cloud, `2000` on existing paths | Maximum response tokens |
 | `top_p` | `f32` | - | Nucleus sampling threshold |
 | `timeout_seconds` | `u64` | - | Request timeout in seconds |
 

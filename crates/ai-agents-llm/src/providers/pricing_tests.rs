@@ -310,17 +310,19 @@ fn rs_paid_inventory_rejects_unaudited_upstream_and_unknown_request_options() {
         ProviderType::Phind,
         ProviderType::Ollama,
     ] {
+        let endpoint = match kind {
+            ProviderType::Anthropic => crate::sdk::messages::OFFICIAL_BASE,
+            _ => "http://127.0.0.1:9/",
+        };
         let provider = ProviderBuilder::new()
             .provider(kind)
             .model("fixture-model")
             .api_key("fixture")
-            .base_url("http://127.0.0.1:9/")
+            .base_url(endpoint)
             .build()
             .unwrap();
         assert!(
-            provider
-                .with_declared_pricing(schedule("http://127.0.0.1:9/"))
-                .is_err(),
+            provider.with_declared_pricing(schedule(endpoint)).is_err(),
             "{kind:?}"
         );
     }

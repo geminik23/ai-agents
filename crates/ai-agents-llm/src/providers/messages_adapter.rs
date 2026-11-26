@@ -67,6 +67,178 @@ pub(super) fn connect(
     MessagesClient::at_endpoint(base, auth, version, official).map_err(sdk_error)
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum RequestConfig<'a> {
+    Explicit(&'a LLMConfig),
+    DefaultAnthropic(&'a LLMConfig),
+}
+
+pub(super) fn validate_default_destination(base: Option<&str>) -> Result<(), LLMError> {
+    if base.is_some_and(|base| {
+        !reqwest::Url::parse(base).is_ok_and(|url| {
+            url.origin().ascii_serialization() == OFFICIAL_ORIGIN
+                && url.path().trim_end_matches('/') == "/v1"
+                && url.username().is_empty()
+                && url.password().is_none()
+                && url.query().is_none()
+                && url.fragment().is_none()
+        })
+    }) {
+        return Err(configuration(
+            "default Anthropic uses the official /v1 endpoint; use anthropic-compatible for a custom base_url",
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn validate_default_options(config: &LLMConfig) -> Result<(), LLMError> {
+    for field in [
+        "protocol",
+        "provider_options",
+        "anthropic_version",
+        "messages_auth",
+    ] {
+        if config.extra.contains_key(field) {
+            return Err(LLMError::Config(format!(
+                "{field} requires explicitly selecting the Messages SDK; configure protocol: messages for native options, or use legacy settings with build_llm()"
+            )));
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn uses_resilient_transport(config: &LLMConfig) -> bool {
+    config.extra.get("resilient").and_then(Value::as_bool) == Some(true)
+}
+
+fn default_thinking(config: &LLMConfig) -> Result<Option<Thinking>, LLMError> {
+    let enabled = config
+        .reasoning
+        .or_else(|| config.extra.get("reasoning").and_then(Value::as_bool));
+    if enabled != Some(true) {
+        return Ok(None);
+    }
+    let budget_tokens = match (
+        config.reasoning_budget_tokens,
+        config.extra.get("reasoning_budget_tokens"),
+    ) {
+        (Some(n), _) => n,
+        (None, None) => 16_000,
+        (None, Some(value)) => value
+            .as_u64()
+            .and_then(|n| u32::try_from(n).ok())
+            .ok_or_else(|| {
+                configuration("manual thinking budget must be an unsigned 32-bit integer")
+            })?,
+    };
+    Ok(Some(Thinking::Enabled { budget_tokens }))
+}
+
+pub(super) fn validate_default_generation(
+    model: &str,
+    config: &LLMConfig,
+    selection: Option<&ToolChoice>,
+    streaming: bool,
+) -> Result<(), LLMError> {
+    let thinking = if streaming {
+        None
+    } else {
+        default_thinking(config)?
+    };
+    validate_generation(
+        true,
+        model,
+        thinking.as_ref(),
+        config.max_tokens.unwrap_or(300),
+        selection.and_then(choice).as_ref(),
+    )
+    .map_err(sdk_error)
+}
+
+fn default_timeout(config: &LLMConfig) -> u64 {
+    config
+        .timeout_seconds
+        .or_else(|| config.extra.get("timeout_seconds").and_then(Value::as_u64))
+        .unwrap_or(30)
+}
+
+// Upstream accepts a custom HTTP client; reject the redirect response before its body reaches a legacy decoder.
+fn legacy_http_client(seconds: u64) -> Result<reqwest::Client, LLMError> {
+    let mut builder =
+        reqwest::Client::builder().redirect(reqwest::redirect::Policy::custom(|attempt| {
+            attempt.error("redirect refused for authenticated Anthropic request")
+        }));
+    if seconds > 0 {
+        builder = builder.timeout(Duration::from_secs(seconds));
+    }
+    builder
+        .build()
+        .map_err(|_| configuration("could not construct Anthropic HTTP client"))
+}
+
+// Use the upstream backend for raw operations and resilience, with the client bound to the first destination.
+pub(super) fn legacy_client(
+    model: &str,
+    key: &str,
+    config: &LLMConfig,
+    system: Option<&str>,
+    tools: Option<Vec<llm::chat::Tool>>,
+    tool_choice: Option<llm::chat::ToolChoice>,
+) -> Result<Box<dyn llm::LLMProvider>, LLMError> {
+    use llm::backends::anthropic::Anthropic;
+    use llm::resilient_llm::ResilientLLM;
+
+    super::unified::legacy_reasoning_effort(config)?;
+    let seconds = default_timeout(config);
+    let client = legacy_http_client(seconds)?;
+    // Blocking dispatch and raw construction already validated the budget. The upstream text stream ignores it.
+    let thinking = default_thinking(config).ok().flatten();
+    let budget = match thinking {
+        Some(Thinking::Enabled { budget_tokens }) => Some(budget_tokens),
+        _ => None,
+    };
+    let backend = Box::new(Anthropic::with_client(
+        client,
+        key,
+        Some(model.to_owned()),
+        config.max_tokens,
+        config.temperature,
+        Some(seconds),
+        system.filter(|s| !s.is_empty()).map(str::to_owned),
+        config.top_p,
+        config.top_k,
+        tools,
+        tool_choice,
+        Some(thinking.is_some()),
+        budget,
+    ));
+    if let Some(policy) = super::unified::legacy_resilience(config) {
+        Ok(Box::new(ResilientLLM::new(backend, policy)))
+    } else {
+        Ok(backend)
+    }
+}
+
+// The official thinking-mode table is the positive evidence for old unsigned tool turns.
+pub(super) fn allows_legacy_unsigned_replay(model: &str, config: &LLMConfig) -> bool {
+    matches!(default_thinking(config), Ok(None))
+        && include_str!("messages_legacy_thinking_off.txt")
+            .lines()
+            .any(|id| id == model)
+}
+
+pub(super) fn supports_default_choice(
+    model: &str,
+    config: &LLMConfig,
+    selection: &ToolChoice,
+) -> bool {
+    let Ok(thinking) = default_thinking(config) else {
+        return false;
+    };
+    choice(selection)
+        .is_some_and(|selection| allows_choice(true, model, thinking.as_ref(), &selection))
+}
+
 fn options(config: &LLMConfig) -> Result<Options, LLMError> {
     let mut options = match config.extra.get("provider_options") {
         Some(value) => serde_json::from_value::<Options>(value.clone())
@@ -185,6 +357,7 @@ fn history(
     client: &MessagesClient,
     model: &str,
     input: &[ChatMessage],
+    settings: RequestConfig<'_>,
 ) -> Result<(Option<String>, Vec<Value>), LLMError> {
     let native = inspect_native_history(input)?;
     if native.has_incomplete_unsigned()
@@ -195,6 +368,12 @@ fn history(
     {
         return Err(invalid("incomplete Messages tool history"));
     }
+    let (system_separator, require_signed) = match settings {
+        RequestConfig::DefaultAnthropic(config) => {
+            ("\n", !allows_legacy_unsigned_replay(model, config))
+        }
+        RequestConfig::Explicit(_) => ("\n\n", false),
+    };
     let mut system = Vec::new();
     let mut messages: Vec<Value> = Vec::new();
     for message in input {
@@ -210,6 +389,11 @@ fn history(
                     if let Some(state) = state {
                         replay_blocks(client, model, &state, &calls)?
                     } else {
+                        if require_signed {
+                            return Err(invalid(
+                                "Anthropic thinking cannot replay unsigned legacy tool history",
+                            ));
+                        }
                         calls.into_iter().map(|call| json!({
                             "type":"tool_use","id":call.id,"name":call.name,"input":call.arguments,
                         })).collect()
@@ -229,6 +413,11 @@ fn history(
                         let content = output.as_str().map_or_else(|| output.to_string(), str::to_owned);
                         json!({"type":"tool_result","tool_use_id":result.id(),"content":content})
                     }).collect()
+                } else if matches!(settings, RequestConfig::DefaultAnthropic(_)) {
+                    let content = native_readable_projection(&message.content)?;
+                    vec![
+                        json!({"type":"text","text":super::prompt_tool_result(message.name.as_deref(), &content)}),
+                    ]
                 } else {
                     vec![text_block(message)?]
                 };
@@ -244,48 +433,85 @@ fn history(
             messages.push(json!({"role":role,"content":blocks}));
         }
     }
-    Ok(((!system.is_empty()).then(|| system.join("\n\n")), messages))
+    Ok((
+        (!system.is_empty()).then(|| system.join(system_separator)),
+        messages,
+    ))
 }
 
 fn request(
     client: &MessagesClient,
     model: &str,
     messages: &[ChatMessage],
-    config: &LLMConfig,
+    settings: RequestConfig<'_>,
     tools: Option<&LLMToolRequest>,
+    streaming: bool,
 ) -> Result<MessagesRequest, LLMError> {
-    if config.extra.keys().any(|key| {
-        !matches!(
-            key.as_str(),
-            "protocol" | "provider_options" | "anthropic_version" | "messages_auth"
-        )
-    }) || config
-        .extra
-        .get("protocol")
-        .is_some_and(|value| value != "messages")
-        || config.frequency_penalty.is_some()
-        || config.presence_penalty.is_some()
-        || config.stop_sequences.is_some()
-    {
-        return Err(configuration("unsupported Messages request setting"));
-    }
-    let limit = config
-        .max_tokens
-        .filter(|max| *max > 0)
-        .ok_or_else(|| configuration("Messages requires explicit positive max_tokens"))?;
-    let options = options(config)?;
-    let (system, messages) = history(client, model, messages)?;
+    let (config, limit, thinking, effort) = match settings {
+        RequestConfig::DefaultAnthropic(config) => {
+            super::unified::legacy_reasoning_effort(config)?;
+            let thinking = if streaming {
+                None
+            } else {
+                default_thinking(config)?
+            };
+            (config, config.max_tokens.unwrap_or(300), thinking, None)
+        }
+        RequestConfig::Explicit(config) => {
+            if config.extra.keys().any(|key| {
+                !matches!(
+                    key.as_str(),
+                    "protocol" | "provider_options" | "anthropic_version" | "messages_auth"
+                )
+            }) || config
+                .extra
+                .get("protocol")
+                .is_some_and(|value| value != "messages")
+                || config.frequency_penalty.is_some()
+                || config.presence_penalty.is_some()
+                || config.stop_sequences.is_some()
+            {
+                return Err(configuration("unsupported Messages request setting"));
+            }
+            let limit = config
+                .max_tokens
+                .filter(|max| *max > 0)
+                .ok_or_else(|| configuration("Messages requires explicit positive max_tokens"))?;
+            let options = options(config)?;
+            let effort = config
+                .reasoning_effort
+                .clone()
+                .or(options.output_config.and_then(|config| config.effort));
+            (config, limit, options.thinking, effort)
+        }
+    };
+    let default = matches!(settings, RequestConfig::DefaultAnthropic(_));
+    let (system, messages) = history(client, model, messages, settings)?;
     let mut request = MessagesRequest::new(model, messages, limit);
-    request.system = system;
-    request.temperature = config.temperature;
+    request.system = if default {
+        Some(
+            system
+                .filter(|text| !text.is_empty())
+                .unwrap_or_else(|| "You are a helpful assistant.".into()),
+        )
+    } else {
+        system
+    };
+    request.temperature = if default {
+        config.temperature.or(Some(0.7))
+    } else {
+        config.temperature
+    };
     request.top_p = config.top_p;
     request.top_k = config.top_k;
-    request.timeout = config.timeout_seconds.map(Duration::from_secs);
-    request.effort = config
-        .reasoning_effort
-        .clone()
-        .or(options.output_config.and_then(|config| config.effort));
-    request.thinking = options.thinking;
+    request.timeout = if default {
+        let seconds = default_timeout(config);
+        (seconds > 0).then(|| Duration::from_secs(seconds))
+    } else {
+        config.timeout_seconds.map(Duration::from_secs)
+    };
+    request.effort = effort;
+    request.thinking = thinking;
     if let Some(tools) = tools {
         request.functions = tools
             .tools
@@ -317,14 +543,25 @@ pub(super) async fn complete(
     client: &MessagesClient,
     model: &str,
     messages: &[ChatMessage],
-    config: &LLMConfig,
+    settings: RequestConfig<'_>,
     tools: Option<&LLMToolRequest>,
 ) -> Result<LLMResponse, LLMError> {
     let response = client
-        .complete(&request(client, model, messages, config, tools)?)
+        .complete(&request(client, model, messages, settings, tools, false)?)
         .await
         .map_err(sdk_error)?;
-    let mut result = LLMResponse::new(response.text, FinishReason::Stop);
+    let text = match settings {
+        // The legacy blocking API kept a newline between successive text blocks, including empty ones.
+        RequestConfig::DefaultAnthropic(_) => response
+            .blocks
+            .iter()
+            .filter(|block| block["type"] == "text")
+            .filter_map(|block| block["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        RequestConfig::Explicit(_) => response.text,
+    };
+    let mut result = LLMResponse::new(text, FinishReason::Stop);
     result.model = Some(model.to_owned());
     result.usage = response.usage.and_then(usage);
     if !response.tool_calls.is_empty() {
@@ -360,9 +597,9 @@ pub(super) async fn stream(
     client: &MessagesClient,
     model: &str,
     messages: &[ChatMessage],
-    config: &LLMConfig,
+    settings: RequestConfig<'_>,
 ) -> Result<FrameworkStream, LLMError> {
-    let request = request(client, model, messages, config, None)?;
+    let request = request(client, model, messages, settings, None, true)?;
     let stream = client
         .stream(&request)
         .await
@@ -382,6 +619,206 @@ pub(super) async fn stream(
 mod tests {
     use super::*;
     use ai_agents_core::{encode_native_tool_call_markers, encode_native_tool_result_marker};
+
+    #[test]
+    fn default_anthropic_retains_transport_defaults_without_reinterpreting_effort() {
+        let client = MessagesClient::new("fixture".into()).unwrap();
+        let fallback = LLMConfig {
+            temperature: None,
+            max_tokens: None,
+            top_p: None,
+            ..Default::default()
+        };
+        let wire = |config, messages: &[ChatMessage], streaming| {
+            request(
+                &client,
+                "claude-sonnet-4-6",
+                messages,
+                RequestConfig::DefaultAnthropic(config),
+                None,
+                streaming,
+            )
+            .unwrap()
+        };
+        let rust = LLMConfig::default();
+        let default_rust = wire(&rust, &[], false);
+        assert_eq!(default_rust.max_tokens, 2048);
+        assert_eq!(default_rust.top_p, Some(0.9));
+        let request = wire(&fallback, &[], false);
+        assert_eq!(request.max_tokens, 300);
+        assert_eq!(request.temperature, Some(0.7));
+        assert_eq!(request.top_p, None);
+        assert_eq!(request.timeout, Some(Duration::from_secs(30)));
+        assert_eq!(
+            request.system.as_deref(),
+            Some("You are a helpful assistant.")
+        );
+
+        let manual = LLMConfig {
+            reasoning: Some(true),
+            timeout_seconds: Some(0),
+            reasoning_effort: Some("HIGH".into()),
+            top_k: Some(7),
+            ..fallback.clone()
+        };
+        let system = [ChatMessage::system("first"), ChatMessage::system("second")];
+        let ordinary = wire(&manual, &system, false);
+        assert_eq!(ordinary.system.as_deref(), Some("first\nsecond"));
+        assert!(matches!(
+            ordinary.thinking,
+            Some(Thinking::Enabled {
+                budget_tokens: 16_000
+            })
+        ));
+        assert_eq!(ordinary.top_k, Some(7));
+        assert!(ordinary.effort.is_none() && ordinary.timeout.is_none());
+        assert!(wire(&manual, &system, true).thinking.is_none());
+        assert!(!supports_default_choice(
+            "claude-sonnet-4-6",
+            &manual,
+            &ToolChoice::Required
+        ));
+    }
+
+    #[tokio::test]
+    async fn anthropic_legacy_http_client_refuses_redirects() {
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::TcpListener,
+        };
+        let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let destination = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/v1/messages", origin.local_addr().unwrap());
+        let location = destination.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = origin.accept().await.unwrap();
+            let mut buf = [0; 1024];
+            assert!(socket.read(&mut buf).await.unwrap() > 0);
+            socket.write_all(format!("HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{location}/next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+        });
+        let client = legacy_http_client(0).unwrap();
+        tokio::select! {
+            result = client.post(url).send() => assert!(result.unwrap_err().is_redirect()),
+            _ = destination.accept() => panic!("unexpected redirect request"),
+        }
+        server.await.unwrap();
+        assert!(futures::poll!(Box::pin(destination.accept())).is_pending());
+    }
+
+    // Capture both HTTP bodies so follow-up assertions exercise serialization through the SDK.
+    async fn two_messages_requests(
+        content: Value,
+    ) -> (MessagesClient, tokio::task::JoinHandle<Vec<Value>>) {
+        use tokio::{
+            io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+            net::TcpListener,
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = MessagesClient::at_endpoint(
+            &format!("http://{}/v1", listener.local_addr().unwrap()),
+            MessagesAuth::ApiKey("fixture".into()),
+            API_VERSION,
+            true,
+        )
+        .unwrap();
+        let server = tokio::spawn(async move {
+            let reply = json!({"id":"msg_fixture","type":"message","role":"assistant",
+                "stop_reason":"end_turn","content":content})
+            .to_string();
+            let mut bodies = Vec::new();
+            for _ in 0..2 {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut socket = BufReader::new(socket);
+                let mut length = None;
+                loop {
+                    let mut line = String::new();
+                    assert_ne!(socket.read_line(&mut line).await.unwrap(), 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some((key, value)) = line.split_once(':')
+                        && key.eq_ignore_ascii_case("content-length")
+                    {
+                        length = Some(value.trim().parse::<usize>().unwrap());
+                    }
+                }
+                let mut body = vec![0; length.unwrap()];
+                socket.read_exact(&mut body).await.unwrap();
+                bodies.push(serde_json::from_slice(&body).unwrap());
+                socket.get_mut().write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}", reply.len()).as_bytes()).await.unwrap();
+            }
+            bodies
+        });
+        (client, server)
+    }
+
+    #[tokio::test]
+    async fn only_default_blocking_messages_join_text_blocks_with_newlines() {
+        let (client, server) = two_messages_requests(json!([
+            {"type":"text","text":"first"}, {"type":"thinking","thinking":"hidden","signature":"fixture"},
+            {"type":"text","text":""},{"type":"text","text":"second"}
+        ])).await;
+        let cfg = LLMConfig::default();
+        for (settings, expected) in [
+            (RequestConfig::DefaultAnthropic(&cfg), "first\n\nsecond"),
+            (RequestConfig::Explicit(&cfg), "firstsecond"),
+        ] {
+            let result = complete(
+                &client,
+                "fixture",
+                &[ChatMessage::user("hello")],
+                settings,
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.content, expected);
+        }
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn messages_second_request_labels_plain_tool_results_only_for_default_anthropic() {
+        let cfg = LLMConfig::default();
+        let prompt_call = r#"{"tool":"echo","arguments":{"message":"ok"}}"#;
+        for (settings, expected) in [
+            (
+                RequestConfig::DefaultAnthropic(&cfg),
+                [
+                    "[echo result]: ok",
+                    "[count result]: 2",
+                    "[tool result]: unnamed",
+                ],
+            ),
+            (RequestConfig::Explicit(&cfg), ["ok", "2", "unnamed"]),
+        ] {
+            let (client, server) =
+                two_messages_requests(json!([{"type":"text","text":prompt_call}])).await;
+            let mut history = vec![ChatMessage::user("run tools")];
+            let reply = complete(&client, "fixture", &history, settings, None)
+                .await
+                .unwrap();
+            history.push(ChatMessage::assistant(reply.content));
+            history.push(ChatMessage::tool("echo", "ok"));
+            history.push(ChatMessage::function("count", "2"));
+            let mut unnamed = ChatMessage::tool("tool", "unnamed");
+            unnamed.name = None;
+            history.push(unnamed);
+            complete(&client, "fixture", &history, settings, None)
+                .await
+                .unwrap();
+            let bodies = server.await.unwrap();
+            assert_eq!(bodies[0]["messages"].as_array().unwrap().len(), 1);
+            assert_eq!(
+                bodies[1]["messages"],
+                json!([
+                    {"role":"user","content":[{"type":"text","text":"run tools"}]},
+                    {"role":"assistant","content":[{"type":"text","text":prompt_call}]},
+                    {"role":"user","content":expected.map(|text| json!({"type":"text","text":text}))}
+                ])
+            );
+        }
+    }
 
     #[test]
     fn messages_forced_choice_depends_on_model_service_and_thinking() {
@@ -534,7 +971,12 @@ mod tests {
                     encode_native_tool_result_marker(&call, json!("found")).unwrap(),
                 ),
             ];
-            let result = history(&client, "test", &messages);
+            let result = history(
+                &client,
+                "test",
+                &messages,
+                RequestConfig::Explicit(&LLMConfig::default()),
+            );
             if valid {
                 let (_, messages) = result.unwrap();
                 assert_eq!(messages[1]["content"], blocks);
@@ -559,7 +1001,17 @@ mod tests {
             LLMConfig::default().with_extra("provider_options", json!({"max_tokens":100})),
             LLMConfig::default().with_extra("provider_options", json!({"api_key":"other"})),
         ] {
-            assert!(request(&client, "test", &[], &config, None).is_err());
+            assert!(
+                request(
+                    &client,
+                    "test",
+                    &[],
+                    RequestConfig::Explicit(&config),
+                    None,
+                    false
+                )
+                .is_err()
+            );
         }
     }
 }
