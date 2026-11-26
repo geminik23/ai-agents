@@ -375,7 +375,7 @@ Capability override fields (`function_calling`, `vision`, `json_mode`) are not s
 
 Additional YAML keys are captured in an `extra` map. The selected backend determines their effect. For example, `openai_enable_web_search: true` selects the upstream backend for OpenAI and OpenAI-compatible Chat. Ordinary framework chat still sends a request without a hosted search tool. The xAI backend includes `search_parameters` in blocking chat requests and omits the field when streaming. The granted built-in `web_search` tool uses the framework’s own policy, approval and execution path. [Provider options and transport settings](@/docs/providers.md#extra-parameters)
 
-OpenRouter accepts gateway routing under `provider_options.provider` and explicit reasoning under `provider_options.reasoning`. The top-level legacy `reasoning_effort` keeps its historical validation and omission. When replaying a native tool turn with private reasoning, configure one provider route with fallback disabled and use the exact model ID. [OpenRouter setup and limits](@/docs/providers.md#openrouter)
+OpenRouter accepts gateway routing under `provider_options.provider` and explicit reasoning under `provider_options.reasoning`. For OpenRouter, set the boolean `parallel_tool_calls` once in `extra_body` or `provider_options` to control parallel tool calls. Omission leaves the wire field absent. The top-level legacy `reasoning_effort` keeps its historical validation and omission. When replaying a native tool turn with private reasoning, configure one provider route with fallback disabled and use the exact model ID. [OpenRouter setup and limits](@/docs/providers.md#openrouter)
 
 
 ```yaml

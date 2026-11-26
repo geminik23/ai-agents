@@ -12,6 +12,7 @@ use std::time::Duration;
 
 const PROVIDER: &str = "openrouter";
 const API: &str = "chat-completions";
+pub(super) const REPORTED_MODEL: &str = "openrouter_reported_model";
 
 pub(super) fn official_origin(base: &str) -> bool {
     reqwest::Url::parse(base)
@@ -85,7 +86,22 @@ pub(super) fn request(
         .or_else(|| cfg.extra.get("timeout_seconds").and_then(Value::as_u64))
         .map(Duration::from_secs);
     chat_adapter::request_tools(&mut chat, tools)?;
-    chat_adapter::request_options(&mut chat, cfg)?;
+    let mut request = Request::new(chat);
+    chat_adapter::request_options(cfg, |field, key, value| {
+        if key == "parallel_tool_calls" {
+            let parallel = value
+                .as_bool()
+                .ok_or_else(|| LLMError::Config(format!("{field}.{key} must be a boolean")))?;
+            if request.parallel_tool_calls.is_some() {
+                return Err(LLMError::Config(
+                    "declare OpenRouter parallel_tool_calls only once".into(),
+                ));
+            }
+            request.parallel_tool_calls = Some(parallel);
+            return Ok(());
+        }
+        chat_adapter::apply_option(&mut request.chat, field, key, value)
+    })?;
     let history = inspect_native_history(messages)?;
     if history.has_incomplete_unsigned()
         || history
@@ -108,14 +124,13 @@ pub(super) fn request(
         {
             return Err(invalid("legacy OpenRouter cannot replay SDK tool history"));
         }
-        client.body(&Request::new(chat), false).map_err(sdk_error)?;
+        client.body(&request, false).map_err(sdk_error)?;
         return Ok(None);
     }
     let (system, _) = super::unified::extract_system_and_messages(messages);
     if let Some(system) = system.filter(|s| !s.is_empty()) {
-        chat.messages.push(sdk::Message::System(system));
+        request.chat.messages.push(sdk::Message::System(system));
     }
-    let mut request = Request::new(chat);
     for message in messages.iter().filter(|m| m.role != Role::System) {
         if message.role == Role::Assistant
             && let Some(batch) = decode_native_tool_call_markers(&message.content)?
@@ -199,6 +214,13 @@ pub(super) async fn complete(
         },
         model,
     )?;
+    // Legacy builders can synthesize response.model from the request; only a wire receipt is pricing evidence.
+    if let Some(reported_model) = raw.model {
+        response
+            .metadata
+            .insert(REPORTED_MODEL.into(), Value::String(reported_model.clone()));
+        response.model = Some(reported_model);
+    }
     if let Some(state) = state {
         set_response_provider_state(&mut response, state)?;
     }
@@ -208,19 +230,26 @@ pub(super) async fn complete(
 pub(super) async fn stream(
     client: &OpenRouterClient,
     request: &Request,
+    priced_model: Option<String>,
 ) -> Result<Box<dyn Stream<Item = Result<LLMChunk, LLMError>> + Unpin + Send>, LLMError> {
     let stream = client.stream(request).await.map_err(sdk_error)?;
-    Ok(Box::new(stream.map(|event| {
+    Ok(Box::new(stream.map(move |event| {
         match event.map_err(|error| match error {
             sdk::Error::Transport => invalid("OpenRouter response stream disconnected"),
             other => sdk_error(other),
         })? {
             StreamEvent::Text(text) => Ok(LLMChunk::new(text, false)),
             StreamEvent::Finished(output) if output.tool_calls.is_empty() => {
+                // The stream settlement hook sees only final usage. Qualify it while the gateway model is still available.
+                let usage = output.usage.filter(|_| {
+                    priced_model
+                        .as_ref()
+                        .is_none_or(|model| output.model.as_ref() == Some(model))
+                });
                 Ok(LLMChunk::final_chunk(
                     "",
                     chat_adapter::finish(&output.finish_reason),
-                    output.usage.map(chat_adapter::usage),
+                    usage.map(chat_adapter::usage),
                 ))
             }
             _ => Err(invalid("unexpected OpenRouter tool call in text stream")),

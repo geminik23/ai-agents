@@ -16,6 +16,8 @@ const INVALID_REPLAY: &str = "OpenRouter assistant replay does not match the ori
 pub struct Request {
     /// Shared chat settings. The output ceiling is encoded as OpenRouter's max_tokens.
     pub chat: ChatRequest,
+    /// Omit to use the gateway default, or explicitly permit or disable parallel tool calls.
+    pub parallel_tool_calls: Option<bool>,
     replay: BTreeMap<usize, AssistantTurn>,
 }
 
@@ -23,6 +25,7 @@ impl Request {
     pub fn new(chat: ChatRequest) -> Self {
         Self {
             chat,
+            parallel_tool_calls: None,
             replay: BTreeMap::new(),
         }
     }
@@ -226,6 +229,9 @@ impl OpenRouterClient {
         let obj = body.as_object_mut().expect("chat body is an object");
         if let Some(limit) = obj.remove("max_completion_tokens") {
             obj.insert("max_tokens".into(), limit);
+        }
+        if let Some(parallel) = request.parallel_tool_calls {
+            obj.insert("parallel_tool_calls".into(), Value::Bool(parallel));
         }
         // OpenRouter includes final usage without the Chat compatibility toggle.
         obj.remove("stream_options");

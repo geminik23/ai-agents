@@ -3,7 +3,7 @@
 ## Unreleased
 
 ### Added
-- OpenRouter: call Chat Completions from Rust and YAML, enforce required routing parameters, and resume approved native tools with the original reasoning on a pinned route
+- OpenRouter: call Chat Completions from Rust and YAML, preserve parallel tool settings, enforce required routing parameters, settle declared costs against the reported model, and resume approved native tools with the original reasoning on a pinned route
 - Tool execution: validate arguments against the registered input schema before approval and recheck the final arguments before invocation
 - Ollama Cloud: use native chat, text streaming and single native tool calls from Rust and YAML, with approval and supported task restoration
 - Model catalogs: list models from OpenAI, Anthropic, and Ollama Cloud from the Rust SDK with provider-reported metadata and Anthropic pagination

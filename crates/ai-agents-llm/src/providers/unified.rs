@@ -1944,7 +1944,12 @@ impl LLMProvider for UnifiedLLMProvider {
                 None,
             )?
         {
-            return openrouter::stream(client, &wire).await;
+            return openrouter::stream(
+                client,
+                &wire,
+                self.pricing.as_ref().map(|pricing| pricing.model.clone()),
+            )
+            .await;
         }
         if let Some(SdkBackend::Chat(chat)) = &self.sdk
             && let Some(wire) = chat_adapter::request(
@@ -2056,6 +2061,7 @@ impl LLMProvider for UnifiedLLMProvider {
                 if request
                     .tools
                     .is_some_and(|tools| !self.supports_choice_for_provider(&tools.choice))
+                    || wire.parallel_tool_calls.is_some()
                     || !wire.chat.provider_options.is_empty()
                     || wire.chat.response_format.is_some()
                 {
@@ -2152,9 +2158,19 @@ impl LLMProvider for UnifiedLLMProvider {
         bound: &ProviderCostBound,
         response: &LLMResponse,
     ) -> Result<Option<ProviderCostSettlement>, LLMError> {
-        self.pricing.as_ref().map_or(Ok(None), |pricing| {
-            pricing.settle(self.accounting_adapter(), bound, response)
-        })
+        let Some(pricing) = &self.pricing else {
+            return Ok(None);
+        };
+        if self.provider_type == ProviderType::OpenRouter
+            && response
+                .metadata
+                .get(openrouter::REPORTED_MODEL)
+                .and_then(serde_json::Value::as_str)
+                != Some(pricing.model.as_str())
+        {
+            return Ok(None);
+        }
+        pricing.settle(self.accounting_adapter(), bound, response)
     }
 
     fn settle_stream_request_cost(

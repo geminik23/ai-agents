@@ -426,6 +426,8 @@ llm:
   model: openai/gpt-5.4-mini
 ```
 
+Existing YAML can set `extra_body: {parallel_tool_calls: false}` to send an explicit boolean. The OpenRouter SDK also accepts `provider_options.parallel_tool_calls` in YAML and `Request::parallel_tool_calls` in Rust. Omission uses the gateway default. Declare the field once across the two YAML maps.
+
 The SDK sends one generation request with no automatic retry or model list lookup. Ordinary calls use the gateway's default routing unless you specify options. Required and specific native tool choices enforce `provider.require_parameters: true` and validate the returned function. An explicit `false` conflicts with those choices. Separate gateway routing from framework fallback aliases. Pin a route before inviting a reasoning model to return native tools that must resume.
 
 ```yaml
@@ -443,7 +445,7 @@ llm:
 
 The adapter needs one explicit provider route and the exact resolved model to accept a native tool response carrying private reasoning for replay. It preserves the assistant blocks and tool IDs through the existing approval and restart path. Gateway aliases, model fallbacks, and a changed destination can make a reasoning turn ineligible for replay. The regular text stream treats partial output as provisional. HTTP 200 followed by an SSE error or disconnection before `[DONE]` fails the turn.
 
-`provider.max_price` filters unit rates. A hard-priced task uses the host's `DeclaredPricing` contract, which must cover every eligible gateway route and internal attempt. Arbitrary routing overrides, extra billable services and model fallback options require their own audit. The current priced SDK request path rejects explicit gateway extensions before sending a request, including when a route and reasoning are configured for private replay. Final settlement requires a complete token receipt and a single audited attempt. Missing usage or an interrupted stream retains the reservation.
+`provider.max_price` filters unit rates. A hard-priced task uses the host's `DeclaredPricing` contract, which must cover every eligible gateway route and internal attempt. Arbitrary routing overrides, extra billable services and model fallback options require their own audit. The current priced SDK request path rejects explicit gateway extensions before sending a request, including when a route and reasoning are configured for private replay. Final settlement requires one audited attempt and a complete token receipt for the exact model in the pricing contract. A missing or different reported model retains the full reservation, as do missing usage and stream interruption. A framework stream with declared pricing exposes final token usage only for a matching model. The direct SDK returns the gateway’s reported model and usage.
 
 For a custom API origin, select a dedicated `api_key_env` or pass an explicit Rust credential for that destination. Existing `resilient: true` or explicit `normalize_response` select the legacy backend before dispatch and conflict with new SDK options. The low-level `build_llm()` API still exposes the upstream provider. [Direct OpenRouter Rust SDK](@/docs/rust-api.md#direct-openrouter-chat-sdk-development)
 

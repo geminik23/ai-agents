@@ -3490,3 +3490,59 @@ llms:
     }
     assert_eq!(fixture.get_calls.load(Ordering::SeqCst), 0);
 }
+
+#[test]
+fn openrouter_yaml_preserves_parallel_tool_calls_and_rejects_duplicates() {
+    let bodies = Arc::new(Mutex::new(Vec::new()));
+    let observed = bodies.clone();
+    let fixture =
+        Fixture::observe_requests(&[], move |body| observed.lock().unwrap().push(body.clone()));
+    let path = fixture.dir.join("agent.yaml");
+    let run = |options: &str| {
+        std::fs::write(&path, format!(
+            "name: Router\nsystem_prompt: Test\nllm:\n  provider: openrouter\n  base_url: {}\n  api_key_env: TASK_FIXTURE_TOKEN\n  model: test/model\n{options}", fixture.url
+        )).unwrap();
+        fixture.run(&["run", path.to_str().unwrap(), "--plain"], "hello\n")
+    };
+    for (options, expected) in [
+        ("", None),
+        ("  extra_body: {parallel_tool_calls: false}\n", Some(false)),
+        (
+            "  provider_options: {parallel_tool_calls: true}\n",
+            Some(true),
+        ),
+        (
+            "  normalize_response: true\n  extra_body: {parallel_tool_calls: false}\n",
+            Some(false),
+        ),
+    ] {
+        let output = run(options);
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("done"),
+            "{output:?}"
+        );
+        let requests = std::mem::take(&mut *bodies.lock().unwrap());
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].get("parallel_tool_calls"),
+            expected.map(Value::Bool).as_ref()
+        );
+    }
+    for (invalid, diagnostic) in [
+        (
+            "  extra_body: {parallel_tool_calls: false}\n  provider_options: {parallel_tool_calls: false}\n",
+            "declare OpenRouter parallel_tool_calls only once",
+        ),
+        (
+            "  extra_body: {parallel_tool_calls: 'false'}\n",
+            "extra_body.parallel_tool_calls must be a boolean",
+        ),
+    ] {
+        let output = run(invalid);
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(diagnostic),
+            "{output:?}"
+        );
+        assert!(bodies.lock().unwrap().is_empty());
+    }
+}

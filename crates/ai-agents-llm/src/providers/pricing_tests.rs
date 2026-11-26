@@ -78,6 +78,16 @@ async fn fixture_stream(
     retry_first: bool,
     stream_payload: Option<String>,
 ) -> Fixture {
+    fixture_http(google, responses, retry_first, None, stream_payload).await
+}
+
+async fn fixture_http(
+    google: bool,
+    responses: usize,
+    retry_first: bool,
+    unary_payload: Option<String>,
+    stream_payload: Option<String>,
+) -> Fixture {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -123,7 +133,7 @@ async fn fixture_stream(
                 if google {
                     google_body.into()
                 } else {
-                    openai_body.into()
+                    unary_payload.clone().unwrap_or_else(|| openai_body.into())
                 }
             } else if google {
                 stream_payload
@@ -681,7 +691,7 @@ async fn responses_pricing_requires_its_own_endpoint_and_final_matching_usage() 
 
 #[tokio::test]
 async fn openrouter_priced_stream_settles_only_complete_single_attempt_receipts() {
-    let usage = serde_json::json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":4,"total_tokens":14,"cost":0.125}});
+    let usage = serde_json::json!({"model":"fixture-model","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":4,"total_tokens":14,"cost":0.125}});
     for (ending, attempts, expected_charge, expected_error) in [
         (
             format!("data: {usage}\n\ndata: [DONE]\n\n"),
@@ -721,6 +731,7 @@ async fn openrouter_priced_stream_settles_only_complete_single_attempt_receipts(
                 serde_json::json!({"models":["other/model"]}),
                 serde_json::json!({"provider":{"max_price":{"prompt":1}}}),
                 serde_json::json!({"plugins":[{"id":"web"}]}),
+                serde_json::json!({"parallel_tool_calls":false}),
             ] {
                 let config = LLMConfig::default().with_extra("provider_options", options);
                 assert!(provider.complete(&messages, Some(&config)).await.is_err());
@@ -748,6 +759,70 @@ async fn openrouter_priced_stream_settles_only_complete_single_attempt_receipts(
         assert_eq!(
             settlements[0].as_ref().map(|s| s.charged_micro_usd),
             expected_charge
+        );
+    }
+}
+
+#[tokio::test]
+async fn openrouter_settles_only_receipts_for_the_declared_model() {
+    for (reported_model, expected_charge) in [
+        (Some("other-model"), None),
+        (None, None),
+        (Some("fixture-model"), Some(16)),
+    ] {
+        let usage = serde_json::json!({"prompt_tokens":10,"completion_tokens":4,"total_tokens":14});
+        let mut unary = serde_json::json!({"choices":[{"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}],"usage":usage});
+        let mut chunk = serde_json::json!({"choices":[{"delta":{"content":"done"},"finish_reason":"stop"}],"usage":usage});
+        if let Some(model) = reported_model {
+            unary["model"] = model.into();
+            chunk["model"] = model.into();
+        }
+        let (endpoint, _requests) = fixture_http(
+            false,
+            2,
+            false,
+            Some(unary.to_string()),
+            Some(format!("data: {chunk}\n\ndata: [DONE]\n\n")),
+        )
+        .await;
+        let provider = ProviderBuilder::new()
+            .provider(ProviderType::OpenRouter)
+            .model("fixture-model")
+            .api_key("fixture")
+            .base_url(&endpoint)
+            .build()
+            .unwrap()
+            .with_declared_pricing(schedule(&endpoint))
+            .unwrap();
+        let provider = crate::managed_provider(Arc::new(provider));
+        let ledger = Arc::new(Ledger::default());
+        crate::scope_invocation_admission(ledger.clone(), async {
+            let messages = [ChatMessage::user("hello")];
+            let response = provider.complete(&messages, None).await.unwrap();
+            assert_eq!(response.content, "done");
+            if let Some(model) = reported_model {
+                assert_eq!(response.model.as_deref(), Some(model));
+            }
+            assert_eq!(response.usage.unwrap().total_tokens, 14);
+            let mut stream = provider.complete_stream(&messages, None).await.unwrap();
+            while let Some(chunk) = stream.next().await {
+                chunk.unwrap();
+            }
+        })
+        .await;
+        let bounds = ledger.bounds.lock();
+        assert_eq!(bounds.len(), 2);
+        assert!(bounds.iter().all(|bound| bound.max_micro_usd == 6146));
+        let charges: Vec<_> = ledger
+            .settlements
+            .lock()
+            .iter()
+            .map(|receipt| receipt.as_ref().map(|s| s.charged_micro_usd))
+            .collect();
+        assert_eq!(
+            charges,
+            [expected_charge, expected_charge],
+            "reported model: {reported_model:?}"
         );
     }
 }

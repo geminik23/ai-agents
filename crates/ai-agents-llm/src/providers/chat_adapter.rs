@@ -120,32 +120,44 @@ fn requires_legacy(cfg: &LLMConfig) -> Result<bool, LLMError> {
 }
 
 pub(super) fn request_options(
-    request: &mut sdk::ChatRequest,
     cfg: &LLMConfig,
+    mut apply: impl FnMut(&str, &str, &Value) -> Result<(), LLMError>,
 ) -> Result<(), LLMError> {
-    let extra = &cfg.extra;
     for field in ["extra_body", "provider_options"] {
-        if let Some(value) = extra.get(field) {
+        if let Some(value) = cfg.extra.get(field) {
             let options = value
                 .as_object()
                 .ok_or_else(|| LLMError::Config(format!("{field} must be an object")))?;
-            for (k, v) in options {
-                if field == "extra_body" && k == "response_format" {
-                    // Migrate the legacy wire shape into the owned request field.
-                    request.response_format =
-                        serde_json::from_value(v.clone()).map_err(|error| {
-                            LLMError::Config(format!("invalid extra_body.response_format: {error}"))
-                        })?;
-                    continue;
-                }
-                if sdk::reserved(k) {
-                    return Err(LLMError::Config(format!("reserved option {field}.{k}")));
-                }
-                merge_option(&mut request.provider_options, k, v, &format!("{field}.{k}"))?;
+            for (key, value) in options {
+                apply(field, key, value)?;
             }
         }
     }
     Ok(())
+}
+
+pub(super) fn apply_option(
+    request: &mut sdk::ChatRequest,
+    field: &str,
+    key: &str,
+    value: &Value,
+) -> Result<(), LLMError> {
+    if field == "extra_body" && key == "response_format" {
+        // Migrate the legacy wire shape into the owned request field.
+        request.response_format = serde_json::from_value(value.clone()).map_err(|error| {
+            LLMError::Config(format!("invalid extra_body.response_format: {error}"))
+        })?;
+        return Ok(());
+    }
+    if sdk::reserved(key) {
+        return Err(LLMError::Config(format!("reserved option {field}.{key}")));
+    }
+    merge_option(
+        &mut request.provider_options,
+        key,
+        value,
+        &format!("{field}.{key}"),
+    )
 }
 
 pub(super) fn request(
@@ -184,7 +196,9 @@ pub(super) fn request(
         .timeout_seconds
         .or_else(|| extra.get("timeout_seconds").and_then(Value::as_u64))
         .map(Duration::from_secs);
-    request_options(&mut request, cfg)?;
+    request_options(cfg, |field, key, value| {
+        apply_option(&mut request, field, key, value)
+    })?;
     if provider == ProviderType::OpenAI {
         let hosted_search = extra
             .get("openai_enable_web_search")
