@@ -1782,6 +1782,23 @@ println!("{}", reply.text);
 
 The stream yields text followed by a completed response with validated function calls, token usage when reported, and the gateway's optional cost. Keep the returned `AssistantTurn` private. For a pinned route, call `Request::push_assistant` with that turn and append the corresponding `Message::ToolResult` before the next request. The SDK checks the original target before sending replay data. Framework approvals and execution live in the [OpenRouter adapter](@/docs/providers.md#openrouter).
 
+## Direct Local Ollama SDK (development)
+
+```rust
+use ai_agents_llm::sdk::ollama::{
+    ChatRequest, KeepAlive, LocalChatRequest, Message, OllamaLocalClient,
+};
+
+let client = OllamaLocalClient::new(None)?;
+let chat = ChatRequest::new("your-local-model", vec![Message::text("user", "Hello")]);
+let mut request = LocalChatRequest::new(chat);
+request.keep_alive = Some(KeepAlive::Duration("5m".into()));
+let output = client.complete(&request).await?;
+println!("{}", output.message.content);
+```
+
+Pass `Some(server_root)` for a different daemon. `stream` yields text and then a single `LocalChatEvent::Finished` after verified completion. An older daemon or compatible server can omit the finish reason. Direct callers receive it as `None`. The response exposes the model and token usage reported by the server when available. Direct calls omit unconfigured sampling and output options. `build_llm()` accepts legacy local Ollama settings for raw operations such as `list_models(None)`. If its effective config contains `provider_options`, construction returns a configuration error. Use the native client for chat with those options.
+
 ## Direct Ollama Cloud SDK (development)
 
 ```rust

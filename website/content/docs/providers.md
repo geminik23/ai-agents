@@ -292,7 +292,25 @@ llm:
   base_url: "http://192.168.1.100:11434"
 ```
 
-The local chat backend sends YAML `top_p` as `options.top_p`. A top-level YAML `top_k` stays in the extra settings and the request contains `"top_k": null` under `options`. Rust callers can set `LLMConfig::with_top_k` to send a numeric `options.top_k`. It accepts YAML declarations for `num_ctx`, `num_gpu`, `keep_alive`, `temperature`, `max_tokens` and `extra_body`, but omits them from the local chat request. Configure the required context window on the Ollama server or model. The native Ollama Cloud preset has its own option mapping.
+In the development checkout, local chat and text streaming use the native `/api/chat` SDK. The preset sends no authorization header, even when `api_key_env` is present. The configured server root can include a path prefix. The SDK submits one request and does not follow redirects. A stream must end with a daemon completion record to produce a final response. Configured framework tools continue to use the prompt tool path. [Direct Rust SDK](@/docs/rust-api.md#direct-local-ollama-sdk-development)
+
+Existing YAML `top_p` is sent as `options.top_p`. A top-level YAML `top_k` leaves `options.top_k` null. Rust callers can use `LLMConfig::with_top_k` to send a numeric value. The old `num_ctx`, `num_gpu`, `keep_alive`, `temperature`, `max_tokens` and `extra_body` declarations still leave those fields out of local chat requests. Move values that should reach the daemon into native options.
+
+```yaml
+llm:
+  provider: ollama
+  model: llama3.1
+  provider_options:
+    options:
+      num_ctx: 8192
+      num_predict: 256
+      top_k: 30
+    keep_alive: 5m
+```
+
+The local SDK checks documented option types before sending a request. Use integers for `num_ctx`, `num_gpu`, `num_predict`, `top_k` and `seed`, numbers for `temperature` and `top_p`, and a string array for `stop`. Daemon-specific extensions inside `options` pass through. The legacy `reasoning_effort` field accepts `low`, `medium` or `high` case-insensitively and leaves the daemon’s thinking mode at its default.
+
+Use `options.num_predict` for the output limit and `keep_alive` for model retention on the daemon. Remove any old declaration for the same setting before adding its native equivalent. `resilient: true` selects the existing upstream transport before generation and cannot be combined with native options. Ollama reports token usage when available. Hard-priced task admission remains unavailable for this preset.
 
 To access Ollama through its OpenAI-compatible endpoint instead, use `provider: openai-compatible` and include `/v1` in the URL:
 

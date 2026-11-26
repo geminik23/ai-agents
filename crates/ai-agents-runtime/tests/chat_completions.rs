@@ -735,6 +735,7 @@ llm:
   provider: ollama
   model: fixture
   base_url: {base}
+  reasoning_effort: HIGH
   top_k: {top_k}
   top_p: 0.5
   num_ctx: 4096
@@ -746,9 +747,16 @@ llm:
 "#
     );
     let server = tokio::spawn(async move {
-        for expected_top_k in [Value::Null, json!(top_k)] {
-            let (mut socket, body, _) = receive_path(&listener, "/tenant/v1/api/chat").await;
+        for (expected_top_k, streaming) in [
+            (Value::Null, false),
+            (Value::Null, true),
+            (json!(top_k), false),
+        ] {
+            let (mut socket, body, headers) = receive_path(&listener, "/tenant/v1/api/chat").await;
+            assert!(!headers.contains("authorization:"));
             assert_eq!(body["model"], "fixture");
+            assert_eq!(body["stream"], streaming);
+            assert!(body.get("think").is_none());
             assert_eq!(body["options"]["top_p"], 0.5);
             assert_eq!(body["options"].get("top_k"), Some(&expected_top_k));
             for name in ["num_ctx", "num_gpu", "num_predict", "temperature", "seed"] {
@@ -756,8 +764,13 @@ llm:
             }
             assert!(body.get("keep_alive").is_none());
             let payload = r#"{"message":{"role":"assistant","content":"local reply"},"done":true}"#;
+            let mime = if streaming {
+                "application/x-ndjson"
+            } else {
+                "application/json"
+            };
             let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                "HTTP/1.1 200 OK\r\nContent-Type: {mime}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
                 payload.len()
             );
             socket.write_all(response.as_bytes()).await.unwrap();
@@ -770,13 +783,26 @@ llm:
         .build()
         .unwrap();
     assert_eq!(agent.chat("hello").await.unwrap().content, "local reply");
+    let streamed = agent
+        .chat_stream_events("hello")
+        .await
+        .unwrap()
+        .collect::<Vec<_>>()
+        .await;
+    assert!(streamed.iter().any(
+        |event| matches!(event, AgentStreamEvent::Final(reply) if reply.content == "local reply")
+    ));
 
     let provider = UnifiedLLMProvider::from_spec_config(
         ProviderType::Ollama,
         "fixture",
         None,
         Some(base),
-        LLMConfig::default().with_top_p(0.5).with_top_k(top_k),
+        LLMConfig::default()
+            .with_top_p(0.5)
+            .with_top_k(top_k)
+            .with_extra("reasoning_effort", json!("superseded"))
+            .with_reasoning_effort("Medium"),
     )
     .unwrap();
     let reply = provider
@@ -784,6 +810,199 @@ llm:
         .await
         .unwrap();
     assert_eq!(reply.content, "local reply");
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn local_ollama_named_yaml_sends_native_options_and_streams_authoritative_final() {
+    let (listener, base) = fixture().await;
+    let server = tokio::spawn(async move {
+        let (mut socket, body, headers) = receive_path(&listener, "/tenant/v1/api/chat").await;
+        assert!(!headers.contains("authorization:"));
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["keep_alive"], "5m");
+        assert_eq!(
+            body["options"],
+            json!({"num_ctx": 4096, "num_gpu": -1, "top_p": null,
+            "top_k": 23, "temperature": 0.25, "num_predict": 99, "future_option": {"level": "custom"}})
+        );
+        assert!(body.get("tools").is_none());
+        let records = concat!(
+            "{\"message\":{\"role\":\"assistant\",\"content\":\"로컬\"},\"done\":false}\n",
+            "{\"done\":true,\"done_reason\":\"stop\",\"prompt_eval_count\":3,\"eval_count\":2}\n",
+        );
+        socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{records}", records.len()).as_bytes()).await.unwrap();
+        assert!(futures::poll!(Box::pin(listener.accept())).is_pending());
+    });
+    let yaml = format!(
+        r#"name: Local
+system_prompt: Answer briefly.
+llms:
+  default:
+    provider: ollama
+    model: fixture
+    base_url: {base}
+    api_key_env: OLLAMA_API_KEY
+    provider_options:
+      keep_alive: 5m
+      options: {{num_ctx: 4096, num_gpu: -1, top_k: 23, temperature: 0.25, num_predict: 99, future_option: {{level: custom}}}}
+"#
+    );
+    let agent = AgentBuilder::from_yaml(&yaml)
+        .unwrap()
+        .auto_configure_llms()
+        .unwrap()
+        .build()
+        .unwrap();
+    let mut events = agent.chat_stream_events("Hello").await.unwrap();
+    let mut completed = false;
+    while let Some(event) = events.next().await {
+        if let AgentStreamEvent::Final(response) = event {
+            assert_eq!(response.content, "로컬");
+            completed = true;
+        }
+    }
+    assert!(completed);
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn local_ollama_sdk_never_follows_a_redirect() {
+    use ai_agents_llm::sdk::ollama::{ChatRequest, LocalChatRequest, Message, OllamaLocalClient};
+
+    let (listener, base) = fixture().await;
+    let (foreign, target) = fixture().await;
+    let server = tokio::spawn(async move {
+        let (mut socket, body, head) = receive_path(&listener, "/tenant/v1/api/chat").await;
+        assert!(!head.contains("authorization:"));
+        assert!(body.get("options").is_none());
+        assert!(body.get("keep_alive").is_none());
+        socket.write_all(format!("HTTP/1.1 307 Temporary Redirect\r\nLocation: {target}/api/chat\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+    });
+    let client = OllamaLocalClient::new(Some(&base)).unwrap();
+    let request = LocalChatRequest::new(ChatRequest::new(
+        "fixture",
+        vec![Message::text("user", "hello")],
+    ));
+    assert!(matches!(
+        client.complete(&request).await,
+        Err(Error::Http(307))
+    ));
+    server.await.unwrap();
+    assert!(futures::poll!(Box::pin(foreign.accept())).is_pending());
+}
+
+#[tokio::test]
+async fn local_ollama_rejects_conflicts_and_invalid_options_before_connecting() {
+    let (listener, base) = fixture().await;
+    for (settings, diagnostic) in [
+        ("reasoning_effort: invalid", "Invalid reasoning_effort"),
+        (
+            "provider_options: {options: {num_ctx: oops}}",
+            "options.num_ctx",
+        ),
+        (
+            "provider_options: {options: {temperature: {value: 1}}}",
+            "options.temperature",
+        ),
+        (
+            "temperature: 0.5\n  provider_options: {options: {temperature: 0.25}}",
+            "both temperature and provider_options.options.temperature",
+        ),
+        (
+            "max_tokens: 9\n  provider_options: {options: {num_predict: 5}}",
+            "both max_tokens and provider_options.options.num_predict",
+        ),
+        (
+            "top_k: 12\n  provider_options: {options: {top_k: 23}}",
+            "both top_k and provider_options.options.top_k",
+        ),
+        (
+            "extra_body: {options: {seed: 11}}\n  provider_options: {options: {seed: 12}}",
+            "both extra_body.options.seed and provider_options.options.seed",
+        ),
+        (
+            "keep_alive: 2m\n  provider_options: {keep_alive: 5m}",
+            "both keep_alive and provider_options.keep_alive",
+        ),
+        (
+            "provider_options: {stream: true}",
+            "invalid Ollama provider_options",
+        ),
+        (
+            "resilient: true\n  provider_options: {options: {top_k: 23}}",
+            "remove resilient: true",
+        ),
+    ] {
+        let yaml = format!(
+            "name: Local\nsystem_prompt: Test.\nllm:\n  provider: ollama\n  model: fixture\n  base_url: {base}\n  {settings}\n"
+        );
+        for streaming in [false, true] {
+            let call = async {
+                let builder = AgentBuilder::from_yaml(&yaml).unwrap();
+                let agent = match builder.auto_configure_llms() {
+                    Ok(builder) => builder.build().unwrap(),
+                    Err(error) => return error.to_string(),
+                };
+                if streaming {
+                    let mut events = match agent.chat_stream_events("hello").await {
+                        Ok(events) => events,
+                        Err(error) => return error.to_string(),
+                    };
+                    while let Some(event) = events.next().await {
+                        match event {
+                            AgentStreamEvent::Chunk(StreamChunk::Error { message }) => {
+                                return message;
+                            }
+                            AgentStreamEvent::Final(_) => panic!("unexpected success: {settings}"),
+                            _ => {}
+                        }
+                    }
+                    panic!("missing stream error: {settings}");
+                }
+                agent.chat("hello").await.unwrap_err().to_string()
+            };
+            tokio::select! {
+                error = call => assert!(error.contains(diagnostic), "{error}"),
+                _ = listener.accept() => panic!("invalid options opened a connection: {settings}, stream={streaming}"),
+            }
+            assert!(futures::poll!(Box::pin(listener.accept())).is_pending());
+        }
+    }
+}
+
+#[tokio::test]
+async fn local_ollama_raw_consumer_can_still_list_models() {
+    let (listener, base) = fixture().await;
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut head = String::new();
+        let mut reader = BufReader::new(&mut socket);
+        loop {
+            let mut line = String::new();
+            assert!(reader.read_line(&mut line).await.unwrap() > 0);
+            if line == "\r\n" {
+                break;
+            }
+            head.push_str(&line);
+        }
+        assert!(head.starts_with("GET /tenant/v1/api/tags HTTP/1.1\r\n"));
+        assert!(!head.to_ascii_lowercase().contains("authorization:"));
+        reader.get_mut().write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 13\r\nConnection: close\r\n\r\n{\"models\":[]}").await.unwrap();
+    });
+    let provider = ai_agents_llm::providers::UnifiedLLMProvider::new(
+        ai_agents_llm::providers::ProviderType::Ollama,
+        "fixture".into(),
+        Some("fixture-key".into()),
+        Some(base),
+    )
+    .unwrap();
+    provider
+        .build_llm(None)
+        .unwrap()
+        .list_models(None)
+        .await
+        .unwrap();
     server.await.unwrap();
 }
 

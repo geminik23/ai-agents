@@ -3,6 +3,7 @@ mod google;
 pub mod local;
 mod messages_adapter;
 mod ollama_adapter;
+mod ollama_local;
 pub(crate) mod openai;
 mod openrouter;
 mod pricing;

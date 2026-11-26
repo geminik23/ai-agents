@@ -16,12 +16,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use super::chat_adapter;
 use super::google::GoogleProvider;
 use super::pricing::DeclaredPricing;
-use super::{messages_adapter, ollama_adapter, openrouter, responses_adapter};
+use super::{messages_adapter, ollama_adapter, ollama_local, openrouter, responses_adapter};
 use crate::sdk::{
     ChatClient,
     decisions::{self, ChoiceOption, DecisionClient},
     messages::{self, MessagesClient},
-    ollama::OllamaCloudClient,
+    ollama::{LOCAL_ROOT, LocalChatRequest, OllamaCloudClient, OllamaLocalClient},
     openrouter::OpenRouterClient,
     responses::ResponsesClient,
 };
@@ -32,6 +32,7 @@ enum SdkBackend {
     Responses(ResponsesClient),
     Messages(MessagesClient),
     OllamaCloud(OllamaCloudClient),
+    OllamaLocal(OllamaLocalClient),
     Decisions(DecisionClient),
 }
 
@@ -232,6 +233,9 @@ impl ProviderType {
         protocol: Option<&str>,
         base_url: Option<&str>,
     ) -> Result<Option<String>, LLMError> {
+        if *self == Self::Ollama {
+            return Ok(None);
+        }
         self.check_credential_destination(variable, base_url)?;
         let Some(name) = variable else {
             return Ok(None);
@@ -276,7 +280,7 @@ impl ProviderType {
 
     pub fn default_base_url(&self) -> Option<&'static str> {
         match self {
-            Self::Ollama => Some("http://localhost:11434"),
+            Self::Ollama => Some(LOCAL_ROOT),
             Self::OpenAICompatible => None, // MUST be provided by user via base_url
             Self::OpenRouter => Some(crate::sdk::openrouter::API_BASE),
             _ => None, // Most providers use their default URLs
@@ -619,6 +623,28 @@ fn marked_json_values(content: &str, marker: &str) -> Option<Vec<serde_json::Val
     }
 }
 
+// Preserve typed-over-extra precedence and the accepted spellings of the upstream builder.
+fn legacy_reasoning_effort(config: &LLMConfig) -> Result<Option<ReasoningEffort>, LLMError> {
+    let effort = config.reasoning_effort.as_deref().or_else(|| {
+        config
+            .extra
+            .get("reasoning_effort")
+            .and_then(serde_json::Value::as_str)
+    });
+    let Some(effort) = effort else {
+        return Ok(None);
+    };
+    match effort.to_ascii_lowercase().as_str() {
+        "low" => Ok(Some(ReasoningEffort::Low)),
+        "medium" => Ok(Some(ReasoningEffort::Medium)),
+        "high" => Ok(Some(ReasoningEffort::High)),
+        other => Err(LLMError::Config(format!(
+            "Invalid reasoning_effort '{}'. Expected: low, medium, high",
+            other
+        ))),
+    }
+}
+
 fn merged_ollama_extra_body(config: &LLMConfig) -> Result<Option<serde_json::Value>, LLMError> {
     let has_named_fields = config.extra.contains_key("num_ctx")
         || config.extra.contains_key("num_gpu")
@@ -684,7 +710,7 @@ fn map_provider_error(
         };
     }
 
-    let base = base_url.unwrap_or("http://localhost:11434");
+    let base = base_url.unwrap_or(LOCAL_ROOT);
     let msg = err.to_string();
     let lower = msg.to_ascii_lowercase();
 
@@ -801,6 +827,7 @@ impl UnifiedLLMProvider {
                 "anthropic-compatible requires the Messages protocol".into(),
             ));
         }
+        let is_ollama_local = provider_type == ProviderType::Ollama;
         let is_ollama_cloud = provider_type == ProviderType::OllamaCloud;
         if is_ollama_cloud {
             if protocol.is_some() {
@@ -839,7 +866,7 @@ impl UnifiedLLMProvider {
             && !is_messages
             && !is_ollama_cloud
             && (default_config.extra.contains_key("protocol")
-                || default_config.extra.contains_key("provider_options"))
+                || !is_ollama_local && default_config.extra.contains_key("provider_options"))
         {
             return Err(LLMError::Config(
                 "SDK protocol/options require a supported provider preset".into(),
@@ -871,7 +898,9 @@ impl UnifiedLLMProvider {
                 "Messages requires explicit positive max_tokens".into(),
             ));
         }
-        let actual_api_key = if let Some(key) = api_key {
+        let actual_api_key = if is_ollama_local {
+            String::new()
+        } else if let Some(key) = api_key {
             key
         } else if let Some(env_var) = provider_type.api_key_env_var() {
             std::env::var(env_var).map_err(|_| {
@@ -909,6 +938,11 @@ impl UnifiedLLMProvider {
                 actual_base_url.as_deref(),
                 actual_api_key.clone(),
             )?))
+        } else if is_ollama_local {
+            ollama_local::uses_legacy(&default_config)?;
+            Some(SdkBackend::OllamaLocal(
+                OllamaLocalClient::new(actual_base_url.as_deref()).map_err(super::sdk_error)?,
+            ))
         } else if is_chat {
             let base = actual_base_url
                 .as_deref()
@@ -1121,6 +1155,23 @@ impl UnifiedLLMProvider {
                 Ok(message)
             })
             .collect()
+    }
+
+    // Select the legacy resilience wrapper before dispatch and validate only the effective request.
+    fn local_ollama_request(
+        &self,
+        messages: &[ChatMessage],
+        config: Option<&LLMConfig>,
+    ) -> Result<Option<LocalChatRequest>, LLMError> {
+        let cfg = config.unwrap_or(&self.default_config);
+        if ollama_local::uses_legacy(cfg)? {
+            return Ok(None);
+        }
+        // The legacy Ollama builder validated effort but never sent it to the daemon.
+        legacy_reasoning_effort(cfg)?;
+        let legacy_body = merged_ollama_extra_body(cfg)?;
+        let messages = Self::project_foreign_messages(messages)?;
+        ollama_local::request(&self.model, &messages, cfg, legacy_body.as_ref()).map(Some)
     }
 
     /// Convert a non-system ChatMessage to llm::chat::ChatMessage.
@@ -1371,26 +1422,8 @@ impl UnifiedLLMProvider {
             builder = builder.reasoning(r);
         }
 
-        // --- Reasoning effort (first-class, fallback to extra) ---
-        let reasoning_effort = config.reasoning_effort.as_deref().or_else(|| {
-            config
-                .extra
-                .get("reasoning_effort")
-                .and_then(|v| v.as_str())
-        });
-        if let Some(effort) = reasoning_effort {
-            let re = match effort.to_lowercase().as_str() {
-                "low" => ReasoningEffort::Low,
-                "medium" => ReasoningEffort::Medium,
-                "high" => ReasoningEffort::High,
-                other => {
-                    return Err(LLMError::Config(format!(
-                        "Invalid reasoning_effort '{}'. Expected: low, medium, high",
-                        other
-                    )));
-                }
-            };
-            builder = builder.reasoning_effort(re);
+        if let Some(effort) = legacy_reasoning_effort(config)? {
+            builder = builder.reasoning_effort(effort);
         }
 
         // --- Reasoning budget (first-class, fallback to extra) ---
@@ -1581,6 +1614,12 @@ impl UnifiedLLMProvider {
             ));
         }
         let cfg = config.unwrap_or(&self.default_config);
+        if self.provider_type == ProviderType::Ollama && cfg.extra.contains_key("provider_options")
+        {
+            return Err(LLMError::Config(
+                "Local Ollama provider_options require native chat; build_llm() only accepts legacy settings".into()
+            ));
+        }
         self.build_llm_with_system(cfg, None, None, None)
     }
 
@@ -1664,6 +1703,11 @@ impl LLMProvider for UnifiedLLMProvider {
         self.require_generation()?;
         if let Some(google) = &self.google {
             return google.complete(messages, config).await;
+        }
+        if let Some(SdkBackend::OllamaLocal(client)) = &self.sdk
+            && let Some(request) = self.local_ollama_request(messages, config)?
+        {
+            return ollama_local::complete(client, &request).await;
         }
         if let Some(SdkBackend::OllamaCloud(client)) = &self.sdk {
             self.validate_configured_tool_choice()?;
@@ -1905,6 +1949,11 @@ impl LLMProvider for UnifiedLLMProvider {
         self.require_generation()?;
         if let Some(google) = &self.google {
             return google.complete_stream(messages, config).await;
+        }
+        if let Some(SdkBackend::OllamaLocal(client)) = &self.sdk
+            && let Some(request) = self.local_ollama_request(messages, config)?
+        {
+            return Ok(Box::new(ollama_local::stream(client, &request).await?));
         }
         if let Some(SdkBackend::OllamaCloud(client)) = &self.sdk {
             self.validate_configured_tool_choice()?;
@@ -2449,6 +2498,29 @@ mod tests {
                 .to_string()
                 .contains("Provider type not set")
         );
+    }
+
+    #[test]
+    fn ollama_local_raw_builder_checks_effective_native_options() {
+        let raw = LLMConfig::default();
+        let native = raw.clone().with_extra(
+            "provider_options",
+            serde_json::json!({"options": {"num_predict": 7}}),
+        );
+        let provider = UnifiedLLMProvider::from_spec_config(
+            ProviderType::Ollama,
+            "fixture",
+            None,
+            None,
+            native.clone(),
+        )
+        .unwrap();
+        for cfg in [None, Some(&native)] {
+            assert!(
+                matches!(provider.build_llm(cfg), Err(LLMError::Config(message)) if message.contains("provider_options"))
+            );
+        }
+        assert!(provider.build_llm(Some(&raw)).is_ok());
     }
 
     #[test]

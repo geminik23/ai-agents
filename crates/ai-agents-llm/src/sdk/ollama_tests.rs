@@ -24,14 +24,15 @@ async fn ollama_ndjson_preserves_split_utf8_terminal_usage_and_single_call() {
             Ok::<_, ()>(&records.as_bytes()[..byte_split]),
             Ok(&records.as_bytes()[byte_split..]),
         ]),
-        Assembly::new(&request_with_tool()),
+        Assembly::new(&request_with_tool(), FinishPolicy::Require),
+        Ok,
     );
-    assert!(matches!(events.next().await, Some(Ok(ChatEvent::Text(text))) if text == "한"));
-    assert!(matches!(events.next().await, Some(Ok(ChatEvent::Text(text))) if text == "글"));
-    let Some(Ok(ChatEvent::Finished(output))) = events.next().await else {
+    assert!(matches!(events.next().await, Some(Ok(LocalChatEvent::Text(text))) if text == "한"));
+    assert!(matches!(events.next().await, Some(Ok(LocalChatEvent::Text(text))) if text == "글"));
+    let Some(Ok(LocalChatEvent::Finished(output))) = events.next().await else {
         panic!("missing verified finish");
     };
-    assert_eq!(output.finish, Finish::ToolCall);
+    assert_eq!(output.finish, Some(Finish::ToolCall));
     assert_eq!(output.message.content, "한글");
     assert_eq!(output.message.thinking.as_deref(), Some("private"));
     assert_eq!(output.message.tool_calls[0].id, None);
@@ -57,10 +58,10 @@ async fn ollama_ndjson_rejects_error_eof_bad_tools_and_post_terminal_data() {
             {"function":{"name":"test_tool","arguments":"not an object" }}
         ]}}).to_string(),
     ] {
-        let events = decode(stream::iter([Ok::<_, ()>(bad)]), Assembly::new(&request_with_tool()))
+        let events = decode(stream::iter([Ok::<_, ()>(bad)]), Assembly::new(&request_with_tool(), FinishPolicy::Require), Ok)
             .collect::<Vec<_>>().await;
         assert!(matches!(events.last(), Some(Err(Error::Protocol(_)))));
-        assert!(events.iter().all(|event| !matches!(event, Ok(ChatEvent::Finished(_)))));
+        assert!(events.iter().all(|event| !matches!(event, Ok(LocalChatEvent::Finished(_)))));
     }
 }
 
@@ -73,13 +74,17 @@ async fn ollama_stream_distinguishes_length_and_never_estimates_missing_usage() 
     .to_string();
     let mut events = decode(
         stream::iter([Ok::<_, ()>(reply)]),
-        Assembly::new(&request_with_tool()),
+        Assembly::new(&request_with_tool(), FinishPolicy::Require),
+        Ok,
     );
-    assert!(matches!(events.next().await, Some(Ok(ChatEvent::Text(_)))));
-    let Some(Ok(ChatEvent::Finished(output))) = events.next().await else {
+    assert!(matches!(
+        events.next().await,
+        Some(Ok(LocalChatEvent::Text(_)))
+    ));
+    let Some(Ok(LocalChatEvent::Finished(output))) = events.next().await else {
         panic!("missing verified finish");
     };
-    assert_eq!(output.finish, Finish::Length);
+    assert_eq!(output.finish, Some(Finish::Length));
     assert!(output.usage.is_none());
 }
 
@@ -101,6 +106,33 @@ fn ollama_preserves_option_omission_and_passes_open_thinking_levels() {
 }
 
 #[tokio::test]
+async fn ollama_legacy_local_terminal_without_reason_is_not_a_cloud_success() {
+    let reply = json!({"model":"fixture:tag", "done":true,
+        "message":{"role":"assistant", "content":"text"}});
+    let mut events = decode(
+        stream::iter([Ok::<_, ()>(reply.to_string())]),
+        Assembly::new(&request_with_tool(), FinishPolicy::AllowOmitted),
+        Ok,
+    );
+    assert!(matches!(
+        events.next().await,
+        Some(Ok(LocalChatEvent::Text(_)))
+    ));
+    let Some(Ok(LocalChatEvent::Finished(output))) = events.next().await else {
+        panic!("missing local completion");
+    };
+    assert_eq!(output.model.as_deref(), Some("fixture:tag"));
+    assert!(output.done_reason.is_none() && output.finish.is_none());
+    let mut cloud = decode(
+        stream::iter([Ok::<_, ()>(reply.to_string())]),
+        Assembly::new(&request_with_tool(), FinishPolicy::Require),
+        Ok,
+    );
+    assert!(matches!(cloud.next().await, Some(Err(Error::Protocol(_)))));
+    assert!(cloud.next().await.is_none());
+}
+
+#[tokio::test]
 async fn ollama_drop_releases_a_partial_stream_without_a_final_record() {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -118,9 +150,51 @@ async fn ollama_drop_releases_a_partial_stream_without_a_final_record() {
         yield Ok::<_, ()>(b"{\"message\":{\"role\":\"assistant\",\"content\":\"partial\"},\"done\":false}\n");
         std::future::pending::<()>().await;
     });
-    let mut events = decode(bytes, Assembly::new(&request_with_tool()));
-    assert!(matches!(events.next().await, Some(Ok(ChatEvent::Text(_)))));
+    let mut events = decode(
+        bytes,
+        Assembly::new(&request_with_tool(), FinishPolicy::Require),
+        Ok,
+    );
+    assert!(matches!(
+        events.next().await,
+        Some(Ok(LocalChatEvent::Text(_)))
+    ));
     assert!(!dropped.load(Ordering::SeqCst));
     drop(events);
     assert!(dropped.load(Ordering::SeqCst));
+}
+
+#[test]
+fn ollama_local_native_option_types_and_extensions() {
+    let mut request = LocalChatRequest::new(ChatRequest::new("fixture", Vec::new()));
+    for (name, invalid) in [
+        ("temperature", json!({"value": 1})),
+        ("top_p", json!("0.9")),
+        ("top_k", json!(0.5)),
+        ("num_predict", json!(true)),
+        ("num_ctx", json!("4096")),
+        ("num_gpu", json!([1])),
+        ("stop", json!(["end", 1])),
+        ("seed", json!("1")),
+    ] {
+        request.chat.options.insert(name.into(), invalid);
+        for stream in [false, true] {
+            assert!(
+                matches!(request.body(stream), Err(Error::Config(msg)) if msg.contains(name)),
+                "{name}"
+            );
+        }
+        request.chat.options.clear();
+    }
+    request.chat.options = json!({"num_predict": -1, "num_gpu": -1, "stop": ["end"],
+        "top_p": null, "top_k": null, "future_option": {"level": "custom"}})
+    .as_object()
+    .unwrap()
+    .clone();
+    for stream in [false, true] {
+        assert_eq!(
+            request.body(stream).unwrap()["options"],
+            json!(request.chat.options)
+        );
+    }
 }
