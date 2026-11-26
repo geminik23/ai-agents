@@ -520,6 +520,56 @@ async fn review_legacy_response_formats_reach_chat_wire_as_owned_fields() {
 }
 
 #[tokio::test]
+async fn migrated_chat_yaml_preserves_explicit_null_and_absent_response_format() {
+    let (listener, base) = fixture().await;
+    let server = tokio::spawn(async move {
+        for expected in [None, Some(Value::Null)] {
+            for streaming in [false, true] {
+                let (mut socket, body, _) = receive(&listener).await;
+                assert_eq!(body.get("response_format"), expected.as_ref());
+                assert_eq!(body["stream"], streaming);
+                if streaming {
+                    open_stream(&mut socket).await;
+                    frame(&mut socket, json!({"content":"ok"}), Some("stop")).await;
+                    socket.write_all(b"data: [DONE]\n\n").await.unwrap();
+                } else {
+                    reply(
+                        &mut socket,
+                        json!({"role":"assistant","content":"ok"}),
+                        "stop",
+                    )
+                    .await;
+                }
+            }
+        }
+    });
+    for extension in ["", "  extra_body: {response_format: null}\n"] {
+        let source = format!(
+            "name: Legacy\nsystem_prompt: Test.\nllm:\n  provider: openai-compatible\n  model: fixture\n  base_url: {base}\n  reasoning: true\n{extension}"
+        );
+        let agent = AgentBuilder::from_yaml(&source)
+            .unwrap()
+            .auto_configure_llms()
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(agent.chat("hello").await.unwrap().content, "ok");
+        let events = agent
+            .chat_stream_events("hello")
+            .await
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await;
+        assert!(
+            events.iter().any(
+                |event| matches!(event, AgentStreamEvent::Final(reply) if reply.content == "ok")
+            )
+        );
+    }
+    server.await.unwrap();
+}
+
+#[tokio::test]
 async fn responses_sdk_preserves_items_and_reasoning_options_for_both_models() {
     use ai_agents_llm::sdk::responses::{ResponsesClient, ResponsesRequest};
     for model in ["gpt-6.2-astra", "gpt-6.2-sol"] {

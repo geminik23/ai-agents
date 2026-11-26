@@ -14,6 +14,8 @@ use std::{future::Future, time::Duration};
 
 use super::sdk_error as error;
 
+pub(super) const REPORTED_MODEL: &str = "chat_reported_model";
+
 pub(super) fn append_message(
     out: &mut Vec<sdk::Message>,
     msg: &ChatMessage,
@@ -141,12 +143,17 @@ pub(super) fn apply_option(
     field: &str,
     key: &str,
     value: &Value,
+    explicit_null_format: Option<sdk::ResponseFormat>,
 ) -> Result<(), LLMError> {
     if field == "extra_body" && key == "response_format" {
         // Migrate the legacy wire shape into the owned request field.
-        request.response_format = serde_json::from_value(value.clone()).map_err(|error| {
-            LLMError::Config(format!("invalid extra_body.response_format: {error}"))
-        })?;
+        request.response_format = if value.is_null() {
+            explicit_null_format
+        } else {
+            Some(serde_json::from_value(value.clone()).map_err(|error| {
+                LLMError::Config(format!("invalid extra_body.response_format: {error}"))
+            })?)
+        };
         return Ok(());
     }
     if sdk::reserved(key) {
@@ -198,7 +205,13 @@ pub(super) fn request(
         .or_else(|| extra.get("timeout_seconds").and_then(Value::as_u64))
         .map(Duration::from_secs);
     request_options(cfg, |field, key, value| {
-        apply_option(&mut request, field, key, value)
+        apply_option(
+            &mut request,
+            field,
+            key,
+            value,
+            Some(sdk::ResponseFormat::Null),
+        )
     })?;
     if previously_legacy {
         if extra.contains_key("provider_options") || extra.contains_key("protocol") {
@@ -265,16 +278,27 @@ pub(super) struct Dispatch {
 
 impl Dispatch {
     pub(super) async fn complete(self, client: &sdk::ChatClient) -> Result<LLMResponse, LLMError> {
-        let output = self.send(|| client.complete(&self.request)).await?;
-        response(output, &self.request.model)
+        let (output, reported) = self
+            .send(|| client.complete_with_reported_model(&self.request))
+            .await?;
+        let mut result = response(output, &self.request.model)?;
+        if let Some(model) = reported {
+            result
+                .metadata
+                .insert(REPORTED_MODEL.into(), Value::String(model.clone()));
+            result.model = Some(model);
+        }
+        Ok(result)
     }
 
     pub(super) async fn stream(
         self,
         client: &sdk::ChatClient,
+        usage_model: Option<&str>,
     ) -> Result<sdk::ChatStream, LLMError> {
         // Opening the stream is the only retryable stage. Polling bytes never starts a new request.
-        self.send(|| client.stream(&self.request)).await
+        self.send(|| client.stream_with_usage_model(&self.request, usage_model))
+            .await
     }
 
     async fn send<T, F: Future<Output = Result<T, sdk::Error>>>(

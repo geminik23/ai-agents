@@ -100,7 +100,7 @@ pub(super) fn request(
             request.parallel_tool_calls = Some(parallel);
             return Ok(());
         }
-        chat_adapter::apply_option(&mut request.chat, field, key, value)
+        chat_adapter::apply_option(&mut request.chat, field, key, value, None)
     })?;
     let history = inspect_native_history(messages)?;
     if history.has_incomplete_unsigned()

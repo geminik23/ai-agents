@@ -184,6 +184,7 @@ impl Assembly {
 pub(super) fn decode<B, E>(
     bytes: impl futures::Stream<Item = Result<B, E>> + Unpin + Send + 'static,
     expected: super::ExpectedCalls,
+    usage_model: Option<String>,
 ) -> ChatStream
 where
     B: AsRef<[u8]> + Send + 'static,
@@ -192,9 +193,13 @@ where
     Box::pin(async_stream::try_stream! {
         let mut frames = super::transport::frames(bytes);
         let mut assembly = Assembly::default();
+        let mut model_conflict = false;
         while let Some(frame) = frames.next().await {
             let frame = frame?;
             if frame == "[DONE]" {
+                if model_conflict {
+                    assembly.usage = None;
+                }
                 let event = assembly.finish()?;
                 if let Event::Finished { tool_calls, .. } = &event {
                     expected.check(tool_calls)?;
@@ -202,9 +207,19 @@ where
                 yield event;
                 return;
             }
-            let chunk = serde_json::from_str(&frame)
+            let chunk: super::wire::Reported<Choice> = serde_json::from_str(&frame)
                 .map_err(|_| Error::Protocol("invalid chat stream event"))?;
-            if let Some(event) = assembly.accept(chunk)? {
+            let contains_usage = chunk.envelope.usage.is_some();
+            let event = assembly.accept(chunk.envelope)?;
+            if let Some(expected) = usage_model.as_deref() {
+                let reported = chunk.model.as_deref();
+                // A conflicting frame invalidates attribution. Only the accepted terminal receipt must name a model.
+                model_conflict |= match reported {
+                    Some(model) => model != expected,
+                    None => contains_usage && assembly.terminal_receipt_seen,
+                };
+            }
+            if let Some(event) = event {
                 yield event;
             }
         }
@@ -228,6 +243,7 @@ mod tests {
                 names: vec!["probe".into()],
                 choice: None,
             },
+            None,
         )
     }
 

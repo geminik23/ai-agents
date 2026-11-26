@@ -2112,7 +2112,14 @@ impl LLMProvider for UnifiedLLMProvider {
                 config.unwrap_or(&self.default_config),
                 None,
             )?;
-            return Ok(Box::new(wire.stream(chat).await?.map(chat_adapter::chunk)));
+            return Ok(Box::new(
+                wire.stream(
+                    chat,
+                    self.pricing.as_ref().map(|pricing| pricing.model.as_str()),
+                )
+                .await?
+                .map(chat_adapter::chunk),
+            ));
         }
         let projected_messages = Self::project_foreign_messages(messages)?;
         // Separate system messages from non-system messages
@@ -2310,10 +2317,15 @@ impl LLMProvider for UnifiedLLMProvider {
         let Some(pricing) = &self.pricing else {
             return Ok(None);
         };
-        if self.provider_type == ProviderType::OpenRouter
+        let reported_model_key = match self.sdk {
+            Some(SdkBackend::Chat(_)) => Some(chat_adapter::REPORTED_MODEL),
+            Some(SdkBackend::OpenRouter(_)) => Some(openrouter::REPORTED_MODEL),
+            _ => None,
+        };
+        if let Some(key) = reported_model_key
             && response
                 .metadata
-                .get(openrouter::REPORTED_MODEL)
+                .get(key)
                 .and_then(serde_json::Value::as_str)
                 != Some(pricing.model.as_str())
         {
