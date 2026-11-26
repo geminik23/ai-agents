@@ -678,3 +678,76 @@ async fn responses_pricing_requires_its_own_endpoint_and_final_matching_usage() 
         }
     }
 }
+
+#[tokio::test]
+async fn openrouter_priced_stream_settles_only_complete_single_attempt_receipts() {
+    let usage = serde_json::json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":4,"total_tokens":14,"cost":0.125}});
+    for (ending, attempts, expected_charge, expected_error) in [
+        (
+            format!("data: {usage}\n\ndata: [DONE]\n\n"),
+            1,
+            Some(16),
+            false,
+        ),
+        (format!("data: {usage}\n\ndata: [DONE]\n\n"), 2, None, false),
+        ("data: [DONE]\n\n".into(), 1, None, false),
+        (
+            "data: {\"choices\":[],\"error\":{\"code\":502}}\n\n".into(),
+            1,
+            None,
+            true,
+        ),
+    ] {
+        let stream_payload = format!(
+            "data: {{\"choices\":[{{\"delta\":{{\"content\":\"done\"}},\"finish_reason\":\"stop\"}}]}}\n\n{ending}"
+        );
+        let (endpoint, mut received) = fixture_stream(false, 1, false, Some(stream_payload)).await;
+        let mut declared = schedule(&endpoint);
+        declared.max_internal_attempts = attempts;
+        let provider = ProviderBuilder::new()
+            .provider(ProviderType::OpenRouter)
+            .model("fixture-model")
+            .api_key("fixture-key")
+            .base_url(&endpoint)
+            .build()
+            .unwrap()
+            .with_declared_pricing(declared)
+            .unwrap();
+        let provider = crate::managed_provider(Arc::new(provider));
+        let ledger = Arc::new(Ledger::default());
+        crate::scope_invocation_admission(ledger.clone(), async {
+            let messages = [ChatMessage::user("sample")];
+            for options in [
+                serde_json::json!({"models":["other/model"]}),
+                serde_json::json!({"provider":{"max_price":{"prompt":1}}}),
+                serde_json::json!({"plugins":[{"id":"web"}]}),
+            ] {
+                let config = LLMConfig::default().with_extra("provider_options", options);
+                assert!(provider.complete(&messages, Some(&config)).await.is_err());
+            }
+            assert!(ledger.bounds.lock().is_empty());
+            assert!(matches!(
+                received.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ));
+            let stream = provider.complete_stream(&messages, None).await.unwrap();
+            let replies = stream.collect::<Vec<_>>().await;
+            assert_eq!(replies.iter().any(Result::is_err), expected_error);
+        })
+        .await;
+        let body = received.try_recv().unwrap();
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["max_tokens"], 2048);
+        assert!(received.try_recv().is_err());
+        assert_eq!(
+            ledger.bounds.lock()[0].max_micro_usd,
+            6146 * u64::from(attempts)
+        );
+        let settlements = ledger.settlements.lock();
+        assert_eq!(settlements.len(), 1);
+        assert_eq!(
+            settlements[0].as_ref().map(|s| s.charged_micro_usd),
+            expected_charge
+        );
+    }
+}
