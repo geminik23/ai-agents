@@ -67,6 +67,86 @@ pub(super) fn connect(
     MessagesClient::at_endpoint(base, auth, version, official).map_err(sdk_error)
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum RequestConfig<'a> {
+    Explicit(&'a LLMConfig),
+    DefaultAnthropic(&'a LLMConfig),
+}
+
+pub(super) fn validate_default_destination(base: Option<&str>) -> Result<(), LLMError> {
+    if base.is_some_and(|base| {
+        !reqwest::Url::parse(base).is_ok_and(|url| {
+            url.origin().ascii_serialization() == OFFICIAL_ORIGIN
+                && url.path().trim_end_matches('/') == "/v1"
+                && url.username().is_empty()
+                && url.password().is_none()
+                && url.query().is_none()
+                && url.fragment().is_none()
+        })
+    }) {
+        return Err(configuration(
+            "default Anthropic uses the official /v1 endpoint; use anthropic-compatible for a custom base_url",
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn validate_default_options(config: &LLMConfig) -> Result<(), LLMError> {
+    for field in [
+        "protocol",
+        "provider_options",
+        "anthropic_version",
+        "messages_auth",
+    ] {
+        if config.extra.contains_key(field) {
+            return Err(LLMError::Config(format!(
+                "{field} requires explicitly selecting the Messages SDK; configure protocol: messages for native options, or use legacy settings with build_llm()"
+            )));
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn uses_resilient_transport(config: &LLMConfig) -> bool {
+    config.extra.get("resilient").and_then(Value::as_bool) == Some(true)
+}
+
+fn default_thinking(config: &LLMConfig) -> Option<Thinking> {
+    let enabled = config
+        .reasoning
+        .or_else(|| config.extra.get("reasoning").and_then(Value::as_bool));
+    (enabled == Some(true)).then(|| Thinking::Enabled {
+        budget_tokens: config
+            .reasoning_budget_tokens
+            .or_else(|| {
+                config
+                    .extra
+                    .get("reasoning_budget_tokens")
+                    .and_then(Value::as_u64)
+                    .map(|n| n as u32)
+            })
+            .unwrap_or(16_000),
+    })
+}
+
+// The official thinking-mode table is the positive evidence for old unsigned tool turns.
+pub(super) fn allows_legacy_unsigned_replay(model: &str, config: &LLMConfig) -> bool {
+    default_thinking(config).is_none()
+        && include_str!("messages_legacy_thinking_off.txt")
+            .lines()
+            .any(|id| id == model)
+}
+
+pub(super) fn supports_default_choice(
+    model: &str,
+    config: &LLMConfig,
+    selection: &ToolChoice,
+) -> bool {
+    choice(selection).is_some_and(|selection| {
+        allows_choice(true, model, default_thinking(config).as_ref(), &selection)
+    })
+}
+
 fn options(config: &LLMConfig) -> Result<Options, LLMError> {
     let mut options = match config.extra.get("provider_options") {
         Some(value) => serde_json::from_value::<Options>(value.clone())
@@ -185,6 +265,8 @@ fn history(
     client: &MessagesClient,
     model: &str,
     input: &[ChatMessage],
+    system_separator: &str,
+    require_signed: bool,
 ) -> Result<(Option<String>, Vec<Value>), LLMError> {
     let native = inspect_native_history(input)?;
     if native.has_incomplete_unsigned()
@@ -210,6 +292,11 @@ fn history(
                     if let Some(state) = state {
                         replay_blocks(client, model, &state, &calls)?
                     } else {
+                        if require_signed {
+                            return Err(invalid(
+                                "Anthropic thinking cannot replay unsigned legacy tool history",
+                            ));
+                        }
                         calls.into_iter().map(|call| json!({
                             "type":"tool_use","id":call.id,"name":call.name,"input":call.arguments,
                         })).collect()
@@ -244,48 +331,94 @@ fn history(
             messages.push(json!({"role":role,"content":blocks}));
         }
     }
-    Ok(((!system.is_empty()).then(|| system.join("\n\n")), messages))
+    Ok((
+        (!system.is_empty()).then(|| system.join(system_separator)),
+        messages,
+    ))
 }
 
 fn request(
     client: &MessagesClient,
     model: &str,
     messages: &[ChatMessage],
-    config: &LLMConfig,
+    settings: RequestConfig<'_>,
     tools: Option<&LLMToolRequest>,
+    streaming: bool,
 ) -> Result<MessagesRequest, LLMError> {
-    if config.extra.keys().any(|key| {
-        !matches!(
-            key.as_str(),
-            "protocol" | "provider_options" | "anthropic_version" | "messages_auth"
-        )
-    }) || config
-        .extra
-        .get("protocol")
-        .is_some_and(|value| value != "messages")
-        || config.frequency_penalty.is_some()
-        || config.presence_penalty.is_some()
-        || config.stop_sequences.is_some()
-    {
-        return Err(configuration("unsupported Messages request setting"));
-    }
-    let limit = config
-        .max_tokens
-        .filter(|max| *max > 0)
-        .ok_or_else(|| configuration("Messages requires explicit positive max_tokens"))?;
-    let options = options(config)?;
-    let (system, messages) = history(client, model, messages)?;
+    let (config, limit, thinking, effort) = match settings {
+        RequestConfig::DefaultAnthropic(config) => {
+            super::unified::legacy_reasoning_effort(config)?;
+            let thinking = if streaming {
+                None
+            } else {
+                default_thinking(config)
+            };
+            (config, config.max_tokens.unwrap_or(300), thinking, None)
+        }
+        RequestConfig::Explicit(config) => {
+            if config.extra.keys().any(|key| {
+                !matches!(
+                    key.as_str(),
+                    "protocol" | "provider_options" | "anthropic_version" | "messages_auth"
+                )
+            }) || config
+                .extra
+                .get("protocol")
+                .is_some_and(|value| value != "messages")
+                || config.frequency_penalty.is_some()
+                || config.presence_penalty.is_some()
+                || config.stop_sequences.is_some()
+            {
+                return Err(configuration("unsupported Messages request setting"));
+            }
+            let limit = config
+                .max_tokens
+                .filter(|max| *max > 0)
+                .ok_or_else(|| configuration("Messages requires explicit positive max_tokens"))?;
+            let options = options(config)?;
+            let effort = config
+                .reasoning_effort
+                .clone()
+                .or(options.output_config.and_then(|config| config.effort));
+            (config, limit, options.thinking, effort)
+        }
+    };
+    let default = matches!(settings, RequestConfig::DefaultAnthropic(_));
+    let (system, messages) = history(
+        client,
+        model,
+        messages,
+        if default { "\n" } else { "\n\n" },
+        default && !allows_legacy_unsigned_replay(model, config),
+    )?;
     let mut request = MessagesRequest::new(model, messages, limit);
-    request.system = system;
-    request.temperature = config.temperature;
+    request.system = if default {
+        Some(
+            system
+                .filter(|text| !text.is_empty())
+                .unwrap_or_else(|| "You are a helpful assistant.".into()),
+        )
+    } else {
+        system
+    };
+    request.temperature = if default {
+        config.temperature.or(Some(0.7))
+    } else {
+        config.temperature
+    };
     request.top_p = config.top_p;
     request.top_k = config.top_k;
-    request.timeout = config.timeout_seconds.map(Duration::from_secs);
-    request.effort = config
-        .reasoning_effort
-        .clone()
-        .or(options.output_config.and_then(|config| config.effort));
-    request.thinking = options.thinking;
+    request.timeout = if default {
+        let seconds = config
+            .timeout_seconds
+            .or_else(|| config.extra.get("timeout_seconds").and_then(Value::as_u64))
+            .unwrap_or(30);
+        (seconds > 0).then(|| Duration::from_secs(seconds))
+    } else {
+        config.timeout_seconds.map(Duration::from_secs)
+    };
+    request.effort = effort;
+    request.thinking = thinking;
     if let Some(tools) = tools {
         request.functions = tools
             .tools
@@ -317,11 +450,11 @@ pub(super) async fn complete(
     client: &MessagesClient,
     model: &str,
     messages: &[ChatMessage],
-    config: &LLMConfig,
+    settings: RequestConfig<'_>,
     tools: Option<&LLMToolRequest>,
 ) -> Result<LLMResponse, LLMError> {
     let response = client
-        .complete(&request(client, model, messages, config, tools)?)
+        .complete(&request(client, model, messages, settings, tools, false)?)
         .await
         .map_err(sdk_error)?;
     let mut result = LLMResponse::new(response.text, FinishReason::Stop);
@@ -360,9 +493,9 @@ pub(super) async fn stream(
     client: &MessagesClient,
     model: &str,
     messages: &[ChatMessage],
-    config: &LLMConfig,
+    settings: RequestConfig<'_>,
 ) -> Result<FrameworkStream, LLMError> {
-    let request = request(client, model, messages, config, None)?;
+    let request = request(client, model, messages, settings, None, true)?;
     let stream = client
         .stream(&request)
         .await
@@ -382,6 +515,66 @@ pub(super) async fn stream(
 mod tests {
     use super::*;
     use ai_agents_core::{encode_native_tool_call_markers, encode_native_tool_result_marker};
+
+    #[test]
+    fn default_anthropic_retains_transport_defaults_without_reinterpreting_effort() {
+        let client = MessagesClient::new("fixture".into()).unwrap();
+        let fallback = LLMConfig {
+            temperature: None,
+            max_tokens: None,
+            top_p: None,
+            ..Default::default()
+        };
+        let wire = |config, messages: &[ChatMessage], streaming| {
+            request(
+                &client,
+                "claude-sonnet-4-6",
+                messages,
+                RequestConfig::DefaultAnthropic(config),
+                None,
+                streaming,
+            )
+            .unwrap()
+        };
+        let rust = LLMConfig::default();
+        let default_rust = wire(&rust, &[], false);
+        assert_eq!(default_rust.max_tokens, 2048);
+        assert_eq!(default_rust.top_p, Some(0.9));
+        let request = wire(&fallback, &[], false);
+        assert_eq!(request.max_tokens, 300);
+        assert_eq!(request.temperature, Some(0.7));
+        assert_eq!(request.top_p, None);
+        assert_eq!(request.timeout, Some(Duration::from_secs(30)));
+        assert_eq!(
+            request.system.as_deref(),
+            Some("You are a helpful assistant.")
+        );
+
+        let manual = LLMConfig {
+            reasoning: Some(true),
+            timeout_seconds: Some(0),
+            reasoning_effort: Some("HIGH".into()),
+            top_k: Some(7),
+            ..fallback.clone()
+        };
+        let system = [ChatMessage::system("first"), ChatMessage::system("second")];
+        let ordinary = wire(&manual, &system, false);
+        assert_eq!(ordinary.system.as_deref(), Some("first\nsecond"));
+        assert!(matches!(
+            ordinary.thinking,
+            Some(Thinking::Enabled {
+                budget_tokens: 16_000
+            })
+        ));
+        assert_eq!(ordinary.top_k, Some(7));
+        assert!(ordinary.effort.is_none() && ordinary.timeout.is_none());
+        assert!(wire(&manual, &system, true).thinking.is_none());
+        assert!(!supports_default_choice(
+            "claude-sonnet-4-6",
+            &manual,
+            &ToolChoice::Required
+        ));
+    }
 
     #[test]
     fn messages_forced_choice_depends_on_model_service_and_thinking() {
@@ -534,7 +727,7 @@ mod tests {
                     encode_native_tool_result_marker(&call, json!("found")).unwrap(),
                 ),
             ];
-            let result = history(&client, "test", &messages);
+            let result = history(&client, "test", &messages, "\n\n", false);
             if valid {
                 let (_, messages) = result.unwrap();
                 assert_eq!(messages[1]["content"], blocks);
@@ -559,7 +752,17 @@ mod tests {
             LLMConfig::default().with_extra("provider_options", json!({"max_tokens":100})),
             LLMConfig::default().with_extra("provider_options", json!({"api_key":"other"})),
         ] {
-            assert!(request(&client, "test", &[], &config, None).is_err());
+            assert!(
+                request(
+                    &client,
+                    "test",
+                    &[],
+                    RequestConfig::Explicit(&config),
+                    None,
+                    false
+                )
+                .is_err()
+            );
         }
     }
 }

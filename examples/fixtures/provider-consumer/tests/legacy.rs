@@ -28,7 +28,7 @@ fn existing_presets_expose_their_documented_low_level_builder() {
             id.parse().unwrap(),
             "fixture",
             Some("fixture-key".into()),
-            Some(base.clone()),
+            (id != "anthropic").then(|| base.clone()),
             LLMConfig {
                 temperature: None,
                 top_p: None,
@@ -46,6 +46,20 @@ fn existing_presets_expose_their_documented_low_level_builder() {
             );
         }
     }
+    let anthropic = UnifiedLLMProvider::new(
+        ProviderType::Anthropic,
+        "fixture".into(),
+        Some("fixture-key".into()),
+        None,
+    )
+    .unwrap();
+    let default: Box<dyn llm::LLMProvider> = anthropic.build_llm(None).unwrap();
+    drop(default);
+    let sdk_only = LLMConfig::default().with_extra("anthropic_version", "2023-06-01".into());
+    assert!(matches!(
+        anthropic.build_llm(Some(&sdk_only)),
+        Err(ai_agents_llm::LLMError::Config(_))
+    ));
     for (preset, protocol, limit) in [
         (ProviderType::OpenAI, "responses", None),
         (ProviderType::OpenAI, "decisions", None),

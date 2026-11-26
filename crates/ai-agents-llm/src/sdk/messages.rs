@@ -223,9 +223,10 @@ impl MessagesClient {
             && let Some(Thinking::Enabled { budget_tokens }) = request.thinking
             && !(1024..request.max_tokens).contains(&budget_tokens)
         {
-            return Err(Error::Config(
-                "manual thinking budget must be at least 1024 and below max_tokens".into(),
-            ));
+            return Err(Error::Config(format!(
+                "manual thinking budget {budget_tokens} must be at least 1024 and below max_tokens {}",
+                request.max_tokens
+            )));
         }
         self.transport
             .send(&request.body(stream)?, request.timeout)

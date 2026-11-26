@@ -124,18 +124,21 @@ impl ProviderType {
         if !self.supports_preset_choice(enabled, choice) {
             return false;
         }
-        if self.uses_messages(
-            config
-                .extra
-                .get("protocol")
-                .and_then(serde_json::Value::as_str),
-        ) {
+        let protocol = config
+            .extra
+            .get("protocol")
+            .and_then(serde_json::Value::as_str);
+        if self.uses_messages(protocol) {
             return messages_adapter::supports_choice(
                 self == Self::Anthropic,
                 model,
                 config,
                 choice,
             );
+        }
+        if self.is_default_anthropic(config) && !messages_adapter::uses_resilient_transport(config)
+        {
+            return messages_adapter::supports_default_choice(model, config, choice);
         }
         self.model_allows_tools(model, config)
     }
@@ -156,12 +159,14 @@ impl ProviderType {
                 "configured choice requires native tool support".into(),
             ));
         }
-        if self.uses_messages(
+        if (self.uses_messages(
             config
                 .extra
                 .get("protocol")
                 .and_then(serde_json::Value::as_str),
-        ) && matches!(choice, ToolChoice::Required | ToolChoice::Specific(_))
+        ) || (self.is_default_anthropic(config)
+            && !messages_adapter::uses_resilient_transport(config)))
+            && matches!(choice, ToolChoice::Required | ToolChoice::Specific(_))
         {
             return Err(LLMError::Config(
                 "configured Messages tool choice is unsupported".into(),
@@ -287,13 +292,28 @@ impl ProviderType {
         }
     }
 
-    /// Whether this preset and protocol select the first-party Messages client.
+    /// Whether this declaration uses the explicit Messages configuration contract.
     pub fn uses_messages(self, protocol: Option<&str>) -> bool {
         match self {
             Self::Anthropic => protocol == Some("messages"),
             Self::AnthropicCompatible => matches!(protocol, None | Some("messages")),
             _ => false,
         }
+    }
+
+    // A missing protocol retains the historical framework contract even with SDK dispatch.
+    fn is_default_anthropic(self, config: &LLMConfig) -> bool {
+        self == Self::Anthropic && !config.extra.contains_key("protocol")
+    }
+
+    /// Reports whether a default Anthropic configuration requires signed evidence to replay a legacy tool exchange.
+    pub fn requires_signed_default_anthropic_history(
+        self,
+        model: &str,
+        config: &LLMConfig,
+    ) -> bool {
+        self.is_default_anthropic(config)
+            && !messages_adapter::allows_legacy_unsigned_replay(model, config)
     }
 
     fn to_llm_backend(self) -> Option<llm::builder::LLMBackend> {
@@ -624,7 +644,9 @@ fn marked_json_values(content: &str, marker: &str) -> Option<Vec<serde_json::Val
 }
 
 // Preserve typed-over-extra precedence and the accepted spellings of the upstream builder.
-fn legacy_reasoning_effort(config: &LLMConfig) -> Result<Option<ReasoningEffort>, LLMError> {
+pub(super) fn legacy_reasoning_effort(
+    config: &LLMConfig,
+) -> Result<Option<ReasoningEffort>, LLMError> {
     let effort = config.reasoning_effort.as_deref().or_else(|| {
         config
             .extra
@@ -820,6 +842,11 @@ impl UnifiedLLMProvider {
                 ));
             }
         }
+        let is_default_anthropic = provider_type.is_default_anthropic(&default_config);
+        if is_default_anthropic {
+            messages_adapter::validate_default_destination(base_url.as_deref())?;
+            messages_adapter::validate_default_options(&default_config)?;
+        }
         let is_messages = provider_type.uses_messages(protocol.and_then(serde_json::Value::as_str))
             && protocol.is_none_or(|value| value.is_string());
         if provider_type == ProviderType::AnthropicCompatible && !is_messages {
@@ -968,7 +995,7 @@ impl UnifiedLLMProvider {
                     _ => return Err(LLMError::Config("unsupported protocol for provider".into())),
                 },
             )
-        } else if is_messages {
+        } else if is_messages || is_default_anthropic {
             Some(SdkBackend::Messages(messages_adapter::connect(
                 provider_type,
                 actual_base_url.as_deref(),
@@ -1118,6 +1145,42 @@ impl UnifiedLLMProvider {
             }
         }
         Ok(config)
+    }
+
+    // Dispatch resilient requests through their declared upstream wrapper before attempting I/O.
+    fn messages_dispatch<'a>(
+        &'a self,
+        config: Option<&'a LLMConfig>,
+        messages: &[ChatMessage],
+    ) -> Result<Option<(&'a MessagesClient, messages_adapter::RequestConfig<'a>)>, LLMError> {
+        let Some(SdkBackend::Messages(client)) = &self.sdk else {
+            return Ok(None);
+        };
+        let cfg = self.messages_config(config)?;
+        let settings = if self
+            .provider_type
+            .is_default_anthropic(&self.default_config)
+        {
+            messages_adapter::validate_default_options(cfg)?;
+            if messages_adapter::uses_resilient_transport(cfg) {
+                if ai_agents_core::inspect_native_history(messages)?
+                    .exchanges()
+                    .iter()
+                    .any(|turn| {
+                        turn.state().provider() == "anthropic" && turn.state().api() == "messages"
+                    })
+                {
+                    return Err(LLMError::Config(
+                        "legacy Anthropic resilience cannot replay signed Messages history".into(),
+                    ));
+                }
+                return Ok(None);
+            }
+            messages_adapter::RequestConfig::DefaultAnthropic(cfg)
+        } else {
+            messages_adapter::RequestConfig::Explicit(cfg)
+        };
+        Ok(Some((client, settings)))
     }
 
     fn validate_configured_tool_choice(&self) -> Result<(), LLMError> {
@@ -1607,13 +1670,23 @@ impl UnifiedLLMProvider {
         self.require_generation()?;
         if matches!(
             self.sdk,
-            Some(SdkBackend::Responses(_) | SdkBackend::Messages(_) | SdkBackend::OllamaCloud(_))
-        ) {
+            Some(SdkBackend::Responses(_) | SdkBackend::OllamaCloud(_))
+        ) || matches!(self.sdk, Some(SdkBackend::Messages(_)))
+            && !self
+                .provider_type
+                .is_default_anthropic(&self.default_config)
+        {
             return Err(LLMError::Config(
                 "configured protocol requires the first-party SDK".into(),
             ));
         }
         let cfg = config.unwrap_or(&self.default_config);
+        if self
+            .provider_type
+            .is_default_anthropic(&self.default_config)
+        {
+            messages_adapter::validate_default_options(cfg)?;
+        }
         if self.provider_type == ProviderType::Ollama && cfg.extra.contains_key("provider_options")
         {
             return Err(LLMError::Config(
@@ -1720,16 +1793,9 @@ impl LLMProvider for UnifiedLLMProvider {
             )
             .await;
         }
-        if let Some(SdkBackend::Messages(client)) = &self.sdk {
+        if let Some((client, settings)) = self.messages_dispatch(config, messages)? {
             self.validate_configured_tool_choice()?;
-            return messages_adapter::complete(
-                client,
-                &self.model,
-                messages,
-                self.messages_config(config)?,
-                None,
-            )
-            .await;
+            return messages_adapter::complete(client, &self.model, messages, settings, None).await;
         }
         if let Some(SdkBackend::Responses(client)) = &self.sdk {
             return responses_adapter::complete(
@@ -1847,13 +1913,13 @@ impl LLMProvider for UnifiedLLMProvider {
             )
             .await;
         }
-        if let Some(SdkBackend::Messages(client)) = &self.sdk {
+        if let Some((client, settings)) = self.messages_dispatch(config, messages)? {
             self.validate_configured_tool_choice()?;
             return messages_adapter::complete(
                 client,
                 &self.model,
                 messages,
-                self.messages_config(config)?,
+                settings,
                 Some(request),
             )
             .await;
@@ -1965,15 +2031,9 @@ impl LLMProvider for UnifiedLLMProvider {
             )
             .await;
         }
-        if let Some(SdkBackend::Messages(client)) = &self.sdk {
+        if let Some((client, settings)) = self.messages_dispatch(config, messages)? {
             self.validate_configured_tool_choice()?;
-            return messages_adapter::stream(
-                client,
-                &self.model,
-                messages,
-                self.messages_config(config)?,
-            )
-            .await;
+            return messages_adapter::stream(client, &self.model, messages, settings).await;
         }
         if let Some(SdkBackend::Responses(client)) = &self.sdk {
             return responses_adapter::stream(
@@ -2297,13 +2357,19 @@ impl LLMProvider for UnifiedLLMProvider {
         }
         if matches!(feature, LLMFeature::FunctionCalling)
             && matches!(self.sdk, Some(SdkBackend::Messages(_)))
+            && !self
+                .provider_type
+                .is_default_anthropic(&self.default_config)
         {
             return self.supports_tool_choice(&ToolChoice::Auto);
         }
         if matches!(
             self.sdk,
             Some(SdkBackend::Responses(_) | SdkBackend::Messages(_))
-        ) && matches!(feature, LLMFeature::Vision | LLMFeature::JsonMode)
+        ) && !self
+            .provider_type
+            .is_default_anthropic(&self.default_config)
+            && matches!(feature, LLMFeature::Vision | LLMFeature::JsonMode)
         {
             return false; // The first framework Responses path accepts text and native functions.
         }

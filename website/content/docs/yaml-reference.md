@@ -342,8 +342,8 @@ The simplest form: one LLM for everything. Use `llm` as a flat object.
 |-------|------|---------|-------------|
 | `provider` | `string` | `"openai"` | Provider identifier |
 | `model` | `string` | `"gpt-4"` | Model name |
-| `temperature` | `f32` | omitted for OpenAI, first-party Messages and Ollama Cloud, `0.7` for existing compatible/legacy paths | Sampling temperature. Explicit values follow the selected endpoint and model. |
-| `max_tokens` | `u32` | omitted for Responses and Ollama Cloud, required for first-party Messages, `2000` for existing Chat and legacy paths | Maximum output tokens. Decisions accepts no output limit. |
+| `temperature` | `f32` | omitted for OpenAI, explicit Messages, Messages-compatible and Ollama Cloud, `0.7` for default Anthropic and existing compatible/legacy paths | Sampling temperature. Explicit values follow the selected endpoint and model. |
+| `max_tokens` | `u32` | omitted for Responses and Ollama Cloud, required for explicit Messages and Messages-compatible, `2000` for existing Chat and legacy paths | Maximum output tokens. Decisions accepts no output limit. |
 | `top_p` | `f32` | `null` | Nucleus sampling |
 | `base_url` | `string` | `null` | API endpoint override (required for `openai-compatible`) |
 | `api_key_env` | `string` | `null` | Env var holding the API key (overrides provider default) |
