@@ -196,9 +196,9 @@ llm:
 
 ### First-party Messages (development)
 
-The default Anthropic preset uses the native Messages SDK and the official API with `x-api-key` and `anthropic-version: 2023-06-01`. Existing YAML sends a default temperature of 0.7 and a maximum of 2000 output tokens. An omitted `top_p` stays absent. An alternate `base_url` requires the `anthropic-compatible` preset. Existing `resilient: true` selects the upstream transport before generation.
+The default Anthropic preset uses the native Messages SDK and the official API with `x-api-key` and `anthropic-version: 2023-06-01`. Existing YAML sends a default temperature of 0.7 and a maximum of 2000 output tokens. An omitted `top_p` stays absent. An alternate `base_url` requires the `anthropic-compatible` preset. With `resilient: true`, the framework validates the effective thinking budget and tool choice before dispatch. Its retry policy applies to attempts at the official endpoint. The SDK, resilient transport and raw Rust client all refuse to follow HTTP redirects.
 
-With the default preset, `reasoning: true` sends manual thinking on ordinary and buffered tool requests. Set a compatible model, a thinking budget of at least 1024, and a larger `max_tokens`. The historical omitted budget is 16000. Ordinary text streams omit the thinking field. A stream must reach `message_stop` to yield a final response.
+With the default preset, `reasoning: true` sends manual thinking on ordinary and buffered tool requests. Set a compatible model, a thinking budget of at least 1024, and a larger `max_tokens`. The historical omitted budget is 16000. Ordinary text streams omit the thinking field. Blocking replies in the default preset join text blocks with a newline. Explicit Messages and native text streaming concatenate the text as received. The SDK stream requires `message_stop` before yielding a final response.
 
 Choose `protocol: messages` for native thinking and effort options. The SDK sends the configured model ID as supplied.
 

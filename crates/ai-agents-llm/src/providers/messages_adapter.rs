@@ -111,27 +111,117 @@ pub(super) fn uses_resilient_transport(config: &LLMConfig) -> bool {
     config.extra.get("resilient").and_then(Value::as_bool) == Some(true)
 }
 
-fn default_thinking(config: &LLMConfig) -> Option<Thinking> {
+fn default_thinking(config: &LLMConfig) -> Result<Option<Thinking>, LLMError> {
     let enabled = config
         .reasoning
         .or_else(|| config.extra.get("reasoning").and_then(Value::as_bool));
-    (enabled == Some(true)).then(|| Thinking::Enabled {
-        budget_tokens: config
-            .reasoning_budget_tokens
-            .or_else(|| {
-                config
-                    .extra
-                    .get("reasoning_budget_tokens")
-                    .and_then(Value::as_u64)
-                    .map(|n| n as u32)
-            })
-            .unwrap_or(16_000),
-    })
+    if enabled != Some(true) {
+        return Ok(None);
+    }
+    let budget_tokens = match (
+        config.reasoning_budget_tokens,
+        config.extra.get("reasoning_budget_tokens"),
+    ) {
+        (Some(n), _) => n,
+        (None, None) => 16_000,
+        (None, Some(value)) => value
+            .as_u64()
+            .and_then(|n| u32::try_from(n).ok())
+            .ok_or_else(|| {
+                configuration("manual thinking budget must be an unsigned 32-bit integer")
+            })?,
+    };
+    Ok(Some(Thinking::Enabled { budget_tokens }))
+}
+
+pub(super) fn validate_default_generation(
+    model: &str,
+    config: &LLMConfig,
+    selection: Option<&ToolChoice>,
+    streaming: bool,
+) -> Result<(), LLMError> {
+    let thinking = if streaming {
+        None
+    } else {
+        default_thinking(config)?
+    };
+    validate_generation(
+        true,
+        model,
+        thinking.as_ref(),
+        config.max_tokens.unwrap_or(300),
+        selection.and_then(choice).as_ref(),
+    )
+    .map_err(sdk_error)
+}
+
+fn default_timeout(config: &LLMConfig) -> u64 {
+    config
+        .timeout_seconds
+        .or_else(|| config.extra.get("timeout_seconds").and_then(Value::as_u64))
+        .unwrap_or(30)
+}
+
+// Upstream accepts a custom HTTP client; reject the redirect response before its body reaches a legacy decoder.
+fn legacy_http_client(seconds: u64) -> Result<reqwest::Client, LLMError> {
+    let mut builder =
+        reqwest::Client::builder().redirect(reqwest::redirect::Policy::custom(|attempt| {
+            attempt.error("redirect refused for authenticated Anthropic request")
+        }));
+    if seconds > 0 {
+        builder = builder.timeout(Duration::from_secs(seconds));
+    }
+    builder
+        .build()
+        .map_err(|_| configuration("could not construct Anthropic HTTP client"))
+}
+
+// Use the upstream backend for raw operations and resilience, with the client bound to the first destination.
+pub(super) fn legacy_client(
+    model: &str,
+    key: &str,
+    config: &LLMConfig,
+    system: Option<&str>,
+    tools: Option<Vec<llm::chat::Tool>>,
+    tool_choice: Option<llm::chat::ToolChoice>,
+) -> Result<Box<dyn llm::LLMProvider>, LLMError> {
+    use llm::backends::anthropic::Anthropic;
+    use llm::resilient_llm::ResilientLLM;
+
+    super::unified::legacy_reasoning_effort(config)?;
+    let seconds = default_timeout(config);
+    let client = legacy_http_client(seconds)?;
+    // Blocking dispatch and raw construction already validated the budget. The upstream text stream ignores it.
+    let thinking = default_thinking(config).ok().flatten();
+    let budget = match thinking {
+        Some(Thinking::Enabled { budget_tokens }) => Some(budget_tokens),
+        _ => None,
+    };
+    let backend = Box::new(Anthropic::with_client(
+        client,
+        key,
+        Some(model.to_owned()),
+        config.max_tokens,
+        config.temperature,
+        Some(seconds),
+        system.filter(|s| !s.is_empty()).map(str::to_owned),
+        config.top_p,
+        config.top_k,
+        tools,
+        tool_choice,
+        Some(thinking.is_some()),
+        budget,
+    ));
+    if let Some(policy) = super::unified::legacy_resilience(config) {
+        Ok(Box::new(ResilientLLM::new(backend, policy)))
+    } else {
+        Ok(backend)
+    }
 }
 
 // The official thinking-mode table is the positive evidence for old unsigned tool turns.
 pub(super) fn allows_legacy_unsigned_replay(model: &str, config: &LLMConfig) -> bool {
-    default_thinking(config).is_none()
+    matches!(default_thinking(config), Ok(None))
         && include_str!("messages_legacy_thinking_off.txt")
             .lines()
             .any(|id| id == model)
@@ -142,9 +232,11 @@ pub(super) fn supports_default_choice(
     config: &LLMConfig,
     selection: &ToolChoice,
 ) -> bool {
-    choice(selection).is_some_and(|selection| {
-        allows_choice(true, model, default_thinking(config).as_ref(), &selection)
-    })
+    let Ok(thinking) = default_thinking(config) else {
+        return false;
+    };
+    choice(selection)
+        .is_some_and(|selection| allows_choice(true, model, thinking.as_ref(), &selection))
 }
 
 fn options(config: &LLMConfig) -> Result<Options, LLMError> {
@@ -351,7 +443,7 @@ fn request(
             let thinking = if streaming {
                 None
             } else {
-                default_thinking(config)
+                default_thinking(config)?
             };
             (config, config.max_tokens.unwrap_or(300), thinking, None)
         }
@@ -409,10 +501,7 @@ fn request(
     request.top_p = config.top_p;
     request.top_k = config.top_k;
     request.timeout = if default {
-        let seconds = config
-            .timeout_seconds
-            .or_else(|| config.extra.get("timeout_seconds").and_then(Value::as_u64))
-            .unwrap_or(30);
+        let seconds = default_timeout(config);
         (seconds > 0).then(|| Duration::from_secs(seconds))
     } else {
         config.timeout_seconds.map(Duration::from_secs)
@@ -457,7 +546,18 @@ pub(super) async fn complete(
         .complete(&request(client, model, messages, settings, tools, false)?)
         .await
         .map_err(sdk_error)?;
-    let mut result = LLMResponse::new(response.text, FinishReason::Stop);
+    let text = match settings {
+        // The legacy blocking API kept a newline between successive text blocks, including empty ones.
+        RequestConfig::DefaultAnthropic(_) => response
+            .blocks
+            .iter()
+            .filter(|block| block["type"] == "text")
+            .filter_map(|block| block["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        RequestConfig::Explicit(_) => response.text,
+    };
+    let mut result = LLMResponse::new(text, FinishReason::Stop);
     result.model = Some(model.to_owned());
     result.usage = response.usage.and_then(usage);
     if !response.tool_calls.is_empty() {
@@ -574,6 +674,76 @@ mod tests {
             &manual,
             &ToolChoice::Required
         ));
+    }
+
+    #[tokio::test]
+    async fn anthropic_legacy_http_client_refuses_redirects() {
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::TcpListener,
+        };
+        let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let destination = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/v1/messages", origin.local_addr().unwrap());
+        let location = destination.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = origin.accept().await.unwrap();
+            let mut buf = [0; 1024];
+            assert!(socket.read(&mut buf).await.unwrap() > 0);
+            socket.write_all(format!("HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{location}/next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+        });
+        let client = legacy_http_client(0).unwrap();
+        tokio::select! {
+            result = client.post(url).send() => assert!(result.unwrap_err().is_redirect()),
+            _ = destination.accept() => panic!("unexpected redirect request"),
+        }
+        server.await.unwrap();
+        assert!(futures::poll!(Box::pin(destination.accept())).is_pending());
+    }
+
+    #[tokio::test]
+    async fn only_default_blocking_messages_join_text_blocks_with_newlines() {
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::TcpListener,
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = MessagesClient::at_endpoint(
+            &format!("http://{}/v1", listener.local_addr().unwrap()),
+            MessagesAuth::ApiKey("fixture".into()),
+            API_VERSION,
+            true,
+        )
+        .unwrap();
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut buffer = [0; 4096];
+                assert!(stream.read(&mut buffer).await.unwrap() > 0);
+                let data = json!({"id":"msg_fixture","type":"message","role":"assistant", "stop_reason":"end_turn","content":[
+                    {"type":"text","text":"first"}, {"type":"thinking","thinking":"hidden","signature":"fixture"},
+                    {"type":"text","text":""},{"type":"text","text":"second"}
+                ]}).to_string();
+                stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{data}",data.len()).as_bytes()).await.unwrap();
+            }
+        });
+        let cfg = LLMConfig::default();
+        for (settings, expected) in [
+            (RequestConfig::DefaultAnthropic(&cfg), "first\n\nsecond"),
+            (RequestConfig::Explicit(&cfg), "firstsecond"),
+        ] {
+            let result = complete(
+                &client,
+                "fixture",
+                &[ChatMessage::user("hello")],
+                settings,
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.content, expected);
+        }
+        server.await.unwrap();
     }
 
     #[test]

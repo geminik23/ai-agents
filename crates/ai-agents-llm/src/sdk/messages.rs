@@ -141,6 +141,36 @@ pub(crate) fn allows_choice(
             && !AUTO_OR_NONE_ONLY.lines().any(|id| id == model))
 }
 
+// Validate the effective request before any official Messages transport gets a chance to send it.
+pub(crate) fn validate_generation(
+    official: bool,
+    model: &str,
+    thinking: Option<&Thinking>,
+    max_tokens: u32,
+    choice: Option<&FunctionChoice>,
+) -> Result<(), Error> {
+    if max_tokens == 0 {
+        return Err(Error::Config(
+            "Messages generation requires max_tokens greater than zero".into(),
+        ));
+    }
+    if choice.is_some_and(|choice| !allows_choice(official, model, thinking, choice)) {
+        return Err(Error::Config(
+            "the selected Anthropic model and thinking mode do not support forced tool choice"
+                .into(),
+        ));
+    }
+    if official
+        && let Some(Thinking::Enabled { budget_tokens }) = thinking
+        && !(1024..max_tokens).contains(budget_tokens)
+    {
+        return Err(Error::Config(format!(
+            "manual thinking budget {budget_tokens} must be at least 1024 and below max_tokens {max_tokens}"
+        )));
+    }
+    Ok(())
+}
+
 #[derive(Clone)]
 pub struct MessagesClient {
     transport: transport::Transport,
@@ -206,28 +236,13 @@ impl MessagesClient {
         request: &MessagesRequest,
         stream: bool,
     ) -> Result<reqwest::Response, Error> {
-        if let Some(choice) = &request.tool_choice
-            && !allows_choice(
-                self.official,
-                &request.model,
-                request.thinking.as_ref(),
-                choice,
-            )
-        {
-            return Err(Error::Config(
-                "the selected Anthropic model and thinking mode do not support forced tool choice"
-                    .into(),
-            ));
-        }
-        if self.official
-            && let Some(Thinking::Enabled { budget_tokens }) = request.thinking
-            && !(1024..request.max_tokens).contains(&budget_tokens)
-        {
-            return Err(Error::Config(format!(
-                "manual thinking budget {budget_tokens} must be at least 1024 and below max_tokens {}",
-                request.max_tokens
-            )));
-        }
+        validate_generation(
+            self.official,
+            &request.model,
+            request.thinking.as_ref(),
+            request.max_tokens,
+            request.tool_choice.as_ref(),
+        )?;
         self.transport
             .send(&request.body(stream)?, request.timeout)
             .await

@@ -136,8 +136,7 @@ impl ProviderType {
                 choice,
             );
         }
-        if self.is_default_anthropic(config) && !messages_adapter::uses_resilient_transport(config)
-        {
+        if self.is_default_anthropic(config) {
             return messages_adapter::supports_default_choice(model, config, choice);
         }
         self.model_allows_tools(model, config)
@@ -164,8 +163,7 @@ impl ProviderType {
                 .extra
                 .get("protocol")
                 .and_then(serde_json::Value::as_str),
-        ) || (self.is_default_anthropic(config)
-            && !messages_adapter::uses_resilient_transport(config)))
+        ) || self.is_default_anthropic(config))
             && matches!(choice, ToolChoice::Required | ToolChoice::Specific(_))
         {
             return Err(LLMError::Config(
@@ -667,6 +665,37 @@ pub(super) fn legacy_reasoning_effort(
     }
 }
 
+// Apply the upstream retry defaults and the framework's configured backoff bounds consistently.
+pub(super) fn legacy_resilience(
+    config: &LLMConfig,
+) -> Option<llm::resilient_llm::ResilienceConfig> {
+    if config
+        .extra
+        .get("resilient")
+        .and_then(serde_json::Value::as_bool)
+        != Some(true)
+    {
+        return None;
+    }
+    let mut policy = llm::resilient_llm::ResilienceConfig::defaults();
+    let number = |key| config.extra.get(key).and_then(serde_json::Value::as_u64);
+    if let Some(n) = number("resilient_attempts") {
+        policy.max_attempts = n as usize;
+    }
+    if let Some(base) = number("resilient_base_delay_ms") {
+        policy.base_delay_ms = base;
+        policy.max_delay_ms = number("resilient_max_delay_ms").unwrap_or(base.saturating_mul(30));
+    }
+    if let Some(jitter) = config
+        .extra
+        .get("resilient_jitter")
+        .and_then(serde_json::Value::as_bool)
+    {
+        policy.jitter = jitter;
+    }
+    Some(policy)
+}
+
 fn merged_ollama_extra_body(config: &LLMConfig) -> Result<Option<serde_json::Value>, LLMError> {
     let has_named_fields = config.extra.contains_key("num_ctx")
         || config.extra.contains_key("num_gpu")
@@ -1152,6 +1181,8 @@ impl UnifiedLLMProvider {
         &'a self,
         config: Option<&'a LLMConfig>,
         messages: &[ChatMessage],
+        selection: Option<&ToolChoice>,
+        streaming: bool,
     ) -> Result<Option<(&'a MessagesClient, messages_adapter::RequestConfig<'a>)>, LLMError> {
         let Some(SdkBackend::Messages(client)) = &self.sdk else {
             return Ok(None);
@@ -1163,6 +1194,13 @@ impl UnifiedLLMProvider {
         {
             messages_adapter::validate_default_options(cfg)?;
             if messages_adapter::uses_resilient_transport(cfg) {
+                messages_adapter::validate_default_generation(
+                    &self.model,
+                    cfg,
+                    selection,
+                    streaming,
+                )?;
+                self.validate_configured_tool_choice()?;
                 if ai_agents_core::inspect_native_history(messages)?
                     .exchanges()
                     .iter()
@@ -1392,6 +1430,21 @@ impl UnifiedLLMProvider {
         tool_choice: Option<&ToolChoice>,
         tools: Option<&[LLMToolDefinition]>,
     ) -> Result<Box<dyn llm::LLMProvider>, LLMError> {
+        if self
+            .provider_type
+            .is_default_anthropic(&self.default_config)
+        {
+            return messages_adapter::legacy_client(
+                &self.model,
+                self.api_key.as_deref().unwrap_or_default(),
+                config,
+                system_prompt,
+                tools
+                    .filter(|items| !items.is_empty())
+                    .map(|items| items.iter().map(map_tool_definition).collect()),
+                tool_choice.map(map_tool_choice).transpose()?,
+            );
+        }
         let mut builder =
             llm::builder::LLMBuilder::new()
                 .backend(self.provider_type.to_llm_backend().ok_or_else(|| {
@@ -1518,35 +1571,12 @@ impl UnifiedLLMProvider {
             builder = builder.deployment_id(deployment_id);
         }
 
-        // --- Transport-level resilience (complementary to agent-level recovery) ---
-        if let Some(resilient) = config.extra.get("resilient").and_then(|v| v.as_bool()) {
-            builder = builder.resilient(resilient);
-        }
-        if let Some(attempts) = config
-            .extra
-            .get("resilient_attempts")
-            .and_then(|v| v.as_u64())
-        {
-            builder = builder.resilient_attempts(attempts as usize);
-        }
-        if let Some(base_delay) = config
-            .extra
-            .get("resilient_base_delay_ms")
-            .and_then(|v| v.as_u64())
-        {
-            let max_delay = config
-                .extra
-                .get("resilient_max_delay_ms")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(base_delay.saturating_mul(30));
-            builder = builder.resilient_backoff(base_delay, max_delay);
-        }
-        if let Some(jitter) = config
-            .extra
-            .get("resilient_jitter")
-            .and_then(|v| v.as_bool())
-        {
-            builder = builder.resilient_jitter(jitter);
+        if let Some(policy) = legacy_resilience(config) {
+            builder = builder
+                .resilient(true)
+                .resilient_attempts(policy.max_attempts)
+                .resilient_backoff(policy.base_delay_ms, policy.max_delay_ms)
+                .resilient_jitter(policy.jitter);
         }
 
         // --- Extra body (universal escape hatch for arbitrary provider JSON) ---
@@ -1686,6 +1716,12 @@ impl UnifiedLLMProvider {
             .is_default_anthropic(&self.default_config)
         {
             messages_adapter::validate_default_options(cfg)?;
+            messages_adapter::validate_default_generation(
+                &self.model,
+                cfg,
+                self.tool_choice.as_ref(),
+                false,
+            )?;
         }
         if self.provider_type == ProviderType::Ollama && cfg.extra.contains_key("provider_options")
         {
@@ -1793,7 +1829,7 @@ impl LLMProvider for UnifiedLLMProvider {
             )
             .await;
         }
-        if let Some((client, settings)) = self.messages_dispatch(config, messages)? {
+        if let Some((client, settings)) = self.messages_dispatch(config, messages, None, false)? {
             self.validate_configured_tool_choice()?;
             return messages_adapter::complete(client, &self.model, messages, settings, None).await;
         }
@@ -1913,7 +1949,9 @@ impl LLMProvider for UnifiedLLMProvider {
             )
             .await;
         }
-        if let Some((client, settings)) = self.messages_dispatch(config, messages)? {
+        if let Some((client, settings)) =
+            self.messages_dispatch(config, messages, Some(choice), false)?
+        {
             self.validate_configured_tool_choice()?;
             return messages_adapter::complete(
                 client,
@@ -2031,7 +2069,7 @@ impl LLMProvider for UnifiedLLMProvider {
             )
             .await;
         }
-        if let Some((client, settings)) = self.messages_dispatch(config, messages)? {
+        if let Some((client, settings)) = self.messages_dispatch(config, messages, None, true)? {
             self.validate_configured_tool_choice()?;
             return messages_adapter::stream(client, &self.model, messages, settings).await;
         }
@@ -2563,6 +2601,67 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("Provider type not set")
+        );
+    }
+
+    #[test]
+    fn anthropic_resilience_checks_the_effective_tool_and_thinking_request_before_fallback() {
+        let provider = UnifiedLLMProvider::new(
+            ProviderType::Anthropic,
+            "fixture".into(),
+            Some("fixture-key".into()),
+            None,
+        )
+        .unwrap();
+        let cfg = LLMConfig::default()
+            .with_extra("resilient", true.into())
+            .with_reasoning(true);
+        assert!(
+            matches!(provider.messages_dispatch(Some(&cfg), &[], None, false),
+            Err(LLMError::Config(message)) if message.contains("16000"))
+        );
+        assert!(
+            provider
+                .messages_dispatch(Some(&cfg), &[], None, true)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            matches!(provider.build_llm(Some(&cfg)), Err(LLMError::Config(message)) if message.contains("16000"))
+        );
+        let oversized = cfg.clone().with_extra(
+            "reasoning_budget_tokens",
+            serde_json::json!(4_294_968_320_u64),
+        );
+        assert!(
+            matches!(provider.messages_dispatch(Some(&oversized), &[], None, false),
+            Err(LLMError::Config(message)) if message.contains("32-bit"))
+        );
+        let cfg = LLMConfig {
+            reasoning_budget_tokens: Some(1024),
+            ..cfg
+        };
+        for forced in [ToolChoice::Required, ToolChoice::Specific("lookup".into())] {
+            assert!(
+                matches!(provider.messages_dispatch(Some(&cfg), &[], Some(&forced), false),
+                Err(LLMError::Config(message)) if message.contains("forced tool choice"))
+            );
+            assert!(
+                ProviderType::Anthropic
+                    .validate_declared_tool_choice("fixture", &cfg, None, &forced)
+                    .is_err()
+            );
+        }
+        assert!(
+            provider
+                .messages_dispatch(Some(&cfg), &[], Some(&ToolChoice::Auto), false)
+                .unwrap()
+                .is_none()
+        );
+        assert!(provider.build_llm(Some(&cfg)).is_ok());
+        let forced = provider.with_tool_choice(ToolChoice::Required);
+        assert!(
+            matches!(forced.build_llm(Some(&cfg)), Err(LLMError::Config(message)) if message.contains("forced tool choice"))
         );
     }
 
