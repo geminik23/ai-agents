@@ -1009,18 +1009,28 @@ async fn local_ollama_raw_consumer_can_still_list_models() {
 #[tokio::test]
 async fn legacy_deployment_and_search_settings_keep_the_ordinary_chat_request() {
     for option in [
-        "  api_version: fixture-version\n  deployment_id: fixture-deployment",
+        "  api_version: fixture-version",
+        "  deployment_id: fixture-deployment",
+        "  reasoning: true\n  reasoning_budget_tokens: 25\n  reasoning_effort: HIGH",
         "  openai_enable_web_search: true\n  openai_web_search_context_size: medium",
     ] {
         let (listener, base) = fixture().await;
         let server = tokio::spawn(async move {
-            let (mut socket, body, _) = receive(&listener).await;
+            let (mut socket, body, headers) = receive(&listener).await;
+            assert!(!headers.contains("authorization:"));
+            assert_eq!(body["max_completion_tokens"], 2000);
+            assert_eq!(body["temperature"], 0.7);
+            if option.contains("reasoning_effort") {
+                assert_eq!(body["reasoning_effort"], "high");
+            }
             assert_eq!(body["model"], "fixture");
             for key in [
                 "deployment_id",
                 "api_version",
                 "tools",
                 "web_search_options",
+                "reasoning",
+                "reasoning_budget_tokens",
             ] {
                 assert!(body.get(key).is_none(), "{key}: {body}");
             }
@@ -1042,6 +1052,89 @@ async fn legacy_deployment_and_search_settings_keep_the_ordinary_chat_request() 
             .unwrap();
         assert_eq!(agent.chat("test").await.unwrap().content, "ordinary chat");
         server.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn chat_migration_retries_only_the_initial_transient_failure() {
+    use ai_agents_llm::providers::{ProviderType, UnifiedLLMProvider};
+    use ai_agents_llm::{ChatMessage, LLMConfig, LLMProvider};
+
+    for provider_type in [ProviderType::OpenAI, ProviderType::OpenAICompatible] {
+        for (status, attempts, streaming, succeed) in [
+            (503, 2, false, true),
+            (503, 2, false, false),
+            (400, 1, false, false),
+            (307, 1, false, false),
+            (503, 2, true, false),
+        ] {
+            let (listener, base) = fixture().await;
+            let (destination, foreign) = fixture().await;
+            let server = tokio::spawn(async move {
+                for attempt in 0..attempts {
+                    let (mut socket, body, _) = receive(&listener).await;
+                    assert_eq!(body["stream"], streaming);
+                    assert_eq!(body["reasoning_effort"], "high");
+                    assert!(body.get("reasoning_budget_tokens").is_none());
+                    if attempt > 0 && (succeed || streaming) {
+                        if streaming {
+                            // A partial 200 stream cannot turn into a successful terminal response or another attempt.
+                            open_stream(&mut socket).await;
+                            frame(&mut socket, json!({"content":"partial"}), None).await;
+                        } else {
+                            reply(
+                                &mut socket,
+                                json!({"role":"assistant","content":"done"}),
+                                "stop",
+                            )
+                            .await;
+                        }
+                    } else {
+                        socket.write_all(format!(
+                            "HTTP/1.1 {status} Fixture\r\nLocation: {foreign}/chat/completions\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        ).as_bytes()).await.unwrap();
+                    }
+                }
+                listener
+            });
+            let cfg = LLMConfig::default()
+                .with_reasoning_effort("HIGH")
+                .with_extra("reasoning_budget_tokens", json!(50))
+                .with_extra("resilient", json!(true))
+                .with_extra("resilient_attempts", json!(2))
+                .with_extra("resilient_base_delay_ms", json!(1));
+            let provider = UnifiedLLMProvider::from_spec_config(
+                provider_type,
+                "fixture",
+                Some("fixture-key".into()),
+                Some(base),
+                cfg,
+            )
+            .unwrap();
+            let messages = [ChatMessage::user("hello")];
+            let call = async {
+                if streaming {
+                    let mut stream = provider.complete_stream(&messages, None).await.unwrap();
+                    let text = stream.next().await.unwrap().unwrap();
+                    assert_eq!(text.delta, "partial");
+                    assert!(!text.is_final);
+                    assert!(stream.next().await.unwrap().is_err());
+                    assert!(stream.next().await.is_none());
+                } else {
+                    assert_eq!(provider.complete(&messages, None).await.is_ok(), succeed);
+                }
+            };
+            tokio::select! {
+                result = tokio::time::timeout(std::time::Duration::from_secs(5), call) => result.unwrap(),
+                _ = destination.accept() => panic!("Chat followed an HTTP redirect"),
+            }
+            let listener = tokio::time::timeout(std::time::Duration::from_secs(5), server)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(futures::poll!(Box::pin(listener.accept())).is_pending());
+            assert!(futures::poll!(Box::pin(destination.accept())).is_pending());
+        }
     }
 }
 

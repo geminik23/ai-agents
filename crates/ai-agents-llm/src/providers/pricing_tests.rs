@@ -264,41 +264,58 @@ async fn rs_paid_actual_dispatch_matrix_keeps_completion_native_and_stream_accou
 
 #[tokio::test]
 async fn rs_paid_internal_retry_retains_every_attempts_bound() {
-    let (endpoint, mut received) = fixture(false, 2, true).await;
-    let mut pricing = schedule(&endpoint);
-    pricing.max_internal_attempts = 2;
-    let mut config = LLMConfig::default();
-    config
-        .extra
-        .insert("resilient".into(), serde_json::json!(true));
-    config
-        .extra
-        .insert("resilient_attempts".into(), serde_json::json!(2));
-    config
-        .extra
-        .insert("resilient_base_delay_ms".into(), serde_json::json!(1));
-    let provider = UnifiedLLMProvider::from_spec_config(
-        ProviderType::OpenAI,
-        "fixture-model",
-        Some("fixture".into()),
-        Some(endpoint),
-        config,
-    )
-    .unwrap()
-    .with_declared_pricing(pricing)
-    .unwrap();
-    let provider = crate::managed_provider(Arc::new(provider));
-    let ledger = Arc::new(Ledger::default());
-    crate::scope_invocation_admission(
-        ledger.clone(),
-        provider.complete(&[ChatMessage::user("retry")], None),
-    )
-    .await
-    .unwrap();
-    assert!(received.try_recv().is_ok());
-    assert!(received.try_recv().is_ok());
-    assert_eq!(ledger.bounds.lock()[0].max_micro_usd, 12292);
-    assert!(ledger.settlements.lock()[0].is_none());
+    for streaming in [false, true] {
+        let payload = concat!(
+            r#"data: {"choices":[{"index":0,"delta":{"content":"done"},"finish_reason":"stop"}]}"#,
+            "\n\n",
+            r#"data: {"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":4,"total_tokens":14}}"#,
+            "\n\n",
+            "data: [DONE]\n\n",
+        );
+        let (endpoint, mut received) = fixture_stream(false, 2, true, Some(payload.into())).await;
+        let mut pricing = schedule(&endpoint);
+        pricing.max_internal_attempts = 2;
+        let mut config = LLMConfig::default();
+        config
+            .extra
+            .insert("resilient".into(), serde_json::json!(true));
+        config
+            .extra
+            .insert("resilient_attempts".into(), serde_json::json!(2));
+        config
+            .extra
+            .insert("resilient_base_delay_ms".into(), serde_json::json!(1));
+        let provider = UnifiedLLMProvider::from_spec_config(
+            ProviderType::OpenAI,
+            "fixture-model",
+            Some("fixture".into()),
+            Some(endpoint),
+            config,
+        )
+        .unwrap()
+        .with_declared_pricing(pricing)
+        .unwrap();
+        let provider = crate::managed_provider(Arc::new(provider));
+        let ledger = Arc::new(Ledger::default());
+        crate::scope_invocation_admission(ledger.clone(), async {
+            let messages = [ChatMessage::user("retry")];
+            if streaming {
+                let mut stream = provider.complete_stream(&messages, None).await.unwrap();
+                let mut finished = false;
+                while let Some(item) = stream.next().await {
+                    finished |= item.unwrap().is_final;
+                }
+                assert!(finished);
+            } else {
+                provider.complete(&messages, None).await.unwrap();
+            }
+        })
+        .await;
+        assert_eq!(received.try_recv().unwrap()["stream"], streaming);
+        assert_eq!(received.try_recv().unwrap()["stream"], streaming);
+        assert_eq!(ledger.bounds.lock()[0].max_micro_usd, 12292);
+        assert!(ledger.settlements.lock()[0].is_none());
+    }
 }
 
 #[test]

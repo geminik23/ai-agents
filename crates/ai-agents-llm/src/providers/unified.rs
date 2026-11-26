@@ -262,6 +262,17 @@ impl ProviderType {
         variable: Option<&str>,
         base_url: Option<&str>,
     ) -> Result<(), LLMError> {
+        if matches!(self, Self::OpenAI | Self::OpenAICompatible)
+            && variable == Self::OpenAI.api_key_env_var()
+            && base_url.is_some_and(|base| {
+                !reqwest::Url::parse(base)
+                    .is_ok_and(|url| url.origin().ascii_serialization() == "https://api.openai.com")
+            })
+        {
+            return Err(LLMError::Config(
+                "OPENAI_API_KEY is bound to the official OpenAI origin; choose a credential for the custom base_url".into(),
+            ));
+        }
         if *self == Self::OllamaCloud
             && variable == self.api_key_env_var()
             && base_url.is_some_and(|base| !ollama_adapter::official_origin(base))
@@ -1702,6 +1713,18 @@ impl UnifiedLLMProvider {
             ));
         }
         let cfg = config.unwrap_or(&self.default_config);
+        if matches!(self.sdk, Some(SdkBackend::Chat(_)))
+            && (cfg.extra.contains_key("provider_options")
+                || cfg
+                    .extra
+                    .get("protocol")
+                    .is_some_and(|protocol| protocol != "chat-completions"))
+        {
+            return Err(LLMError::Config(
+                "SDK-only Chat options cannot be used with build_llm(); use the native Chat client"
+                    .into(),
+            ));
+        }
         if self
             .provider_type
             .is_default_anthropic(&self.default_config)
@@ -1845,19 +1868,15 @@ impl LLMProvider for UnifiedLLMProvider {
         {
             return openrouter::complete(client, &wire).await;
         }
-        if let Some(SdkBackend::Chat(chat)) = &self.sdk
-            && let Some(wire) = chat_adapter::request(
+        if let Some(SdkBackend::Chat(chat)) = &self.sdk {
+            let wire = chat_adapter::request(
                 self.provider_type,
                 &self.model,
                 messages,
                 config.unwrap_or(&self.default_config),
                 None,
-            )?
-        {
-            return chat_adapter::response(
-                chat.complete(&wire).await.map_err(super::sdk_error)?,
-                &self.model,
-            );
+            )?;
+            return wire.complete(chat).await;
         }
         let projected_messages = Self::project_foreign_messages(messages)?;
         // Separate system messages from non-system messages
@@ -1974,19 +1993,15 @@ impl LLMProvider for UnifiedLLMProvider {
         {
             return openrouter::complete(client, &wire).await;
         }
-        if let Some(SdkBackend::Chat(chat)) = &self.sdk
-            && let Some(wire) = chat_adapter::request(
+        if let Some(SdkBackend::Chat(chat)) = &self.sdk {
+            let wire = chat_adapter::request(
                 self.provider_type,
                 &self.model,
                 messages,
                 config.unwrap_or(&self.default_config),
                 Some(request),
-            )?
-        {
-            return chat_adapter::response(
-                chat.complete(&wire).await.map_err(super::sdk_error)?,
-                &self.model,
-            );
+            )?;
+            return wire.complete(chat).await;
         }
         let projected_messages = Self::project_foreign_messages(messages)?;
         let (system_prompt, non_system_msgs) = extract_system_and_messages(&projected_messages);
@@ -2089,21 +2104,15 @@ impl LLMProvider for UnifiedLLMProvider {
             )
             .await;
         }
-        if let Some(SdkBackend::Chat(chat)) = &self.sdk
-            && let Some(wire) = chat_adapter::request(
+        if let Some(SdkBackend::Chat(chat)) = &self.sdk {
+            let wire = chat_adapter::request(
                 self.provider_type,
                 &self.model,
                 messages,
                 config.unwrap_or(&self.default_config),
                 None,
-            )?
-        {
-            return Ok(Box::new(Box::pin(
-                chat.stream(&wire)
-                    .await
-                    .map_err(super::sdk_error)?
-                    .map(chat_adapter::chunk),
-            )));
+            )?;
+            return Ok(Box::new(wire.stream(chat).await?.map(chat_adapter::chunk)));
         }
         let projected_messages = Self::project_foreign_messages(messages)?;
         // Separate system messages from non-system messages
@@ -2227,45 +2236,47 @@ impl LLMProvider for UnifiedLLMProvider {
         } else {
             if matches!(self.sdk, Some(SdkBackend::Chat(_))) {
                 let cfg = request.config.unwrap_or(&self.default_config);
-                if let Some(wire) = chat_adapter::request(
+                let wire = chat_adapter::request(
                     self.provider_type,
                     &self.model,
                     request.messages,
                     cfg,
                     request.tools,
-                )? {
-                    if request
-                        .tools
-                        .is_some_and(|t| !self.supports_choice_for_provider(&t.choice))
-                    {
-                        return Err(LLMError::Config(
-                            "unsupported priced native tool choice".into(),
-                        ));
-                    }
-                    wire.body(request.streaming).map_err(super::sdk_error)?;
-                    // Only extensions with the same audited semantics as a typed setting can be quoted.
-                    let mut effective = cfg.clone();
-                    effective.extra.remove("protocol");
-                    if let Some(serde_json::Value::Object(mut options)) =
-                        effective.extra.remove("provider_options")
-                    {
-                        if let Some(serde_json::Value::String(effort)) =
-                            options.remove("reasoning_effort")
-                        {
-                            effective.reasoning_effort = Some(effort);
-                        }
-                        if !options.is_empty() {
-                            return Err(LLMError::Config("unbounded Chat provider option".into()));
-                        }
-                    }
-                    let priced = ProviderRequest {
-                        config: Some(&effective),
-                        ..*request
-                    };
-                    return pricing
-                        .quote(self.accounting_adapter(), &priced, &effective)
-                        .map(Some);
+                )?;
+                if request
+                    .tools
+                    .is_some_and(|t| !self.supports_choice_for_provider(&t.choice))
+                {
+                    return Err(LLMError::Config(
+                        "unsupported priced native tool choice".into(),
+                    ));
                 }
+                wire.request
+                    .body(request.streaming)
+                    .map_err(super::sdk_error)?;
+                // Only extensions with the same audited semantics as a typed setting can be quoted.
+                let mut effective = cfg.clone();
+                effective.reasoning_effort = wire.request.reasoning_effort.clone();
+                effective.extra.remove("protocol");
+                if let Some(serde_json::Value::Object(mut options)) =
+                    effective.extra.remove("provider_options")
+                {
+                    if let Some(serde_json::Value::String(effort)) =
+                        options.remove("reasoning_effort")
+                    {
+                        effective.reasoning_effort = Some(effort);
+                    }
+                    if !options.is_empty() {
+                        return Err(LLMError::Config("unbounded Chat provider option".into()));
+                    }
+                }
+                let priced = ProviderRequest {
+                    config: Some(&effective),
+                    ..*request
+                };
+                return pricing
+                    .quote(self.accounting_adapter(), &priced, &effective)
+                    .map(Some);
             }
             let projected = Self::project_foreign_messages(request.messages)?;
             let (_, non_system) = extract_system_and_messages(&projected);
@@ -3617,7 +3628,7 @@ mod tests {
             Some(&tools),
         )
         .unwrap()
-        .unwrap()
+        .request
         .body(false)
         .unwrap();
         assert!(

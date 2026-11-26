@@ -765,7 +765,7 @@ Any YAML field not recognized as a named parameter is captured as a provider-spe
 
 The `llm` crate supports HTTP-level retry with exponential backoff, complementary to the framework's agent-level `error_recovery`. Both can be active simultaneously.
 
-These `resilient_*` fields apply to upstream-backed providers. The first-party Google adapter does not add an internal retry loop; configure agent-level `error_recovery` for Google. Local native-history and protocol integrity errors are terminal and do not enter retry, fallback-model, or static-response recovery.
+For OpenAI and OpenAI-compatible Chat, `resilient: true` enables retries at the configured endpoint for transport failures and HTTP 408, 429, 500, 502, 503, or 504. A successful stream opening ends retry admission. Redirects and invalid requests end the attempt immediately. The first-party Google adapter supports agent-level `error_recovery`. Local native-history and protocol integrity errors are terminal.
 
 ```yaml
 llm:
@@ -781,22 +781,24 @@ llm:
 | Parameter | Type | Description |
 | --- | --- | --- |
 | `resilient` | `bool` | Enable transport-level retry |
-| `resilient_attempts` | `u64` | Max retry attempts |
+| `resilient_attempts` | `u64` | Total attempts including the first request |
 | `resilient_base_delay_ms` | `u64` | Base delay for exponential backoff |
 | `resilient_max_delay_ms` | `u64` | Maximum backoff delay |
 | `resilient_jitter` | `bool` | Add randomness to backoff timing |
 
 > **Note:** If you also have an `error_recovery:` section in your agent spec, main-response provider retries can multiply transport-level attempts. `error_recovery.default.max_retries` counts retries after the initial provider attempt. Record actual calls rather than estimating them from one product formula because transport adapters may apply their own attempt semantics.
 
+For ordinary Chat, existing `reasoning` and `reasoning_budget_tokens` settings keep their historical wire behavior. The budget still participates in declared pricing checks. For Chat requests previously using the upstream transport, legacy `reasoning_effort` accepts low, medium and high and sends the canonical lowercase value. Other native Chat requests accept the selected endpoint's effort values. Framework Chat accepts the legacy Rust penalty and stop settings and omits them from the request. Use an explicit supported body option to send these fields. Raw structured streams retain the upstream `normalize_response` setting. For a compatible server with no configured key, framework Chat omits the Authorization header. To send a token, explicitly configure credentials for that endpoint.
+
 ### Azure OpenAI
 
-The legacy fields `api_version` and `deployment_id` select the upstream Chat backend. It appends `chat/completions` to the configured base URL and omits the deployment path and version query. A resource root plus those two fields is insufficient for a versioned Azure deployment request.
+For ordinary Chat, the provider appends `chat/completions` to the configured base URL. For a v1-shaped endpoint, set the full API base ending in `/openai/v1/` and use the deployment name as `model`. The legacy fields `api_version` and `deployment_id` preserve the historical request to the configured base. Versioned deployment URLs and Azure-specific authentication have their own compatibility requirements.
 
 ### OpenAI provider-native web search
 
 Provider-native search runs on the service. The separately granted `web_search` tool runs through `WebSearchProvider`, framework tool policy, HITL and tool-execution evidence. [Built-in Tools](@/docs/built-in-tools.md#web-search-versus-web-fetch)
 
-On the OpenAI and OpenAI-compatible presets, `openai_enable_web_search: true` selects the upstream backend. Ordinary framework chat still sends a Chat Completions request without a hosted search tool. The upstream Rust client exposes a separate `chat_with_web_search` operation.
+The legacy `openai_enable_web_search` and context settings preserve ordinary Chat behavior, which uses plain Chat Completions. The upstream Rust client exposes a separate `chat_with_web_search` operation.
 
 ### xAI provider-native search
 
