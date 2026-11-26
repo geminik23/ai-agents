@@ -216,12 +216,25 @@ impl LLMConfig {
         })
     }
 
-    /// Resolves declaration defaults for both runtime and eval without modifying the saved spec.
+    // Local native options use declaration presence to validate overlaps with legacy fields.
+    fn uses_local_native_options(&self, provider: ProviderType) -> bool {
+        provider == ProviderType::Ollama && self.extra.contains_key("provider_options")
+    }
+
+    /// Resolves declaration defaults for runtime and eval while preserving Local Ollama option presence for conflict checks.
     pub fn to_provider_config(&self, provider: ProviderType) -> ai_agents_core::LLMConfig {
-        let temperature = self.effective_temperature(provider);
+        // Legacy Local Ollama omitted these fields on the wire. Native options only conflict with explicitly set values.
+        let (temperature, max_tokens) = if self.uses_local_native_options(provider) {
+            (self.temperature, self.max_tokens)
+        } else {
+            (
+                self.effective_temperature(provider),
+                self.effective_max_tokens(),
+            )
+        };
         ai_agents_core::LLMConfig {
             temperature,
-            max_tokens: self.effective_max_tokens(),
+            max_tokens,
             top_p: self.top_p,
             top_k: None,
             frequency_penalty: None,
@@ -242,6 +255,13 @@ impl super::AgentSpec {
     pub(crate) fn identity_value(&self) -> ai_agents_core::Result<serde_json::Value> {
         let mut value = serde_json::to_value(self)?;
         let normalize = |config: &LLMConfig, target: &mut serde_json::Value| {
+            if config
+                .provider
+                .parse()
+                .is_ok_and(|provider| config.uses_local_native_options(provider))
+            {
+                return;
+            }
             if let Some(limit) = config.effective_max_tokens() {
                 target["max_tokens"] = serde_json::json!(limit);
             }
@@ -348,6 +368,43 @@ mod tests {
             Some(0.7)
         );
         assert_eq!(legacy.effective_max_tokens(), Some(2000));
+    }
+
+    #[test]
+    fn ollama_local_explicit_options_survive_save_without_changing_legacy_identity() {
+        let parse = |fields: &str| {
+            super::super::AgentSpec::from_yaml_strict(&format!(
+                "name: Local\nsystem_prompt: test\nllm: {{provider: ollama, model: chosen{fields}}}",
+            ))
+            .unwrap()
+        };
+        let legacy_identity = parse("").identity_value().unwrap();
+        assert_eq!(
+            legacy_identity,
+            parse(", temperature: 0.7, max_tokens: 2000")
+                .identity_value()
+                .unwrap(),
+        );
+        let native = parse(", provider_options: {options: {temperature: 0.2, num_predict: 8}}");
+        let before = native.identity_value().unwrap();
+        assert_ne!(before, legacy_identity);
+        let duplicate = parse(
+            ", temperature: 0.7, max_tokens: 2000, provider_options: {options: {temperature: 0.2, num_predict: 8}}",
+        );
+        assert_ne!(duplicate.identity_value().unwrap(), before);
+        let saved = serde_yaml::to_string(&native).unwrap();
+        let loaded = super::super::AgentSpec::from_yaml_strict(&saved).unwrap();
+        assert_eq!(loaded.identity_value().unwrap(), before);
+        let config = loaded
+            .llm
+            .as_config()
+            .unwrap()
+            .to_provider_config(ProviderType::Ollama);
+        assert!(config.temperature.is_none() && config.max_tokens.is_none());
+        assert_eq!(
+            config.extra["provider_options"]["options"]["num_predict"],
+            8
+        );
     }
 
     #[test]
