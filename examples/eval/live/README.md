@@ -227,7 +227,7 @@ live real-llm examples yaml basic context disambiguation error-recovery memory o
 
 ## Manual Code Agent repair evaluation
 
-The [Code Agent example](../../README.md) uses a disposable Rust project, individual operator approvals and an isolated behavioral checker. Its [campaign entry](../../rust/code-agent/repair-eval/campaign.py) has separate configuration, offline fixture and paid modes. It runs outside the unattended live suite helper. Each of three fresh trials must produce an approved edit, a changed selected file, a later passing checker and a completed task within the trial budget. Record failures and unexecuted slots when reporting the campaign.
+The [Code Agent example](../../README.md) uses a disposable Rust project, individual operator approvals and an isolated behavioral checker. Its [campaign entry](../../rust/code-agent/repair-eval/campaign.py) has separate configuration, offline fixture and paid modes. Before the first model call in each trial, the checker must run all four named Rust tests and reproduce a behavioral failure in the original project. A checker setup error or incomplete test run stops the campaign during preflight. It runs outside the unattended live suite helper. Each of three fresh trials must produce an approved edit, a changed selected file, a later passing checker and a completed task within the trial budget. Record failures and unexecuted slots when reporting the campaign.
 
 ## Quality suites
 

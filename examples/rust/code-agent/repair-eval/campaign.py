@@ -15,8 +15,9 @@ def inventory(root):
     return {p.relative_to(root): p.read_bytes() for p in root.rglob("*") if p.is_file()}
 
 
-def checker_status(checker, root):
-    return subprocess.run([checker, root, root / SOURCE], env={}).returncode
+def checker_matches(checker, root, *, expect_failure=False):
+    flags = ["--expect-failure"] if expect_failure else []
+    return subprocess.run([checker, *flags, root, root / SOURCE], env={}).returncode == 0
 
 
 def main():
@@ -57,15 +58,17 @@ def main():
         subprocess.run(command, check=True)
         if args.dry_config_check:
             return 0
-        if checker_status(checker, root) != 1:
+        if not checker_matches(checker, root, expect_failure=True):
             sys.exit("original fixture did not reproduce a behavioral failure")
         if args.verify_fixture:
             src = root / SOURCE
-            for replacement, expected in [("last.1 = last.1.max(end);", 0),
-                                          ("if end > last.1 { last.1 = end; }", 0),
-                                          ("last.1 = start;", 1)]:
+            for replacement, expect_failure in [
+                ("last.1 = last.1.max(end);", False),
+                ("if end > last.1 { last.1 = end; }", False),
+                ("last.1 = start;", True),
+            ]:
                 src.write_text(original[SOURCE].decode().replace("last.1 = end;", replacement))
-                if checker_status(checker, root) != expected:
+                if not checker_matches(checker, root, expect_failure=expect_failure):
                     sys.exit("independent checker failed fixture control")
             return 0
         command[2:3] = ["--real-llm", "--trust-checker", "--share-source"]
