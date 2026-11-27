@@ -225,6 +225,10 @@ live real-llm examples yaml basic context disambiguation error-recovery memory o
 | `examples/fixtures/tool_examples/edit_target.txt` | dry-run edit fixture | `support-file` | fixture | Used by `examples/eval/live/examples/tools/file_edit_review_live.yaml`. |
 | `examples/fixtures/tool_examples/patch_target.txt` | dry-run patch fixture | `support-file` | fixture | Used by `examples/eval/live/examples/tools/patch_review_live.yaml`. |
 
+## Manual Code Agent repair evaluation
+
+The [Code Agent example](../../README.md) uses a disposable Rust project, individual operator approvals and an isolated behavioral checker. Its [campaign entry](../../rust/code-agent/repair-eval/campaign.py) has separate configuration, offline fixture and paid modes. Before the first model call in each trial, the checker must run all four named Rust tests and reproduce a behavioral failure in the original project. A checker setup error or incomplete test run stops the campaign during preflight. It runs outside the unattended live suite helper. Each of three fresh trials must produce an approved edit, a changed selected file, a later passing checker and a completed task within the trial budget. Record failures and unexecuted slots when reporting the campaign.
+
 ## Quality suites
 
 Quality suites use live providers and semantic or judge-style assertions. Keep them separate from runnable example smoke checks.

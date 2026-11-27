@@ -261,6 +261,21 @@ fn workspace_setup(
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     match args.as_slice() {
+        [action, args @ ..] if action == "repair-eval" => {
+            let (root, checker, live) = match args {
+                [mode, root, checker] if mode == "--dry-config-check" => (root, checker, false),
+                [mode, trust, share, root, checker] if mode == "--real-llm" && trust == "--trust-checker" && share == "--share-source" => (root, checker, true),
+                _ => return Err("repair-eval requires --dry-config-check or --real-llm --trust-checker --share-source, followed by the synthetic workspace and trusted checker".into()),
+            };
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?
+                .block_on(workspace_agent::repair_eval::trial(
+                    Path::new(root),
+                    Path::new(checker),
+                    live,
+                ))?;
+        }
         [action, rest @ ..] if action == "check-workspace" => {
             let setup = workspace_setup(rest, false)?;
             let _builder = setup
@@ -411,7 +426,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
         _ => {
-            return Err("usage: code-agent-setup prepare NEW_ABSOLUTE_PATH | check-config WORKSPACE CARGO RUSTC | verify WORKSPACE CARGO RUSTC | run-offline WORKSPACE CARGO RUSTC [--rust-analyzer EXECUTABLE] | check-workspace WORKSPACE SOURCE CHECKER PROVIDER MODEL [INSTRUCTIONS | --auto-instructions] [--file PATH] [--new-file PATH] [--assume-exclusive-workspace] [--allow-discovery] [--max-output-tokens N] [--checker-timeout-ms N] | run-workspace --trust-checker --share-source WORKSPACE SOURCE CHECKER PROVIDER MODEL [INSTRUCTIONS | --auto-instructions] [--file PATH] [--new-file PATH] [--assume-exclusive-workspace] [--allow-discovery] [--max-output-tokens N] [--checker-timeout-ms N] | check-root WORKSPACE CHECKER PROVIDER MODEL --protect PATH [--protect PATH] [INSTRUCTIONS] [--assume-exclusive-workspace] [--max-output-tokens N] [--checker-timeout-ms N] | run-root --trust-checker --share-workspace WORKSPACE CHECKER PROVIDER MODEL --protect PATH [--protect PATH] [INSTRUCTIONS] [--assume-exclusive-workspace] [--max-output-tokens N] [--checker-timeout-ms N] | check-read-only WORKSPACE SOURCE PROVIDER MODEL [INSTRUCTIONS | --auto-instructions] [--file PATH] [--allow-discovery] [--max-output-tokens N] | run-read-only --share-source WORKSPACE SOURCE PROVIDER MODEL [INSTRUCTIONS | --auto-instructions] [--file PATH] [--allow-discovery] [--max-output-tokens N]".into());
+            return Err("usage: code-agent-setup repair-eval (--dry-config-check | --real-llm --trust-checker --share-source) SYNTHETIC_WORKSPACE TRUSTED_CHECKER | prepare NEW_ABSOLUTE_PATH | check-config WORKSPACE CARGO RUSTC | verify WORKSPACE CARGO RUSTC | run-offline WORKSPACE CARGO RUSTC [--rust-analyzer EXECUTABLE] | check-workspace WORKSPACE SOURCE CHECKER PROVIDER MODEL [INSTRUCTIONS | --auto-instructions] [--file PATH] [--new-file PATH] [--assume-exclusive-workspace] [--allow-discovery] [--max-output-tokens N] [--checker-timeout-ms N] | run-workspace --trust-checker --share-source WORKSPACE SOURCE CHECKER PROVIDER MODEL [INSTRUCTIONS | --auto-instructions] [--file PATH] [--new-file PATH] [--assume-exclusive-workspace] [--allow-discovery] [--max-output-tokens N] [--checker-timeout-ms N] | check-root WORKSPACE CHECKER PROVIDER MODEL --protect PATH [--protect PATH] [INSTRUCTIONS] [--assume-exclusive-workspace] [--max-output-tokens N] [--checker-timeout-ms N] | run-root --trust-checker --share-workspace WORKSPACE CHECKER PROVIDER MODEL --protect PATH [--protect PATH] [INSTRUCTIONS] [--assume-exclusive-workspace] [--max-output-tokens N] [--checker-timeout-ms N] | check-read-only WORKSPACE SOURCE PROVIDER MODEL [INSTRUCTIONS | --auto-instructions] [--file PATH] [--allow-discovery] [--max-output-tokens N] | run-read-only --share-source WORKSPACE SOURCE PROVIDER MODEL [INSTRUCTIONS | --auto-instructions] [--file PATH] [--allow-discovery] [--max-output-tokens N]".into());
         }
     }
     Ok(())

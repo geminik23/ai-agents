@@ -269,3 +269,69 @@ fn workspace_check_is_provider_free_and_live_mode_requires_explicit_consent() {
     }
     std::fs::remove_dir_all(parent).unwrap();
 }
+
+#[test]
+fn repair_campaign_stops_before_live_when_the_checker_cannot_start() {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("repair-preflight-{}-{nonce}", std::process::id()));
+    fs::create_dir(&dir).unwrap();
+    let output_dir = dir.join("campaign");
+    let log = dir.join("invocations");
+    let host = dir.join("host");
+    let rustup = dir.join("rustup");
+    // Let the real host validate the configuration, but never start a provider in this test.
+    fs::write(
+        &host,
+        r#"#!/bin/sh
+echo "$2" >> "$INVOCATIONS"
+[ "$2" = --dry-config-check ] || exit 3
+exec "$REAL_HOST" "$@"
+"#,
+    )
+    .unwrap();
+    fs::write(
+        &rustup,
+        "#!/bin/sh\necho \"$MISSING_TOOLCHAIN/bin/rustc\"\n",
+    )
+    .unwrap();
+    for executable in [&host, &rustup] {
+        fs::set_permissions(executable, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let campaign = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("repair-eval/campaign.py");
+    let run = Command::new("python3")
+        .arg(campaign)
+        .arg("--real-llm")
+        .arg(host)
+        .arg(&output_dir)
+        .env_clear()
+        .env(
+            "PATH",
+            std::env::join_paths([dir.as_path(), std::path::Path::new("/usr/bin")]).unwrap(),
+        )
+        .env("INVOCATIONS", &log)
+        .env("REAL_HOST", env!("CARGO_BIN_EXE_code-agent-setup"))
+        .env("MISSING_TOOLCHAIN", dir.join("absent"))
+        .output()
+        .unwrap();
+    let stages: serde_json::Value =
+        serde_json::from_slice(&fs::read(output_dir.join("results.json")).unwrap()).unwrap();
+    let calls = fs::read_to_string(log).unwrap();
+    fs::remove_dir_all(dir).unwrap();
+
+    assert!(!run.status.success());
+    assert_eq!(calls, "--dry-config-check\n");
+    assert!(
+        String::from_utf8_lossy(&run.stderr).contains("checker setup failed"),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(stages[0]["stage"], "preflight");
+    assert_eq!(stages[1]["stage"], "not_run");
+    assert_eq!(stages[2]["stage"], "not_run");
+}

@@ -723,6 +723,7 @@ async fn approved_edit_runs_only_the_separate_host_checker() {
         fs::read_to_string(&sandbox.outside).unwrap(),
         "user data stays unchanged\n"
     );
+    assert!(repair_eval::repair_evidence(&done.run, &sandbox.source).unwrap());
     assert!(sandbox.parent.join("checker/acceptance-test").is_file());
     assert_eq!(
         fs::metadata(&sandbox.source).unwrap().permissions().mode() & 0o777,
@@ -4135,5 +4136,70 @@ async fn root_mode_external_replacement_prevents_completion() {
             .is_none()
     );
     drop(runner);
+    sandbox.cleanup();
+}
+
+#[tokio::test]
+async fn repair_eval_rejects_an_unaffordable_call_before_transport() {
+    use ai_agents::autonomy::UsdAmount;
+    use ai_agents::llm::providers::{DeclaredPricing, ProviderBuilder, ProviderType};
+
+    let sandbox = Sandbox::new();
+    fs::create_dir(sandbox.root.join("src")).unwrap();
+    fs::copy(&sandbox.source, sandbox.root.join("src/lib.rs")).unwrap();
+    let mut setup = repair_eval::configure(&sandbox.root, &sandbox.checker).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/v1/", listener.local_addr().unwrap());
+    let LLMConfigOrSelector::Config(config) = &setup.spec.llm else {
+        unreachable!()
+    };
+    let mut pricing: DeclaredPricing =
+        serde_json::from_value(config.extra["declared_pricing"].clone()).unwrap();
+    pricing.endpoint = endpoint.clone();
+    let provider = ProviderBuilder::new()
+        .provider(ProviderType::OpenAI)
+        .model(&config.model)
+        .base_url(endpoint)
+        .api_key("fixture")
+        .build()
+        .unwrap()
+        .with_declared_pricing(pricing)
+        .unwrap();
+    let cap = UsdAmount::parse("0.000001").unwrap();
+    setup.spec.autonomy.defaults.max_cost_usd = Some(cap.clone());
+    let agent = Arc::new(
+        setup
+            .builder()
+            .unwrap()
+            .llm(Arc::new(provider))
+            .auto_configure_features()
+            .unwrap()
+            .autonomy_extensions(setup.extensions().unwrap())
+            .build()
+            .unwrap(),
+    );
+    agent.set_command_runner(setup.checker_runner().unwrap());
+    let store =
+        Arc::new(ScopedTaskRunStore::in_memory(agent.info().id, None, "cost-test".into()).unwrap());
+    let runner = AutonomyRunner::try_new(
+        agent,
+        setup.spec.autonomy.clone(),
+        AutonomyHostCeilings {
+            max_cost_usd: Some(cap),
+            ..Default::default()
+        },
+        store,
+        "cost-test".into(),
+    )
+    .unwrap();
+    tokio::select! {
+        result = runner.run("repair",None) => {
+            let run = result.unwrap().run;
+            assert_ne!(run.status, TaskRunStatus::Completed);
+            assert_eq!(run.counters.charged_micro_usd,0);
+            assert_eq!(run.stop_reason.as_deref(), Some("priced_capacity"));
+        }
+        _ = listener.accept() => panic!("unaffordable request opened a connection"),
+    }
     sandbox.cleanup();
 }
