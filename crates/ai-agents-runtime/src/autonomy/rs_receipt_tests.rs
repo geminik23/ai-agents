@@ -11,7 +11,7 @@ async fn rs_paid_settlement_receipt_failure_retains_exact_bound_and_owner() {
                 paid_server(vec![json!({"role":"assistant","content":"done"})]).await;
             let pricing = DeclaredPricing {
                 schedule_id: "receipt.v1".into(),
-                model: "fixture-model".into(),
+                model: PAID_FIXTURE_MODEL.into(),
                 endpoint: endpoint.clone(),
                 server_input_token_limit: 32,
                 server_output_token_limit: 2048,
@@ -23,7 +23,7 @@ async fn rs_paid_settlement_receipt_failure_retains_exact_bound_and_owner() {
             };
             let provider = ProviderBuilder::new()
                 .provider(ProviderType::OpenAI)
-                .model("fixture-model")
+                .model(PAID_FIXTURE_MODEL)
                 .api_key("isolated-receipt-fixture")
                 .base_url(endpoint)
                 .build()
