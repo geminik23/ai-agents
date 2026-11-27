@@ -21,6 +21,9 @@ use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 
+#[path = "repair_eval.rs"]
+pub mod repair_eval;
+
 const YAML: &str = include_str!("../../../yaml/code-agent/workspace.yaml");
 const READ_ONLY_YAML: &str = include_str!("../../../yaml/code-agent/workspace-read-only.yaml");
 const ROOT_YAML: &str = include_str!("../../../yaml/code-agent/workspace-root.yaml");
