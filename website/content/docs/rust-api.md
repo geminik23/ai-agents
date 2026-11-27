@@ -1114,6 +1114,30 @@ The built-in process runner reports `NotStarted` on pre-spawn failure, `Finished
 
 The curated `ai-agents` facade exports normal host integration for questions, diagnostics, commands, and web search, including `WebSearchProvider` request and response types. Add a matching direct `ai-agents-tools` dependency only for lower-level custom web-fetch transport or resolver injection (`WebFetchTransport`, `WebFetchResolver`, and their request/response types) or eval-oriented `StaticWebSearchProvider` and `UnavailableWebSearchProvider` helpers. A custom web-fetch transport must return one HTTP response per call without automatically following redirects so `WebFetchTool` can validate every hop. A socket-opening implementation must override validated sending, connect only to the supplied approved addresses, and honor `max_response_bytes` while reading each response; the compatibility default cannot enforce a host transport's DNS, proxy, or egress behavior.
 
+### Language server diagnostics (development)
+
+An embedding host can install `ai_agents::tools::lsp::LspDiagnostics` in the existing diagnostics provider slot. Configure an absolute server executable and a canonical workspace root, select the documents and all inputs that affect their analysis, and supply a cooperative revision source. A server starts on a diagnostic request and analyzes a private copy of the selected files. The snapshot is limited to 4 MiB of registered inputs, and the adapter opens only the requested document. The host must control writers to the source tree, keep external toolchain inputs fixed, and supply only trusted executables, options and environment values. The private copy is not process isolation. The adapter stops and waits for its direct server child on cancellation or deadline. The host owns containment of any descendants the configured executable launches.
+
+For example, a trusted Rust host that deserializes a registration into `LspDiagnosticsConfig` can use these settings for a file-local Ruff check:
+
+```json
+{
+  "root": "/absolute/workspace",
+  "program": "/absolute/bin/ruff",
+  "args": ["server"],
+  "documents": ["src/example.py"],
+  "inputs": ["pyproject.toml"],
+  "language_id": "python",
+  "initialization_options": {"settings": {"lint": {"select": ["F821"]}}},
+  "timeout_ms": 10000
+}
+```
+
+Call `LspDiagnostics::new(config, move || workspace_guard.revision())` with a guard covering the registered inputs. Standard registration returns advisory diagnostics for servers advertising independent document pull diagnostics. The result carries a coverage message even for an empty list. A required F33 check therefore stays unknown when an excluded document and a clean document have the same wire response. To use several servers in one workspace, combine their registrations with `LspDiagnosticsHost::new`. Each document has one assigned server. Use `LspDiagnostics::rust_analyzer` for trusted Rust projects and pass the Cargo manifest, lockfile and relevant module inputs. Include applicable project and crate rust-analyzer settings files in the snapshot. The Rust adapter checks their diagnostics setting, preserves compatible initialization options such as Cargo features, and requires the server to report a ready project containing the document. Project setup that requires build scripts, proc macros, or workspace-wide compiler or test results should use a separate host checker.
+
+Registered document names are relative to the canonical registration root. Tool query paths follow the tool policy working directory. Use the absolute document path when that directory differs from the registration root. For F33, set an explicit document path in the existing `builtin.diagnostics` check and bind that check to the same live revision source with `register_validation_target`. For process restart, install the trusted registration and a fresh revision source in your `TaskRestoreComponents` factory. Persist the non-secret registration identity with the component binding and validate it before restoring. Include a new host generation in the revision token after restart so a restarted mutation counter cannot match an earlier proof. No server session or earlier diagnostic response is required to issue the new request. A plain YAML agent can declare that it needs diagnostics, and the embedding host supplies the actual server.
+
+
 ---
 
 ## Custom LLM Providers

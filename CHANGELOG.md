@@ -3,6 +3,7 @@
 ## Unreleased
 
 ### Added
+- Diagnostics: connect trusted stdio language servers from Rust hosts, expose advisory reports and validate current rust-analyzer diagnostics for policy-authorized documents
 - OpenAI Chat: migrate legacy compatibility settings to the native SDK with bounded same-endpoint retries and preserve raw Rust access
 - Anthropic: use native Messages for the default YAML and Rust paths with existing request defaults and signed tool continuation
 - Local Ollama: use native chat and text streaming from Rust and YAML with explicit generation options and daemon model retention

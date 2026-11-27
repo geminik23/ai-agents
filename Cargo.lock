@@ -381,6 +381,7 @@ dependencies = [
  "serde_path_to_error",
  "serde_yaml",
  "sha2 0.10.9",
+ "tempfile",
  "tokio",
  "tracing",
  "uuid",
@@ -482,6 +483,7 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
+ "toml",
  "tracing",
  "uuid",
 ]

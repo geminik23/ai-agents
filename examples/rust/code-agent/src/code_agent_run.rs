@@ -55,7 +55,10 @@ impl LLMProvider for FixtureProvider {
 
 // Keep the original runtime, executor and task owner; only this disposable sample receives scripted input.
 // Initial and final independent checks are host-owned; the task validation command uses the task ledger.
-pub async fn run(setup: &PreparedConfiguration) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run(
+    setup: &mut PreparedConfiguration,
+    analyzer: Option<&std::path::Path>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let initial = setup.verify_fixture()?;
     if initial.passed {
         return Err("sample project is already passing; prepare a new failing workspace".into());
@@ -86,12 +89,16 @@ pub async fn run(setup: &PreparedConfiguration) -> Result<(), Box<dyn std::error
         "The sample edit is ready for the required acceptance check.".to_string(),
     ]);
     let provider = Arc::new(FixtureProvider(Mutex::new(responses)));
+    let (builder, extensions) = if let Some(analyzer) = analyzer {
+        setup.with_rust_diagnostics(analyzer)?
+    } else {
+        (setup.builder(), AutonomyExtensions::builtins())
+    };
     let agent = Arc::new(
-        setup
-            .builder()
+        builder
             .llm(provider)
             .auto_configure_features()?
-            .autonomy_extensions(AutonomyExtensions::builtins())
+            .autonomy_extensions(extensions)
             .build()?,
     );
     // This runtime's built-ins share their actual command slot; no eval recording registry is replaced.
@@ -116,6 +123,30 @@ pub async fn run(setup: &PreparedConfiguration) -> Result<(), Box<dyn std::error
         .await?;
     if result.run.status != TaskRunStatus::Completed {
         return Err(format!("sample task did not complete: {:?}", result.run.status).into());
+    }
+    if analyzer.is_some() {
+        let record = result
+            .run
+            .evidence
+            .tool_calls
+            .iter()
+            .map(|call| &call.record)
+            .find(|record| {
+                record.canonical_id == "diagnostics"
+                    && matches!(record.source, ToolCallSource::Task)
+            })
+            .ok_or("missing task diagnostic observation")?;
+        let report: serde_json::Value = serde_json::from_str(&record.output)?;
+        if !record.executed
+            || !record.success
+            || record.output_truncated
+            || report["available"] != true
+            || !report["message"].is_null()
+            || record.executed_arguments["path"] != serde_json::json!(source)
+        {
+            return Err("sample diagnostics did not confirm the edited document".into());
+        }
+        println!("Fresh rust-analyzer diagnostics accepted for the edited source.");
     }
     for id in ["file_read", "file_edit"] {
         let record = &result
