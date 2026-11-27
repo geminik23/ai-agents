@@ -244,51 +244,19 @@ impl TaskRestoreComponents for Application {
         saved: Option<&TaskRestoreBinding>,
         _: Option<&ai_agents_llm::LLMRegistry>,
     ) -> ai_agents_core::Result<(AgentBuilder, Arc<dyn TaskRestoreComponentState>)> {
-        let root = self.directory.join("project");
-        let target = root.join(PATH);
-        let guard = WorkspaceGuard::new(
-            &root,
-            WorkspaceScope::Selected([target.clone()].into()),
-            vec![],
-        )
-        .map_err(|error| AgentError::Config(error.to_string()))?;
-        let mut tools = ToolRegistry::new();
-        tools
-            .register(Arc::new(DiagnosticsTool::new(
-                tools.diagnostics_provider_slot(),
-            )))
-            .unwrap();
-        tools
-            .register(Arc::new(AskUserTool::new(tools.question_handler_slot())))
-            .unwrap();
-        guard
-            .install(&mut tools)
-            .map_err(|error| AgentError::Config(error.to_string()))?;
-        let revision = Arc::new(InstalledRevision {
-            generation: uuid::Uuid::new_v4(),
-            guard,
-        });
-        let source = revision.clone();
-        let diagnostics = LspDiagnostics::rust_analyzer(
-            server(&root, "AI_AGENTS_RUST_ANALYZER", PATH),
-            move || source.revision().ok(),
-        )?;
-        tools.set_diagnostics_provider(Arc::new(diagnostics));
-        let mut extensions = AutonomyExtensions::builtins();
-        extensions.register_validation_target("syntax", "selected-document", revision)?;
+        let builder = document_builder(&self.directory, builder)?;
+        let target = self.directory.join("project").join(PATH);
         let cursor = Arc::new(AtomicU64::new(
             saved
                 .and_then(|binding| binding.state.as_u64())
                 .unwrap_or_default(),
         ));
         let builder = builder
-            .tools(tools)
             .llm(Arc::new(EditProgram {
                 cursor: cursor.clone(),
                 target,
             }))
-            .auto_configure_features()?
-            .autonomy_extensions(extensions);
+            .auto_configure_features()?;
         Ok((
             builder,
             Arc::new(Installed {
@@ -297,6 +265,46 @@ impl TaskRestoreComponents for Application {
             }),
         ))
     }
+}
+
+// Both consumers install the same guard, actual language server and live revision binding.
+fn document_builder(
+    directory: &Path,
+    builder: AgentBuilder,
+) -> ai_agents_core::Result<AgentBuilder> {
+    let root = directory.join("project");
+    let target = root.join(PATH);
+    let guard = WorkspaceGuard::new(
+        &root,
+        WorkspaceScope::Selected([target.clone()].into()),
+        vec![],
+    )
+    .map_err(|error| AgentError::Config(error.to_string()))?;
+    let mut tools = ToolRegistry::new();
+    tools
+        .register(Arc::new(DiagnosticsTool::new(
+            tools.diagnostics_provider_slot(),
+        )))
+        .unwrap();
+    tools
+        .register(Arc::new(AskUserTool::new(tools.question_handler_slot())))
+        .unwrap();
+    guard
+        .install(&mut tools)
+        .map_err(|error| AgentError::Config(error.to_string()))?;
+    let revision = Arc::new(InstalledRevision {
+        generation: uuid::Uuid::new_v4(),
+        guard,
+    });
+    let source = revision.clone();
+    let diagnostics =
+        LspDiagnostics::rust_analyzer(server(&root, "AI_AGENTS_RUST_ANALYZER", PATH), move || {
+            source.revision().ok()
+        })?;
+    tools.set_diagnostics_provider(Arc::new(diagnostics));
+    let mut extensions = AutonomyExtensions::builtins();
+    extensions.register_validation_target("syntax", "selected-document", revision)?;
+    Ok(builder.tools(tools).autonomy_extensions(extensions))
 }
 
 struct EditProgram {
@@ -364,7 +372,6 @@ async fn process_worker() {
     };
     let directory = std::env::current_dir().unwrap();
     let host = host(&directory);
-    let receipt = directory.join("paused.json");
     if mode == "seed" {
         let result = host
             .build()
@@ -380,37 +387,58 @@ async fn process_worker() {
             result.run.stop_reason,
             result.run.evidence.tool_calls
         );
-        assert_eq!(
-            fs::read_to_string(directory.join("project").join(PATH)).unwrap(),
-            ORIGINAL.replace(BROKEN_LINE, FIX),
-            "pending={:?}, calls={:?}",
-            result.run.pending,
-            result.run.evidence.tool_calls
-        );
-        let previous = result
-            .run
-            .evidence
-            .tool_calls
-            .iter()
-            .find(|entry| entry.record.canonical_id == "diagnostics" && entry.record.executed)
-            .expect("pre-restart diagnostics ran");
-        let previous_output: Value = serde_json::from_str(&previous.record.output).unwrap();
-        assert_eq!(previous_output["available"], true, "{previous_output}");
-        assert_eq!(previous_output["count"], 0);
-        fs::write(
-            receipt,
-            json!({
-                "id":result.run.key.run_id,
-                "revision":result.run.revision,
-                "attempts":result.run.counters.llm_attempts,
-                "diagnostic_call":previous.record.call_id,
-                "expires_at":result.run.clocks.expires_at.expect("wall allowance"),
-            })
-            .to_string(),
-        )
-        .unwrap();
+        save_after_edit(&directory, &result, 1);
         return;
     }
+    resume_document(&directory, host, mode.to_str().unwrap(), || {}).await;
+}
+
+fn save_after_edit(directory: &Path, result: &TaskRunResult, expected_diagnostics: usize) {
+    let receipt = directory.join("paused.json");
+    assert_eq!(
+        fs::read_to_string(directory.join("project").join(PATH)).unwrap(),
+        ORIGINAL.replace(BROKEN_LINE, FIX),
+        "pending={:?}, calls={:?}",
+        result.run.pending,
+        result.run.evidence.tool_calls
+    );
+    let diagnostics: Vec<_> = result
+        .run
+        .evidence
+        .tool_calls
+        .iter()
+        .filter(|entry| entry.record.canonical_id == "diagnostics" && entry.record.executed)
+        .collect();
+    assert_eq!(diagnostics.len(), expected_diagnostics);
+    let previous = diagnostics.last().expect("pre-restart diagnostics ran");
+    let previous_output: Value = serde_json::from_str(&previous.record.output).unwrap();
+    assert_eq!(previous_output["available"], true, "{previous_output}");
+    assert_eq!(previous_output["count"], 0);
+    fs::write(
+        receipt,
+        json!({
+            "id":result.run.key.run_id,
+            "revision":result.run.revision,
+            "attempts":result.run.counters.llm_attempts,
+            "diagnostic_calls":diagnostics.iter().map(|entry| &entry.record.call_id).collect::<Vec<_>>(),
+            "cost":result.run.counters.charged_micro_usd,
+            "pending_id":result.run.pending.as_ref().unwrap().id,
+            "question_call":result.run.pending.as_ref().unwrap().reviewed_action["call_id"],
+            "question":result.run.pending.as_ref().unwrap().reviewed_action["question"],
+            "expires_at":result.run.clocks.expires_at.expect("wall allowance"),
+        })
+        .to_string(),
+    )
+    .unwrap();
+}
+
+async fn resume_document(
+    directory: &Path,
+    host: Arc<ConfiguredTaskRestoreHost>,
+    mode: &str,
+    before_answer: impl FnOnce(),
+) {
+    let receipt = directory.join("paused.json");
     let saved: Value = serde_json::from_slice(&fs::read(receipt).unwrap()).unwrap();
     let id = saved["id"].as_str().unwrap();
     let restored = host
@@ -434,6 +462,17 @@ async fn process_worker() {
         )
         .await
         .unwrap();
+    assert_eq!(
+        json!(reviewed.run.counters.charged_micro_usd),
+        saved["cost"]
+    );
+    assert_eq!(json!(reviewed.run.counters.llm_attempts), saved["attempts"]);
+    let pending = reviewed.run.pending.as_ref().unwrap();
+    // Reconstruction rotates the response capability while preserving the pending native call.
+    assert_ne!(json!(pending.id), saved["pending_id"]);
+    assert_eq!(pending.reviewed_action["call_id"], saved["question_call"]);
+    assert_eq!(pending.reviewed_action["question"], saved["question"]);
+    before_answer();
     let outcome = runner
         .resume(
             id,
@@ -464,16 +503,25 @@ async fn process_worker() {
         .tool_calls
         .iter()
         .filter(|entry| entry.record.canonical_id == "diagnostics" && entry.record.executed);
-    assert_eq!(
-        json!(diagnostics.next().unwrap().record.call_id),
-        saved["diagnostic_call"]
-    );
+    let prior = saved["diagnostic_calls"].as_array().unwrap();
+    for call in prior {
+        assert_eq!(&json!(diagnostics.next().unwrap().record.call_id), call);
+    }
     let diagnostics_record = diagnostics
         .next()
         .expect("new diagnostics ran after restart");
-    assert_ne!(
-        json!(diagnostics_record.record.call_id),
-        saved["diagnostic_call"]
+    assert!(!prior.contains(&json!(diagnostics_record.record.call_id)));
+    assert!(matches!(
+        diagnostics_record.record.source,
+        ai_agents_core::ToolCallSource::Task
+    ));
+    assert_eq!(
+        diagnostics_record.record.executed_arguments["path"],
+        json!(directory.join("project").join(PATH))
+    );
+    assert_eq!(
+        diagnostics_record.record.executed_arguments["severity"],
+        "all"
     );
     assert!(diagnostics.next().is_none());
     let output: Value = serde_json::from_str(&diagnostics_record.record.output).unwrap();
@@ -791,3 +839,6 @@ async fn tool_policy_and_registered_document_share_one_path() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[path = "chat_sdk.rs"]
+mod chat_sdk;
