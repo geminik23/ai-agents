@@ -2114,7 +2114,7 @@ fn signed_tool_task_survives_restarts(protocol: ReplayProtocol) {
         .enable_all()
         .build()
         .unwrap();
-    let read_usage = || {
+    let read_snapshot = || {
         runtime.block_on(async {
             use ai_agents::persistence::{AgentStorage, SqliteStorage};
             let store = SqliteStorage::new(db.to_str().unwrap()).await.unwrap();
@@ -2122,18 +2122,20 @@ fn signed_tool_task_survives_restarts(protocol: ReplayProtocol) {
                 agent_id: "Fixture".into(),
                 run_id: id.to_owned(),
             };
-            let snapshot = store.load_task_run(&key).await.unwrap().unwrap();
-            snapshot.payload["reservations"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .filter_map(|attempt| {
-                    attempt
-                        .pointer("/result/response/usage")
-                        .map(|usage| usage["total_tokens"].as_u64().unwrap())
-                })
-                .collect::<Vec<_>>()
+            store.load_task_run(&key).await.unwrap().unwrap()
         })
+    };
+    let read_usage = || {
+        read_snapshot().payload["reservations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|attempt| {
+                attempt
+                    .pointer("/result/response/usage")
+                    .map(|usage| usage["total_tokens"].as_u64().unwrap())
+            })
+            .collect::<Vec<_>>()
     };
     assert_eq!(read_usage(), vec![16]);
     let revision = saved["revision"].as_u64().unwrap().to_string();
@@ -2210,7 +2212,22 @@ fn signed_tool_task_survives_restarts(protocol: ReplayProtocol) {
     assert_eq!(done["counters"]["llm_attempts"], 3);
     assert_eq!(provider.calls.load(Ordering::SeqCst), 3);
     assert_eq!(done["counters"]["tool_attempts"], 1);
-    for output in [&seed, &between, &result] {
+
+    // Removing the fixture output lets an unauthorized repeat create a detectable file under the original tool policy.
+    let completed = read_snapshot();
+    assert_eq!(done["revision"], completed.revision);
+    std::fs::remove_file(&path).unwrap();
+    let terminal = resume(&completed.revision.to_string(), "yes\nyes\n");
+    assert_exit(&terminal, 2);
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 3);
+    assert_eq!(provider.get_calls.load(Ordering::SeqCst), 0);
+    assert!(!path.exists());
+    assert_eq!(
+        serde_json::to_value(read_snapshot()).unwrap(),
+        serde_json::to_value(completed).unwrap()
+    );
+
+    for output in [&seed, &between, &result, &terminal] {
         for private in [
             "private-replay-fixture",
             "fixture-private-thinking",
