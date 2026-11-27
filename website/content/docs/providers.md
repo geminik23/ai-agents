@@ -47,7 +47,7 @@ llm:
     logprobs: true
 ```
 
-`protocol` is optional. The first-party codec sends an ordinary request's nonempty effort string verbatim and omits it when absent. Choose a value and extensions supported by your server. The adapter combines explicit `provider_options` and legacy `extra_body` on distinct JSON paths. Conflicting values and overrides of messages, tools, model, stream controls, output ceilings, credentials or other owned fields fail before sending a request. Hard-priced calls require the audited option set. An existing `extra_body.response_format` with `text`, `json_object`, or `json_schema` maps to the owned Chat response format. Direct SDK callers can set `ChatRequest::response_format`.
+`protocol` is optional. The first-party codec sends an ordinary request's nonempty effort string verbatim and omits it when absent. Choose a value and extensions supported by your server. The adapter combines explicit `provider_options` and legacy `extra_body` on distinct JSON paths. Conflicting values and overrides of messages, tools, model, stream controls, output ceilings, credentials or other owned fields fail before sending a request. Hard-priced calls require the audited option set. An existing `extra_body.response_format` with `text`, `json_object`, or `json_schema` maps to the owned Chat response format. An omitted format leaves the key absent. An explicit `extra_body.response_format: null` sends JSON null. Direct SDK callers can select `Some(ResponseFormat::Null)` for the same request.
 
 For `provider: openai`, an omitted temperature stays absent from the HTTP request. Existing legacy presets and `openai-compatible` resolve an omitted temperature to their historical `0.7` at provider construction. First-party Messages preserves omission. Both shorthand and named YAML configurations preserve omission on save. The output token default is `2000`.
 
@@ -124,7 +124,7 @@ Model-generated child YAML cannot install an audited pricing contract. Inside a 
 
 The full input/output ceilings plus request fee are reserved for every possible internal attempt, with checked integer arithmetic and upward rounding. This intentionally trades utilization for a conservative bound without introducing an unproven generic tokenizer. Effective per-call output and reasoning settings must stay inside the contract. Unknown extras, arbitrary body overrides and native search/service fees without a complete adapter bound are rejected under hard pricing; no fallback may bypass that denial. Enabled internal resilience needs an explicit total-attempt count no larger than the installed contract. Multi-attempt results retain the full reservation because upstream may report only the final attempt.
 
-Only audited complete provider usage may release unused reservation. Google additionally requires an explicitly reported total rather than relying on a display total synthesized by normalization. Missing/partial usage retains the complete upper bound. Google streams can settle a complete explicitly reported terminal usage receipt only after normal EOF; early cumulative or later partial reports are not final billing evidence. First-party Chat Completions streams can also settle after a verified finish, a complete matching token receipt and the end marker. Streams through legacy adapters retain the full bound when the upstream stream supplies no billing receipt. Errors, cancellation after possible dispatch, drop and lost acknowledgements never imply a refund or cleanup. The guarantee covers declared prices for managed conforming model requests, not actual invoices, unrelated tool-service fees, arbitrary host I/O or exactly-once effects.
+Only audited complete provider usage may release unused reservation. Google additionally requires an explicitly reported total rather than relying on a display total synthesized by normalization. Missing/partial usage retains the complete upper bound. Google streams can settle a complete explicitly reported terminal usage receipt only after normal EOF; early cumulative or later partial reports are not final billing evidence. OpenAI and compatible Chat settlement requires the usage receipt to name the exact model in the pricing contract. A missing or different reported model retains the full reservation. For streams, the usage-bearing terminal frame must name the model, reported model IDs must be consistent, and the end marker must arrive. Streams through legacy adapters retain the full bound when the upstream stream supplies no billing receipt. Errors, cancellation after possible dispatch, drop and lost acknowledgements never imply a refund or cleanup. The guarantee covers declared prices for managed conforming model requests, not actual invoices, unrelated tool-service fees, arbitrary host I/O or exactly-once effects.
 
 See [Rust task APIs](@/docs/rust-api.md#guarded-standalone-execution-development-only) and [YAML pricing fields](@/docs/yaml-reference.md#declared-pricing-development-only). Offline fixture acceptance is separate from live provider/billing validation; no live paid run is needed to use the tests.
 
@@ -765,7 +765,7 @@ Any YAML field not recognized as a named parameter is captured as a provider-spe
 
 The `llm` crate supports HTTP-level retry with exponential backoff, complementary to the framework's agent-level `error_recovery`. Both can be active simultaneously.
 
-These `resilient_*` fields apply to upstream-backed providers. The first-party Google adapter does not add an internal retry loop; configure agent-level `error_recovery` for Google. Local native-history and protocol integrity errors are terminal and do not enter retry, fallback-model, or static-response recovery.
+For OpenAI and OpenAI-compatible Chat, `resilient: true` enables retries at the configured endpoint for transport failures and HTTP 408, 429, 500, 502, 503, or 504. A successful stream opening ends retry admission. Redirects and invalid requests end the attempt immediately. The first-party Google adapter supports agent-level `error_recovery`. Local native-history and protocol integrity errors are terminal.
 
 ```yaml
 llm:
@@ -781,22 +781,24 @@ llm:
 | Parameter | Type | Description |
 | --- | --- | --- |
 | `resilient` | `bool` | Enable transport-level retry |
-| `resilient_attempts` | `u64` | Max retry attempts |
+| `resilient_attempts` | `u64` | Total attempts including the first request |
 | `resilient_base_delay_ms` | `u64` | Base delay for exponential backoff |
 | `resilient_max_delay_ms` | `u64` | Maximum backoff delay |
 | `resilient_jitter` | `bool` | Add randomness to backoff timing |
 
 > **Note:** If you also have an `error_recovery:` section in your agent spec, main-response provider retries can multiply transport-level attempts. `error_recovery.default.max_retries` counts retries after the initial provider attempt. Record actual calls rather than estimating them from one product formula because transport adapters may apply their own attempt semantics.
 
+For ordinary Chat, existing `reasoning` and `reasoning_budget_tokens` settings keep their historical wire behavior. The budget still participates in declared pricing checks. For Chat requests previously using the upstream transport, legacy `reasoning_effort` accepts low, medium and high and sends the canonical lowercase value. Other native Chat requests accept the selected endpoint's effort values. Framework Chat accepts the legacy Rust penalty and stop settings and omits them from the request. Use an explicit supported body option to send these fields. Raw structured streams retain the upstream `normalize_response` setting. For a compatible server with no configured key, framework Chat omits the Authorization header. To send a token, explicitly configure credentials for that endpoint.
+
 ### Azure OpenAI
 
-The legacy fields `api_version` and `deployment_id` select the upstream Chat backend. It appends `chat/completions` to the configured base URL and omits the deployment path and version query. A resource root plus those two fields is insufficient for a versioned Azure deployment request.
+For ordinary Chat, the provider appends `chat/completions` to the configured base URL. For a v1-shaped endpoint, set the full API base ending in `/openai/v1/` and use the deployment name as `model`. The legacy fields `api_version` and `deployment_id` preserve the historical request to the configured base. Versioned deployment URLs and Azure-specific authentication have their own compatibility requirements.
 
 ### OpenAI provider-native web search
 
 Provider-native search runs on the service. The separately granted `web_search` tool runs through `WebSearchProvider`, framework tool policy, HITL and tool-execution evidence. [Built-in Tools](@/docs/built-in-tools.md#web-search-versus-web-fetch)
 
-On the OpenAI and OpenAI-compatible presets, `openai_enable_web_search: true` selects the upstream backend. Ordinary framework chat still sends a Chat Completions request without a hosted search tool. The upstream Rust client exposes a separate `chat_with_web_search` operation.
+The legacy `openai_enable_web_search` and context settings preserve ordinary Chat behavior, which uses plain Chat Completions. The upstream Rust client exposes a separate `chat_with_web_search` operation.
 
 ### xAI provider-native search
 

@@ -10,9 +10,11 @@ use ai_agents_core::{
     native_readable_projection,
 };
 use serde_json::Value;
-use std::time::Duration;
+use std::{future::Future, time::Duration};
 
 use super::sdk_error as error;
+
+pub(super) const REPORTED_MODEL: &str = "chat_reported_model";
 
 pub(super) fn append_message(
     out: &mut Vec<sdk::Message>,
@@ -89,8 +91,8 @@ fn merge_option(
     Ok(())
 }
 
-// Only enabled features choose the upstream backend. Tuning a disabled feature has no wire effect.
-fn requires_legacy(cfg: &LLMConfig) -> Result<bool, LLMError> {
+// Preserve the validation of requests previously sent through upstream.
+fn used_legacy_transport(cfg: &LLMConfig) -> Result<bool, LLMError> {
     let enabled = |name| {
         cfg.extra.get(name).map_or(Ok(false), |value| {
             value
@@ -141,12 +143,17 @@ pub(super) fn apply_option(
     field: &str,
     key: &str,
     value: &Value,
+    explicit_null_format: Option<sdk::ResponseFormat>,
 ) -> Result<(), LLMError> {
     if field == "extra_body" && key == "response_format" {
         // Migrate the legacy wire shape into the owned request field.
-        request.response_format = serde_json::from_value(value.clone()).map_err(|error| {
-            LLMError::Config(format!("invalid extra_body.response_format: {error}"))
-        })?;
+        request.response_format = if value.is_null() {
+            explicit_null_format
+        } else {
+            Some(serde_json::from_value(value.clone()).map_err(|error| {
+                LLMError::Config(format!("invalid extra_body.response_format: {error}"))
+            })?)
+        };
         return Ok(());
     }
     if sdk::reserved(key) {
@@ -166,7 +173,7 @@ pub(super) fn request(
     messages: &[ChatMessage],
     cfg: &LLMConfig,
     tools: Option<&LLMToolRequest>,
-) -> Result<Option<sdk::ChatRequest>, LLMError> {
+) -> Result<Dispatch, LLMError> {
     let mut request = sdk::ChatRequest::new(model, vec![]);
     request.temperature = cfg.temperature;
     request.max_completion_tokens = cfg.max_tokens;
@@ -192,13 +199,29 @@ pub(super) fn request(
         ),
         None => cfg.reasoning_effort.clone(),
     };
+    let previously_legacy = used_legacy_transport(cfg)?;
     request.timeout = cfg
         .timeout_seconds
         .or_else(|| extra.get("timeout_seconds").and_then(Value::as_u64))
         .map(Duration::from_secs);
     request_options(cfg, |field, key, value| {
-        apply_option(&mut request, field, key, value)
+        apply_option(
+            &mut request,
+            field,
+            key,
+            value,
+            Some(sdk::ResponseFormat::Null),
+        )
     })?;
+    if previously_legacy {
+        if extra.contains_key("provider_options") || extra.contains_key("protocol") {
+            return Err(LLMError::Config(
+                "SDK options conflict with legacy Chat settings".into(),
+            ));
+        }
+        request.reasoning_effort =
+            super::unified::legacy_reasoning_effort(cfg)?.map(|effort| effort.to_string());
+    }
     if provider == ProviderType::OpenAI {
         let hosted_search = extra
             .get("openai_enable_web_search")
@@ -206,15 +229,14 @@ pub(super) fn request(
             == Some(true);
         super::openai::validate(&request, tools.is_some() || hosted_search).map_err(error)?;
     }
-    if requires_legacy(cfg)? {
-        if extra.contains_key("provider_options") || extra.contains_key("protocol") {
-            return Err(LLMError::Config(
-                "SDK options conflict with legacy transport settings".into(),
-            ));
-        }
-        // Validate extra_body against typed settings even when the upstream transport sends it.
-        request.body(false).map_err(error)?;
-        return Ok(None);
+    let retry = super::unified::legacy_resilience(cfg);
+    if retry
+        .as_ref()
+        .is_some_and(|policy| policy.max_attempts == 0)
+    {
+        return Err(LLMError::Config(
+            "Chat retries require at least one total attempt".into(),
+        ));
     }
     let (system, _) = super::unified::extract_system_and_messages(messages);
     if let Some(text) = system.filter(|s| !s.is_empty()) {
@@ -246,7 +268,72 @@ pub(super) fn request(
         append_message(&mut request.messages, msg, native)?;
     }
     request_tools(&mut request, tools)?;
-    Ok(Some(request))
+    Ok(Dispatch { request, retry })
+}
+
+pub(super) struct Dispatch {
+    pub(super) request: sdk::ChatRequest,
+    retry: Option<llm::resilient_llm::ResilienceConfig>,
+}
+
+impl Dispatch {
+    pub(super) async fn complete(self, client: &sdk::ChatClient) -> Result<LLMResponse, LLMError> {
+        let (output, reported) = self
+            .send(|| client.complete_with_reported_model(&self.request))
+            .await?;
+        let mut result = response(output, &self.request.model)?;
+        if let Some(model) = reported {
+            result
+                .metadata
+                .insert(REPORTED_MODEL.into(), Value::String(model.clone()));
+            result.model = Some(model);
+        }
+        Ok(result)
+    }
+
+    pub(super) async fn stream(
+        self,
+        client: &sdk::ChatClient,
+        usage_model: Option<&str>,
+    ) -> Result<sdk::ChatStream, LLMError> {
+        // Opening the stream is the only retryable stage. Polling bytes never starts a new request.
+        self.send(|| client.stream_with_usage_model(&self.request, usage_model))
+            .await
+    }
+
+    async fn send<T, F: Future<Output = Result<T, sdk::Error>>>(
+        &self,
+        mut attempt: impl FnMut() -> F,
+    ) -> Result<T, LLMError> {
+        let Some(policy) = &self.retry else {
+            return attempt().await.map_err(error);
+        };
+        let mut index = 0;
+        loop {
+            match attempt().await {
+                Err(
+                    sdk::Error::Http(408 | 429 | 500 | 502 | 503 | 504) | sdk::Error::Transport,
+                ) if index + 1 < policy.max_attempts => {
+                    // Keep the configured upstream backoff and jitter for explicit framework retries.
+                    let mut delay = policy
+                        .base_delay_ms
+                        .saturating_mul(1 << index.min(16))
+                        .min(policy.max_delay_ms);
+                    if policy.jitter {
+                        let span = (delay / 2).max(1);
+                        let jitter = (index as u64)
+                            .wrapping_mul(6364136223846793005)
+                            .wrapping_add(1)
+                            % span;
+                        delay = delay.saturating_sub(jitter);
+                    }
+                    tokio::time::sleep(Duration::from_millis(delay)).await;
+                    index += 1;
+                }
+                result => return result.map_err(error),
+            }
+        }
+    }
 }
 
 pub(super) fn request_tools(
@@ -345,7 +432,7 @@ mod tests {
             .insert("provider_options".into(), json!({"vendor":{"b":true}}));
         let body = request(ProviderType::OpenAICompatible, "model", &[], &cfg, None)
             .unwrap()
-            .unwrap()
+            .request
             .body(false)
             .unwrap();
         assert_eq!(body["vendor"], json!({"a":1,"b":true}));
@@ -372,13 +459,51 @@ mod tests {
     }
 
     #[test]
+    fn migrated_legacy_options_preserve_sampling_and_ignored_fields_on_the_wire() {
+        for provider in [ProviderType::OpenAI, ProviderType::OpenAICompatible] {
+            let cfg = LLMConfig {
+                frequency_penalty: Some(0.3),
+                presence_penalty: Some(0.2),
+                stop_sequences: Some(vec!["legacy".into()]),
+                reasoning_budget_tokens: Some(25),
+                ..LLMConfig::default()
+            }
+            .with_reasoning(true)
+            .with_reasoning_effort("HiGh")
+            .with_extra("extra_body", json!({"stop":["sent"],"presence_penalty":0.5,"response_format":{"type":"json_object"}}));
+            let dispatch = request(provider, "fixture", &[], &cfg, None).unwrap();
+            assert!(dispatch.retry.is_none());
+            let body = dispatch.request.body(false).unwrap();
+            assert_eq!(body["stop"], json!(["sent"]));
+            assert_eq!(body["presence_penalty"], 0.5);
+            assert_eq!(body["response_format"], json!({"type":"json_object"}));
+            assert_eq!(body["reasoning_effort"], "high");
+            assert_eq!(body["max_completion_tokens"], 2048);
+            for field in ["frequency_penalty", "reasoning", "reasoning_budget_tokens"] {
+                assert!(body.get(field).is_none(), "{field}: {body}");
+            }
+            assert!(
+                request(
+                    provider,
+                    "fixture",
+                    &[],
+                    &cfg.with_reasoning_effort("unknown"),
+                    None
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
     fn legacy_transport_selection_never_discards_explicit_sdk_options() {
         let mut cfg = LLMConfig::default();
         cfg.extra.insert("resilient".into(), json!(true));
         assert!(
             request(ProviderType::OpenAICompatible, "model", &[], &cfg, None)
                 .unwrap()
-                .is_none()
+                .retry
+                .is_some()
         );
         cfg.extra
             .insert("protocol".into(), json!("chat-completions"));

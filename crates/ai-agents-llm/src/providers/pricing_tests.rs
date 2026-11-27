@@ -264,41 +264,62 @@ async fn rs_paid_actual_dispatch_matrix_keeps_completion_native_and_stream_accou
 
 #[tokio::test]
 async fn rs_paid_internal_retry_retains_every_attempts_bound() {
-    let (endpoint, mut received) = fixture(false, 2, true).await;
-    let mut pricing = schedule(&endpoint);
-    pricing.max_internal_attempts = 2;
-    let mut config = LLMConfig::default();
-    config
-        .extra
-        .insert("resilient".into(), serde_json::json!(true));
-    config
-        .extra
-        .insert("resilient_attempts".into(), serde_json::json!(2));
-    config
-        .extra
-        .insert("resilient_base_delay_ms".into(), serde_json::json!(1));
-    let provider = UnifiedLLMProvider::from_spec_config(
-        ProviderType::OpenAI,
-        "fixture-model",
-        Some("fixture".into()),
-        Some(endpoint),
-        config,
-    )
-    .unwrap()
-    .with_declared_pricing(pricing)
-    .unwrap();
-    let provider = crate::managed_provider(Arc::new(provider));
-    let ledger = Arc::new(Ledger::default());
-    crate::scope_invocation_admission(
-        ledger.clone(),
-        provider.complete(&[ChatMessage::user("retry")], None),
-    )
-    .await
-    .unwrap();
-    assert!(received.try_recv().is_ok());
-    assert!(received.try_recv().is_ok());
-    assert_eq!(ledger.bounds.lock()[0].max_micro_usd, 12292);
-    assert!(ledger.settlements.lock()[0].is_none());
+    for streaming in [false, true] {
+        let payload = concat!(
+            r#"data: {"choices":[{"index":0,"delta":{"content":"done"},"finish_reason":"stop"}]}"#,
+            "\n\n",
+            r#"data: {"model":"fixture-model","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":4,"total_tokens":14}}"#,
+            "\n\n",
+            "data: [DONE]\n\n",
+        );
+        let (endpoint, mut received) = fixture_stream(false, 2, true, Some(payload.into())).await;
+        let mut pricing = schedule(&endpoint);
+        pricing.max_internal_attempts = 2;
+        let mut config = LLMConfig::default();
+        config
+            .extra
+            .insert("resilient".into(), serde_json::json!(true));
+        config
+            .extra
+            .insert("resilient_attempts".into(), serde_json::json!(2));
+        config
+            .extra
+            .insert("resilient_base_delay_ms".into(), serde_json::json!(1));
+        let provider = UnifiedLLMProvider::from_spec_config(
+            ProviderType::OpenAI,
+            "fixture-model",
+            Some("fixture".into()),
+            Some(endpoint),
+            config,
+        )
+        .unwrap()
+        .with_declared_pricing(pricing)
+        .unwrap();
+        let provider = crate::managed_provider(Arc::new(provider));
+        let ledger = Arc::new(Ledger::default());
+        crate::scope_invocation_admission(ledger.clone(), async {
+            let messages = [ChatMessage::user("retry")];
+            if streaming {
+                let mut stream = provider.complete_stream(&messages, None).await.unwrap();
+                let mut finished = false;
+                while let Some(item) = stream.next().await {
+                    let chunk = item.unwrap();
+                    if chunk.is_final {
+                        assert_eq!(chunk.usage.unwrap().total_tokens, 14);
+                        finished = true;
+                    }
+                }
+                assert!(finished);
+            } else {
+                provider.complete(&messages, None).await.unwrap();
+            }
+        })
+        .await;
+        assert_eq!(received.try_recv().unwrap()["stream"], streaming);
+        assert_eq!(received.try_recv().unwrap()["stream"], streaming);
+        assert_eq!(ledger.bounds.lock()[0].max_micro_usd, 12292);
+        assert!(ledger.settlements.lock()[0].is_none());
+    }
 }
 
 #[test]
@@ -570,11 +591,35 @@ fn rs_paid_checked_rounding_identity_and_partial_usage() {
 #[tokio::test]
 async fn chat_sdk_stream_billing_uses_only_a_complete_final_receipt() {
     let finish = r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#;
-    let complete =
-        r#"{"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":4,"total_tokens":14}}"#;
+    let complete = r#"{"model":"fixture-model","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":4,"total_tokens":14}}"#;
     let partial = r#"{"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":4}}"#;
     for (frames, expected_charge, drop_before_eof) in [
         (vec![finish, complete], Some(16), false),
+        (
+            vec![
+                r#"{"choices":[],"usage":{"prompt_tokens":1}}"#,
+                finish,
+                complete,
+            ],
+            Some(16),
+            false,
+        ),
+        (
+            vec![
+                r#"{"model":"other-model","choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+                complete,
+            ],
+            None,
+            false,
+        ),
+        (
+            vec![
+                r#"{"model":"fixture-model","choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+                r#"{"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":4,"total_tokens":14}}"#,
+            ],
+            None,
+            false,
+        ),
         (vec![complete, finish], None, false),
         (vec![finish, partial], None, false),
         (vec![finish, complete], None, true),
@@ -766,65 +811,80 @@ async fn openrouter_priced_stream_settles_only_complete_single_attempt_receipts(
 }
 
 #[tokio::test]
-async fn openrouter_settles_only_receipts_for_the_declared_model() {
-    for (reported_model, expected_charge) in [
-        (Some("other-model"), None),
-        (None, None),
-        (Some("fixture-model"), Some(16)),
+async fn chat_providers_settle_only_receipts_for_the_declared_model() {
+    for kind in [
+        ProviderType::OpenRouter,
+        ProviderType::OpenAI,
+        ProviderType::OpenAICompatible,
     ] {
-        let usage = serde_json::json!({"prompt_tokens":10,"completion_tokens":4,"total_tokens":14});
-        let mut unary = serde_json::json!({"choices":[{"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}],"usage":usage});
-        let mut chunk = serde_json::json!({"choices":[{"delta":{"content":"done"},"finish_reason":"stop"}],"usage":usage});
-        if let Some(model) = reported_model {
-            unary["model"] = model.into();
-            chunk["model"] = model.into();
-        }
-        let (endpoint, _requests) = fixture_http(
-            false,
-            2,
-            false,
-            Some(unary.to_string()),
-            Some(format!("data: {chunk}\n\ndata: [DONE]\n\n")),
-        )
-        .await;
-        let provider = ProviderBuilder::new()
-            .provider(ProviderType::OpenRouter)
-            .model("fixture-model")
-            .api_key("fixture")
-            .base_url(&endpoint)
-            .build()
-            .unwrap()
-            .with_declared_pricing(schedule(&endpoint))
-            .unwrap();
-        let provider = crate::managed_provider(Arc::new(provider));
-        let ledger = Arc::new(Ledger::default());
-        crate::scope_invocation_admission(ledger.clone(), async {
-            let messages = [ChatMessage::user("hello")];
-            let response = provider.complete(&messages, None).await.unwrap();
-            assert_eq!(response.content, "done");
+        for (reported_model, expected_charge) in [
+            (Some("other-model"), None),
+            (None, None),
+            (Some("fixture-model"), Some(16)),
+        ] {
+            let usage =
+                serde_json::json!({"prompt_tokens":10,"completion_tokens":4,"total_tokens":14});
+            let mut unary = serde_json::json!({"choices":[{"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}],"usage":usage});
+            let mut chunk = serde_json::json!({"choices":[{"delta":{"content":"done"},"finish_reason":"stop"}],"usage":usage});
             if let Some(model) = reported_model {
-                assert_eq!(response.model.as_deref(), Some(model));
+                unary["model"] = model.into();
+                chunk["model"] = model.into();
             }
-            assert_eq!(response.usage.unwrap().total_tokens, 14);
-            let mut stream = provider.complete_stream(&messages, None).await.unwrap();
-            while let Some(chunk) = stream.next().await {
-                chunk.unwrap();
-            }
-        })
-        .await;
-        let bounds = ledger.bounds.lock();
-        assert_eq!(bounds.len(), 2);
-        assert!(bounds.iter().all(|bound| bound.max_micro_usd == 6146));
-        let charges: Vec<_> = ledger
-            .settlements
-            .lock()
-            .iter()
-            .map(|receipt| receipt.as_ref().map(|s| s.charged_micro_usd))
-            .collect();
-        assert_eq!(
-            charges,
-            [expected_charge, expected_charge],
-            "reported model: {reported_model:?}"
-        );
+            let (endpoint, _requests) = fixture_http(
+                false,
+                2,
+                false,
+                Some(unary.to_string()),
+                Some(format!("data: {chunk}\n\ndata: [DONE]\n\n")),
+            )
+            .await;
+            let provider = ProviderBuilder::new()
+                .provider(kind)
+                .model("fixture-model")
+                .api_key("fixture")
+                .base_url(&endpoint)
+                .build()
+                .unwrap()
+                .with_declared_pricing(schedule(&endpoint))
+                .unwrap();
+            let provider = crate::managed_provider(Arc::new(provider));
+            let ledger = Arc::new(Ledger::default());
+            crate::scope_invocation_admission(ledger.clone(), async {
+                let messages = [ChatMessage::user("hello")];
+                let cfg = if kind == ProviderType::OpenRouter {
+                    LLMConfig::default()
+                } else {
+                    LLMConfig::default().with_reasoning(true)
+                };
+                let response = provider.complete(&messages, Some(&cfg)).await.unwrap();
+                assert_eq!(response.content, "done");
+                if let Some(model) = reported_model {
+                    assert_eq!(response.model.as_deref(), Some(model));
+                }
+                assert_eq!(response.usage.unwrap().total_tokens, 14);
+                let mut stream = provider
+                    .complete_stream(&messages, Some(&cfg))
+                    .await
+                    .unwrap();
+                while let Some(chunk) = stream.next().await {
+                    chunk.unwrap();
+                }
+            })
+            .await;
+            let bounds = ledger.bounds.lock();
+            assert_eq!(bounds.len(), 2);
+            assert!(bounds.iter().all(|bound| bound.max_micro_usd == 6146));
+            let charges: Vec<_> = ledger
+                .settlements
+                .lock()
+                .iter()
+                .map(|receipt| receipt.as_ref().map(|s| s.charged_micro_usd))
+                .collect();
+            assert_eq!(
+                charges,
+                [expected_charge, expected_charge],
+                "reported model: {reported_model:?}"
+            );
+        }
     }
 }

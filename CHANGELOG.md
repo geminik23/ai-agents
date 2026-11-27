@@ -3,6 +3,7 @@
 ## Unreleased
 
 ### Added
+- OpenAI Chat: migrate legacy compatibility settings to the native SDK with bounded same-endpoint retries and preserve raw Rust access
 - Anthropic: use native Messages for the default YAML and Rust paths with existing request defaults and signed tool continuation
 - Local Ollama: use native chat and text streaming from Rust and YAML with explicit generation options and daemon model retention
 - OpenRouter: call Chat Completions from Rust and YAML, preserve parallel tool settings, enforce required routing parameters, settle declared costs against the reported model, and resume approved native tools with the original reasoning on a pinned route

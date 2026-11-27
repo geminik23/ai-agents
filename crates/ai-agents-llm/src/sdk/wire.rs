@@ -3,6 +3,14 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashSet;
 
+/// The model reported alongside a Chat response or usage frame. A request model is never receipt evidence.
+#[derive(Deserialize)]
+pub(super) struct Reported<T> {
+    pub model: Option<String>,
+    #[serde(flatten)]
+    pub envelope: Envelope<T>,
+}
+
 #[derive(Deserialize)]
 pub(super) struct Envelope<T> {
     pub error: Option<Value>,

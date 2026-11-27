@@ -227,7 +227,12 @@ pub struct Usage {
 pub enum ResponseFormat {
     Text {},
     JsonObject {},
-    JsonSchema { json_schema: ResponseSchema },
+    JsonSchema {
+        json_schema: ResponseSchema,
+    },
+    /// Send an explicit JSON null. Omitting the request field leaves the key absent.
+    #[serde(untagged)]
+    Null,
 }
 
 /// Provider-side constraints for a structured response.
@@ -478,21 +483,40 @@ impl ChatClient {
 
     /// Send one non-streaming request and return the complete assistant turn.
     pub async fn complete(&self, request: &ChatRequest) -> Result<Completion, Error> {
+        self.complete_with_reported_model(request)
+            .await
+            .map(|(output, _)| output)
+    }
+
+    pub(crate) async fn complete_with_reported_model(
+        &self,
+        request: &ChatRequest,
+    ) -> Result<(Completion, Option<String>), Error> {
         let response = self.send(request, false).await?;
-        let payload = response
+        let payload: wire::Reported<wire::Choice> = response
             .json()
             .await
             .map_err(|_| Error::Protocol("invalid completion JSON"))?;
-        let output = wire::complete(payload)?;
+        let output = wire::complete(payload.envelope)?;
         ExpectedCalls::from_request(request).check(&output.tool_calls)?;
-        Ok(output)
+        Ok((output, payload.model))
     }
 
     /// Text events are provisional. A finished event carries assembled calls and any final usage receipt.
     pub async fn stream(&self, request: &ChatRequest) -> Result<ChatStream, Error> {
+        self.stream_with_usage_model(request, None).await
+    }
+
+    // A caller that prices the stream can restrict usage to receipts for its audited model.
+    pub(crate) async fn stream_with_usage_model(
+        &self,
+        request: &ChatRequest,
+        usage_model: Option<&str>,
+    ) -> Result<ChatStream, Error> {
         Ok(stream::decode(
             self.send(request, true).await?.bytes_stream(),
             ExpectedCalls::from_request(request),
+            usage_model.map(str::to_owned),
         ))
     }
 }
