@@ -34,6 +34,7 @@ parking_lot = { workspace = true }
 reqwest = { workspace = true }
 rmcp = { workspace = true }
 tempfile = "3"
+toml = "0.8"
 
 [dev-dependencies]
 serde_yaml = { workspace = true }

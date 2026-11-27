@@ -375,8 +375,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("Configuration validated without constructing a provider or starting a task.");
             println!("The command runner is not installed; actual agent execution is not enabled.");
         }
-        [action, root, cargo, rustc] if action == "run-offline" => {
-            let setup = code_agent_workspace::prepare_configuration(
+        [action, root, cargo, rustc, rest @ ..] if action == "run-offline" => {
+            let analyzer = match rest {
+                [] => None,
+                [flag, path] if flag == "--rust-analyzer" => Some(Path::new(path)),
+                _ => return Err("expected optional --rust-analyzer ABSOLUTE_EXECUTABLE".into()),
+            };
+            let mut setup = code_agent_workspace::prepare_configuration(
                 Path::new(root),
                 &std::env::current_exe()?,
                 Path::new(cargo),
@@ -385,7 +390,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?
-                .block_on(code_agent_run::run(&setup))?;
+                .block_on(code_agent_run::run(&mut setup, analyzer))?;
         }
         [action, root, cargo, rustc] if action == "verify" => {
             let setup = code_agent_workspace::prepare_configuration(
@@ -406,7 +411,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
         _ => {
-            return Err("usage: code-agent-setup prepare NEW_ABSOLUTE_PATH | check-config WORKSPACE CARGO RUSTC | verify WORKSPACE CARGO RUSTC | run-offline WORKSPACE CARGO RUSTC | check-workspace WORKSPACE SOURCE CHECKER PROVIDER MODEL [INSTRUCTIONS | --auto-instructions] [--file PATH] [--new-file PATH] [--assume-exclusive-workspace] [--allow-discovery] [--max-output-tokens N] [--checker-timeout-ms N] | run-workspace --trust-checker --share-source WORKSPACE SOURCE CHECKER PROVIDER MODEL [INSTRUCTIONS | --auto-instructions] [--file PATH] [--new-file PATH] [--assume-exclusive-workspace] [--allow-discovery] [--max-output-tokens N] [--checker-timeout-ms N] | check-root WORKSPACE CHECKER PROVIDER MODEL --protect PATH [--protect PATH] [INSTRUCTIONS] [--assume-exclusive-workspace] [--max-output-tokens N] [--checker-timeout-ms N] | run-root --trust-checker --share-workspace WORKSPACE CHECKER PROVIDER MODEL --protect PATH [--protect PATH] [INSTRUCTIONS] [--assume-exclusive-workspace] [--max-output-tokens N] [--checker-timeout-ms N] | check-read-only WORKSPACE SOURCE PROVIDER MODEL [INSTRUCTIONS | --auto-instructions] [--file PATH] [--allow-discovery] [--max-output-tokens N] | run-read-only --share-source WORKSPACE SOURCE PROVIDER MODEL [INSTRUCTIONS | --auto-instructions] [--file PATH] [--allow-discovery] [--max-output-tokens N]".into());
+            return Err("usage: code-agent-setup prepare NEW_ABSOLUTE_PATH | check-config WORKSPACE CARGO RUSTC | verify WORKSPACE CARGO RUSTC | run-offline WORKSPACE CARGO RUSTC [--rust-analyzer EXECUTABLE] | check-workspace WORKSPACE SOURCE CHECKER PROVIDER MODEL [INSTRUCTIONS | --auto-instructions] [--file PATH] [--new-file PATH] [--assume-exclusive-workspace] [--allow-discovery] [--max-output-tokens N] [--checker-timeout-ms N] | run-workspace --trust-checker --share-source WORKSPACE SOURCE CHECKER PROVIDER MODEL [INSTRUCTIONS | --auto-instructions] [--file PATH] [--new-file PATH] [--assume-exclusive-workspace] [--allow-discovery] [--max-output-tokens N] [--checker-timeout-ms N] | check-root WORKSPACE CHECKER PROVIDER MODEL --protect PATH [--protect PATH] [INSTRUCTIONS] [--assume-exclusive-workspace] [--max-output-tokens N] [--checker-timeout-ms N] | run-root --trust-checker --share-workspace WORKSPACE CHECKER PROVIDER MODEL --protect PATH [--protect PATH] [INSTRUCTIONS] [--assume-exclusive-workspace] [--max-output-tokens N] [--checker-timeout-ms N] | check-read-only WORKSPACE SOURCE PROVIDER MODEL [INSTRUCTIONS | --auto-instructions] [--file PATH] [--allow-discovery] [--max-output-tokens N] | run-read-only --share-source WORKSPACE SOURCE PROVIDER MODEL [INSTRUCTIONS | --auto-instructions] [--file PATH] [--allow-discovery] [--max-output-tokens N]".into());
         }
     }
     Ok(())

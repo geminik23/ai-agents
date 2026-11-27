@@ -66,32 +66,72 @@ async fn live_servers_use_current_documents_through_the_same_tool() {
             LspDiagnostics::rust_analyzer(config, || Some("exclusive-test-inputs".into())).unwrap(),
         ))
     };
+    let target = root.join(PATH);
+    let absolute = target.to_str().unwrap();
     install(server(root, "AI_AGENTS_RUST_ANALYZER", PATH));
-    let (_, scope, evidence) = observe(runtime.clone(), PATH).await;
+    let (_, scope, evidence) = observe(runtime.clone(), absolute).await;
+    assert_outcomes(&scope, &evidence, GateOutcome::Fail);
+    let mut config = server(root, "AI_AGENTS_RUST_ANALYZER", PATH);
+    config.inputs.push("rust-analyzer.toml".into());
+    fs::write(
+        root.join("rust-analyzer.toml"),
+        "[diagnostics]\nenable = false\n",
+    )
+    .unwrap();
+    install(config);
+    let (_, scope, evidence) = observe(runtime.clone(), absolute).await;
+    assert_outcomes(&scope, &evidence, GateOutcome::Unknown);
+    fs::write(
+        root.join("rust-analyzer.toml"),
+        "[diagnostics]\nenable = true\n",
+    )
+    .unwrap();
+    let mut config = server(root, "AI_AGENTS_RUST_ANALYZER", PATH);
+    config.inputs.push("rust-analyzer.toml".into());
+    config.initialization_options = json!({"cargo":{"features":["selected"]}});
+    fs::OpenOptions::new()
+        .append(true)
+        .open(root.join("Cargo.toml"))
+        .unwrap()
+        .write_all(b"\n[features]\nselected = []\n")
+        .unwrap();
+    fs::write(
+        root.join(PATH),
+        format!("#[cfg(feature = \"selected\")]\n{ORIGINAL}"),
+    )
+    .unwrap();
+    install(config);
+    let (_, scope, evidence) = observe(runtime.clone(), absolute).await;
     assert_outcomes(&scope, &evidence, GateOutcome::Fail);
     fs::write(root.join(PATH), ORIGINAL.replace(BROKEN_LINE, FIX)).unwrap();
-    let (_, scope, evidence) = observe(runtime.clone(), PATH).await;
+    let (_, scope, evidence) = observe(runtime.clone(), absolute).await;
     assert_outcomes(&scope, &evidence, GateOutcome::Pass);
     let (_, scope, evidence) = observe(runtime.clone(), ".").await;
     assert_outcomes(&scope, &evidence, GateOutcome::Unknown);
 
+    // A discovered project override must travel with its snapshot, even when it currently enables analysis.
+    install(server(root, "AI_AGENTS_RUST_ANALYZER", PATH));
+    let (_, scope, evidence) = observe(runtime.clone(), absolute).await;
+    assert_outcomes(&scope, &evidence, GateOutcome::Unknown);
+    fs::remove_file(root.join("rust-analyzer.toml")).unwrap();
     let mut config = server(root, "AI_AGENTS_RUST_ANALYZER", "outside.rs");
     fs::write(root.join("outside.rs"), "").unwrap();
     config.inputs.push(PATH.into());
     install(config);
-    let (_, scope, evidence) = observe(runtime.clone(), "outside.rs").await;
+    let (_, scope, evidence) =
+        observe(runtime.clone(), root.join("outside.rs").to_str().unwrap()).await;
     assert_outcomes(&scope, &evidence, GateOutcome::Unknown);
 
     let mut config = server(root, "AI_AGENTS_RUST_ANALYZER", PATH);
     config.initialization_options = json!({"diagnostics":{"enable":false}});
     install(config);
-    let (_, scope, evidence) = observe(runtime.clone(), PATH).await;
+    let (_, scope, evidence) = observe(runtime.clone(), absolute).await;
     assert_outcomes(&scope, &evidence, GateOutcome::Unknown);
 
     let mut config = server(root, "AI_AGENTS_RUST_ANALYZER", PATH);
     config.program = root.join("not-installed");
     install(config);
-    let (_, scope, evidence) = observe(runtime.clone(), PATH).await;
+    let (_, scope, evidence) = observe(runtime.clone(), absolute).await;
     assert_outcomes(&scope, &evidence, GateOutcome::Unknown);
 
     let mut registration: Value = serde_json::from_str(include_str!("ruff.json")).unwrap();
@@ -105,14 +145,32 @@ async fn live_servers_use_current_documents_through_the_same_tool() {
     let ruff = LspDiagnostics::new(config, || Some("exclusive-test-inputs".into())).unwrap();
     assert!(LspDiagnosticsHost::new(vec![rust.clone(), rust.clone()]).is_err());
     runtime.set_diagnostics_provider(Arc::new(LspDiagnosticsHost::new(vec![rust, ruff]).unwrap()));
-    let (_, scope, evidence) = observe(runtime.clone(), PATH).await;
+    let (_, scope, evidence) = observe(runtime.clone(), absolute).await;
     assert_outcomes(&scope, &evidence, GateOutcome::Pass);
-    fs::write(root.join("diagnostic.py"), "print(missing)\n").unwrap();
-    let (_, scope, evidence) = observe(runtime.clone(), "diagnostic.py").await;
-    assert_outcomes(&scope, &evidence, GateOutcome::Fail);
-    fs::write(root.join("diagnostic.py"), "print('defined')\n").unwrap();
-    let (_, scope, evidence) = observe(runtime, "diagnostic.py").await;
-    assert_outcomes(&scope, &evidence, GateOutcome::Pass);
+    let python = root.join("diagnostic.py");
+    for (source, settings, count) in [
+        ("print(missing)\n", "[tool.ruff]\n", 1),
+        ("print('defined')\n", "[tool.ruff]\n", 0),
+        (
+            "print(missing)\n",
+            "[tool.ruff]\nexclude=['diagnostic.py']\n",
+            0,
+        ),
+    ] {
+        fs::write(&python, source).unwrap();
+        fs::write(root.join("pyproject.toml"), settings).unwrap();
+        let (state, scope, evidence) = observe(runtime.clone(), python.to_str().unwrap()).await;
+        let ObservationResult::Tool { record } = &state.completed["observe"].result else {
+            panic!("expected diagnostics record")
+        };
+        let output: Value = serde_json::from_str(&record.output).unwrap();
+        assert_eq!(output["available"], true, "{output}");
+        assert_eq!(output["count"], count, "{output}");
+        if count == 1 {
+            assert_eq!(output["diagnostics"][0]["code"], "F821");
+        }
+        assert_outcomes(&scope, &evidence, GateOutcome::Unknown);
+    }
 }
 
 // A new host generation cannot inherit the previous guard's revision counter.
@@ -256,7 +314,7 @@ impl LLMProvider for EditProgram {
         let content = match self.cursor.fetch_add(1, Ordering::SeqCst) {
             0 => json!({"tool":"file_read","arguments":{"path":self.target}}).to_string(),
             1 => json!({"tool":"file_edit","arguments":{"path":self.target,"old_text":BROKEN_LINE,"new_text":FIX}}).to_string(),
-            2 => json!({"tool":"diagnostics","arguments":{"path":PATH}}).to_string(),
+            2 => json!({"tool":"diagnostics","arguments":{"path":self.target}}).to_string(),
             3 => json!({"tool":"ask_user","arguments":{"question":"Confirm the edit","options":["yes"],"allow_other":false}}).to_string(),
             4 => "done".into(),
             _ => return Err(LLMError::Config("unexpected repeated or extra model work".into())),
@@ -355,10 +413,17 @@ async fn process_worker() {
     }
     let saved: Value = serde_json::from_slice(&fs::read(receipt).unwrap()).unwrap();
     let id = saved["id"].as_str().unwrap();
-    let (runner, paused) = host
+    let restored = host
         .restore(id.into(), saved["revision"].as_u64().unwrap())
-        .await
-        .unwrap();
+        .await;
+    if mode == "resume-rebound" {
+        let error = restored
+            .err()
+            .expect("different installed server must refuse restoration");
+        assert!(error.to_string().contains("binding"), "{error}");
+        return;
+    }
+    let (runner, paused) = restored.unwrap();
     let review = runner.restoration_review(id).await.unwrap().unwrap();
     let reviewed = runner
         .approve_restoration(
@@ -412,6 +477,11 @@ async fn process_worker() {
     );
     assert!(diagnostics.next().is_none());
     let output: Value = serde_json::from_str(&diagnostics_record.record.output).unwrap();
+    if mode == "resume-unavailable" {
+        assert_eq!(output["available"], false, "{output}");
+        assert_ne!(outcome.run.status, TaskRunStatus::Completed);
+        return;
+    }
     assert_eq!(output["available"], true, "{output}");
     if mode == "resume-current" {
         assert_eq!(
@@ -437,7 +507,12 @@ async fn process_worker() {
 #[tokio::test]
 #[ignore = "requires rust-analyzer and native Linux restoration clock evidence"]
 async fn restart_with_live_rust_diagnostics_does_not_replay_the_edit() {
-    for mode in ["resume-current", "resume-changed"] {
+    for mode in [
+        "resume-current",
+        "resume-changed",
+        "resume-rebound",
+        "resume-unavailable",
+    ] {
         let directory = tempfile::tempdir().unwrap();
         let project_root = directory.path().join("project");
         project(&project_root);
@@ -453,7 +528,7 @@ tool_security:
   enabled: true
   tools:
     file_read: {{allow_without_confirmation: true}}
-    file_edit: {{allow_without_confirmation: true, require_read_before_write: true, write_paths: ['{}']}}
+    file_edit: {{allow_without_confirmation: true, require_read_before_write: true, write_paths: ['{0}']}}
     diagnostics: {{allow_without_confirmation: true}}
 autonomy:
   enabled: true
@@ -463,15 +538,24 @@ autonomy:
   persistence: {{enabled: true, resume_on_start: true}}
   hitl: {{on_user_question: pause_run, on_approval_required: pause_run}}
   validation:
-    checks: [{{id: syntax, adapter: builtin.diagnostics, config: {{path: src/lib.rs}}}}]
+    checks: [{{id: syntax, adapter: builtin.diagnostics, config: {{path: '{0}'}}}}]
   completion: {{all: [{{response_contains: done}}, {{validator_passed: syntax}}]}}
-storage: {{type: sqlite, path: '{}'}}
+storage: {{type: sqlite, path: '{1}'}}
 "#,
                 project_root.join(PATH).display(), root.join("tasks.sqlite").display()
             ),
         )
         .unwrap();
+        let registered = root.join("language-server");
+        std::os::unix::fs::symlink(
+            std::env::var("AI_AGENTS_RUST_ANALYZER").unwrap(),
+            &registered,
+        )
+        .unwrap();
         for step in ["seed", mode] {
+            if step == "resume-unavailable" {
+                fs::remove_file(&registered).unwrap();
+            }
             if step == "resume-changed" {
                 fs::write(project_root.join(PATH), ORIGINAL).unwrap();
             }
@@ -485,6 +569,14 @@ storage: {{type: sqlite, path: '{}'}}
                 worker
                     .args(["--exact", "lsp_acceptance::process_worker", "--nocapture"])
                     .env("AI_AGENTS_LSP_PROCESS_MODE", step)
+                    .env(
+                        "AI_AGENTS_RUST_ANALYZER",
+                        if step == "resume-rebound" {
+                            root.join("different-server")
+                        } else {
+                            registered.clone()
+                        },
+                    )
                     .current_dir(root)
                     .kill_on_drop(true)
                     .output(),
@@ -569,7 +661,9 @@ async fn lsp_stale_partial_crashed_and_cancelled_sessions_never_supply_clean_evi
             revision.clone(),
         )));
         let current = agent.clone();
-        let observation = tokio::spawn(async move { observe(current, PATH).await });
+        let file = root.join(PATH);
+        let observation =
+            tokio::spawn(async move { observe(current, file.to_str().unwrap()).await });
         if mode == "wait" {
             wait_until(|| control.join("collecting").exists()).await;
             // The target path is unchanged, but a related input invalidates the held clean response.
@@ -582,17 +676,35 @@ async fn lsp_stale_partial_crashed_and_cancelled_sessions_never_supply_clean_evi
             revision.fetch_add(1, Ordering::SeqCst);
             fs::write(control.join("release"), "").unwrap();
         }
-        let (_, scope, evidence) = observation.await.unwrap();
+        let (state, scope, evidence) = observation.await.unwrap();
+        let ObservationResult::Tool { record } = &state.completed["observe"].result else {
+            panic!("missing diagnostics record")
+        };
+        assert_eq!(
+            serde_json::from_str::<Value>(&record.output).unwrap()["available"],
+            false
+        );
         assert_outcomes(&scope, &evidence, GateOutcome::Unknown);
     }
     let control = root.join("cancel");
     fs::create_dir(&control).unwrap();
     let provider = controlled(root, &control, "wait", revision);
+    assert!(
+        !provider
+            .diagnostics(DiagnosticsRequest {
+                path: Some(PATH.into()),
+                ..Default::default()
+            })
+            .await
+            .available
+    );
+    assert!(!control.join("pid").exists());
     let current = provider.clone();
+    let file = root.join(PATH).to_str().unwrap().to_owned();
     let observation = tokio::spawn(async move {
         current
             .diagnostics(DiagnosticsRequest {
-                path: Some(PATH.into()),
+                path: Some(file),
                 ..Default::default()
             })
             .await
@@ -606,10 +718,76 @@ async fn lsp_stale_partial_crashed_and_cancelled_sessions_never_supply_clean_evi
     assert!(
         provider
             .diagnostics(DiagnosticsRequest {
-                path: Some(PATH.into()),
+                path: Some(root.join(PATH).to_str().unwrap().into()),
                 ..Default::default()
             })
             .await
             .available
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires Python for the controllable stdio peer"]
+async fn tool_policy_and_registered_document_share_one_path() {
+    if let Some(other) = std::env::var_os("AI_AGENTS_OTHER_DOCUMENT_ROOT") {
+        let registered_root = PathBuf::from(other);
+        let cwd = std::env::current_dir().unwrap();
+        let provider = controlled(
+            &registered_root,
+            &registered_root,
+            "partial",
+            Arc::new(AtomicU64::new(1)),
+        );
+        let yaml = format!(
+            "name: PolicyPath\nsystem_prompt: test\ntools: [diagnostics]\ntool_security:\n  enabled: true\n  tools:\n    diagnostics:\n      read_paths: ['{}']\n",
+            cwd.display()
+        );
+        let runtime = Arc::new(
+            AgentBuilder::from_yaml(&yaml)
+                .unwrap()
+                .llm(Arc::new(MockLLMProvider::new("path")))
+                .auto_configure_features()
+                .unwrap()
+                .autonomy_extensions(AutonomyExtensions::builtins())
+                .build()
+                .unwrap(),
+        );
+        runtime.set_diagnostics_provider(Arc::new(provider));
+        for (path, executed) in [
+            (PATH.to_string(), true),
+            (registered_root.join(PATH).display().to_string(), false),
+        ] {
+            let (state, scope, evidence) = observe(runtime.clone(), &path).await;
+            let ObservationResult::Tool { record } = &state.completed["observe"].result else {
+                panic!("missing policy record")
+            };
+            assert_eq!(record.executed, executed, "{}", record.output);
+            assert_outcomes(&scope, &evidence, GateOutcome::Unknown);
+            assert!(!registered_root.join("pid").exists());
+        }
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let allowed = directory.path().join("allowed");
+    let registered = directory.path().join("registered");
+    for root in [&allowed, &registered] {
+        project(root);
+    }
+    let output = tokio::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "lsp_acceptance::tool_policy_and_registered_document_share_one_path",
+            "--ignored",
+            "--nocapture",
+        ])
+        .current_dir(allowed)
+        .env("AI_AGENTS_OTHER_DOCUMENT_ROOT", registered)
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }

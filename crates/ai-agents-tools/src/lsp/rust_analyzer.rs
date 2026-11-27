@@ -5,7 +5,7 @@ use super::{DocumentReadiness, LspDiagnostics, LspDiagnosticsConfig};
 use async_trait::async_trait;
 use reqwest::Url;
 use serde_json::{Value, json};
-use std::{io, sync::Arc};
+use std::{collections::BTreeSet, io, path::Path, sync::Arc};
 
 struct RustAnalyzer;
 
@@ -31,21 +31,39 @@ impl DocumentReadiness for RustAnalyzer {
         if !options.is_null() && !options.is_object() {
             return Err(invalid("invalid rust-analyzer initialization options"));
         }
-        for (key, required) in [
-            ("checkOnSave", json!(false)),
-            (
-                "cargo",
-                json!({"buildScripts":{"enable":false},"offline":true}),
-            ),
-            ("procMacro", json!({"enable":false})),
-            ("diagnostics", json!({"enable":true})),
-        ] {
-            if options.get(key).is_some_and(|value| *value != required) {
-                return Err(invalid(
-                    "settings conflict with the native Rust diagnostic scope",
-                ));
+        apply_native_scope(options)
+    }
+
+    fn certifies_coverage(&self) -> bool {
+        true
+    }
+
+    async fn validate_snapshot(
+        &self,
+        config: &LspDiagnosticsConfig,
+        scratch: &Path,
+    ) -> io::Result<()> {
+        // Project and crate settings take precedence over client initialization. Verify the
+        // actual copied inputs; a missing declared override must not turn disabled diagnostics on.
+        let directories: BTreeSet<_> = config
+            .inputs
+            .iter()
+            .flat_map(|input| input.parent().into_iter().flat_map(Path::ancestors))
+            .collect();
+        for directory in directories {
+            for name in ["rust-analyzer.toml", ".rust-analyzer.toml"] {
+                let relative = directory.join(name);
+                if tokio::fs::try_exists(config.root.join(&relative)).await? {
+                    let text = tokio::fs::read_to_string(scratch.join(&relative))
+                        .await
+                        .map_err(|_| {
+                            invalid("Rust project settings missing from diagnostic inputs")
+                        })?;
+                    let mut settings: Value = toml::from_str(&text)
+                        .map_err(|_| invalid("invalid Rust project settings"))?;
+                    apply_native_scope(&mut settings)?;
+                }
             }
-            options[key] = required;
         }
         Ok(())
     }
@@ -87,4 +105,41 @@ impl DocumentReadiness for RustAnalyzer {
         }
         Ok(())
     }
+}
+
+// Use the same required leaves when constructing client settings and checking higher-priority project settings.
+fn apply_native_scope(options: &mut Value) -> io::Result<()> {
+    merge_required(
+        options,
+        &json!({
+            "checkOnSave":false,
+            "cargo":{"buildScripts":{"enable":false},"extraEnv":{"CARGO_NET_OFFLINE":"true"}},
+            "procMacro":{"enable":false},
+            "diagnostics":{"enable":true}
+        }),
+    )
+}
+
+// Insert missing contract fields without replacing host options at adjacent leaves.
+fn merge_required(options: &mut Value, required: &Value) -> io::Result<()> {
+    if let Some(fields) = required.as_object() {
+        if options.is_null() {
+            *options = json!({});
+        }
+        let target = options
+            .as_object_mut()
+            .ok_or_else(|| invalid("invalid rust-analyzer option group"))?;
+        for (key, value) in fields {
+            if let Some(existing) = target.get_mut(key) {
+                merge_required(existing, value)?;
+            } else {
+                target.insert(key.clone(), value.clone());
+            }
+        }
+    } else if options != required {
+        return Err(invalid(
+            "settings conflict with the native Rust diagnostic scope",
+        ));
+    }
+    Ok(())
 }

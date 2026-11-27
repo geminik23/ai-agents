@@ -48,6 +48,91 @@ impl PreparedConfiguration {
         ))
     }
 
+    // Add a document check to the same task as the independent sample verifier.
+    // Only the selected source is mutable; the host owns all other sample inputs.
+    pub fn with_rust_diagnostics(
+        &mut self,
+        analyzer: &Path,
+    ) -> Result<(AgentBuilder, ai_agents::autonomy::AutonomyExtensions)> {
+        use ai_agents::autonomy::{AutonomyExtensions, CompletionGate};
+        use ai_agents::tools::{
+            CommandTool, DiagnosticsTool, ToolRegistry, WorkspaceGuard, WorkspaceScope,
+            lsp::{LspDiagnostics, LspDiagnosticsConfig},
+        };
+        use std::sync::Arc;
+        let source = self.source_file();
+        let guard = WorkspaceGuard::new(
+            &self.root,
+            WorkspaceScope::Selected(vec![source.clone()]),
+            vec![],
+        )?;
+        let mut tools = ToolRegistry::new();
+        guard.install(&mut tools)?;
+        tools.register(Arc::new(CommandTool::new(tools.command_runner_slot())))?;
+        tools.register(Arc::new(DiagnosticsTool::new(
+            tools.diagnostics_provider_slot(),
+        )))?;
+        let mut env = std::collections::BTreeMap::new();
+        let toolchain = self.cargo.parent().ok_or("missing toolchain directory")?;
+        env.insert(
+            "PATH".into(),
+            toolchain.to_str().ok_or("invalid toolchain path")?.into(),
+        );
+        if let Ok(home) = std::env::var("HOME") {
+            env.insert("HOME".into(), home);
+        }
+        let config = LspDiagnosticsConfig {
+            root: self.root.clone(),
+            program: analyzer.to_owned(),
+            args: vec![],
+            env,
+            documents: vec!["src/lib.rs".into()],
+            inputs: vec![
+                "Cargo.toml".into(),
+                "Cargo.lock".into(),
+                "tests/acceptance.rs".into(),
+            ],
+            language_id: "rust".into(),
+            initialization_options: serde_json::Value::Null,
+            timeout_ms: self.spec.tool_security.default_timeout_ms,
+        };
+        let revision = guard.clone();
+        tools.set_diagnostics_provider(Arc::new(LspDiagnostics::rust_analyzer(
+            config,
+            move || revision.revision(),
+        )?));
+        let mut extensions = AutonomyExtensions::builtins();
+        extensions.register_validation_target("document", "sample-workspace", guard)?;
+        self.spec
+            .tools
+            .as_mut()
+            .ok_or("missing sample grants")?
+            .push(ai_agents::spec::ToolEntry::Simple("diagnostics".into()));
+        let policy = self
+            .spec
+            .tool_security
+            .tools
+            .entry("diagnostics".into())
+            .or_default();
+        policy.read_paths = vec![command_word(&source)?];
+        policy.allow_without_confirmation = true;
+        let defaults = &mut self.spec.autonomy.defaults;
+        defaults
+            .validation
+            .as_mut()
+            .and_then(|v| v.checks.as_mut())
+            .ok_or("missing sample validation")?
+            .push(serde_json::from_value(
+                json!({"id":"document","adapter":"builtin.diagnostics","config":{"path":source}}),
+            )?);
+        let Some(CompletionGate::All(gates)) = &mut defaults.completion else {
+            return Err("missing sample completion conditions".into());
+        };
+        gates.push(CompletionGate::ValidatorPassed("document".into()));
+        self.spec.validate()?;
+        Ok((self.builder().tools(tools), extensions))
+    }
+
     // The application configuration and independent fixture check use the same resolved bindings.
     pub fn verify_fixture(&self) -> Result<Verification> {
         verify(&self.root, &self.cargo, &self.rustc)

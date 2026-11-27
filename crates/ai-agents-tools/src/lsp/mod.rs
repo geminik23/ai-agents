@@ -64,6 +64,19 @@ trait DocumentReadiness: Send + Sync {
 
     fn supports(&self, diagnostic_provider: &Value) -> bool;
 
+    // A full report may be empty even for excluded documents. Only a checked adapter can certify coverage.
+    fn certifies_coverage(&self) -> bool {
+        false
+    }
+
+    async fn validate_snapshot(
+        &self,
+        _config: &LspDiagnosticsConfig,
+        _scratch: &Path,
+    ) -> io::Result<()> {
+        Ok(())
+    }
+
     async fn ready(&self, _session: &mut Session, _uri: &Url) -> io::Result<()> {
         Ok(())
     }
@@ -132,14 +145,12 @@ impl LspDiagnostics {
         })
     }
 
-    fn document(&self, path: Option<&str>) -> io::Result<&Path> {
-        let path = Path::new(path.ok_or_else(|| invalid("document path required"))?);
-        let path = if path.is_absolute() {
-            path.strip_prefix(&self.config.root)
-                .map_err(|_| invalid("document outside workspace"))?
-        } else {
-            path
-        };
+    fn document(&self, absolute: &Path) -> io::Result<&Path> {
+        // Tool policy resolves relative operands against the process working directory.
+        // Keep the same operand through registration lookup, admission and snapshot collection.
+        let path = absolute
+            .strip_prefix(&self.config.root)
+            .map_err(|_| invalid("document outside workspace"))?;
         self.config
             .documents
             .iter()
@@ -229,7 +240,7 @@ impl LspDiagnostics {
             .as_array()
             .ok_or_else(|| invalid("missing diagnostic items"))?
             .iter()
-            .map(|item| diagnostic(document, item))
+            .map(|item| diagnostic(&self.config.root.join(document), item))
             .collect::<io::Result<Vec<_>>>()?;
         session
             .notify(
@@ -247,10 +258,10 @@ impl LspDiagnostics {
 
     async fn collect(
         &self,
-        path: Option<&str>,
+        absolute: &Path,
         result: &mut oneshot::Sender<io::Result<Vec<DiagnosticItem>>>,
     ) -> io::Result<Vec<DiagnosticItem>> {
-        let document = self.document(path)?;
+        let document = self.document(absolute)?;
         let deadline = tokio::time::Instant::now()
             .checked_add(Duration::from_millis(self.config.timeout_ms))
             .ok_or_else(|| invalid("invalid diagnostic collection deadline"))?;
@@ -261,7 +272,13 @@ impl LspDiagnostics {
         let revision =
             (self.revision)().ok_or_else(|| invalid("workspace revision unavailable"))?;
         let scratch = tempfile::tempdir()?;
-        tokio::time::timeout_at(deadline, self.snapshot(scratch.path())).await??;
+        tokio::time::timeout_at(deadline, async {
+            self.snapshot(scratch.path()).await?;
+            self.readiness
+                .validate_snapshot(&self.config, scratch.path())
+                .await
+        })
+        .await??;
         if result.is_closed() || (self.revision)().as_ref() != Some(&revision) {
             return Err(invalid("diagnostic input changed or request was cancelled"));
         }
@@ -289,14 +306,29 @@ impl LspDiagnostics {
     }
 }
 
-#[async_trait]
-impl DiagnosticsProvider for LspDiagnostics {
-    async fn diagnostics(&self, request: DiagnosticsRequest) -> DiagnosticsResponse {
+fn query_path(request: &DiagnosticsRequest) -> io::Result<PathBuf> {
+    let path = request
+        .path
+        .as_deref()
+        .ok_or_else(|| invalid("document path required"))?;
+    crate::security::path::PathPolicyResolver::new()
+        .and_then(|resolver| resolver.resolve_path(Path::new(path)))
+        .map_err(|_| invalid("invalid diagnostic document path"))
+}
+
+fn unavailable_document() -> DiagnosticsResponse {
+    DiagnosticsResponse {
+        message: Some("document is outside the registered diagnostic scope".into()),
+        ..Default::default()
+    }
+}
+
+impl LspDiagnostics {
+    async fn report(&self, request: DiagnosticsRequest, absolute: PathBuf) -> DiagnosticsResponse {
         let (mut send, receive) = oneshot::channel();
         let host = self.clone();
-        let path = request.path;
         tokio::spawn(async move {
-            let collected = host.collect(path.as_deref(), &mut send).await;
+            let collected = host.collect(&absolute, &mut send).await;
             let _ = send.send(collected);
         });
         let mut diagnostics = match receive.await {
@@ -330,10 +362,24 @@ impl DiagnosticsProvider for LspDiagnostics {
                 diagnostics.truncate(limit);
                 "language server diagnostics exceeded the result limit".into()
             });
+        let message = message.or_else(|| {
+            (!self.readiness.certifies_coverage())
+                .then(|| "Document coverage is unverified; diagnostics are advisory".into())
+        });
         DiagnosticsResponse {
             available: true,
             diagnostics,
             message,
+        }
+    }
+}
+
+#[async_trait]
+impl DiagnosticsProvider for LspDiagnostics {
+    async fn diagnostics(&self, request: DiagnosticsRequest) -> DiagnosticsResponse {
+        match query_path(&request) {
+            Ok(absolute) => self.report(request, absolute).await,
+            Err(_) => unavailable_document(),
         }
     }
 }
@@ -370,17 +416,17 @@ impl LspDiagnosticsHost {
 #[async_trait]
 impl DiagnosticsProvider for LspDiagnosticsHost {
     async fn diagnostics(&self, request: DiagnosticsRequest) -> DiagnosticsResponse {
+        let Ok(absolute) = query_path(&request) else {
+            return unavailable_document();
+        };
         if let Some(server) = self
             .servers
             .iter()
-            .find(|server| server.document(request.path.as_deref()).is_ok())
+            .find(|server| server.document(&absolute).is_ok())
         {
-            server.diagnostics(request).await
+            server.report(request, absolute).await
         } else {
-            DiagnosticsResponse {
-                message: Some("document is outside the registered diagnostic scope".into()),
-                ..Default::default()
-            }
+            unavailable_document()
         }
     }
 }

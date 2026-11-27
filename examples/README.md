@@ -664,6 +664,8 @@ cargo run --manifest-path examples/Cargo.toml -p example-code-agent --bin code-a
 cargo run --manifest-path examples/Cargo.toml -p example-code-agent --bin code-agent-setup --offline -- run-offline /tmp/code-agent-sample "$CARGO_BIN" "$RUSTC_BIN"
 ```
 
+Append `--rust-analyzer /absolute/path/to/rust-analyzer` to `run-offline` to require fresh native diagnostics for the edited file alongside the command checker. The caller supplies a trusted executable and exclusive use of the disposable sample.
+
 `prepare` refuses to overwrite an existing path. `check-config` neither constructs a provider nor starts a task. `run-offline` requires the original failing sample and cannot be repeated on the already fixed workspace; prepare a new directory for another run.
 
 The sample verifier accepts only the original source or its exact reviewed reference correction. It checks the protected manifest, lockfile, instructions and test bytes, rejects extra entries and source changes during verification, and requires all five named tests. The verifier retains temporary evidence; timeout or a dropped process does not prove descendant cleanup.
