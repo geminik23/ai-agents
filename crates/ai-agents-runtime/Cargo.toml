@@ -55,6 +55,7 @@ jsonschema = { version = "0.62", default-features = false }
 libc = "0.2"
 
 [dev-dependencies]
+tempfile = "3"
 ai-agents-llm = { workspace = true, features = ["test-util"] }
 
 [features]

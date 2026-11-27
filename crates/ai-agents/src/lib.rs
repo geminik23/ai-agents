@@ -515,6 +515,7 @@ pub mod tools {
         ToolPolicyBindings, ToolPolicyDecisionRecord, ToolResult, ToolSafetyMetadata,
         ToolSideEffectLevel,
     };
+    pub use ai_agents_tools::lsp;
     pub use ai_agents_tools::{
         AskUserTool, CalculatorTool, CommandExecutionState, CommandRequest, CommandResponse,
         CommandRunner, CommandRunnerSlot, CommandTool, ConditionEvaluator, CopyPathTool,

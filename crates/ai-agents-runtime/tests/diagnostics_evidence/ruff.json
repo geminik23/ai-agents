@@ -1,0 +1,7 @@
+{
+  "args": ["server"],
+  "documents": ["diagnostic.py"],
+  "language_id": "python",
+  "initialization_options": {"settings": {"lint": {"select": ["F821"]}}},
+  "timeout_ms": 10000
+}

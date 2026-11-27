@@ -563,3 +563,7 @@ async fn validation_error(agent: Arc<RuntimeAgent>, path: &str) -> String {
         .expect_err("invalid diagnostics must not pass")
         .to_string()
 }
+
+#[cfg(all(feature = "sqlite", target_os = "linux"))]
+#[path = "diagnostics_evidence/lsp_acceptance.rs"]
+mod lsp_acceptance;
