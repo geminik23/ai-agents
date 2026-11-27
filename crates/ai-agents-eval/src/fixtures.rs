@@ -1346,6 +1346,19 @@ pub fn build_llm_registry(
     fixtures: &LlmFixtureConfig,
     base_dir: &Path,
 ) -> Result<(LLMRegistry, Option<Arc<dyn LLMProvider>>)> {
+    build_llm_registry_with(spec, fixtures, base_dir, |_, provider| provider)
+}
+
+// Install scenario recording and budget layers only around providers that can actually dispatch.
+pub(crate) fn build_llm_registry_with(
+    spec: &AgentSpec,
+    fixtures: &LlmFixtureConfig,
+    base_dir: &Path,
+    prepare_generation: impl Fn(
+        &ai_agents_runtime::spec::LLMConfig,
+        Arc<dyn LLMProvider>,
+    ) -> Arc<dyn LLMProvider>,
+) -> Result<(LLMRegistry, Option<Arc<dyn LLMProvider>>)> {
     let mut registry = LLMRegistry::new();
     let aliases = if spec.llms.is_empty() {
         vec![(
@@ -1377,6 +1390,13 @@ pub fn build_llm_registry(
     let mut judge_provider = None;
 
     for (alias, config) in aliases {
+        if ai_agents_llm::providers::unified::is_choice_protocol(
+            config.extra.get("protocol").and_then(Value::as_str),
+        ) {
+            // Keep role resolution exact without opening a paid client or consuming a text fixture.
+            registry.register(alias, Arc::new(UnavailableChoiceFixture));
+            continue;
+        }
         let fixture_delay_ms = fixtures.delays_by_alias.get(&alias).copied().unwrap_or(0);
         let provider = match fixtures.mode {
             LlmFixtureMode::Mock => {
@@ -1386,7 +1406,7 @@ pub fn build_llm_registry(
                     load_fixture_outcomes_for_alias(fixtures, &alias, &fixture_responses);
                 Arc::new(
                     SequenceLLMProvider::new(fixture_outcomes, fixture_delay_ms)
-                        .with_tool_choice(config.tool_choice.clone()),
+                        .with_tools(FixtureTools::from_spec(&config)?),
                 ) as Arc<dyn LLMProvider>
             }
             LlmFixtureMode::Replay => Arc::new(
@@ -1396,7 +1416,7 @@ pub fn build_llm_registry(
                     cassette_records.clone(),
                     fixture_delay_ms,
                 )
-                .with_tool_choice(config.tool_choice.clone()),
+                .with_tools(FixtureTools::from_spec(&config)?),
             ) as Arc<dyn LLMProvider>,
             LlmFixtureMode::Real => build_real_provider(&config)?,
             LlmFixtureMode::Record => {
@@ -1416,7 +1436,7 @@ pub fn build_llm_registry(
         if judge_provider.is_none() {
             judge_provider = Some(provider.clone());
         }
-        registry.register(alias, provider);
+        registry.register(alias, prepare_generation(&config, provider));
     }
 
     let default_alias = spec.llm.get_default_alias();
@@ -1430,26 +1450,67 @@ pub fn build_llm_registry(
     Ok((registry, judge_provider))
 }
 
+/// Reserves a choice-only alias in every fixture mode until evaluation supports typed decisions.
+struct UnavailableChoiceFixture;
+
+impl UnavailableChoiceFixture {
+    fn error() -> LLMError {
+        LLMError::Config("scenario evaluation does not support structured choice calls".into())
+    }
+}
+
+#[async_trait]
+impl LLMProvider for UnavailableChoiceFixture {
+    fn uses_choice_for_routing(&self) -> bool {
+        true
+    }
+
+    fn validate_choice(
+        &self,
+        _: &ai_agents_core::ChoiceRequest<'_>,
+    ) -> std::result::Result<(), LLMError> {
+        Err(Self::error())
+    }
+
+    async fn complete(
+        &self,
+        _: &[ChatMessage],
+        _: Option<&LLMConfig>,
+    ) -> std::result::Result<LLMResponse, LLMError> {
+        Err(Self::error())
+    }
+
+    async fn complete_stream(
+        &self,
+        _: &[ChatMessage],
+        _: Option<&LLMConfig>,
+    ) -> std::result::Result<
+        Box<dyn Stream<Item = std::result::Result<LLMChunk, LLMError>> + Unpin + Send>,
+        LLMError,
+    > {
+        Err(Self::error())
+    }
+
+    fn is_terminal_error(&self, _: &LLMError) -> bool {
+        true
+    }
+
+    fn provider_name(&self) -> &str {
+        "eval-unavailable-choice"
+    }
+
+    fn supports(&self, _: LLMFeature) -> bool {
+        false
+    }
+}
+
 fn build_real_provider(
     config: &ai_agents_runtime::spec::LLMConfig,
 ) -> Result<Arc<dyn LLMProvider>> {
     use std::str::FromStr;
     let provider_type = ProviderType::from_str(&config.provider)
         .map_err(|error| EvalError::Config(error.to_string()))?;
-    let core_config = ai_agents_core::LLMConfig {
-        temperature: Some(config.temperature),
-        max_tokens: Some(config.max_tokens),
-        top_p: config.top_p,
-        top_k: None,
-        frequency_penalty: None,
-        presence_penalty: None,
-        stop_sequences: None,
-        timeout_seconds: config.timeout_seconds,
-        reasoning: config.reasoning,
-        reasoning_effort: config.reasoning_effort.clone(),
-        reasoning_budget_tokens: config.reasoning_budget_tokens,
-        extra: config.extra.clone(),
-    };
+    let core_config = config.to_provider_config(provider_type);
     let base_url = config.base_url.clone().or_else(|| {
         config
             .extra
@@ -1457,10 +1518,16 @@ fn build_real_provider(
             .and_then(Value::as_str)
             .map(str::to_string)
     });
-    let api_key = config
-        .api_key_env
-        .as_ref()
-        .and_then(|env| std::env::var(env).ok());
+    let api_key = provider_type
+        .configured_api_key_at(
+            config.api_key_env.as_deref(),
+            config
+                .extra
+                .get("protocol")
+                .and_then(serde_json::Value::as_str),
+            base_url.as_deref(),
+        )
+        .map_err(|error| EvalError::Config(error.to_string()))?;
     let mut provider = UnifiedLLMProvider::from_spec_config(
         provider_type,
         &config.model,
@@ -1473,7 +1540,9 @@ fn build_real_provider(
         provider = provider.with_feature_override(LLMFeature::FunctionCalling, value);
     }
     if let Some(choice) = config.tool_choice.clone() {
-        provider = provider.with_tool_choice(choice);
+        provider = provider
+            .with_validated_tool_choice(choice)
+            .map_err(|error| EvalError::Config(error.to_string()))?;
     }
     if let Some(value) = config.vision {
         provider = provider.with_feature_override(LLMFeature::Vision, value);
@@ -1584,6 +1653,47 @@ enum SequenceOutcome {
     },
 }
 
+// Keep fixture transport offline while using the preset's real request capabilities.
+#[derive(Default)]
+struct FixtureTools {
+    preset: Option<ProviderType>,
+    model: String,
+    config: LLMConfig,
+    enabled: Option<bool>,
+    choice: Option<ToolChoice>,
+}
+
+impl FixtureTools {
+    fn from_spec(config: &ai_agents_runtime::spec::LLMConfig) -> Result<Self> {
+        let preset = config.provider.parse::<ProviderType>().ok();
+        let tools = Self {
+            preset,
+            model: config.model.clone(),
+            config: preset
+                .map(|p| config.to_provider_config(p))
+                .unwrap_or_default(),
+            enabled: config.function_calling,
+            choice: config.tool_choice.clone(),
+        };
+        if let (Some(preset), Some(choice)) = (tools.preset, &tools.choice) {
+            preset
+                .validate_declared_tool_choice(&tools.model, &tools.config, tools.enabled, choice)
+                .map_err(|error| EvalError::Config(error.to_string()))?;
+        }
+        Ok(tools)
+    }
+
+    fn allows_prompt(&self) -> bool {
+        self.preset.is_none_or(ProviderType::allows_prompt_tools)
+    }
+
+    fn supports_native(&self, choice: &ToolChoice, synthetic_default: bool) -> bool {
+        self.preset.map_or(synthetic_default, |preset| {
+            preset.supports_native_tool_choice(&self.model, &self.config, self.enabled, choice)
+        })
+    }
+}
+
 /// Deterministic LLM provider returning fixture outcomes in order.
 struct SequenceLLMProvider {
     /// Ordered response and error outcomes used by mock mode.
@@ -1592,7 +1702,7 @@ struct SequenceLLMProvider {
     index: Mutex<usize>,
     /// Fixed delay before returning a response.
     delay_ms: u64,
-    tool_choice: Option<ToolChoice>,
+    tools: FixtureTools,
 }
 
 /// LLM provider replaying cassette records by request hash.
@@ -1605,7 +1715,7 @@ struct ReplayLLMProvider {
     records: Arc<Vec<CassetteRecord>>,
     /// Fixed delay before returning a replayed response.
     delay_ms: u64,
-    tool_choice: Option<ToolChoice>,
+    tools: FixtureTools,
 }
 
 impl SequenceLLMProvider {
@@ -1614,12 +1724,12 @@ impl SequenceLLMProvider {
             outcomes: Arc::new(outcomes),
             index: Mutex::new(0),
             delay_ms,
-            tool_choice: None,
+            tools: FixtureTools::default(),
         }
     }
 
-    fn with_tool_choice(mut self, tool_choice: Option<ToolChoice>) -> Self {
-        self.tool_choice = tool_choice;
+    fn with_tools(mut self, tools: FixtureTools) -> Self {
+        self.tools = tools;
         self
     }
 
@@ -1653,12 +1763,12 @@ impl ReplayLLMProvider {
             model,
             records: Arc::new(records),
             delay_ms,
-            tool_choice: None,
+            tools: FixtureTools::default(),
         }
     }
 
-    fn with_tool_choice(mut self, tool_choice: Option<ToolChoice>) -> Self {
-        self.tool_choice = tool_choice;
+    fn with_tools(mut self, tools: FixtureTools) -> Self {
+        self.tools = tools;
         self
     }
 
@@ -1730,15 +1840,16 @@ impl LLMProvider for ReplayLLMProvider {
         self.response_for_tools(messages, config, request)
     }
 
+    fn allows_prompt_tools(&self) -> bool {
+        self.tools.allows_prompt()
+    }
+
     fn configured_tool_choice(&self) -> Option<ToolChoice> {
-        self.tool_choice.clone()
+        self.tools.choice.clone()
     }
 
     fn supports_tool_choice(&self, choice: &ToolChoice) -> bool {
-        matches!(
-            choice,
-            ToolChoice::Auto | ToolChoice::Required | ToolChoice::Specific(_) | ToolChoice::None
-        )
+        self.tools.supports_native(choice, true)
     }
 
     async fn complete_stream(
@@ -1776,8 +1887,30 @@ impl LLMProvider for SequenceLLMProvider {
         self.next_outcome()
     }
 
+    fn supports_tool_choice(&self, choice: &ToolChoice) -> bool {
+        self.tools.supports_native(choice, false)
+    }
+
+    async fn complete_with_tools(
+        &self,
+        messages: &[ChatMessage],
+        config: Option<&LLMConfig>,
+        request: &LLMToolRequest,
+    ) -> std::result::Result<LLMResponse, LLMError> {
+        if !self.supports_tool_choice(&request.choice) {
+            return Err(LLMError::Config(
+                "fixture cannot perform requested native tool choice".into(),
+            ));
+        }
+        self.complete(messages, config).await
+    }
+
+    fn allows_prompt_tools(&self) -> bool {
+        self.tools.allows_prompt()
+    }
+
     fn configured_tool_choice(&self) -> Option<ToolChoice> {
-        self.tool_choice.clone()
+        self.tools.choice.clone()
     }
 
     async fn complete_stream(
@@ -1992,6 +2125,10 @@ impl LLMProvider for RecordingLLMProvider {
         };
         self.writer.append(&record)?;
         Ok(response)
+    }
+
+    fn allows_prompt_tools(&self) -> bool {
+        self.inner.allows_prompt_tools()
     }
 
     fn configured_tool_choice(&self) -> Option<ToolChoice> {
@@ -2838,6 +2975,67 @@ web_fetch_transport:
                 .unwrap_err()
                 .to_string();
         assert!(error.contains("resposes"));
+    }
+
+    #[tokio::test]
+    async fn tool_contract_mock_and_replay_keep_native_only_text_inert() {
+        use ai_agents_llm::mock::MockLLMProvider;
+        use ai_agents_runtime::{Agent, AgentBuilder};
+
+        let text = r#"{"tool":"echo","arguments":{"message":"sample"}}"#;
+        for choice in [None, Some(ToolChoice::Auto)] {
+            let mut yaml = String::from(
+                "name: Contract\nsystem_prompt: Answer.\ntools: [echo]\nllm:\n  provider: ollama-cloud\n  model: fixture\n",
+            );
+            if choice.is_some() {
+                yaml.push_str("  tool_choice: auto\n");
+            }
+            let spec = serde_yaml::from_str(&yaml).unwrap();
+            let dir = std::env::temp_dir()
+                .join(format!("ai_agents_eval_contract_{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("cassette.jsonl");
+            let mut wire = MockLLMProvider::new("recorded native-only provider");
+            wire.set_prompt_tool_support(false);
+            wire.set_tool_choice(choice.clone());
+            wire.set_response(text);
+            let recorded = Arc::new(RecordingLLMProvider::new(
+                Arc::new(wire.clone()),
+                "default".into(),
+                "fixture".into(),
+                CassetteWriter::shared(path.clone()).unwrap(),
+            ));
+            let agent = AgentBuilder::from_yaml(&yaml)
+                .unwrap()
+                .tools(create_builtin_registry())
+                .llm(recorded)
+                .build()
+                .unwrap();
+            assert_eq!(agent.chat("question").await.unwrap().content, text);
+            let call = wire.last_call().unwrap();
+            assert_eq!(call.request.is_some(), choice.is_some());
+            assert!(!call.messages[0].content.contains("echo"));
+
+            for mode in [LlmFixtureMode::Mock, LlmFixtureMode::Replay] {
+                let fixtures = LlmFixtureConfig {
+                    mode,
+                    responses: vec![text.to_owned()],
+                    cassette: (mode == LlmFixtureMode::Replay).then(|| path.clone()),
+                    ..Default::default()
+                };
+                let (registry, _) = build_llm_registry(&spec, &fixtures, &dir).unwrap();
+                let agent = AgentBuilder::from_yaml(&yaml)
+                    .unwrap()
+                    .tools(create_builtin_registry())
+                    .llm_registry(registry)
+                    .build()
+                    .unwrap();
+                let response = agent.chat("question").await.unwrap();
+                assert_eq!(response.content, text);
+                assert!(agent.tool_call_history().is_empty());
+            }
+            std::fs::remove_dir_all(dir).unwrap();
+        }
     }
 
     #[tokio::test]

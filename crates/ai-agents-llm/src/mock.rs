@@ -35,6 +35,7 @@ struct MockLLMProviderInner {
     features: Vec<LLMFeature>,
     tool_choice: Option<ToolChoice>,
     native_tool_support: bool,
+    prompt_tool_support: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -61,6 +62,7 @@ impl MockLLMProvider {
                 features: vec![LLMFeature::Streaming, LLMFeature::SystemMessages],
                 tool_choice: None,
                 native_tool_support: true,
+                prompt_tool_support: true,
             })),
         }
     }
@@ -116,6 +118,11 @@ impl MockLLMProvider {
         self.inner.write().tool_choice = choice;
     }
 
+    /// Select whether text tool prompts are part of this fixture provider's contract.
+    pub fn set_prompt_tool_support(&mut self, supported: bool) {
+        self.inner.write().prompt_tool_support = supported;
+    }
+
     pub fn set_native_tool_support(&mut self, supported: bool) {
         self.inner.write().native_tool_support = supported;
     }
@@ -149,6 +156,7 @@ impl MockLLMProvider {
         inner.latency_ms = 0;
         inner.tool_choice = None;
         inner.native_tool_support = true;
+        inner.prompt_tool_support = true;
     }
 
     fn get_next_response(&self) -> LLMResponse {
@@ -375,6 +383,10 @@ impl LLMProvider for MockLLMProvider {
 
     fn provider_name(&self) -> &str {
         "mock"
+    }
+
+    fn allows_prompt_tools(&self) -> bool {
+        self.inner.read().prompt_tool_support
     }
 
     fn configured_tool_choice(&self) -> Option<ToolChoice> {

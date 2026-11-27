@@ -121,6 +121,10 @@ impl LLMProvider for MultiLLMRouter {
             .await
     }
 
+    fn allows_prompt_tools(&self) -> bool {
+        self.primary.allows_prompt_tools()
+    }
+
     fn configured_tool_choice(&self) -> Option<ToolChoice> {
         self.primary.configured_tool_choice()
     }

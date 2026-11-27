@@ -911,7 +911,7 @@ if !terminal_seen {
 }
 ```
 
-`chat_stream_events()` emits no `Chunk(StreamChunk::Done {})`. A successful stream ends with exactly one `Final(AgentResponse)` after root-turn finalization. Provider failure, root-future or streaming-task abort, consumer drop, whole-turn timeout, and discarded speculative work do not produce a successful `Final`; consumers must treat EOF before `Final` or a terminal error as incomplete rather than promoting provisional chunks to a completed response. `RuntimeControlHandle::cancel_all()` is narrower: it stops or denies tool work, and the owning root turn may still recover and produce `Final`. Expected HITL rejection also finalizes an authoritative cancellation response such as `Operation cancelled: ...` because the turn completed normally with a rejected action.
+`chat_stream_events()` emits no `Chunk(StreamChunk::Done {})`. A successful stream ends with exactly one `Final(AgentResponse)` after root-turn finalization. An explicit non-success provider text finish, provider failure, root-future or streaming-task abort, consumer drop, whole-turn timeout, and discarded speculative work do not produce a successful `Final`; consumers must treat EOF before `Final` or a terminal error as incomplete rather than promoting provisional chunks to a completed response. `RuntimeControlHandle::cancel_all()` is narrower: it stops or denies tool work, and the owning root turn may still recover and produce `Final`. Expected HITL rejection also finalizes an authoritative cancellation response such as `Operation cancelled: ...` because the turn completed normally with a rejected action.
 
 Content chunks are provisional. Output processing, reflection, or a committed transition can replace them before `Final.content` is built. Final processing does not retroactively sanitize content chunks that a host already displayed; hosts that must hide provisional content need an appropriate buffering policy.
 
@@ -1180,7 +1180,16 @@ let response = response.with_provider_state(state)?;
 
 `MultiLLMRouter` uses specialized providers for `select_tool`, `generate_tool_args`, `evaluate_yesno`, and `classify`. With its default fallback enabled, a specialized `Network`, `RateLimit`, or API 408/429/500/502/503/504 error retries that capability once with the primary provider when the selected and primary `Arc`s differ. Provider-terminal errors, configuration or serialization/parsing failures, model-not-found, content filtering, `Other`, API responses outside that allowlist, and status-less API errors do not fallback. If the primary attempt fails, its error is returned. Normal completion, tool completion, streaming, and `process_task` already use primary and are not part of this capability fallback.
 
-For `UnifiedLLMProvider`, normal `provider: google` completion methods use the first-party Google adapter. The public `build_llm()` method deliberately keeps its previous return type and constructs the upstream compatibility backend; direct callers of that escape hatch do not receive first-party Google signed-history handling.
+Use `ai_agents_llm::sdk` for direct protocol calls. Use `UnifiedLLMProvider` for framework chat, including Google's signed-history adapter and the default Anthropic Messages adapter. [Provider support by Rust and YAML entry point](@/docs/providers.md#provider-support-in-1-2-development)
+
+Existing callers of `build_llm()` receive a `Box<dyn llm::LLMProvider>` for supported settings. This raw object uses its upstream backend's HTTP, retry and structured stream behavior. For example, given a configured local Ollama provider, a raw consumer can list daemon models through `GET /api/tags`:
+
+```rust
+let raw: Box<dyn llm::LLMProvider> = provider.build_llm(None)?;
+let models = raw.list_models(None).await?;
+```
+
+Default Anthropic accepts legacy call settings and checks them before constructing the raw client, which refuses redirects. Its default Rust constructor supplies temperature 0.7, top_p 0.9 and max_tokens 2048. An explicit config with absent max_tokens uses the historical upstream limit of 300. Explicit Messages, Responses, Decisions and Ollama Cloud configurations reject raw construction. Default OpenAI and OpenAI-compatible Chat support raw model listing. Their raw builder rejects SDK-only `provider_options` in the effective config.
 
 Existing custom providers compile without implementing tool-specific methods. They use the prompt protocol when an agent configures explicit tool choice. A custom provider can opt into native selection by implementing `complete_with_tools()`, returning `true` from `supports_tool_choice()`, and storing normalized calls in `LLMResponse` with `set_tool_calls()` or `with_tool_calls()`. The request uses `LLMToolRequest`, `LLMToolDefinition`, and `ToolChoice`; native calls are still executed only by the runtime's shared executor. `configured_tool_choice()` is optional and returns no override by default.
 
@@ -1737,6 +1746,163 @@ This page covers the most common patterns. For the complete API - every struct, 
 
 - **[Getting Started](@/docs/getting-started.md)** - quick install and first agent
 - **[CLI Guide](@/docs/cli.md)** - run agents from the command line
-- **[LLM Providers](@/docs/providers.md)** - setup for all 12 supported providers
+- **[LLM Providers](@/docs/providers.md)** - setup for the supported provider presets
 - **[YAML Reference](@/docs/yaml-reference.md)** - the complete agent spec
 - **[Built-in Tools](@/docs/built-in-tools.md)** - built-in schemas, outputs, policy, and host requirements
+
+## Direct Chat Completions SDK (development)
+
+Use `ai_agents_llm::sdk` directly when your application owns the conversation and any tool execution. Provide the API base URL, credentials for that endpoint and a compatible model. An image URL is passed to the server. For image or audio bytes, the SDK builds the appropriate wire representation.
+
+The direct client leaves omitted sampling options unset. On the official origin, the provider validates known model and reasoning-effort combinations. With `https://api.openai.com/v1` and `gpt-6.2-astra` or `gpt-6.2-sol`, leave sampling fields and extensions `temperature`, `top_p`, `logprobs` and `top_logprobs` unset. The client rejects those options and native tool requests before sending HTTP. [Chat model and option support](@/docs/providers.md#first-party-chat-completions-development)
+
+```rust
+use ai_agents_llm::sdk::{ChatClient, ChatRequest, InputPart, Message};
+
+async fn describe(base_url: &str, key: Option<String>, model: &str, png: Vec<u8>)
+    -> Result<String, ai_agents_llm::sdk::Error>
+{
+    let client = ChatClient::new(base_url, key)?;
+    let input = Message::UserParts(vec![
+        InputPart::Text("Describe the image.".into()),
+        InputPart::ImageBytes { mime_type: "image/png".into(), data: png },
+    ]);
+    Ok(client.complete(&ChatRequest::new(model, vec![input])).await?.text)
+}
+```
+
+For audio use `InputPart::Audio` with `AudioFormat::Wav` or `AudioFormat::Mp3`. For plain text use `Message::User`. The client can be shared across requests; model, messages, options and function definitions belong to each request. `stream()` yields provisional `Event::Text` and then `Event::Finished` with assembled calls and optional final usage. Complete usage includes separate input/output token breakdowns when supplied by the endpoint. To continue a tool turn, carry the assistant calls in `Message::Assistant` and return each authorized result using `Message::ToolResult` with its original ID. Direct callers handle their own execution permissions and accounting. Framework hosts can use the existing YAML adapter for managed calls.
+
+## Direct OpenRouter Chat SDK (development)
+
+`ai_agents_llm::sdk::openrouter` provides Chat Completions without creating an agent. Supply the credential and full model ID. The OpenRouter request encodes the shared `ChatRequest::max_completion_tokens` field as `max_tokens`.
+
+```rust,ignore
+use ai_agents_llm::sdk::{ChatRequest, Message, openrouter};
+
+let client = openrouter::OpenRouterClient::new(std::env::var("OPENROUTER_API_KEY")?)?;
+let request = openrouter::Request::new(ChatRequest::new(
+    "anthropic/claude-haiku-4.5",
+    vec![Message::User("Give an example of a prime number.".into())],
+));
+let reply = client.complete(&request).await?;
+println!("{}", reply.text);
+```
+
+The stream yields text followed by a completed response with validated function calls, token usage when reported, and the gateway's optional cost. Keep the returned `AssistantTurn` private. For a pinned route, call `Request::push_assistant` with that turn and append the corresponding `Message::ToolResult` before the next request. The SDK checks the original target before sending replay data. Framework approvals and execution live in the [OpenRouter adapter](@/docs/providers.md#openrouter).
+
+## Direct Local Ollama SDK (development)
+
+```rust
+use ai_agents_llm::sdk::ollama::{
+    ChatRequest, KeepAlive, LocalChatRequest, Message, OllamaLocalClient,
+};
+
+let client = OllamaLocalClient::new(None)?;
+let chat = ChatRequest::new("your-local-model", vec![Message::text("user", "Hello")]);
+let mut request = LocalChatRequest::new(chat);
+request.keep_alive = Some(KeepAlive::Duration("5m".into()));
+let output = client.complete(&request).await?;
+println!("{}", output.message.content);
+```
+
+Pass `Some(server_root)` for a different daemon. `stream` yields text and then a single `LocalChatEvent::Finished` after verified completion. An older daemon or compatible server can omit the finish reason. Direct callers receive it as `None`. The response exposes the model and token usage reported by the server when available. Direct calls omit unconfigured sampling and output options. `build_llm()` accepts legacy local Ollama settings for raw operations such as `list_models(None)`. If its effective config contains `provider_options`, construction returns a configuration error. Use the native client for chat with those options.
+
+## Direct Ollama Cloud SDK (development)
+
+```rust
+use ai_agents_llm::sdk::{
+    Error,
+    ollama::{ChatRequest, Message, OllamaCloudClient},
+};
+
+async fn ask(key: String, model: &str) -> Result<String, Error> {
+    let client = OllamaCloudClient::new(key)?;
+    let request = ChatRequest::new(model, vec![Message::text("user", "Hello")]);
+    Ok(client.complete(&request).await?.message.content)
+}
+```
+
+Callers own the request history and tool execution. An SDK request can expose functions for automatic selection. The final assistant message contains at most one call and can be retained with its correlated tool result. `stream()` returns incremental text and a terminal event carrying the final assistant message, completion reason and reported usage. The terminal message keeps thinking separate from the text deltas. [Framework configuration](@/docs/providers.md#ollama-cloud-development)
+
+## Direct model catalog SDK (development)
+
+`ai_agents_llm::sdk::models` provides `OpenAiCatalog`, `AnthropicCatalog`, and `OllamaCloudCatalog`. Each `list_models()` call returns the complete list in service order and the number of pages read. Each entry has the exact service model ID and provider metadata under its original JSON field names. The metadata map preserves explicit nulls and allows new fields and values.
+
+```rust
+use ai_agents_llm::sdk::models::{AnthropicCatalog, OllamaCloudCatalog, OpenAiCatalog};
+
+async fn list_models(
+    openai_key: String,
+    anthropic_key: String,
+    anthropic_workspace: Option<&str>,
+) -> Result<(), ai_agents_llm::sdk::Error> {
+    let openai = OpenAiCatalog::new(openai_key)?.list_models().await?;
+    let anthropic = AnthropicCatalog::new(anthropic_key, anthropic_workspace)?
+        .list_models()
+        .await?;
+    let ollama = OllamaCloudCatalog::new()?.list_models().await?;
+    for model in openai.models.iter().chain(&anthropic.models).chain(&ollama.models) {
+        println!("{}", model.id);
+    }
+    Ok(())
+}
+```
+
+OpenAI and public Ollama Cloud each use one GET. Anthropic uses catalog API version `2026-10-21` and follows the forward cursor under its default lifecycle filter, which includes active and deprecated models. A failed page or repeated cursor returns an error for the whole lookup. Callers can bound the asynchronous lookup with their own timeout. Catalog metadata supports display and inventory. Inference access and runtime capabilities are determined separately.
+
+## Direct Decisions SDK (development)
+
+```rust
+use ai_agents_llm::sdk::{Error, decisions::{ChoiceOption, ChoiceOutcome, ChoiceRequest, DecisionClient}};
+
+async fn classify(key: String, model: &str, input: &str) -> Result<ChoiceOutcome, Error> {
+    let client = DecisionClient::new("https://api.openai.com/v1", key)?;
+    let options = [
+        ChoiceOption { id: "billing", description: Some("Payments and invoices") },
+        ChoiceOption { id: "support", description: Some("Technical issues") },
+    ];
+    let request = ChoiceRequest {
+        model,
+        input,
+        question: "Which team should handle this request?",
+        options: &options,
+        timeout: None,
+    };
+    Ok(client.choose(&request).await?.outcome)
+}
+```
+
+The response distinguishes a selected ID from a refusal and includes reported usage when available. Provider confidence is exposed only when supplied. Custom framework providers can opt in through the defaulted `LLMProvider` choice methods and return the provider-neutral `ai_agents_core::ChoiceDecision`. The runtime validates the returned ID and owns child execution.
+
+## Direct Responses SDK (development)
+
+```rust
+use ai_agents_llm::sdk::responses::{ResponsesClient, ResponsesRequest};
+use serde_json::json;
+
+async fn ask(key: String, model: &str) -> Result<String, ai_agents_llm::sdk::Error> {
+    let client = ResponsesClient::new("https://api.openai.com/v1", Some(key))?;
+    let request = ResponsesRequest::new(model, vec![json!({"role":"user","content":"Hello"})]);
+    Ok(client.complete(&request).await?.text)
+}
+```
+
+The SDK's `ResponseFunction` carries a JSON Schema and optional strict flag. The caller owns tool execution and state. Use `ResponseOutput::output` for trusted replay and `text` for display. `stream()` yields provisional text followed by one finished output or an error. The framework adapter handles text and completed native calls. [Provider configuration and replay scope](@/docs/providers.md#openai-responses-development)
+
+## Direct Messages SDK (development)
+
+```rust
+use ai_agents_llm::sdk::messages::{MessagesClient, MessagesRequest};
+use serde_json::json;
+
+async fn ask(key: String, model: &str) -> Result<String, ai_agents_llm::sdk::Error> {
+    let client = MessagesClient::new(key)?;
+    let request = MessagesRequest::new(model, vec![json!({"role":"user","content":"Hello"})], 512);
+    Ok(client.complete(&request).await?.text)
+}
+```
+
+For a framework-managed Rust provider with the `AnthropicCompatible` preset, use `UnifiedLLMProvider::from_spec_config` with a positive `max_tokens`. The convenience builder has no parameter for this required ceiling. A direct SDK caller supplies it to `MessagesRequest::new`.
+
+The caller owns tool execution. Send `MessageOutput::blocks` back in an assistant message before the corresponding user `tool_result` blocks. Keep the original `tool_use_id`, thinking signatures, block order and replay destination. Display `text` rather than private blocks. `stream()` yields text and then the completed message or an error. [Messages configuration and verified scope](@/docs/providers.md#first-party-messages-development)

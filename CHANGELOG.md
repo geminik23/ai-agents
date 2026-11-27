@@ -3,6 +3,17 @@
 ## Unreleased
 
 ### Added
+- OpenAI Chat: migrate legacy compatibility settings to the native SDK with bounded same-endpoint retries and preserve raw Rust access
+- Anthropic: use native Messages for the default YAML and Rust paths with existing request defaults and signed tool continuation
+- Local Ollama: use native chat and text streaming from Rust and YAML with explicit generation options and daemon model retention
+- OpenRouter: call Chat Completions from Rust and YAML, preserve parallel tool settings, enforce required routing parameters, settle declared costs against the reported model, and resume approved native tools with the original reasoning on a pinned route
+- Tool execution: validate arguments against the registered input schema before approval and recheck the final arguments before invocation
+- Ollama Cloud: use native chat, text streaming and single native tool calls from Rust and YAML, with approval and supported task restoration
+- Model catalogs: list models from OpenAI, Anthropic, and Ollama Cloud from the Rust SDK with provider-reported metadata and Anthropic pagination
+- OpenAI Decisions: classify text into an exact label from Rust and opt in to structured agent routing from YAML with task continuation. Scenario evals can use other providers alongside an unused Decisions alias
+- Anthropic Messages: call official and explicitly configured compatible endpoints from Rust or YAML, stream text and resume approved native tools with their original signed history
+- OpenAI Responses: call the stateless Responses API from Rust or YAML, stream text, and resume approved native functions with their original call IDs and provider history
+- Chat Completions: call OpenAI-compatible endpoints from Rust with text, image and audio inputs, stream incremental text, and pass completed function calls through the framework adapter
 - Live task examples: run provider-backed analysis, synthetic corpus research, retained support confirmation and reviewed incident escalation through shared application and evaluation hosts, with evaluation budgets separate from ordinary application settings
 - Task invocation settings: development Rust and CLI callers can override one task or skill profile while preserving required reviews, host ceilings and settings across retained or explicitly prepared continuation
 - Workspace file protection: development Rust hosts can confine built-in file tools to one workspace root or selected entries, track created files and expose a cooperative mutation revision without adding write authority
@@ -44,6 +55,8 @@
 - Task validation: development-only tri-state checks, tool/fallback/child observation continuation and external signals preserve post-turn controller progress; fixed host permits and single logical journal charges survive re-pause, without adding a second executor or inferring completion from unavailable evidence
 
 ### Changed
+- Model output limits: Rust agent declarations use `Option<u32>` for `max_tokens` to preserve Responses omission and existing Chat limits
+- OpenAI Chat: preserve omitted sampling options, validate documented model and effort restrictions, and keep the compatible-server temperature default. Rust agent specifications use `Option<f32>` for `temperature`.
 - Rust command compatibility: command response literals include a defaulted execution state; legacy exited observations remain compatible while ambiguous interruptions retain recovery protection
 - Observation privacy: approval completion events retain decision states rather than free-form reasons, and tool arguments or copied failure bodies follow their respective disclosure opt-ins
 - Rust memory compatibility: `MemorySnapshot` and `ConversationContext` literals include defaulted incomplete-history observations; custom memory implementations explicitly opt into restoring them

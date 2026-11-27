@@ -5,6 +5,7 @@
 mod ad_maintenance_fault_tests;
 #[cfg(test)]
 mod admission_tests;
+pub(crate) mod approval_clock;
 mod authority;
 mod host_scope;
 mod restore_clock;

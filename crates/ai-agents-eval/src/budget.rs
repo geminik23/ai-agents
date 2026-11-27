@@ -18,7 +18,7 @@ pub(crate) const BUDGET_ERROR_PREFIX: &str = "eval budget exceeded";
 pub(crate) struct BudgetProviderConfig {
     pub provider: String,
     pub model: String,
-    pub max_output_tokens: u32,
+    pub max_output_tokens: Option<u32>,
 }
 
 #[derive(Clone)]
@@ -124,9 +124,18 @@ impl ScenarioBudgetTracker {
     ) -> Result<BudgetReservation, LLMError> {
         let input_tokens =
             upper_bound_message_tokens(messages).saturating_add(additional_input_tokens);
-        let output_tokens = config
-            .and_then(|config| config.max_tokens)
-            .unwrap_or(provider.max_output_tokens) as u64;
+        let ceiling = config.map_or(provider.max_output_tokens, |cfg| cfg.max_tokens);
+        if ceiling.is_none()
+            && (self.budget.max_total_tokens.is_some() || self.budget.max_cost_usd.is_some())
+        {
+            return Err(mark_failed(
+                &mut self.lock_state(),
+                format!(
+                    "{BUDGET_ERROR_PREFIX}: token or cost admission requires an explicit output ceiling"
+                ),
+            ));
+        }
+        let output_tokens = u64::from(ceiling.unwrap_or_default());
         let tokens = input_tokens.saturating_add(output_tokens);
         let cost_usd = if self.budget.max_cost_usd.is_some() {
             self.estimate_cost(provider, input_tokens, output_tokens)?
@@ -352,6 +361,10 @@ impl LLMProvider for BudgetedLlmProvider {
         }
     }
 
+    fn allows_prompt_tools(&self) -> bool {
+        self.inner.allows_prompt_tools()
+    }
+
     fn configured_tool_choice(&self) -> Option<ToolChoice> {
         self.inner.configured_tool_choice()
     }
@@ -541,8 +554,38 @@ mod tests {
         BudgetProviderConfig {
             provider: "openai".to_string(),
             model: "test".to_string(),
-            max_output_tokens: 10,
+            max_output_tokens: Some(10),
         }
+    }
+
+    #[test]
+    fn responses_budget_requires_a_real_ceiling_for_token_or_cost_limits() {
+        let cfg = BudgetProviderConfig {
+            max_output_tokens: None,
+            ..provider_config()
+        };
+        for budget in [
+            ScenarioBudget {
+                max_total_tokens: Some(100),
+                ..Default::default()
+            },
+            ScenarioBudget {
+                max_cost_usd: Some(1.0),
+                ..Default::default()
+            },
+        ] {
+            let tracker = ScenarioBudgetTracker::new(budget, None);
+            assert!(tracker.reserve(&cfg, &[], None).is_err());
+            assert_eq!(tracker.lock_state().llm_calls, 0);
+        }
+        let calls_only = ScenarioBudgetTracker::new(
+            ScenarioBudget {
+                max_llm_calls: Some(1),
+                ..Default::default()
+            },
+            None,
+        );
+        assert!(calls_only.reserve(&cfg, &[], None).is_ok());
     }
 
     struct PendingProvider {

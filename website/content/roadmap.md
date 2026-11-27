@@ -27,6 +27,8 @@ The development task support boundaries and migration from published 1.1.2 are d
 
 ## Up Next
 
+The development provider SDK supports explicit OpenAI Responses and default Anthropic Messages text and native function requests through Rust and YAML. OpenAI Decisions adds typed single-choice classification and opt-in agent routing. Local Ollama supports native chat, text streaming, and opt-in daemon options. Ollama Cloud adds native text streaming and single-tool turns. The OpenRouter Chat adapter preserves existing YAML and supports native tool replay with reasoning on a pinned route. The [Rust SDK catalog](@/docs/rust-api.md#direct-model-catalog-sdk-development) lists models from OpenAI, Anthropic, and Ollama Cloud. See [provider support](@/docs/providers.md#openai-decisions-development).
+
 | Target | Focus | Summary |
 | --- | --- | --- |
 | **1.2 development** | Generalized Autonomy Runner | YAML-configured task runs with lifecycle stages, todos, completion gates, validation loops, pause/resume, and task-run events |

@@ -10,6 +10,8 @@ use std::sync::{
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+const FIXTURE_MODEL: &str = "fixture-model";
+
 async fn server(messages: Vec<Value>) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -46,7 +48,13 @@ async fn server(messages: Vec<Value>) -> (String, Arc<AtomicUsize>, tokio::task:
             let request: Value = serde_json::from_slice(&bytes[end..end + length]).unwrap();
             assert!(request.to_string().contains("work"));
             called.fetch_add(1, Ordering::SeqCst);
-            let body=json!({"id":"resource-fixture","choices":[{"index":0,"message":message,"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":4,"total_tokens":14}}).to_string();
+            let body = json!({
+                "id": "resource-fixture",
+                "model": FIXTURE_MODEL,
+                "choices": [{"index": 0, "message": message, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 4, "total_tokens": 14}
+            })
+            .to_string();
             let reply = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
@@ -61,7 +69,7 @@ async fn server(messages: Vec<Value>) -> (String, Arc<AtomicUsize>, tokio::task:
 fn declared_provider(endpoint: &str) -> ai_agents_llm::providers::UnifiedLLMProvider {
     let pricing = DeclaredPricing {
         schedule_id: "public.fixture.v1".into(),
-        model: "fixture-model".into(),
+        model: FIXTURE_MODEL.into(),
         endpoint: endpoint.into(),
         server_input_token_limit: 32,
         server_output_token_limit: 2048,
@@ -73,7 +81,7 @@ fn declared_provider(endpoint: &str) -> ai_agents_llm::providers::UnifiedLLMProv
     };
     ProviderBuilder::new()
         .provider(ProviderType::OpenAI)
-        .model("fixture-model")
+        .model(FIXTURE_MODEL)
         .api_key("public-isolated-fixture")
         .base_url(endpoint)
         .build()
@@ -299,7 +307,7 @@ async fn rs_public_child_cannot_replace_the_same_targets_pinned_pricing() {
     let (endpoint,calls,server)=server(vec![json!({"role":"assistant","content":"","tool_calls":[{"id":"send","type":"function","function":{"name":"send_agent_message","arguments":"{\"to\":\"worker\",\"message\":\"work\"}"}}]})]).await;
     let changed = DeclaredPricing {
         schedule_id: "changed-price".into(),
-        model: "fixture-model".into(),
+        model: FIXTURE_MODEL.into(),
         endpoint: endpoint.clone(),
         server_input_token_limit: 32,
         server_output_token_limit: 2048,
@@ -314,7 +322,7 @@ async fn rs_public_child_cannot_replace_the_same_targets_pinned_pricing() {
         .llm(Arc::new(
             ProviderBuilder::new()
                 .provider(ProviderType::OpenAICompatible)
-                .model("fixture-model")
+                .model(FIXTURE_MODEL)
                 .api_key("isolated-other-alias")
                 .base_url(&endpoint)
                 .build()

@@ -4,7 +4,7 @@ agent: ../../../yaml/basic/simple_chat_stream.yaml
 # Streaming mocked evaluation suite.
 # Use this pattern when you want to verify the streaming YAML example without an API key.
 # The mock provider splits this response into multiple stream chunks.
-# The runner collects those chunks into a final response before assertions run.
+# In event mode, eval uses the committed Final response for successful turn assertions.
 #
 # Usage:
 #   cargo run -p ai-agents-cli -- eval \
@@ -12,22 +12,22 @@ agent: ../../../yaml/basic/simple_chat_stream.yaml
 #     --scenarios examples/eval/mocked/basic/simple_chat_streaming_mocked.yaml \
 #     --output target/eval/mocked/basic/simple_chat_streaming_mocked
 #
-# Flow: scenario input -> mocked stream chunks -> collected response -> assertions -> reports
+# Flow: scenario input -> provisional chunks -> Final response -> assertions -> reports
 settings:
   timeout_per_turn_ms: 5000  # milliseconds to wait for the streamed turn. default: 30000
   retries: 0                 # keep stream smoke tests deterministic. default: 0
   isolation: scenario        # fresh runtime per attempt. default: scenario
 
 # The mock provider supports streaming and splits this text by words.
-# RuntimeAgent::chat_stream() receives multiple content chunks, then eval joins them.
+# Content chunks are provisional and may differ from the processed Final content.
 fixtures:
   llm:
     mode: mock
     responses:
       - "Streaming hello from the mocked provider."
 
-# `stream: true` uses RuntimeAgent::chat_stream().
-# Assertions inspect the collected final text, not each individual chunk.
+# `stream: true` uses RuntimeAgent::chat_stream_events().
+# This smoke checks Final text; per-event ordering is covered by runtime tests.
 scenarios:
   - id: streaming-smoke
     name: Streaming response is collected and asserted

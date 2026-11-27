@@ -332,7 +332,7 @@ metadata:
 
 ## LLM Configuration
 
-You can configure LLMs in three ways depending on complexity.
+Use the [1.2 provider support matrix](@/docs/providers.md#provider-support-in-1-2-development) to check the request path and available Rust clients for a preset.
 
 ### Single LLM - `llm` (shorthand)
 
@@ -342,24 +342,26 @@ The simplest form: one LLM for everything. Use `llm` as a flat object.
 |-------|------|---------|-------------|
 | `provider` | `string` | `"openai"` | Provider identifier |
 | `model` | `string` | `"gpt-4"` | Model name |
-| `temperature` | `f32` | `0.7` | Sampling temperature |
-| `max_tokens` | `u32` | `2000` | Max response tokens |
+| `temperature` | `f32` | omitted for OpenAI, explicit Messages, Messages-compatible and Ollama Cloud, `0.7` for default Anthropic and existing compatible/legacy paths | Sampling temperature. Explicit values follow the selected endpoint and model. |
+| `max_tokens` | `u32` | omitted for Responses and Ollama Cloud, required for explicit Messages and Messages-compatible, `2000` for existing Chat and legacy paths | Maximum output tokens. Decisions accepts no output limit. |
 | `top_p` | `f32` | `null` | Nucleus sampling |
 | `base_url` | `string` | `null` | API endpoint override (required for `openai-compatible`) |
 | `api_key_env` | `string` | `null` | Env var holding the API key (overrides provider default) |
 | `timeout_seconds` | `u64` | `null` | Request timeout in seconds |
 | `reasoning` | `bool` | `null` | Enable extended thinking / reasoning mode |
-| `reasoning_effort` | `string` | `null` | Reasoning effort: `low`, `medium`, or `high` |
+| `reasoning_effort` | `string` | `null` | Model-specific effort; the development first-party Chat adapter accepts open strings for ordinary calls |
+| `protocol` | `string` | omitted | OpenAI defaults to Chat and also accepts `responses` for generation or `decisions` for routing. OpenAI-compatible uses Chat. Anthropic and Messages-compatible use Messages. |
+| `provider_options` | object | omitted | Chat request extensions, OpenRouter `provider` and `reasoning`, Responses `reasoning`, Messages `thinking` / `output_config.effort`, or native Ollama options. Conflicts and reserved fields are rejected. |
 | `reasoning_budget_tokens` | `u32` | `null` | Max token budget for reasoning |
 | `function_calling` | `bool` | `null` | Override `supports(FunctionCalling)`; `false` disables native tool selection and `true` opts an OpenAI-compatible server into it |
 | `tool_choice` | `auto`, `required`, `none`, or `{ specific: ID }` | `null` | Opt in to native or runtime-enforced tool selection; omission preserves the legacy prompt protocol |
 | `vision` | `bool` | `null` | Override `supports(Vision)` for this provider |
 | `json_mode` | `bool` | `null` | Override `supports(JsonMode)` for this provider |
-| `num_ctx` | `u32` | `null` | Ollama context window; merged under request `options` |
-| `keep_alive` | `string` or `number` | `null` | Ollama keep-alive duration; top-level request body field |
-| `num_gpu` | `i32` | `null` | Ollama GPU layer count; merged under request `options` |
+| `num_ctx` | `u32` | `null` | Local Ollama context window declaration, currently omitted from chat requests |
+| `keep_alive` | `string` or `number` | `null` | Local Ollama keep-alive declaration, currently omitted from chat requests |
+| `num_gpu` | `i32` | `null` | Local Ollama GPU layer declaration, currently omitted from chat requests |
 | `declared_pricing` | object | `null` | Development-only, host-audited priced capability for the explicit Rust task API; omitted means no built-in hard-priced binding |
-| *(any other key)* | | | Passed through as provider-specific extra parameter |
+| *(any other key)* | | | Captured as a provider extra. Transmission depends on the selected backend. |
 
 ```yaml
 llm:
@@ -369,9 +371,14 @@ llm:
   max_tokens: 4000
 ```
 
-Capability override fields (`function_calling`, `vision`, `json_mode`) are not sent as model parameters. They control framework capability checks; `function_calling: false` also disables native tool selection, while `function_calling: true` opts an OpenAI-compatible server into the native path. Ollama named fields (`num_ctx`, `keep_alive`, `num_gpu`) are captured as provider extras and merged into the Ollama request body.
+Capability override fields (`function_calling`, `vision`, `json_mode`) are not sent as model parameters. They control framework capability checks; `function_calling: false` also disables native tool selection, while `function_calling: true` opts an OpenAI-compatible server into the native path. The GPT-6.2 OpenAI Chat models require Responses for native tools. [Chat model and option support](@/docs/providers.md#first-party-chat-completions-development)
 
-Any field not listed above is captured in an `extra` map via `#[serde(flatten)]` and forwarded to the LLM client when a matching builder method exists. This includes transport-level resilience (`resilient`, `resilient_attempts`, etc.), Azure settings (`api_version`, `deployment_id`), and provider-native search (`openai_enable_web_search`, `xai_search_mode`, etc.). Provider-native search changes the LLM request and is separate from the granted built-in `web_search` tool, its `WebSearchProvider`, shared policy/HITL path, and tool evidence. See [LLM Providers > Extra Parameters](@/docs/providers.md#extra-parameters) for the full list.
+For a local Ollama daemon, move a legacy `num_ctx` declaration to `provider_options.options.num_ctx` to send it on the wire. Model retention uses `provider_options.keep_alive`. [Local Ollama option mappings and YAML example](@/docs/providers.md#migrating-local-ollama-options)
+
+Additional YAML keys are captured in an `extra` map. The selected backend determines their effect. OpenAI and OpenAI-compatible presets send ordinary Chat through the SDK, including configurations with the legacy `openai_enable_web_search` flag. That flag alone leaves the hosted search tool out of the request. The xAI backend includes `search_parameters` in blocking chat requests and omits the field when streaming. The granted built-in `web_search` tool uses the framework’s own policy, approval and execution path. [Provider options and transport settings](@/docs/providers.md#extra-parameters)
+
+OpenRouter accepts gateway routing under `provider_options.provider` and explicit reasoning under `provider_options.reasoning`. For OpenRouter, set the boolean `parallel_tool_calls` once in `extra_body` or `provider_options` to control parallel tool calls. Omission leaves the wire field absent. The top-level legacy `reasoning_effort` keeps its historical validation and omission. When replaying a native tool turn with private reasoning, configure one provider route with fallback disabled and use the exact model ID. [OpenRouter setup and limits](@/docs/providers.md#openrouter)
+
 
 ```yaml
 # Reasoning model with timeout
@@ -385,13 +392,11 @@ llm:
 ```
 
 ```yaml
-# Local Ollama with explicit context window
+# Local Ollama with explicit nucleus sampling
 llm:
   provider: ollama
   model: llama3.1
-  num_ctx: 8192
-  keep_alive: 5m
-  num_gpu: -1
+  top_p: 0.9
 ```
 
 ```yaml
@@ -485,7 +490,9 @@ tools:
   - random
 ```
 
-OpenAI, Anthropic, and OpenRouter use native `auto`, `required`, and `specific` selection. Google currently enables native `auto` only; its `required` and `specific` choices retain one bounded prompt corrective retry. OpenAI-compatible servers use native selection only with `function_calling: true`. Other and custom providers use prompt fallback unless they implement the additive native request methods. `none` is enforced by the runtime without exposing definitions or prompt instructions. A second non-compliant prompt response fails the turn.
+OpenAI, Anthropic, and OpenRouter offer native `auto`, `required`, and `specific` selection subject to the selected protocol and model. Google currently enables native `auto` only; its `required` and `specific` choices retain one bounded prompt corrective retry. OpenAI-compatible servers use native selection only with `function_calling: true`. Other and custom providers use prompt fallback unless they implement the additive native request methods. `none` is enforced by the runtime without exposing definitions or prompt instructions. A second non-compliant prompt response fails the turn.
+
+First-party Messages checks native choice against the selected model and thinking mode. Messages-compatible uses native tools after explicit `function_calling: true`. See [Messages configuration](@/docs/providers.md#first-party-messages-development).
 
 The normal Google path is a first-party GenerateContent adapter. With native `auto`, it retains Gemini's opaque `thoughtSignature`, original model-part order, and call/result correlation across the current tool loop. Signed history does not grant tools and is never parsed recursively as additional calls. Current signed exchanges are kept as an atomic memory group; if that group cannot fit the configured memory or context budget, the turn fails instead of truncating the signature or silently expanding the limit.
 
@@ -585,6 +592,7 @@ Hierarchy child session snapshots store the already-loaded skill definitions inl
 |----------|-----------------|-----------------|-------|
 | OpenAI | `openai` | `OPENAI_API_KEY` | GPT models |
 | Anthropic | `anthropic` | `ANTHROPIC_API_KEY` | Claude models |
+| Messages-compatible | `anthropic-compatible` | Optional via `api_key_env` | Explicit Messages base URL |
 | Google | `google` | `GOOGLE_API_KEY` | Gemini models |
 | Groq | `groq` | `GROQ_API_KEY` | Fast inference |
 | DeepSeek | `deepseek` | `DEEPSEEK_API_KEY` | |
@@ -594,6 +602,7 @@ Hierarchy child session snapshots store the already-loaded skill definitions inl
 | Phind | `phind` | `PHIND_API_KEY` | |
 | OpenRouter | `openrouter` | `OPENROUTER_API_KEY` | Multi-provider gateway |
 | Ollama | `ollama` | - | Local models, no key needed |
+| Ollama Cloud | `ollama-cloud` | `OLLAMA_API_KEY` | Native text and opt-in single-tool calls |
 | OpenAI-Compatible | `openai-compatible` | via `api_key_env` | Any server speaking the OpenAI protocol |
 
 ### `openai-compatible` Example
@@ -3427,7 +3436,7 @@ spawner:
 
 | Tool | Description |
 |------|-------------|
-| `route_to_agent` | Route input to the best-matched agent from a set of candidates |
+| `route_to_agent` | Route input to one candidate agent. A routing role bound to an explicit `protocol: decisions` preset uses [structured choice](@/docs/providers.md#openai-decisions-development). |
 | `pipeline_process` | Chain agents sequentially with per-stage Jinja2 templates (`{{ user_input }}`, `{{ previous_output }}`, `{{ original_input }}`, `{{ stages.<agent_id> }}`) |
 | `concurrent_ask` | Ask multiple agents the same question in parallel and aggregate |
 | `group_discussion` | Run a multi-agent conversation on a topic |
@@ -3505,7 +3514,7 @@ settings:
 | `max_concurrent` | `usize` | `4` | Maximum concurrently running scenarios |
 | `fail_fast` | `bool` | `false` | Stop after the first failed or errored scenario; runs serially |
 | `redact_outputs` | `bool` | `true` | Store `[redacted]` for inputs, responses, and string assertion details; raw evidence is omitted from JSON outputs |
-| `temperature` | `f32?` | `null` | Override agent LLM temperatures during eval. This is useful for more deterministic live-provider smoke tests. |
+| `temperature` | `f32?` | `null` | Override agent LLM temperatures during eval. Omit for GPT-6.2 OpenAI Chat. |
 | `seed` | `u64?` | `null` | Stores `extra.seed` in the eval LLM configuration. Current built-in adapters do not forward that top-level key to provider requests or include it in client-cache identity; custom providers may interpret it. Do not claim deterministic live eval from this field. |
 
 `isolation: scenario` is the recommended default. It creates a fresh runtime and temp workspace per scenario attempt. `isolation: turn` resets conversation state between direct turns, while still reapplying fixture/scenario context. `isolation: suite` and `isolation: none` are rejected until shared-run isolation has a stronger public contract.

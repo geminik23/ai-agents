@@ -5,6 +5,8 @@ use ai_agents_core::ToolCall;
 use ai_agents_llm::providers::{DeclaredPricing, ProviderBuilder, ProviderType};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+const PAID_FIXTURE_MODEL: &str = "fixture-model";
+
 // Real conditional stores preserve charged, in-flight and uncertain commitments independently of result eligibility.
 #[tokio::test]
 async fn rs_settlement_backend_matrix_retains_siblings_and_rejects_duplicate_refunds() {
@@ -87,7 +89,7 @@ async fn rs_settlement_backend_matrix_retains_siblings_and_rejects_duplicate_ref
     }
 }
 
-// The raw provider consumes a real HTTP request, while all fixture output and storage remain isolated and credential-free.
+// The loopback server issues a complete receipt for its fixed model so runtime tests exercise successful provider settlement.
 async fn paid_server(
     replies: Vec<Value>,
 ) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
@@ -124,7 +126,13 @@ async fn paid_server(
                 bytes.extend_from_slice(&buffer[..count]);
             }
             called.fetch_add(1, Ordering::SeqCst);
-            let payload = json!({"id":"rs-fixture","choices":[{"index":0,"message":message,"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":4,"total_tokens":14}}).to_string();
+            let payload = json!({
+                "id": "rs-fixture",
+                "model": PAID_FIXTURE_MODEL,
+                "choices": [{"index": 0, "message": message, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 4, "total_tokens": 14}
+            })
+            .to_string();
             let reply = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
                 payload.len()
@@ -157,7 +165,7 @@ async fn rs_paid_native_question_resume_keeps_exact_usage_on_memory_and_sqlite()
         ]).await;
         let pricing = DeclaredPricing {
             schedule_id: "rs.fixture.v1".into(),
-            model: "fixture-model".into(),
+            model: PAID_FIXTURE_MODEL.into(),
             endpoint: endpoint.clone(),
             server_input_token_limit: 32,
             server_output_token_limit: 2048,
@@ -169,7 +177,7 @@ async fn rs_paid_native_question_resume_keeps_exact_usage_on_memory_and_sqlite()
         };
         let provider = ProviderBuilder::new()
             .provider(ProviderType::OpenAI)
-            .model("fixture-model")
+            .model(PAID_FIXTURE_MODEL)
             .api_key("isolated-fixture")
             .base_url(endpoint)
             .build()

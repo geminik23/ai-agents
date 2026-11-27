@@ -15,6 +15,7 @@ use std::time::{Duration, Instant, SystemTime};
 struct Admission {
     delay: bool,
     delay_remaining: bool,
+    priced: bool,
     admissions: AtomicUsize,
     settlements: AtomicUsize,
     refunds: AtomicUsize,
@@ -23,6 +24,12 @@ struct Admission {
 }
 #[async_trait]
 impl InvocationAdmission for Admission {
+    fn requires_priced_llm(&self) -> bool {
+        self.priced
+    }
+    fn reject_priced_request(&self) {
+        self.stop.store(true, Ordering::SeqCst);
+    }
     async fn admit_llm(&self) -> Result<String, LLMError> {
         self.admissions.fetch_add(1, Ordering::SeqCst);
         if self.delay {
@@ -58,6 +65,19 @@ impl InvocationAdmission for Admission {
 struct Provider(AtomicUsize);
 #[async_trait]
 impl LLMProvider for Provider {
+    fn uses_choice_for_routing(&self) -> bool {
+        true
+    }
+    async fn choose(
+        &self,
+        _: &ai_agents_core::ChoiceRequest<'_>,
+    ) -> Result<ai_agents_core::ChoiceDecision, LLMError> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Ok(ai_agents_core::ChoiceDecision {
+            selected: None,
+            usage: Some(TokenUsage::new(4, 0)),
+        })
+    }
     async fn complete(
         &self,
         _: &[ChatMessage],
@@ -80,6 +100,51 @@ impl LLMProvider for Provider {
     }
     fn supports(&self, _: LLMFeature) -> bool {
         false
+    }
+}
+
+#[tokio::test]
+async fn structured_choice_manages_refusal_once_and_rejects_a_hard_price_limit() {
+    let provider = Arc::new(Provider::default());
+    let wrapped = managed_provider(provider.clone());
+    let candidates = [
+        ai_agents_core::ChoiceCandidate {
+            id: "one",
+            description: None,
+        },
+        ai_agents_core::ChoiceCandidate {
+            id: "two",
+            description: None,
+        },
+    ];
+    let request = ai_agents_core::ChoiceRequest {
+        input: "input",
+        question: "pick one",
+        candidates: &candidates,
+    };
+    for priced in [false, true] {
+        let admission = Arc::new(Admission {
+            priced,
+            ..Default::default()
+        });
+        let result = scope_invocation_admission(
+            admission.clone(),
+            managed_choice(wrapped.as_ref(), &request),
+        )
+        .await;
+        if priced {
+            assert!(matches!(result, Err(LLMError::Config(_))));
+            assert!(admission.stop.load(Ordering::SeqCst));
+            assert_eq!(admission.admissions.load(Ordering::SeqCst), 0);
+            assert_eq!(admission.settlements.load(Ordering::SeqCst), 0);
+        } else {
+            let refusal = result.unwrap();
+            assert_eq!(refusal.selected, None);
+            assert_eq!(refusal.usage.unwrap().total_tokens, 4);
+            assert_eq!(admission.admissions.load(Ordering::SeqCst), 1);
+            assert_eq!(admission.settlements.load(Ordering::SeqCst), 1);
+        }
+        assert_eq!(provider.0.load(Ordering::SeqCst), 1);
     }
 }
 

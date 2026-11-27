@@ -1,5 +1,7 @@
 //! LLM providers for AI Agents framework
 
+use sdk::MAX_SSE_FRAME_BYTES;
+
 pub mod capability;
 mod invocation_bounds;
 mod managed;
@@ -10,7 +12,8 @@ pub use invocation_bounds::{
     scope_invocation_bounds, scope_invocation_evidence, validate_invocation_evidence,
 };
 pub use managed::{
-    current_invocation_admission, managed_completion, managed_provider, scope_invocation_admission,
+    current_invocation_admission, managed_choice, managed_completion, managed_provider,
+    scope_invocation_admission,
 };
 pub mod mock;
 pub mod multi;
@@ -18,6 +21,7 @@ pub mod prompts;
 pub mod providers;
 pub mod registry;
 pub mod routing;
+pub mod sdk;
 
 pub use ai_agents_core::{
     ChatMessage, FinishReason, LLMCapability, LLMChunk, LLMConfig, LLMError, LLMFeature,

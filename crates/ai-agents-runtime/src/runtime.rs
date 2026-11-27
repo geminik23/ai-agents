@@ -407,25 +407,111 @@ enum ToolCallOutcome {
     Rejected(AgentResponse),
 }
 
-#[derive(Clone)]
 struct MainToolProtocol {
     choice: Option<ToolChoice>,
+    allow_prompt_tools: bool,
+    use_native: bool,
     tool_ids: Vec<String>,
     definitions: Vec<LLMToolDefinition>,
 }
 
-struct MainProviderResponse {
-    response: LLMResponse,
-    used_native_tools: bool,
+impl MainToolProtocol {
+    // Choose the representation once from the exposed definitions and the selected primary.
+    fn supports_native(
+        llm: &dyn LLMProvider,
+        choice: Option<&ToolChoice>,
+        definitions: &[LLMToolDefinition],
+    ) -> bool {
+        let Some(choice) = choice else {
+            return false;
+        };
+        if matches!(choice, ToolChoice::None) || definitions.is_empty() {
+            return false;
+        }
+        llm.supports_tool_choice(choice)
+            && definitions.iter().all(|definition| {
+                !definition.name.is_empty()
+                    && definition.name.len() <= 64
+                    && definition
+                        .name
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+            })
+    }
+
+    // Keep the primary request representation on fallback and narrow which text may be interpreted as a call.
+    fn select_fallback(&mut self, fallback: &dyn LLMProvider) -> Result<()> {
+        if !self.tool_ids.is_empty() {
+            let compatible = if self.use_native {
+                self.choice
+                    .as_ref()
+                    .is_some_and(|choice| fallback.supports_tool_choice(choice))
+            } else {
+                self.allow_prompt_tools && fallback.allows_prompt_tools()
+            };
+            if !compatible {
+                return Err(AgentError::Config(
+                    "fallback provider cannot use the active tool protocol".into(),
+                ));
+            }
+        }
+        self.allow_prompt_tools &= fallback.allows_prompt_tools();
+        Ok(())
+    }
+
+    // Omitted choice uses the legacy prompt only for providers that support that protocol.
+    fn uses_legacy_tool_prompt(&self) -> bool {
+        self.choice.is_none() && self.allow_prompt_tools
+    }
 }
 
-//
-// Result of opening the main streaming provider call after recovery policy is applied.
-// A static fallback response is carried as text so the caller can emit it as one chunk and continue the shared post-response pipeline.
-//
+// Opening a stream may select a completed fallback response under the existing recovery policy.
 enum MainStreamSource {
     Stream(Box<dyn Stream<Item = std::result::Result<LLMChunk, LLMError>> + Unpin + Send>),
-    StaticResponse(String),
+    Complete(LLMResponse),
+}
+
+// Text deltas stay provisional until the managed stream acknowledges termination.
+#[derive(Default)]
+struct MainStreamOutput {
+    text: String,
+    finish_reason: Option<FinishReason>,
+    usage: Option<ai_agents_core::TokenUsage>,
+}
+
+impl MainStreamOutput {
+    // Only a final chunk supplies the finish and usage for the entire response.
+    fn observe(&mut self, chunk: &LLMChunk) {
+        self.text.push_str(&chunk.delta);
+        if chunk.is_final {
+            self.finish_reason.clone_from(&chunk.finish_reason);
+            self.usage = chunk.usage;
+        }
+    }
+
+    // Providers with the legacy text stream contract may end without a typed finish receipt.
+    fn into_response(self) -> LLMResponse {
+        let mut response =
+            LLMResponse::new(self.text, self.finish_reason.unwrap_or(FinishReason::Stop));
+        response.usage = self.usage;
+        response
+    }
+}
+
+// The raw text path can parse prompt-based tool requests only from normally completed output.
+fn require_complete_stream_text(reason: &FinishReason) -> Result<()> {
+    let detail = match reason {
+        FinishReason::Stop => return Ok(()),
+        FinishReason::Length => "length (output limit reached)",
+        FinishReason::ContentFilter => "content_filter (output filtered)",
+        FinishReason::UserStopped => "user_stopped",
+        FinishReason::Error => "error",
+        FinishReason::ToolCall => "tool_call (unexpected in a text stream)",
+        FinishReason::Other => "other (unrecognized finish)",
+    };
+    Err(AgentError::LLM(format!(
+        "Text stream did not complete normally: {detail}"
+    )))
 }
 
 // Tracks the latest committed signed model response only to detect custom-memory loss before continuation; replay data remains owned by memory.
@@ -5524,15 +5610,6 @@ impl RuntimeAgent {
         self.skills.iter().collect()
     }
 
-    async fn build_messages(&self) -> Result<Vec<ChatMessage>> {
-        self.build_messages_internal(true, None, true, false).await
-    }
-
-    async fn build_messages_for_draft(&self, user_message: &str) -> Result<Vec<ChatMessage>> {
-        self.build_messages_internal(false, Some(user_message), true, false)
-            .await
-    }
-
     /// Captures the local mutation epoch for a known-safe feedback projection without granting any operation authority.
     pub(crate) fn task_observation_mutation_epoch(&self) -> u64 {
         self.observation_mutations.load(Ordering::Acquire)
@@ -5773,15 +5850,21 @@ impl RuntimeAgent {
         Ok(messages)
     }
 
+    // Freeze the provider's tool protocol and effective grants for the current turn.
     async fn main_tool_protocol(
         &self,
         llm: &dyn LLMProvider,
         ephemeral_new_turn: bool,
     ) -> Result<MainToolProtocol> {
         let mut choice = llm.configured_tool_choice();
-        if matches!(choice.as_ref(), Some(ToolChoice::None)) {
+        let allow_prompt_tools = llm.allows_prompt_tools();
+        if matches!(choice.as_ref(), Some(ToolChoice::None))
+            || (!allow_prompt_tools && choice.is_none())
+        {
             return Ok(MainToolProtocol {
                 choice,
+                allow_prompt_tools,
+                use_native: false,
                 tool_ids: Vec::new(),
                 definitions: Vec::new(),
             });
@@ -5851,8 +5934,11 @@ impl RuntimeAgent {
         //
         // Provider-visible definitions are derived only from the current effective grant. Tool choice never expands registration, scope, or authorization.
         //
+        let use_native = MainToolProtocol::supports_native(llm, choice.as_ref(), &definitions);
         Ok(MainToolProtocol {
+            use_native,
             choice,
+            allow_prompt_tools,
             tool_ids,
             definitions,
         })
@@ -5895,28 +5981,6 @@ impl RuntimeAgent {
             }
         }
         Ok(false)
-    }
-
-    fn provider_can_use_native_tools(
-        &self,
-        llm: &dyn LLMProvider,
-        protocol: &MainToolProtocol,
-    ) -> bool {
-        let Some(choice) = protocol.choice.as_ref() else {
-            return false;
-        };
-        if matches!(choice, ToolChoice::None) || protocol.definitions.is_empty() {
-            return false;
-        }
-        llm.supports_tool_choice(choice)
-            && protocol.definitions.iter().all(|definition| {
-                !definition.name.is_empty()
-                    && definition.name.len() <= 64
-                    && definition
-                        .name
-                        .bytes()
-                        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
-            })
     }
 
     fn prompt_messages_for_tool_protocol(
@@ -5980,12 +6044,11 @@ impl RuntimeAgent {
     // Preflights the actual native or prompt-protocol representation before retries and fallback can hide an oversized request.
     fn validate_main_work_budget(
         &self,
-        llm: &dyn LLMProvider,
         messages: &[ChatMessage],
         protocol: &MainToolProtocol,
         corrective: bool,
     ) -> Result<()> {
-        if self.provider_can_use_native_tools(llm, protocol) {
+        if protocol.use_native {
             self.validate_work_request_budget(messages)?;
             if self.needs_work_request_budget_check() {
                 let definitions = serde_json::to_string(&protocol.definitions)?;
@@ -6006,14 +6069,20 @@ impl RuntimeAgent {
         }
     }
 
+    // Native-only providers cannot fall back to executable prompt JSON if definitions are unsupported.
     async fn invoke_main_provider(
         &self,
         llm: Arc<dyn LLMProvider>,
         messages: &[ChatMessage],
         protocol: &MainToolProtocol,
         corrective: bool,
-    ) -> std::result::Result<MainProviderResponse, LLMError> {
-        let use_native = self.provider_can_use_native_tools(llm.as_ref(), protocol);
+    ) -> std::result::Result<LLMResponse, LLMError> {
+        let use_native = protocol.use_native;
+        if !use_native && !llm.allows_prompt_tools() && !protocol.definitions.is_empty() {
+            return Err(LLMError::Config(
+                "provider cannot accept the effective native tool definitions".into(),
+            ));
+        }
         let response = if use_native {
             let request = LLMToolRequest {
                 tools: protocol.definitions.clone(),
@@ -6036,32 +6105,32 @@ impl RuntimeAgent {
             )
             .await?
         };
-        Ok(MainProviderResponse {
-            response,
-            used_native_tools: use_native,
-        })
+        Ok(response)
     }
 
+    // Retry eligible failures without changing the active tool contract on fallback.
     async fn complete_main_attempt_with_recovery(
         &self,
         llm: Arc<dyn LLMProvider>,
         messages: &[ChatMessage],
-        protocol: &MainToolProtocol,
+        protocol: &mut MainToolProtocol,
         corrective: bool,
-    ) -> Result<MainProviderResponse> {
+    ) -> Result<LLMResponse> {
         // Provider-owned protocol/history failures must remain terminal before generic retry classification or configured fallback can hide corruption.
-        self.validate_main_work_budget(llm.as_ref(), messages, protocol, corrective)?;
+        self.validate_main_work_budget(messages, protocol, corrective)?;
+        let primary_protocol = &*protocol;
         let primary_result = self
             .recovery_manager
             .with_llm_retry(
                 "llm_call",
                 None,
                 || {
-                    let llm = Arc::clone(&llm);
-                    async move {
-                        self.invoke_main_provider(llm, messages, protocol, corrective)
-                            .await
-                    }
+                    self.invoke_main_provider(
+                        Arc::clone(&llm),
+                        messages,
+                        primary_protocol,
+                        corrective,
+                    )
                 },
                 |error| llm.is_terminal_error(error),
             )
@@ -6081,12 +6150,7 @@ impl RuntimeAgent {
                                 "Fallback LLM '{fallback_llm}' not found: {error}"
                             ))
                         })?;
-                        self.validate_main_work_budget(
-                            fallback.as_ref(),
-                            messages,
-                            protocol,
-                            corrective,
-                        )?;
+                        protocol.select_fallback(fallback.as_ref())?;
                         self.invoke_main_provider(fallback, messages, protocol, corrective)
                             .await
                             .map_err(|error| AgentError::LLM(error.to_string()))
@@ -6100,10 +6164,7 @@ impl RuntimeAgent {
                                 "Required tool selection failed and cannot be satisfied by a static fallback response: {primary_error}"
                             )))
                         } else {
-                            Ok(MainProviderResponse {
-                                response: LLMResponse::new(message.clone(), FinishReason::Stop),
-                                used_native_tools: false,
-                            })
+                            Ok(LLMResponse::new(message.clone(), FinishReason::Stop))
                         }
                     }
                     LLMFailureAction::Error => Err(primary_error),
@@ -6112,6 +6173,7 @@ impl RuntimeAgent {
         }
     }
 
+    // Normalize provider calls before dispatch while keeping native-only text inert.
     fn normalize_main_provider_response(
         &self,
         mut response: LLMResponse,
@@ -6134,8 +6196,17 @@ impl RuntimeAgent {
                     "Provider returned replay state without native tool calls".to_string(),
                 ));
             }
-            None if !matches!(protocol.choice.as_ref(), Some(ToolChoice::None)) => {
+            None if protocol.allow_prompt_tools
+                && !matches!(protocol.choice.as_ref(), Some(ToolChoice::None)) =>
+            {
                 self.parse_tool_calls(response.content.trim())?
+            }
+            None if !protocol.allow_prompt_tools
+                && Self::is_native_tool_call_content(response.content.trim())? =>
+            {
+                return Err(AgentError::LLM(
+                    "provider returned reserved tool markers as text".into(),
+                ));
             }
             None => None,
         };
@@ -6173,13 +6244,12 @@ impl RuntimeAgent {
         messages: &[ChatMessage],
         protocol: &MainToolProtocol,
     ) -> Result<LLMResponse> {
-        self.validate_main_work_budget(llm.as_ref(), messages, protocol, false)?;
+        self.validate_main_work_budget(messages, protocol, false)?;
         let response = self
             .invoke_main_provider(llm, messages, protocol, false)
             .await
             .map_err(|error| AgentError::LLM(error.to_string()))?;
-        let (response, compliant) =
-            self.normalize_main_provider_response(response.response, protocol)?;
+        let (response, compliant) = self.normalize_main_provider_response(response, protocol)?;
         if !compliant {
             return Err(AgentError::LLM(
                 "Feedback-bearing request returned no compliant tool call".into(),
@@ -6188,31 +6258,32 @@ impl RuntimeAgent {
         Ok(response)
     }
 
+    // Keep the successful attempt's prompt permissions through normalization and dispatch.
     async fn complete_main_llm_with_recovery(
         &self,
         llm: Arc<dyn LLMProvider>,
         messages: &[ChatMessage],
-        protocol: &MainToolProtocol,
+        protocol: &mut MainToolProtocol,
     ) -> Result<LLMResponse> {
+        let primary_allows_prompt = protocol.allow_prompt_tools;
         let first = self
             .complete_main_attempt_with_recovery(Arc::clone(&llm), messages, protocol, false)
             .await?;
-        let (response, compliant) =
-            self.normalize_main_provider_response(first.response, protocol)?;
+        let (response, compliant) = self.normalize_main_provider_response(first, protocol)?;
         if compliant {
             return Ok(response);
         }
-        if first.used_native_tools {
+        if protocol.use_native {
             return Err(AgentError::LLM(
                 "Provider returned no compliant native call for required tool choice".to_string(),
             ));
         }
 
+        protocol.allow_prompt_tools = primary_allows_prompt;
         let corrected = self
             .complete_main_attempt_with_recovery(llm, messages, protocol, true)
             .await?;
-        let (response, compliant) =
-            self.normalize_main_provider_response(corrected.response, protocol)?;
+        let (response, compliant) = self.normalize_main_provider_response(corrected, protocol)?;
         if compliant {
             return Ok(response);
         }
@@ -6231,7 +6302,7 @@ impl RuntimeAgent {
         &self,
         llm: Arc<dyn LLMProvider>,
         messages: &[ChatMessage],
-        protocol: &MainToolProtocol,
+        protocol: &mut MainToolProtocol,
     ) -> Result<MainStreamSource> {
         debug_assert!(
             protocol.choice.is_none(),
@@ -6271,6 +6342,7 @@ impl RuntimeAgent {
                                 "Fallback LLM '{fallback_llm}' not found: {error}"
                             ))
                         })?;
+                        protocol.select_fallback(fallback.as_ref())?;
                         if fallback.supports(LLMFeature::Streaming) {
                             let stream = self
                                 .observe_purpose(
@@ -6288,11 +6360,14 @@ impl RuntimeAgent {
                                 )
                                 .await
                                 .map_err(|error| AgentError::LLM(error.to_string()))?;
-                            Ok(MainStreamSource::StaticResponse(response.content))
+                            Ok(MainStreamSource::Complete(response))
                         }
                     }
                     LLMFailureAction::FallbackResponse { message } => {
-                        Ok(MainStreamSource::StaticResponse(message.clone()))
+                        Ok(MainStreamSource::Complete(LLMResponse::new(
+                            message.clone(),
+                            FinishReason::Stop,
+                        )))
                     }
                     LLMFailureAction::Error => Err(primary_error),
                 }
@@ -6441,14 +6516,20 @@ impl RuntimeAgent {
         Ok(messages)
     }
 
-    /// Applies tool-choice visibility before parsing validated native markers or legacy prompt JSON.
+    /// Applies tool-choice visibility and permits prompt JSON only for providers using that protocol.
     fn parse_main_tool_calls(
         &self,
         content: &str,
         protocol: &MainToolProtocol,
     ) -> Result<Option<Vec<ToolCall>>> {
-        if matches!(protocol.choice.as_ref(), Some(ToolChoice::None)) {
+        if matches!(protocol.choice.as_ref(), Some(ToolChoice::None))
+            || (!protocol.allow_prompt_tools && protocol.choice.is_none())
+        {
             Ok(None)
+        } else if !protocol.allow_prompt_tools {
+            Ok(decode_native_tool_call_markers(content)
+                .map_err(|error| AgentError::LLM(error.to_string()))?
+                .map(|batch| batch.into_parts().0))
         } else {
             self.parse_tool_calls(content)
         }
@@ -7338,6 +7419,27 @@ impl RuntimeAgent {
         })
     }
 
+    // Apply the resolved implementation's input contract without fetching external schemas or disclosing argument values.
+    // Preserve policy denials and recheck the final arguments against the live implementation after approval.
+    fn check_tool_input(
+        policy: SecurityCheckResult,
+        tool: &dyn ai_agents_core::Tool,
+        args: &Value,
+    ) -> SecurityCheckResult {
+        if policy.is_blocked() {
+            return policy;
+        }
+        match jsonschema::options().offline().build(&tool.input_schema()) {
+            Ok(schema) if schema.is_valid(args) => policy,
+            Ok(_) => SecurityCheckResult::Block {
+                reason: "arguments do not match the tool input schema".into(),
+            },
+            Err(_) => SecurityCheckResult::Unavailable {
+                reason: "tool input schema is invalid or has unresolved references".into(),
+            },
+        }
+    }
+
     // Runs shared policy, approval, admission and record publication under each request's own source and fallback ancestry.
     // The retained hop keeps its original start hook and timing while fresh attempts still reauthorize and consume admission.
     // Original retained response bindings restrict preparation even if current approval gates disappear; known non-invocation still publishes ordinary denial records.
@@ -7588,6 +7690,8 @@ impl RuntimeAgent {
             self.finish_tool_record(&record).await;
             return Ok(record);
         }
+        security_result =
+            Self::check_tool_input(security_result, resolved.tool.as_ref(), &executed_arguments);
         if crate::autonomy::validation_requires_approval(&request)
             && matches!(
                 security_result,
@@ -8447,6 +8551,11 @@ impl RuntimeAgent {
         let final_security_result = security_engine
             .validate_tool_execution_with_bindings(&canonical_id, &final_arguments, &bindings)
             .await?;
+        let final_security_result = Self::check_tool_input(
+            final_security_result,
+            resolved.tool.as_ref(),
+            &final_arguments,
+        );
         match &final_security_result {
             SecurityCheckResult::Block { reason } => {
                 let record = final_denial(
@@ -13233,18 +13342,18 @@ Respond in JSON format:
         reasoning_mode: &ReasoningMode,
     ) -> Result<MainResponseDraft> {
         let llm = self.get_state_llm()?;
-        let protocol = self.main_tool_protocol(llm.as_ref(), true).await?;
+        let mut protocol = self.main_tool_protocol(llm.as_ref(), true).await?;
         let mut messages = self
             .build_messages_internal(
                 false,
                 Some(processed_input),
-                protocol.choice.is_none(),
+                protocol.uses_legacy_tool_prompt(),
                 false,
             )
             .await?;
         self.inject_reasoning_prompt(&mut messages, reasoning_mode, true);
         let response = self
-            .complete_main_llm_with_recovery(llm, &messages, &protocol)
+            .complete_main_llm_with_recovery(llm, &messages, &mut protocol)
             .await?;
         let content = response.content.trim().to_string();
         let (thinking, answer) = self.extract_thinking(&content);
@@ -13708,7 +13817,7 @@ Respond in JSON format:
         Ok(ToolCallOutcome::Continue)
     }
 
-    /// Runs response reflection with one effective configuration snapshot for gating, evaluation, and retry bounds.
+    /// Runs reflection under one configuration snapshot and requests revisions as text-only turns.
     async fn run_reflection(
         &self,
         llm: &dyn LLMProvider,
@@ -13773,7 +13882,10 @@ Respond in JSON format:
                 .add_message(ChatMessage::user(&retry_prompt))
                 .await?;
 
-            let retry_messages = self.build_messages().await?;
+            // Reflection revises text and never dispatches tools on this request.
+            let retry_messages = self
+                .build_messages_internal(true, None, false, false)
+                .await?;
             let retry_response = self
                 .observe_purpose(
                     ObservationPurpose::ReflectionEvaluation,
@@ -13896,9 +14008,9 @@ Respond in JSON format:
         let mut final_content;
 
         for post_iter in 0..self.max_iterations {
-            let protocol = self.main_tool_protocol(new_llm.as_ref(), false).await?;
+            let mut protocol = self.main_tool_protocol(new_llm.as_ref(), false).await?;
             let new_messages = self
-                .build_messages_internal(true, None, protocol.choice.is_none(), false)
+                .build_messages_internal(true, None, protocol.uses_legacy_tool_prompt(), false)
                 .await?;
             if post_iter == 0
                 && let Some(system_msg) = new_messages.first()
@@ -13912,7 +14024,7 @@ Respond in JSON format:
             }
 
             let new_response = self
-                .complete_main_llm_with_recovery(Arc::clone(&new_llm), &new_messages, &protocol)
+                .complete_main_llm_with_recovery(Arc::clone(&new_llm), &new_messages, &mut protocol)
                 .await?;
             final_content = new_response.content.trim().to_string();
 
@@ -15235,6 +15347,9 @@ Respond in JSON format:
         .await
     }
 
+    // A speculative branch owns its buffered deltas until routing selects it.
+    // An incomplete provider response must fail before the branch can commit text or hand off tool work.
+    // Buffer provisional text under the same prompt and parsing rules used by the serial turn.
     async fn generate_buffered_streaming_draft(
         &self,
         processed_input: &str,
@@ -15248,28 +15363,35 @@ Respond in JSON format:
             return Ok(StreamingDraftResult::new(draft, Vec::new()));
         }
         // configured_tool_choice() is None here, so the protocol only carries the effective grant and the raw stream path applies.
-        let protocol = self.main_tool_protocol(llm.as_ref(), true).await?;
-        let messages = self.build_messages_for_draft(processed_input).await?;
+        let mut protocol = self.main_tool_protocol(llm.as_ref(), true).await?;
+        let messages = self
+            .build_messages_internal(
+                false,
+                Some(processed_input),
+                protocol.uses_legacy_tool_prompt(),
+                false,
+            )
+            .await?;
         let source = self
-            .open_main_stream_with_recovery(Arc::clone(&llm), &messages, &protocol)
+            .open_main_stream_with_recovery(Arc::clone(&llm), &messages, &mut protocol)
             .await?;
         let mut buffer = crate::optimization::StreamBranchBuffer::new(self.streaming.buffer_size)?;
         let mut chunks = Vec::new();
-        let mut accumulated = String::new();
-        match source {
-            MainStreamSource::StaticResponse(text) => {
-                accumulated.push_str(&text);
-                let stream_chunk = StreamChunk::content(text);
+        let response = match source {
+            MainStreamSource::Complete(response) => {
+                let stream_chunk = StreamChunk::content(&response.content);
                 if routing_resolved.load(Ordering::SeqCst) {
                     chunks.push(stream_chunk);
                 } else {
                     buffer.push(stream_chunk)?;
                 }
+                response
             }
             MainStreamSource::Stream(mut stream) => {
+                let mut output = MainStreamOutput::default();
                 while let Some(chunk_result) = stream.next().await {
                     let chunk = chunk_result.map_err(|e| AgentError::LLM(e.to_string()))?;
-                    accumulated.push_str(&chunk.delta);
+                    output.observe(&chunk);
                     let stream_chunk = StreamChunk::content(chunk.delta);
                     if routing_resolved.load(Ordering::SeqCst) {
                         chunks.push(stream_chunk);
@@ -15277,11 +15399,13 @@ Respond in JSON format:
                         buffer.push(stream_chunk)?;
                     }
                 }
+                output.into_response()
             }
-        }
+        };
+        require_complete_stream_text(&response.finish_reason)?;
         chunks.splice(0..0, buffer.drain());
-        let content = accumulated.trim().to_string();
-        let draft = if let Some(calls) = self.parse_tool_calls(&content)? {
+        let content = response.content.trim().to_string();
+        let draft = if let Some(calls) = self.parse_main_tool_calls(&content, &protocol)? {
             MainResponseDraft::ToolCalls {
                 raw_content: content,
                 calls,
@@ -15606,9 +15730,8 @@ Respond in JSON format:
         Ok(candidate)
     }
 
-    /// Streaming agent pipeline
-    /// Uses all the same shared helpers as run_loop_internal.
-    /// The ONLY difference: LLM calls use complete_stream() + yield deltas.
+    /// Streams provisional deltas while sharing tool execution and root-turn finalization with the blocking loop.
+    /// Reports terminal provider receipts after settlement and rejects incomplete text before interpretation or commit.
     fn run_loop_internal_stream<'a>(
         &'a self,
         input: &'a str,
@@ -15894,7 +16017,7 @@ Respond in JSON format:
 
                 debug!(iteration = iterations, max = effective_max, "LLM call (stream)");
 
-                let protocol = match self.main_tool_protocol(llm.as_ref(), false).await {
+                let mut protocol = match self.main_tool_protocol(llm.as_ref(), false).await {
                     Ok(protocol) => protocol,
                     Err(e) => {
                         yield StreamChunk::error(e.to_string());
@@ -15902,7 +16025,7 @@ Respond in JSON format:
                     }
                 };
                 let mut messages = match self
-                    .build_messages_internal(true, None, protocol.choice.is_none(), false)
+                    .build_messages_internal(true, None, protocol.uses_legacy_tool_prompt(), false)
                     .await
                 {
                     Ok(m) => m,
@@ -15925,7 +16048,7 @@ Respond in JSON format:
                         .complete_main_llm_with_recovery(
                             Arc::clone(&llm),
                             &messages,
-                            &protocol,
+                            &mut protocol,
                         )
                         .await
                     {
@@ -15941,7 +16064,7 @@ Respond in JSON format:
                 } else {
                     // Streaming LLM call. Retry and fallback apply to opening the stream only (see open_main_stream_with_recovery).
                     let source = match self
-                        .open_main_stream_with_recovery(Arc::clone(&llm), &messages, &protocol)
+                        .open_main_stream_with_recovery(Arc::clone(&llm), &messages, &mut protocol)
                         .await
                     {
                         Ok(source) => source,
@@ -15950,17 +16073,17 @@ Respond in JSON format:
                             return;
                         }
                     };
-                    let mut accumulated = String::new();
-                    match source {
-                        MainStreamSource::StaticResponse(text) => {
-                            accumulated.push_str(&text);
-                            yield StreamChunk::content(text);
+                    let mut response = match source {
+                        MainStreamSource::Complete(response) => {
+                            yield StreamChunk::content(&response.content);
+                            response
                         }
                         MainStreamSource::Stream(mut stream_inner) => {
+                            let mut output = MainStreamOutput::default();
                             while let Some(chunk_result) = stream_inner.next().await {
                                 match chunk_result {
                                     Ok(chunk) => {
-                                        accumulated.push_str(&chunk.delta);
+                                        output.observe(&chunk);
                                         yield StreamChunk::content(chunk.delta);
                                     }
                                     Err(e) => {
@@ -15970,16 +16093,17 @@ Respond in JSON format:
                                     }
                                 }
                             }
+                            output.into_response()
                         }
+                    };
+                    response.content = response.content.trim().to_owned();
+                    // Report the provider receipt only after the managed stream has settled.
+                    self.hooks.on_llm_complete(&response, llm_start.elapsed().as_millis() as u64).await;
+                    if let Err(error) = require_complete_stream_text(&response.finish_reason) {
+                        yield StreamChunk::error(error.to_string());
+                        return;
                     }
-                    let llm_duration_ms = llm_start.elapsed().as_millis() as u64;
-                    // Construct LLMResponse for hooks
-                    let llm_response = ai_agents_core::LLMResponse::new(
-                        accumulated.trim(),
-                        ai_agents_core::FinishReason::Stop,
-                    );
-                    self.hooks.on_llm_complete(&llm_response, llm_duration_ms).await;
-                    accumulated.trim().to_string()
+                    response.content
                 };
 
                 // Tool call handling
@@ -26837,6 +26961,256 @@ memory:
             0,
             "fallback must not run after a visible delta"
         );
+    }
+
+    // Count body entries independently of the executor's denial records.
+    struct SchemaProbe(std::sync::atomic::AtomicUsize);
+
+    #[async_trait]
+    impl Tool for SchemaProbe {
+        // Bind the probe to the same grant in each request mode.
+        fn id(&self) -> &str {
+            "schema_probe"
+        }
+        // Use the canonical name in generated prompts.
+        fn name(&self) -> &str {
+            self.id()
+        }
+        // Describe the observable fixture operation to the model.
+        fn description(&self) -> &str {
+            "Counts schema-validated calls."
+        }
+        // Exercise required fields and a local reference with the same contract exposed to the provider.
+        fn input_schema(&self) -> Value {
+            serde_json::json!({"type":"object","required":["word"],"properties":{"word":{"$ref":"#/$defs/word"}},"$defs":{"word":{"type":"string"}}})
+        }
+        // Count only actual body entries after final admission.
+        async fn execute(&self, _: Value, _: ToolExecutionContext) -> ToolResult {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            ToolResult::ok("counted")
+        }
+    }
+
+    const TOOL_SHAPED_TEXT: &str = r#"{"tool":"schema_probe","arguments":{"word":"ok"}}"#;
+
+    // Missing required fields and wrong types must be rejected before invocation.
+    #[tokio::test]
+    async fn tool_contract_rejects_invalid_objects_before_body_entry() {
+        let probe = Arc::new(SchemaProbe(Default::default()));
+        let agent = AgentBuilder::new()
+            .system_prompt("test")
+            .llm(Arc::new(mock_with_response("ok")))
+            .tool(probe.clone())
+            .build()
+            .unwrap();
+        for args in [serde_json::json!({}), serde_json::json!({"word":42})] {
+            let record = agent
+                .invoke_tool(ToolExecutionRequest::new(
+                    "bad",
+                    "schema_probe",
+                    args,
+                    ToolCallSource::Model,
+                ))
+                .await
+                .unwrap();
+            assert!(!record.executed);
+            assert!(record.output.contains("input schema"), "{}", record.output);
+            assert_eq!(probe.0.load(Ordering::SeqCst), 0);
+        }
+        let record = agent
+            .invoke_tool(ToolExecutionRequest::new(
+                "good",
+                "schema_probe",
+                serde_json::json!({"word":"ok"}),
+                ToolCallSource::Model,
+            ))
+            .await
+            .unwrap();
+        assert!(record.success);
+        assert_eq!(probe.0.load(Ordering::SeqCst), 1);
+    }
+
+    // Final admission validates the arguments returned by approval against the live tool.
+    #[tokio::test]
+    async fn tool_contract_revalidates_modified_approval_before_body_entry() {
+        let probe = Arc::new(SchemaProbe(Default::default()));
+        let yaml = "name: Modified\nsystem_prompt: Answer.\ntools: [schema_probe]\nhitl:\n  tools:\n    schema_probe: {require_approval: true}\n";
+        let handler = ai_agents_hitl::CallbackHandler::new(|_| ApprovalResult::Modified {
+            changes: HashMap::from([("word".into(), serde_json::json!(42))]),
+        });
+        let agent = AgentBuilder::from_yaml(yaml)
+            .unwrap()
+            .llm(Arc::new(mock_with_response("ok")))
+            .tool(probe.clone())
+            .approval_handler(Arc::new(handler))
+            .build()
+            .unwrap();
+        let record = agent
+            .invoke_tool(ToolExecutionRequest::new(
+                "modified",
+                "schema_probe",
+                serde_json::json!({"word":"valid"}),
+                ToolCallSource::Model,
+            ))
+            .await
+            .unwrap();
+        assert!(!record.executed, "{record:?}");
+        assert!(record.output.contains("input schema"), "{record:?}");
+        assert_eq!(probe.0.load(Ordering::SeqCst), 0);
+    }
+
+    // Speculative routing must preserve the text-only decision and its original grant.
+    #[tokio::test]
+    async fn tool_contract_keeps_native_only_stream_text_inert_with_and_without_routing() {
+        for policy in ["buffer_until_routing_done", "disabled"] {
+            let yaml = format!(
+                r#"
+name: StreamContract
+system_prompt: Answer.
+tools: [schema_probe]
+runtime:
+  optimization:
+    enabled: true
+    speculative_state_transitions: true
+    max_speculative_llm_calls_per_turn: 2
+    streaming_policy: {policy}
+    max_parallel_runtime_tasks: 2
+states:
+  initial: first
+  states:
+    first:
+      prompt: Answer here.
+      transitions:
+        - to: second
+          guard:
+            context:
+              route:
+                eq: second
+          timing: parallel
+    second:
+      prompt: Answer there.
+"#
+            );
+            let probe = Arc::new(SchemaProbe(Default::default()));
+            let mut provider = mock_with_response(TOOL_SHAPED_TEXT);
+            provider.set_prompt_tool_support(false);
+            let agent = AgentBuilder::from_yaml(&yaml)
+                .unwrap()
+                .llm(Arc::new(provider.clone()))
+                .tool(probe.clone())
+                .build()
+                .unwrap();
+            let (_, _, response) = collect_stream_events(&agent, "hello").await;
+            assert_eq!(response.unwrap().content, TOOL_SHAPED_TEXT);
+            assert_eq!(probe.0.load(Ordering::SeqCst), 0);
+            assert_eq!(provider.call_count(), 1);
+            assert!(
+                !provider.last_call().unwrap().messages[0]
+                    .content
+                    .contains("schema_probe")
+            );
+        }
+    }
+
+    // Observe both native fallback outcomes using the same effective grant.
+    #[tokio::test]
+    async fn tool_contract_native_fallback_preserves_text_and_native_calls() {
+        for native in [false, true] {
+            let mut primary = MockLLMProvider::new("primary");
+            primary.set_tool_choice(Some(ToolChoice::Auto));
+            primary.set_error("temporary failure");
+            let mut backup = MockLLMProvider::new("backup");
+            backup.set_prompt_tool_support(false);
+            if native {
+                backup.add_response(
+                    LLMResponse::new("", FinishReason::ToolCall)
+                        .with_tool_calls(vec![ToolCall {
+                            id: "one".into(),
+                            name: "schema_probe".into(),
+                            arguments: serde_json::json!({"word":"ok"}),
+                        }])
+                        .unwrap(),
+                );
+                backup.add_response(LLMResponse::new("finished", FinishReason::Stop));
+            } else {
+                backup.set_response(TOOL_SHAPED_TEXT);
+            }
+            let probe = Arc::new(SchemaProbe(Default::default()));
+            let agent = AgentBuilder::new()
+                .system_prompt("test")
+                .llm_alias("default", Arc::new(primary))
+                .llm_alias("backup", Arc::new(backup.clone()))
+                .recovery_manager(fallback_llm_recovery("backup"))
+                .tool(probe.clone())
+                .build()
+                .unwrap();
+            let response = agent.chat("test").await.unwrap();
+            assert_eq!(
+                response.content,
+                if native { "finished" } else { TOOL_SHAPED_TEXT }
+            );
+            assert_eq!(probe.0.load(Ordering::SeqCst), usize::from(native));
+            assert!(backup.call_history().iter().all(|call| {
+                call.request
+                    .as_ref()
+                    .is_some_and(|req| req.choice == ToolChoice::Auto)
+            }));
+        }
+    }
+
+    // A legacy tool prompt must never be forwarded to a native-only fallback.
+    #[tokio::test]
+    async fn tool_contract_rejects_prompt_fallback_before_dispatch() {
+        let mut primary = MockLLMProvider::new("prompt provider");
+        primary.set_error("unavailable");
+        let mut backup = mock_with_response("unexpected");
+        backup.set_prompt_tool_support(false);
+        let agent = AgentBuilder::new()
+            .system_prompt("test")
+            .llm_alias("default", Arc::new(primary))
+            .llm_alias("backup", Arc::new(backup.clone()))
+            .recovery_manager(fallback_llm_recovery("backup"))
+            .tool(Arc::new(SchemaProbe(Default::default())))
+            .build()
+            .unwrap();
+        let error = agent.chat("question").await.unwrap_err();
+        assert!(
+            error.to_string().contains("active tool protocol"),
+            "{error}"
+        );
+        assert_eq!(backup.call_count(), 0);
+    }
+
+    // A text revision must not advertise the tools available to the original main turn.
+    #[tokio::test]
+    async fn tool_contract_reflection_revises_without_tool_instructions() {
+        let yaml = r#"
+name: ReflectionTools
+system_prompt: Answer.
+tools: [schema_probe]
+reflection:
+  enabled: true
+  evaluator_llm: evaluator
+  max_retries: 1
+  criteria: [Clarity]
+"#;
+        let main = mock_with_responses(vec!["first", "revised"]);
+        let judge = mock_with_responses(vec![
+            "OVERALL: FAIL\nCONFIDENCE: 0.1",
+            "OVERALL: PASS\nCONFIDENCE: 1",
+        ]);
+        let agent = AgentBuilder::from_yaml(yaml)
+            .unwrap()
+            .llm_alias("default", Arc::new(main.clone()))
+            .llm_alias("evaluator", Arc::new(judge))
+            .tool(Arc::new(SchemaProbe(Default::default())))
+            .build()
+            .unwrap();
+        assert_eq!(agent.chat("hello").await.unwrap().content, "revised");
+        let calls = main.call_history();
+        assert_eq!(calls.len(), 2);
+        assert!(calls[0].messages[0].content.contains("schema_probe"));
+        assert!(!calls[1].messages[0].content.contains("schema_probe"));
     }
 
     #[tokio::test]

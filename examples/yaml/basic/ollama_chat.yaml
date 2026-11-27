@@ -21,10 +21,8 @@ system_prompt: |
 llm:
   provider: ollama
   model: llama3.2
-  # Set context explicitly for agent prompts; server/model defaults vary.
-  num_ctx: 4096
-  keep_alive: 5m             # keep model loaded after a request
-  num_gpu: -1                # GPU layers; -1 means all supported layers
+  # Older YAML may declare num_ctx, num_gpu and keep_alive here.
+  # Local chat currently uses the server or model settings for these options.
 
 memory:
   type: in-memory
@@ -41,5 +39,5 @@ metadata:
     hints:
       - "Make sure Ollama is running: ollama serve"
       - "Pull the model first: ollama pull llama3.2"
-      - "num_ctx controls the context window size"
+      - "Set the context window on your local server or model"
       - "Native Ollama uses http://localhost:11434; openai-compatible uses /v1"

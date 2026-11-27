@@ -269,9 +269,17 @@ fn task_store_commands_manage_legacy_finite_namespace() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+#[derive(Debug, PartialEq)]
+enum FixtureRequest {
+    Generation(Value),
+    Get,
+}
+
 // Accepted sockets have platform-dependent modes; request parsing requires bounded blocking reads on every platform.
 // EOF/reset ends only this connection, while timeouts and malformed requests remain visible test failures.
-fn read_fixture_request(socket: &mut std::net::TcpStream) -> std::io::Result<Option<Value>> {
+fn read_fixture_request(
+    socket: &mut std::net::TcpStream,
+) -> std::io::Result<Option<FixtureRequest>> {
     use std::io::{Error, ErrorKind};
 
     socket.set_nonblocking(false)?;
@@ -307,9 +315,13 @@ fn read_fixture_request(socket: &mut std::net::TcpStream) -> std::io::Result<Opt
             break i + 4;
         }
     };
-    let len = std::str::from_utf8(&bytes[..end])
-        .map_err(|error| Error::new(ErrorKind::InvalidData, error))?
-        .lines()
+    let headers = std::str::from_utf8(&bytes[..end])
+        .map_err(|error| Error::new(ErrorKind::InvalidData, error))?;
+    let mut lines = headers.lines();
+    if lines.next().is_some_and(|line| line.starts_with("GET ")) {
+        return Ok(Some(FixtureRequest::Get));
+    }
+    let len = lines
         .find_map(|line| {
             line.split_once(':')
                 .filter(|(key, _)| key.eq_ignore_ascii_case("content-length"))
@@ -324,7 +336,7 @@ fn read_fixture_request(socket: &mut std::net::TcpStream) -> std::io::Result<Opt
         }
     }
     serde_json::from_slice(&bytes[end..end + len])
-        .map(Some)
+        .map(|body| Some(FixtureRequest::Generation(body)))
         .map_err(|error| Error::new(ErrorKind::InvalidData, error))
 }
 
@@ -333,6 +345,7 @@ struct Fixture {
     dir: PathBuf,
     url: String,
     calls: Arc<AtomicUsize>,
+    get_calls: Arc<AtomicUsize>,
     stop: Arc<AtomicBool>,
     gate: Arc<AtomicBool>,
     slow_output: bool,
@@ -340,6 +353,31 @@ struct Fixture {
 }
 impl Fixture {
     fn new(replies: &[&str]) -> Self {
+        Self::observe_requests(replies, |_| {})
+    }
+
+    fn observe_requests(replies: &[&str], observe: impl Fn(&Value) + Send + 'static) -> Self {
+        Self::serve(replies, observe, |body, _, reply| {
+            let streaming = body["stream"] == true;
+            Some(if streaming {
+                (
+                    "text/event-stream",
+                    format!(
+                        "data: {}\n\ndata: [DONE]\n\n",
+                        json!({"choices":[{"delta":{"content":reply},"finish_reason":"stop"}]})
+                    ),
+                )
+            } else {
+                ("application/json",json!({"id":"fixture","choices":[{"index":0,"message":{"role":"assistant","content":reply},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}).to_string())
+            })
+        })
+    }
+
+    fn serve(
+        replies: &[&str],
+        observe: impl Fn(&Value) + Send + 'static,
+        response_body: impl Fn(&Value, usize, &str) -> Option<(&'static str, String)> + Send + 'static,
+    ) -> Self {
         let dir = std::env::temp_dir().join(format!(
             "task-cli-{}-{}",
             std::process::id(),
@@ -351,6 +389,8 @@ impl Fixture {
         let url = format!("http://{}/v1/", listener.local_addr().unwrap());
         let calls = Arc::new(AtomicUsize::new(0));
         let count = calls.clone();
+        let get_calls = Arc::new(AtomicUsize::new(0));
+        let get_count = get_calls.clone();
         let stop = Arc::new(AtomicBool::new(false));
         let stopped = stop.clone();
         let gate = Arc::new(AtomicBool::new(false));
@@ -367,28 +407,28 @@ impl Fixture {
                     Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
                     Err(error) => panic!("fixture accept failed: {error}"),
                 };
-                let Some(body) =
+                let Some(request) =
                     read_fixture_request(&mut socket).expect("fixture request read failed")
                 else {
                     // A client may disconnect before sending a request; it does not stop the listener or consume a reply.
                     continue;
                 };
+                let FixtureRequest::Generation(body) = request else {
+                    // Discovery is unavailable on this generation fixture.
+                    get_count.fetch_add(1, Ordering::SeqCst);
+                    let _ = socket.write_all(
+                        b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    );
+                    continue;
+                };
+                observe(&body);
                 let index = count.fetch_add(1, Ordering::SeqCst);
                 let reply = replies.get(index).cloned().unwrap_or_else(|| "done".into());
                 while held.load(Ordering::Acquire) && !stopped.load(Ordering::Acquire) {
                     thread::sleep(Duration::from_millis(2));
                 }
-                let streaming = body["stream"] == true;
-                let (kind, response) = if streaming {
-                    (
-                        "text/event-stream",
-                        format!(
-                            "data: {}\n\ndata: [DONE]\n\n",
-                            json!({"choices":[{"delta":{"content":reply},"finish_reason":null}]})
-                        ),
-                    )
-                } else {
-                    ("application/json",json!({"id":"fixture","choices":[{"index":0,"message":{"role":"assistant","content":reply},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}).to_string())
+                let Some((kind, response)) = response_body(&body, index, &reply) else {
+                    continue;
                 };
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
@@ -401,6 +441,7 @@ impl Fixture {
             dir,
             url,
             calls,
+            get_calls,
             stop,
             gate,
             slow_output: false,
@@ -573,6 +614,112 @@ impl Fixture {
         }
     }
 }
+
+#[test]
+fn chat_sampling_respects_the_yaml_provider_model_and_option_presence() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let captured = requests.clone();
+    let fixture = Fixture::observe_requests(&[], move |body| {
+        captured.lock().unwrap().push(body.clone());
+    });
+    let agent = fixture.agent("");
+    let path = agent.to_str().unwrap();
+    let run = |provider: &str, model: &str, options: &str, streaming| {
+        std::fs::write(
+            &agent,
+            format!(
+                "name: Fixture\nsystem_prompt: Test\nllm:\n  provider: {provider}\n  model: {model}\n  api_key_env: TASK_FIXTURE_TOKEN\n  base_url: {}\n{options}",
+                fixture.url
+            ),
+        )
+        .unwrap();
+        let mut args = vec!["run", path, "--plain"];
+        if streaming {
+            args.push("--stream");
+        }
+        fixture.run(&args, "hello\n")
+    };
+
+    for (model, streaming) in [
+        ("gpt-6-astra", false),
+        ("gpt-6.1-sol", true),
+        ("gpt-6.2-astra", false),
+        ("gpt-6.2-sol", true),
+        ("unregistered-model", false),
+    ] {
+        let output = run("openai", model, "  reasoning_effort: high\n", streaming);
+        assert_exit(&output, 0);
+        let body = requests.lock().unwrap().pop().unwrap();
+        assert_eq!(body["model"], model);
+        assert_eq!(body["stream"], streaming);
+        assert_eq!(body["reasoning_effort"], "high");
+        assert_eq!(body["max_completion_tokens"], 2000);
+        for field in ["temperature", "top_p", "logprobs", "top_logprobs"] {
+            assert!(body.get(field).is_none(), "unexpected {field} in {body}");
+        }
+    }
+
+    for (options, field) in [
+        ("  temperature: 0.7\n", "temperature"),
+        ("  top_p: 0.9\n", "top_p"),
+        ("  provider_options: {logprobs: false}\n", "logprobs"),
+        ("  extra_body: {top_logprobs: 0}\n", "top_logprobs"),
+        (
+            "  extra_body: {temperature: 0.7}\n  resilient: true\n",
+            "temperature",
+        ),
+    ] {
+        let output = run("openai", "gpt-6.2-sol", options, false);
+        let error = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            error.contains(&format!("does not support {field}"))
+                || stdout.contains(&format!("does not support {field}")),
+            "stdout: {stdout}\nstderr: {error}"
+        );
+        assert!(requests.lock().unwrap().is_empty());
+    }
+
+    for (model, effort, allowed) in [
+        ("gpt-6-astra", "low", false),
+        ("gpt-6.1-sol", "low", false),
+        ("gpt-6.1-terra", "none", true),
+        ("gpt-6-luna", "none", true),
+        ("gpt-6-sol", "high", false),
+        ("gpt-5.4", "none", true),
+        ("gpt-5.4", "high", false),
+        ("unregistered-model", "future-effort", true),
+    ] {
+        let options =
+            format!("  temperature: 0.3\n  provider_options: {{reasoning_effort: {effort}}}\n");
+        let output = run("openai", model, &options, false);
+        if allowed {
+            assert_exit(&output, 0);
+            let body = requests.lock().unwrap().pop().unwrap();
+            assert_eq!(body["temperature"], 0.3);
+            assert_eq!(body["reasoning_effort"], effort);
+        } else {
+            let diagnostic = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stderr),
+                String::from_utf8_lossy(&output.stdout)
+            );
+            assert!(
+                diagnostic.contains("does not support temperature"),
+                "{model}: {diagnostic}"
+            );
+            assert!(requests.lock().unwrap().is_empty());
+        }
+    }
+    let output = run("openai-compatible", "gpt-6.2-sol", "  top_p: 0.8\n", false);
+    assert_exit(&output, 0);
+    let body = requests.lock().unwrap().pop().unwrap();
+    assert_eq!(body["temperature"], 0.7);
+    assert_eq!(body["top_p"], 0.8);
+    assert!(requests.lock().unwrap().is_empty());
+    assert_eq!(fixture.get_calls.load(Ordering::SeqCst), 0);
+}
+
 impl Drop for Fixture {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
@@ -622,7 +769,7 @@ fn fixture_request_waits_for_fragmented_data_on_a_nonblocking_socket() {
             .recv_timeout(Duration::from_secs(5))
             .unwrap()
             .unwrap(),
-        Some(json!({}))
+        Some(FixtureRequest::Generation(json!({})))
     );
     worker.join().unwrap();
 }
@@ -1324,6 +1471,894 @@ fn task_subprocess_task_owned_child_questions_keep_one_coordinating_request() {
     assert_eq!(first.calls.load(Ordering::SeqCst), 2);
     assert_eq!(second.calls.load(Ordering::SeqCst), 2);
     assert_eq!(root.calls.load(Ordering::SeqCst), 0);
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn decisions_task_restores_selected_child_without_reselection() {
+    let call = json!({"tool":"route_to_agent","arguments":{
+        "input":"Investigate the failed build","candidates":["ops","devops"],"method":"llm"
+    }});
+    let root = Fixture::new(&[&call.to_string(), "done"]);
+    let ops = Fixture::new(&[]);
+    let child_call =
+        r#"{"tool":"ask_user","arguments":{"question":"Confirm the build log","options":["yes"]}}"#;
+    let devops = Fixture::new(&[child_call, "done-devops"]);
+    let router = Fixture::serve(
+        &[],
+        |body| {
+            assert_eq!(body["model"], "fixture-decision");
+            assert_eq!(body["input"], "Investigate the failed build");
+            assert_eq!(
+                body["questions"][0]["choices"],
+                json!([{"value":"ops"},{"value":"devops"}])
+            );
+            assert!(body.get("max_tokens").is_none() && body.get("temperature").is_none());
+        },
+        |body, index, _| {
+            assert_eq!(index, 0, "decision must not replay");
+            Some(("application/json", json!({
+                "answers":[{"type":"choice","name":body["questions"][0]["name"],"choice":"devops"}],
+                "model":"fixture-decision","usage":{"input_tokens":19,"output_tokens":1,"total_tokens":20}
+            }).to_string()))
+        },
+    );
+    let child = |fixture: &Fixture, name: &str| {
+        let path = fixture.agent("tools: [ask_user]");
+        let yaml = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("name: Fixture", name);
+        std::fs::write(&path, yaml).unwrap();
+        path
+    };
+    let a = child(&ops, "name: Ops");
+    let b = child(&devops, "name: DevOps");
+    let db = root.dir.join("decisions.sqlite");
+    let task = TASK
+        .replace("tools: []", "tools: [route_to_agent, ask_user]")
+        .replace("max_llm_calls: 4", "max_llm_calls: 5");
+    let agent = root.dir.join("agent.yaml");
+    let yaml = format!(
+        r#"
+name: DecisionRoot
+system_prompt: Route to the right team.
+llm:
+  default: main
+  router:
+    orchestration:
+      routing: work_queue
+llms:
+  main:
+    provider: openai-compatible
+    model: fixture
+    base_url: {main}
+    api_key_env: TASK_FIXTURE_TOKEN
+  work_queue:
+    provider: openai
+    protocol: decisions
+    model: fixture-decision
+    base_url: {router}
+    api_key_env: TASK_FIXTURE_TOKEN
+{task}  max_wall_time_seconds: 600
+  restoration_timeout_ms: 5000
+  persistence: {{enabled: true}}
+  hitl: {{on_user_question: pause_run}}
+storage: {{type: sqlite, path: '{db}'}}
+spawner:
+  shared_llms: false
+  orchestration_tools: [route_to_agent]
+  allowed_tools: [ask_user]
+  auto_spawn:
+    - {{id: ops, agent: '{a}'}}
+    - {{id: devops, agent: '{b}'}}
+"#,
+        main = root.url,
+        router = router.url,
+        db = db.display(),
+        a = a.display(),
+        b = b.display()
+    );
+    std::fs::write(&agent, yaml).unwrap();
+    let path = agent.to_str().unwrap();
+    let seed = root.run(
+        &[
+            "task",
+            "run",
+            path,
+            "build help",
+            "--non-interactive",
+            "--json",
+        ],
+        "",
+    );
+    if !assert_configured_seed(&root, &seed, 3, &agent, &db) {
+        assert_eq!(router.calls.load(Ordering::SeqCst), 0);
+        return;
+    }
+    let result = |out: &Output| {
+        serde_json::from_str::<Value>(String::from_utf8_lossy(&out.stdout).lines().last().unwrap())
+            .unwrap()
+    };
+    let saved = result(&seed);
+    assert_eq!(saved["status"], "paused");
+    assert_eq!(saved["counters"]["llm_attempts"], 3);
+    assert_eq!(router.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(ops.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(devops.calls.load(Ordering::SeqCst), 1);
+    let resumed = root.run(
+        &[
+            "task",
+            "resume",
+            path,
+            saved["run_id"].as_str().unwrap(),
+            "--revision",
+            &saved["revision"].to_string(),
+            "--json",
+        ],
+        // Restoration review and the original child question are distinct host decisions.
+        "yes\n1\n",
+    );
+    assert_exit(&resumed, 0);
+    let done = result(&resumed);
+    assert_eq!(done["status"], "completed");
+    assert_eq!(done["run_id"], saved["run_id"]);
+    assert_eq!(done["counters"]["llm_attempts"], 5);
+    assert_eq!(router.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(ops.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(devops.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(root.calls.load(Ordering::SeqCst), 2);
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            use ai_agents::persistence::{AgentStorage, SqliteStorage};
+            let store = SqliteStorage::new(db.to_str().unwrap()).await.unwrap();
+            let key = ai_agents::autonomy::TaskRunKey {
+                agent_id: "DecisionRoot".into(),
+                run_id: saved["run_id"].as_str().unwrap().into(),
+            };
+            let snapshot = store.load_task_run(&key).await.unwrap().unwrap();
+            let choices: Vec<_> = snapshot.payload["reservations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|attempt| {
+                    let result = &attempt["result"];
+                    (result["choice_completed"] == true).then_some(&result["usage"])
+                })
+                .collect();
+            assert_eq!(
+                choices,
+                [&json!({"prompt_tokens":19,"completion_tokens":1,"total_tokens":20})]
+            );
+        });
+}
+
+#[test]
+fn ollama_cloud_yaml_streams_without_catalog_and_keeps_legacy_local_ollama() {
+    for cloud in [true, false] {
+        let fixture = Fixture::serve(
+            &[],
+            |_| {},
+            move |body, _, _| {
+                assert_eq!(body["model"], "fixture:chosen");
+                assert_eq!(body["stream"], cloud);
+                // Exercise local Ollama's existing blocking contract and Cloud's native NDJSON path.
+                if !cloud {
+                    return Some((
+                        "application/json",
+                        json!({
+                            "model":"fixture:chosen","created_at":"2026-11-22T00:00:00Z",
+                            "message":{"role":"assistant","content":"verified reply"},"done":true
+                        })
+                        .to_string(),
+                    ));
+                }
+                assert!(body.get("options").is_none());
+                assert!(body.get("tools").is_none());
+                Some((
+                    "application/x-ndjson",
+                    format!(
+                        "{}\n{}\n",
+                        json!({"model":"fixture:chosen","created_at":"2026-11-22T00:00:00Z","message":{"role":"assistant","content":"verified reply","thinking":"private text"},"done":false}),
+                        json!({"model":"fixture:chosen","created_at":"2026-11-22T00:00:00Z","message":{"role":"assistant","content":""},"done":true,"done_reason":"stop","prompt_eval_count":5,"eval_count":2}),
+                    ),
+                ))
+            },
+        );
+        let agent = fixture.agent("");
+        let source = std::fs::read_to_string(&agent)
+            .unwrap()
+            .replace("model: fixture", "model: fixture:chosen")
+            .replace(
+                "provider: openai-compatible",
+                if cloud {
+                    "provider: ollama-cloud"
+                } else {
+                    "provider: ollama"
+                },
+            );
+        let source = if cloud {
+            source
+        } else {
+            source
+                .replace("  api_key_env: TASK_FIXTURE_TOKEN\n", "")
+                .replace(&fixture.url, fixture.url.trim_end_matches("/v1/"))
+        };
+        std::fs::write(&agent, source).unwrap();
+        let mut args = vec!["run", agent.to_str().unwrap(), "--plain"];
+        if cloud {
+            args.push("--stream");
+        }
+        let out = fixture.run(&args, "hello\n");
+        assert_exit(&out, 0);
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("verified reply"),
+            "{out:?}"
+        );
+        assert!(!String::from_utf8_lossy(&out.stdout).contains("private text"));
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.get_calls.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[test]
+fn ollama_cloud_task_omitted_tool_choice_keeps_granted_tools_out_of_the_prompt() {
+    let fixture = Fixture::serve(
+        &[],
+        |_| {},
+        |body, _, _| {
+            assert!(body.get("tools").is_none());
+            for message in body["messages"].as_array().unwrap() {
+                assert!(!message["content"].as_str().unwrap().contains("file_write"));
+            }
+            Some(("application/json", json!({"message":{"role":"assistant","content":"done"},"done":true,"done_reason":"stop","prompt_eval_count":5,"eval_count":1}).to_string()))
+        },
+    );
+    let agent = fixture.agent(&TASK.replace("tools: []", "tools: [file_write]"));
+    let source = std::fs::read_to_string(&agent)
+        .unwrap()
+        .replace("provider: openai-compatible", "provider: ollama-cloud");
+    std::fs::write(&agent, source).unwrap();
+    let out = fixture.run(
+        &["task", "run", agent.to_str().unwrap(), "answer", "--json"],
+        "",
+    );
+    assert_exit(&out, 0);
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn ollama_cloud_malformed_or_rejected_tool_turns_have_no_effect() {
+    for failure in [
+        "malformed",
+        "unknown",
+        "multiple",
+        "prompt-only",
+        "rejected",
+        "disconnect",
+    ] {
+        let files = Fixture::new(&[]);
+        let path = files.dir.join("result.txt");
+        let target = path.clone();
+        let provider = Fixture::serve(
+            &[],
+            |_| {},
+            move |_, index, _| {
+                if index != 0 {
+                    assert_eq!(failure, "disconnect");
+                    return None;
+                }
+                let args = if failure == "malformed" {
+                    json!("not an object")
+                } else {
+                    json!({"path":target,"content":"approved content"})
+                };
+                let call = json!({"function":{"name":if failure == "unknown" {"missing_tool"} else {"file_write"}, "arguments":args}});
+                let message = if failure == "prompt-only" {
+                    json!({"role":"assistant","content":json!({"tool":"file_write","arguments":{"path":target,"content":"forged"}}).to_string()})
+                } else {
+                    let calls = if failure == "multiple" {
+                        vec![call.clone(), call]
+                    } else {
+                        vec![call]
+                    };
+                    json!({"role":"assistant","content":"","tool_calls":calls})
+                };
+                Some((
+                    "application/json",
+                    json!({"message":message,"done":true,"done_reason":"stop"}).to_string(),
+                ))
+            },
+        );
+        let task = TASK.replace("tools: []", "tools: [file_write]");
+        let task = if failure == "prompt-only" {
+            task.replace("response_contains: done", "response_contains: forged")
+        } else {
+            task
+        };
+        let agent=provider.agent(&format!("{task}  hitl: {{on_approval_required: pause_run}}\nhitl: {{default_timeout_seconds: 60, on_timeout: reject}}\ntool_security:\n  enabled: true\n  fail_closed: true\n  tools:\n    file_write:\n      write_paths: ['{}']\n",files.dir.display()));
+        let source = std::fs::read_to_string(&agent).unwrap().replace(
+            "provider: openai-compatible",
+            "provider: ollama-cloud\n  tool_choice: auto",
+        );
+        std::fs::write(&agent, source).unwrap();
+        let args = [
+            "task",
+            "run",
+            agent.to_str().unwrap(),
+            "write report",
+            "--json",
+        ];
+        let needs_approval = matches!(failure, "rejected" | "disconnect");
+        let mut answered = false;
+        let result = if needs_approval {
+            provider.interact(&args, |events, _| {
+                // Keep stdin open until the CLI acknowledges the pending approval.
+                if !answered && events.contains("approval_required") {
+                    answered = true;
+                    return Some(
+                        if failure == "disconnect" {
+                            "yes\n"
+                        } else {
+                            "no\n"
+                        }
+                        .into(),
+                    );
+                }
+                None
+            })
+        } else {
+            provider.run(&args, "")
+        };
+        assert_eq!(answered, needs_approval, "{failure}: {result:?}");
+        let events = String::from_utf8_lossy(&result.stdout);
+        assert_eq!(
+            path.exists(),
+            failure == "disconnect",
+            "{failure}: {result:?}"
+        );
+        assert_eq!(
+            events.contains("approval_required"),
+            needs_approval,
+            "{failure}: {result:?}"
+        );
+        if failure == "disconnect" {
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "approved content");
+            assert!(!result.status.success(), "{result:?}");
+        }
+        assert_eq!(
+            provider.calls.load(Ordering::SeqCst),
+            if failure == "disconnect" { 2 } else { 1 }
+        );
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn responses_task_approval_survives_process_restart_and_replays_only_the_result() {
+    signed_tool_task_survives_restarts(ReplayProtocol::Responses);
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn messages_task_approval_survives_process_restart_and_replays_only_the_result() {
+    signed_tool_task_survives_restarts(ReplayProtocol::Messages);
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn messages_compatible_task_approval_preserves_signed_replay() {
+    signed_tool_task_survives_restarts(ReplayProtocol::CompatibleMessages);
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn ollama_cloud_task_approval_and_tool_result_survive_process_restarts() {
+    for with_wire_id in [false, true] {
+        signed_tool_task_survives_restarts(ReplayProtocol::OllamaCloud { with_wire_id });
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn openrouter_task_approval_and_reasoning_survive_process_restarts() {
+    signed_tool_task_survives_restarts(ReplayProtocol::OpenRouter);
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Clone, Copy)]
+enum ReplayProtocol {
+    Responses,
+    OpenRouter,
+    Messages,
+    CompatibleMessages,
+    OllamaCloud { with_wire_id: bool },
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn signed_tool_task_survives_restarts(protocol: ReplayProtocol) {
+    let files = Fixture::new(&[]);
+    let path = files.dir.join("report.txt");
+    let target = path.clone();
+    let provider = Fixture::serve(
+        &[],
+        |_| {},
+        move |body, index, _| {
+            if matches!(protocol, ReplayProtocol::OpenRouter) {
+                assert_eq!(body["model"], "vendor/fixture");
+                assert_eq!(body["provider"]["only"], json!(["fixture-provider"]));
+                assert_eq!(body["provider"]["allow_fallbacks"], false);
+                assert_eq!(body["reasoning"], json!({"effort":"fixture-effort"}));
+                assert_eq!(body["max_tokens"], 2000);
+                let first = json!({
+                    "role":"assistant","content":null,
+                    "reasoning_details":[
+                        {"type":"reasoning.encrypted","index":0,"data":"private-replay-fixture"},
+                        {"type":"reasoning.summary","index":1,"summary":"private-redacted-fixture","signature":"fixture-private-thinking"}
+                    ],
+                    "tool_calls":[{"id":"call_original","type":"function","function":{
+                        "name":"file_write","arguments":json!({"path":target,"content":"verified"}).to_string()
+                    }}]
+                });
+                let (message, reason) = if index == 0 {
+                    assert!(!target.exists());
+                    assert_eq!(body["tool_choice"], "auto");
+                    (first, "tool_calls")
+                } else {
+                    assert!(index <= 2);
+                    let messages = body["messages"].as_array().unwrap();
+                    let at = messages
+                        .iter()
+                        .position(|m| m["tool_calls"].is_array())
+                        .unwrap();
+                    assert_eq!(messages[at], first);
+                    assert_eq!(messages[at + 1]["role"], "tool");
+                    assert_eq!(messages[at + 1]["tool_call_id"], "call_original");
+                    assert!(
+                        messages[at + 1]["content"]
+                            .as_str()
+                            .is_some_and(|c| !c.is_empty())
+                    );
+                    assert_eq!(std::fs::read_to_string(&target).unwrap(), "verified");
+                    (
+                        json!({"role":"assistant","content":if index == 1 {"draft"} else {"done"}}),
+                        "stop",
+                    )
+                };
+                return Some(("application/json", json!({
+                    "id":format!("gen_{index}"), "model":"vendor/fixture", "provider":"Fixture Provider",
+                    "choices":[{"message":message,"finish_reason":reason}],
+                    "usage":{"prompt_tokens":12,"completion_tokens":4,"total_tokens":16,"cost":0.01}
+                }).to_string()));
+            }
+            if let ReplayProtocol::OllamaCloud { with_wire_id } = protocol {
+                assert_eq!(body["model"], "fixture");
+                assert_eq!(body["stream"], false);
+                assert!(body.get("options").is_none());
+                assert_eq!(body["tools"][0]["function"]["name"], "file_write");
+                let mut call = json!({"type":"function","function":{
+                    "index":0,"name":"file_write","arguments":{"path":target,"content":"verified"}
+                }});
+                if with_wire_id {
+                    call["id"] = json!("cloud_wire_id");
+                }
+                let first = json!({"role":"assistant","content":"","thinking":"fixture-private-thinking","tool_calls":[call]});
+                let message = if index == 0 {
+                    assert!(!target.exists());
+                    first
+                } else {
+                    assert!(index <= 2);
+                    let turns = body["messages"].as_array().unwrap();
+                    let at = turns
+                        .iter()
+                        .position(|message| message["tool_calls"].is_array())
+                        .unwrap();
+                    assert_eq!(turns[at], first);
+                    let result = &turns[at + 1];
+                    assert_eq!(result["role"], "tool");
+                    assert_eq!(result["tool_name"], "file_write");
+                    assert!(
+                        result["content"]
+                            .as_str()
+                            .is_some_and(|content| !content.is_empty())
+                    );
+                    if with_wire_id {
+                        assert_eq!(result["tool_call_id"], "cloud_wire_id");
+                    } else {
+                        assert!(result.get("tool_call_id").is_none());
+                    }
+                    assert_eq!(std::fs::read_to_string(&target).unwrap(), "verified");
+                    json!({"role":"assistant","content":if index == 1 {"draft"} else {"done"}})
+                };
+                return Some(("application/json", json!({
+                    "done":true,"done_reason":"stop","message":message,"prompt_eval_count":12,"eval_count":4
+                }).to_string()));
+            }
+            if !matches!(protocol, ReplayProtocol::Responses) {
+                assert_eq!(body["model"], "claude-sonnet-4-6");
+                assert_eq!(body["max_tokens"], 256);
+                assert!(body.get("temperature").is_none());
+                assert_eq!(body["thinking"]["type"], "adaptive");
+                let signed = json!({"type":"thinking","thinking":"fixture-private-thinking","signature":"private-replay-fixture"});
+                let redacted =
+                    json!({"type":"redacted_thinking","data":"private-redacted-fixture"});
+                let call = json!({
+                    "type":"tool_use","id":"call_original","name":"file_write",
+                    "input":{"path":target,"content":"verified"}
+                });
+                let (content, stop_reason) = if index == 0 {
+                    assert!(!target.exists());
+                    assert_eq!(body["tool_choice"]["type"], "auto");
+                    assert!(
+                        body["tools"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|tool| tool["name"] == "file_write")
+                    );
+                    (json!([signed, redacted, call]), "tool_use")
+                } else {
+                    assert!(index <= 2, "unexpected provider replay");
+                    let turns = body["messages"].as_array().unwrap();
+                    let replay = turns
+                        .iter()
+                        .position(|turn| {
+                            turn["role"] == "assistant" && turn["content"][0] == signed
+                        })
+                        .unwrap();
+                    assert_eq!(turns[replay]["content"], json!([signed, redacted, call]));
+                    assert_eq!(turns[replay + 1]["role"], "user");
+                    assert_eq!(turns[replay + 1]["content"][0]["type"], "tool_result");
+                    assert_eq!(
+                        turns[replay + 1]["content"][0]["tool_use_id"],
+                        "call_original"
+                    );
+                    assert_eq!(std::fs::read_to_string(&target).unwrap(), "verified");
+                    (
+                        json!([{"type":"text","text":if index==1 {"draft"} else {"done"}}]),
+                        "end_turn",
+                    )
+                };
+                let reply = json!({"id":format!("msg_{index}"),"role":"assistant","stop_reason":stop_reason,
+                    "content":content,"usage":{"input_tokens":12,"output_tokens":4}});
+                return Some(("application/json", reply.to_string()));
+            }
+            assert_eq!(body["store"], false);
+            assert!(body.get("max_output_tokens").is_none());
+            assert_eq!(body["model"], "gpt-6.2-sol");
+            let output = match index {
+                0 => {
+                    assert!(!target.exists());
+                    assert!(
+                        body["tools"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|t| t["name"] == "file_write")
+                    );
+                    json!([{"type":"reasoning","id":"rs_1","summary":[],"encrypted_content":"private-replay-fixture"},{"type":"function_call","id":"fc_item","call_id":"call_original","name":"file_write","arguments":json!({"path":target,"content":"verified"}).to_string(),"status":"completed"}])
+                }
+                1 | 2 => {
+                    let items = body["input"].as_array().unwrap();
+                    let start = items.iter().position(|x| x["id"] == "rs_1").unwrap();
+                    assert_eq!(items[start + 1]["id"], "fc_item");
+                    assert_eq!(items[start + 2]["type"], "function_call_output");
+                    assert_eq!(items[start + 2]["call_id"], "call_original");
+                    assert_eq!(std::fs::read_to_string(&target).unwrap(), "verified");
+                    json!([{"type":"message","id":format!("msg_{index}"),"role":"assistant","content":[{"type":"output_text","text":if index==1 {"draft"} else {"done"}}]}])
+                }
+                _ => panic!("unexpected provider replay"),
+            };
+            Some(("application/json",json!({"id":format!("resp_{index}"),"status":"completed","output":output,"usage":{"input_tokens":12,"output_tokens":4,"total_tokens":16}}).to_string()))
+        },
+    );
+    let db = provider.dir.join("responses.sqlite");
+    let task=TASK.replace("tools: []","tools: [file_write]").replace("completion: {response_contains: done}","completion: {all: [{response_contains: done}, {tool_called: {id: file_write, count: 1, executed: true, success: true}}]}");
+    let agent=provider.agent(&format!("{task}  premature_finish: {{action: ask_user, on_unavailable: stop}}\n  max_wall_time_seconds: 600\n  restoration_timeout_ms: 5000\n  persistence: {{enabled: true}}\n  hitl: {{on_approval_required: pause_run}}\nstorage: {{type: sqlite, path: '{}'}}\nhitl: {{default_timeout_seconds: 60, on_timeout: reject}}\ntool_security:\n  enabled: true\n  fail_closed: true\n  tools:\n    file_write:\n      write_paths: ['{}']\n      overwrite_existing: false\n",db.display(), files.dir.display()));
+    let (preset, model) = match protocol {
+        ReplayProtocol::OpenRouter => (
+            "provider: openrouter\n  tool_choice: auto\n  provider_options: {provider: {only: [fixture-provider], allow_fallbacks: false}, reasoning: {effort: fixture-effort}}",
+            "vendor/fixture",
+        ),
+        ReplayProtocol::OllamaCloud { .. } => {
+            ("provider: ollama-cloud\n  tool_choice: auto", "fixture")
+        }
+        ReplayProtocol::Messages => (
+            "provider: anthropic\n  protocol: messages\n  tool_choice: auto\n  max_tokens: 256\n  provider_options: {thinking: {type: adaptive}}",
+            "claude-sonnet-4-6",
+        ),
+        ReplayProtocol::CompatibleMessages => (
+            "provider: anthropic-compatible\n  function_calling: true\n  tool_choice: auto\n  max_tokens: 256\n  provider_options: {thinking: {type: adaptive}}",
+            "claude-sonnet-4-6",
+        ),
+        ReplayProtocol::Responses => (
+            "provider: openai\n  protocol: responses\n  tool_choice: auto",
+            "gpt-6.2-sol",
+        ),
+    };
+    let source = std::fs::read_to_string(&agent)
+        .unwrap()
+        .replace("provider: openai-compatible", preset)
+        .replace("model: fixture", &format!("model: {model}"));
+    std::fs::write(&agent, &source).unwrap();
+    let agent_path = agent.to_str().unwrap();
+    let seed = provider.run(
+        &[
+            "task",
+            "run",
+            agent_path,
+            "write report",
+            "--non-interactive",
+            "--json",
+        ],
+        "",
+    );
+    if !assert_configured_seed(&provider, &seed, 3, &agent, &db) {
+        return;
+    }
+    let saved: Value = serde_json::from_str(
+        String::from_utf8_lossy(&seed.stdout)
+            .lines()
+            .last()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(saved["status"], "paused");
+    assert_eq!(saved["counters"]["llm_attempts"], 1);
+    assert!(!path.exists());
+    assert!(!String::from_utf8_lossy(&seed.stdout).contains("private-replay-fixture"));
+    let id = saved["run_id"].as_str().unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let read_snapshot = || {
+        runtime.block_on(async {
+            use ai_agents::persistence::{AgentStorage, SqliteStorage};
+            let store = SqliteStorage::new(db.to_str().unwrap()).await.unwrap();
+            let key = ai_agents::autonomy::TaskRunKey {
+                agent_id: "Fixture".into(),
+                run_id: id.to_owned(),
+            };
+            store.load_task_run(&key).await.unwrap().unwrap()
+        })
+    };
+    let read_usage = || {
+        read_snapshot().payload["reservations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|attempt| {
+                attempt
+                    .pointer("/result/response/usage")
+                    .map(|usage| usage["total_tokens"].as_u64().unwrap())
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(read_usage(), vec![16]);
+    let revision = saved["revision"].as_u64().unwrap().to_string();
+    let stale = (saved["revision"].as_u64().unwrap() - 1).to_string();
+    let rejected = provider.run(
+        &[
+            "task",
+            "resume",
+            agent_path,
+            id,
+            "--revision",
+            &stale,
+            "--json",
+        ],
+        "yes\nyes\n",
+    );
+    assert_exit(&rejected, 2);
+    assert!(!path.exists());
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    let resume = |rev: &str, input: &str| {
+        provider.run(
+            &[
+                "task",
+                "resume",
+                agent_path,
+                id,
+                "--revision",
+                rev,
+                "--json",
+            ],
+            input,
+        )
+    };
+    if matches!(protocol, ReplayProtocol::OpenRouter) {
+        std::fs::write(&agent, source.replace("fixture-provider", "other-provider")).unwrap();
+        let changed = resume(&revision, "yes\nyes\n");
+        assert!(!changed.status.success());
+        assert!(!path.exists());
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        std::fs::write(&agent, source).unwrap();
+    }
+    let between = resume(&revision, "yes\nyes\n");
+    assert_exit(&between, 3);
+    let last_result = |out: &Output| {
+        serde_json::from_str::<Value>(String::from_utf8_lossy(&out.stdout).lines().last().unwrap())
+            .unwrap()
+    };
+    let paused = last_result(&between);
+    assert_eq!(paused["status"], "paused");
+    assert_eq!(paused["counters"]["llm_attempts"], 2);
+    assert_eq!(paused["counters"]["tool_attempts"], 1);
+    assert_eq!(read_usage(), vec![16, 16]);
+    let expiry = |out: &Output| {
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .find(|v| v["kind"] == "task_paused")
+            .unwrap()["data"]["clocks"]["expires_at"]
+            .clone()
+    };
+    assert!(expiry(&seed).is_string());
+    assert_eq!(expiry(&seed), expiry(&between));
+    let result = resume(&paused["revision"].to_string(), "yes\ncontinue\n");
+    assert_exit(&result, 0);
+    let done: Value = serde_json::from_str(
+        String::from_utf8_lossy(&result.stdout)
+            .lines()
+            .last()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(done["run_id"], id);
+    assert_eq!(done["status"], "completed");
+    assert_eq!(done["counters"]["llm_attempts"], 3);
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 3);
+    assert_eq!(done["counters"]["tool_attempts"], 1);
+
+    // Removing the fixture output lets an unauthorized repeat create a detectable file under the original tool policy.
+    let completed = read_snapshot();
+    assert_eq!(done["revision"], completed.revision);
+    std::fs::remove_file(&path).unwrap();
+    let terminal = resume(&completed.revision.to_string(), "yes\nyes\n");
+    assert_exit(&terminal, 2);
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 3);
+    assert_eq!(provider.get_calls.load(Ordering::SeqCst), 0);
+    assert!(!path.exists());
+    assert_eq!(
+        serde_json::to_value(read_snapshot()).unwrap(),
+        serde_json::to_value(completed).unwrap()
+    );
+
+    for output in [&seed, &between, &result, &terminal] {
+        for private in [
+            "private-replay-fixture",
+            "fixture-private-thinking",
+            "private-redacted-fixture",
+        ] {
+            assert!(!String::from_utf8_lossy(&output.stdout).contains(private));
+            assert!(!String::from_utf8_lossy(&output.stderr).contains(private));
+        }
+    }
+}
+#[test]
+fn responses_task_failure_respects_tool_effects_and_never_replays() {
+    signed_tool_task_failure_respects_effects(false);
+}
+
+#[test]
+fn messages_task_failure_respects_tool_effects_and_never_replays() {
+    signed_tool_task_failure_respects_effects(true);
+}
+
+fn signed_tool_task_failure_respects_effects(messages: bool) {
+    for failure in ["malformed", "rejected", "disconnect"] {
+        let files = Fixture::new(&[]);
+        let path = files.dir.join("result.txt");
+        let target = path.clone();
+        let provider = Fixture::serve(
+            &[],
+            |_| {},
+            move |_, index, _| {
+                if index > 0 && failure == "disconnect" {
+                    assert_eq!(
+                        std::fs::read_to_string(&target).unwrap(),
+                        "approved content"
+                    );
+                    return None; // Drop the HTTP connection after the tool effect.
+                }
+                if messages {
+                    let (content, stop_reason) = if index == 0 {
+                        let input = if failure == "malformed" {
+                            json!("{")
+                        } else {
+                            json!({"path":target,"content":"approved content"})
+                        };
+                        (
+                            json!([{"type":"tool_use","id":"call","name":"file_write","input":input}]),
+                            "tool_use",
+                        )
+                    } else {
+                        (json!([{"type":"text","text":"done"}]), "end_turn")
+                    };
+                    let response = json!({"id":format!("m{index}"),"role":"assistant","content":content,"stop_reason":stop_reason});
+                    return Some(("application/json", response.to_string()));
+                }
+                let output = if index == 0 {
+                    let arguments = if failure == "malformed" {
+                        "{".to_owned()
+                    } else {
+                        json!({"path":target,"content":"approved content"}).to_string()
+                    };
+                    json!([{"type":"function_call","id":"item","call_id":"call","name":"file_write","arguments":arguments}])
+                } else {
+                    json!([{"type":"message","id":"m","role":"assistant","content":[{"type":"output_text","text":"done"}]}])
+                };
+                Some((
+                    "application/json",
+                    json!({"id":format!("r{index}"),"status":"completed","output":output})
+                        .to_string(),
+                ))
+            },
+        );
+        let task = TASK.replace("tools: []", "tools: [file_write]");
+        let agent=provider.agent(&format!("{task}  hitl: {{on_approval_required: pause_run}}\nhitl: {{default_timeout_seconds: 60, on_timeout: reject}}\ntool_security:\n  enabled: true\n  fail_closed: true\n  tools:\n    file_write:\n      write_paths: ['{}']\n",files.dir.display()));
+        let (preset, model) = if messages {
+            (
+                "provider: anthropic\n  protocol: messages\n  tool_choice: auto\n  max_tokens: 256",
+                "claude-sonnet-4-6",
+            )
+        } else {
+            (
+                "provider: openai\n  protocol: responses\n  tool_choice: auto",
+                "gpt-6.2-astra",
+            )
+        };
+        let source = std::fs::read_to_string(&agent)
+            .unwrap()
+            .replace("provider: openai-compatible", preset)
+            .replace("model: fixture", &format!("model: {model}"));
+        let db = provider.dir.join("journal.sqlite");
+        std::fs::write(
+            &agent,
+            format!(
+                "{source}\nstorage: {{type: sqlite, path: '{}'}}\n",
+                db.display()
+            ),
+        )
+        .unwrap();
+        let result = provider.run(
+            &[
+                "task",
+                "run",
+                agent.to_str().unwrap(),
+                "write report",
+                "--json",
+            ],
+            if failure == "disconnect" {
+                "yes\n"
+            } else {
+                "no\n"
+            },
+        );
+        assert_eq!(path.exists(), failure == "disconnect");
+        let events = String::from_utf8_lossy(&result.stdout);
+        if failure == "disconnect" {
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+            let listed = provider.run(&["task", "list", agent.to_str().unwrap(), "--json"], "");
+            assert_exit(&listed, 0);
+            let runs: Value = serde_json::from_slice(&listed.stdout).unwrap();
+            let id = runs[0]["key"]["run_id"].as_str().unwrap();
+            let show = provider.run(&["task", "show", agent.to_str().unwrap(), id, "--json"], "");
+            assert_exit(&show, 0);
+            let view: Value = serde_json::from_slice(&show.stdout).unwrap();
+            assert_eq!(view["counters"]["tool_attempts"], 1);
+            assert_eq!(view["counters"]["llm_attempts"], 2);
+            assert_ne!(view["summary"]["status"], "completed");
+        } else if failure == "malformed" {
+            assert!(!events.contains("approval_required"));
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        } else {
+            assert!(events.contains("approval_required"), "{events}");
+        }
+    }
 }
 
 #[test]
@@ -2410,4 +3445,121 @@ fn task_subprocess_configured_cancelled_pause_cleans_up_without_model_work() {
     assert_eq!(done["status"], "cancelled");
     assert_eq!(done["counters"]["llm_attempts"], 1);
     assert_eq!(f.calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn named_yaml_preserves_legacy_chat_options_and_unused_provider_aliases() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let captured = requests.clone();
+    let fixture = Fixture::observe_requests(&[], move |body| {
+        captured.lock().unwrap().push(body.clone());
+    });
+    let path = fixture.dir.join("aliases.yaml");
+    for provider in [
+        "openrouter",
+        "mistral",
+        "groq",
+        "cohere",
+        "openai_compatible",
+    ] {
+        let yaml = format!(
+            r#"name: Aliases
+system_prompt: Answer briefly.
+llm:
+  default: primary
+llms:
+  primary:
+    provider: {provider}
+    model: selected/model
+    api_key_env: TASK_FIXTURE_TOKEN
+    base_url: {url}
+    reasoning_effort: high
+    extra_body: {{logprobs: true}}
+  spare:
+    provider: groq
+    model: unused/model
+    api_key_env: TASK_FIXTURE_TOKEN
+    base_url: {url}
+"#,
+            url = fixture.url
+        );
+        std::fs::write(&path, yaml).unwrap();
+        let output = fixture.run(&["run", path.to_str().unwrap(), "--plain"], "hello\n");
+        assert_exit(&output, 0);
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("done"),
+            "{provider}"
+        );
+        let bodies = std::mem::take(&mut *requests.lock().unwrap());
+        let [body] = bodies.as_slice() else {
+            panic!("expected one generation for {provider}: {bodies:?}")
+        };
+        assert_eq!(body["model"], "selected/model");
+        assert_eq!(body["logprobs"], true);
+        assert_eq!(body["temperature"], 0.7);
+        if provider == "openai_compatible" {
+            assert_eq!(body["reasoning_effort"], "high");
+            assert_eq!(body["max_completion_tokens"], 2000);
+        } else {
+            assert!(body.get("reasoning_effort").is_none(), "{provider}: {body}");
+            assert_eq!(body["max_tokens"], 2000, "{provider}");
+        }
+    }
+    assert_eq!(fixture.get_calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn openrouter_yaml_preserves_parallel_tool_calls_and_rejects_duplicates() {
+    let bodies = Arc::new(Mutex::new(Vec::new()));
+    let observed = bodies.clone();
+    let fixture =
+        Fixture::observe_requests(&[], move |body| observed.lock().unwrap().push(body.clone()));
+    let path = fixture.dir.join("agent.yaml");
+    let run = |options: &str| {
+        std::fs::write(&path, format!(
+            "name: Router\nsystem_prompt: Test\nllm:\n  provider: openrouter\n  base_url: {}\n  api_key_env: TASK_FIXTURE_TOKEN\n  model: test/model\n{options}", fixture.url
+        )).unwrap();
+        fixture.run(&["run", path.to_str().unwrap(), "--plain"], "hello\n")
+    };
+    for (options, expected) in [
+        ("", None),
+        ("  extra_body: {parallel_tool_calls: false}\n", Some(false)),
+        (
+            "  provider_options: {parallel_tool_calls: true}\n",
+            Some(true),
+        ),
+        (
+            "  normalize_response: true\n  extra_body: {parallel_tool_calls: false}\n",
+            Some(false),
+        ),
+    ] {
+        let output = run(options);
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("done"),
+            "{output:?}"
+        );
+        let requests = std::mem::take(&mut *bodies.lock().unwrap());
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].get("parallel_tool_calls"),
+            expected.map(Value::Bool).as_ref()
+        );
+    }
+    for (invalid, diagnostic) in [
+        (
+            "  extra_body: {parallel_tool_calls: false}\n  provider_options: {parallel_tool_calls: false}\n",
+            "declare OpenRouter parallel_tool_calls only once",
+        ),
+        (
+            "  extra_body: {parallel_tool_calls: 'false'}\n",
+            "extra_body.parallel_tool_calls must be a boolean",
+        ),
+    ] {
+        let output = run(invalid);
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(diagnostic),
+            "{output:?}"
+        );
+        assert!(bodies.lock().unwrap().is_empty());
+    }
 }

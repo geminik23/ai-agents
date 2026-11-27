@@ -1259,3 +1259,36 @@ impl RunExecution {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::*;
+    use std::time::{Duration, Instant, SystemTime};
+
+    // The captured absolute cut follows a spawned child and can never extend an independent native restriction.
+    #[tokio::test]
+    async fn spawned_child_samples_the_original_invocation_clock() {
+        let span = Duration::from_secs(5);
+        let clock = invocation_clock::ManualClock::new(span * 2);
+        let deadline = clock.now() + span;
+        let scope = CompositionScope {
+            runtime_id: "parent".into(),
+            frame_key: "operation".into(),
+            closed: Default::default(),
+            deadline: Some(deadline),
+        };
+        let captured = clock
+            .scope(COMPOSITION_SCOPE.scope(scope, async { invocation::InvocationScope::capture() }))
+            .await;
+        tokio::spawn(captured.scope(async move {
+            let bound = ai_agents_llm::current_invocation_bounds().unwrap();
+            assert_eq!(bound.remaining(), span);
+            let expired = ai_agents_llm::InvocationBounds::new(SystemTime::now(), Instant::now());
+            assert!(bound.intersect(expired).remaining().is_zero());
+            clock.advance_to(deadline);
+            assert!(bound.remaining().is_zero());
+        }))
+        .await
+        .unwrap();
+    }
+}
