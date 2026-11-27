@@ -45,7 +45,7 @@ Use the YAML preset for framework chat, tool approval and task execution. Rust a
 | `google` | First-party GenerateContent adapter with signed tool history. | No dedicated client | Yes, upstream Google backend |
 | `ollama` | Local native chat and text streaming without authentication. `resilient: true` selects upstream. | `OllamaLocalClient` | Yes for legacy settings. Native `provider_options` are rejected. |
 | `ollama-cloud` | Authenticated native chat, NDJSON text streams and single-tool turns. | `OllamaCloudClient` | Rejected |
-| `openrouter` | Gateway Chat. `resilient: true` or an explicit boolean `normalize_response` selects upstream. | `OpenRouterClient` | Yes with default settings. Pinned-route reasoning replay belongs to the framework adapter. |
+| `openrouter` | Gateway Chat. The framework handles tool approval, execution and task recovery after a process restart. `resilient: true` or an explicit boolean `normalize_response` selects upstream. | `OpenRouterClient` supports reasoning replay on a pinned route via `Request::push_assistant`. | Yes with default settings. Returns the upstream OpenRouter client. |
 | `mistral` | Upstream Chat | No dedicated client | Yes |
 | `deepseek` | Upstream blocking Chat. The backend rejects streaming. | No dedicated client | Yes |
 | `xai` | Upstream Chat. Blocking requests can send search parameters. Streams omit them. | No dedicated client | Yes |
