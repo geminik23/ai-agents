@@ -33,6 +33,10 @@ New task profiles have no implicit cumulative count/time budget. Explicit limits
 
 See [task hosting](@/docs/task-autonomy.md), [YAML configuration](@/docs/yaml-reference.md#development-only-autonomy-configuration), [Rust hosting](@/docs/rust-api.md#automatic-state-and-skill-tasks-development-only) and [CLI behavior](@/docs/cli.md#development-task-cli) for the actual entry points.
 
+## Provider migration for 1.2
+
+Existing YAML can keep its provider ID. OpenAI and OpenAI-compatible Chat apply configured retries around the SDK request. Local Ollama users can opt into sending previously omitted daemon settings by moving them to native option paths. Rust callers can continue using the raw `build_llm()` return type with supported presets or select a direct SDK client for a specific protocol. [Provider support matrix](@/docs/providers.md#provider-support-in-1-2-development) · [Local Ollama option migration](@/docs/providers.md#migrating-local-ollama-options)
+
 ## Rust migration from 1.1.2
 
 The development checkout contains source-breaking changes to existing public types. Optional YAML fields and serde defaults do not preserve exhaustive Rust literals or matches. Using the crate facade also does not hide changes to the types it re-exports. The 1.2 migration includes the changes below; the version label does not make existing exhaustive Rust usage source-compatible.
@@ -42,7 +46,7 @@ For struct construction, prefer existing constructors or `..Default::default()` 
 | Public type | Changes and migration |
 |---|---|
 | `AgentSpec` | `autonomy: AutonomyConfig::default()` preserves an ordinary agent |
-| `ai_agents::spec::LLMConfig` | `temperature` is now `Option<f32>`. Wrap explicit values in `Some(value)`. Rust and YAML preserve omission through serialization. OpenAI omits the option on the wire. Other presets apply the historical `0.7` when constructing the provider. Previously saved numeric values remain explicit. When moving an existing OpenAI declaration to provider defaults, its effective configuration and task namespace may change. |
+| `ai_agents::spec::LLMConfig` | `temperature` is now `Option<f32>`. Wrap explicit values in `Some(value)`. Rust and YAML preserve omission through serialization. OpenAI omits the option on the wire. OpenAI-compatible Chat and default Anthropic retain their historical `0.7`. Explicit Messages, Messages-compatible and Ollama Cloud preserve omission. Previously saved numeric values remain explicit. When moving an existing OpenAI declaration to provider defaults, its effective configuration and task namespace may change. |
 | `ai_agents::spec::LLMConfig::max_tokens` | Wrap a numeric Rust declaration in `Some(limit)` or use `None` for omission. Existing Chat and legacy declarations retain their effective default of 2000 and equivalent task identity. Explicit Responses requests omit the output ceiling unless configured. |
 | `ProviderType` | Rust consumers with exhaustive matches must handle `AnthropicCompatible` and `OllamaCloud`. Default Anthropic YAML uses the Messages SDK with historical defaults. Explicit `protocol: messages` requires a positive output ceiling. An older paused Anthropic tool exchange can resume when the stored configuration establishes that thinking was off. Work whose tool continuation needs missing signatures is held before additional execution. |
 | `StateDefinition`, `SkillDefinition` | `autonomy: None` preserves the previous scope |

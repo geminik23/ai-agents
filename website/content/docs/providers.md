@@ -32,6 +32,31 @@ The development checkout offers 14 provider presets - from cloud APIs like OpenA
 
 The default Anthropic preset accepts the official Messages endpoint. For a custom Messages server, select `anthropic-compatible` and supply its API base explicitly. The upstream DeepSeek, xAI and Phind clients use fixed service endpoints for chat.
 
+## Provider support in 1.2 development
+
+Use the YAML preset for framework chat, tool approval and task execution. Rust applications that manage their own requests and history can call the clients in `ai_agents_llm::sdk` directly. Existing Rust callers can also request a raw `Box<dyn llm::LLMProvider>` from `UnifiedLLMProvider::build_llm()`. In the table, **upstream** means the external `llm` crate. Twelve presets can construct a raw client with their default protocol and compatible settings. The operations on that object depend on its backend. This table describes the development checkout for 1.2. Published 1.1.2 has its own API surface.
+
+| YAML preset | Framework request path | Direct Rust SDK for generation or decisions | Raw `build_llm()` |
+|---|---|---|---|
+| `openai` | Chat by default. Select `responses` for Responses or `decisions` for choice-only routing. | `ChatClient`, `ResponsesClient`, `DecisionClient` | Yes for legacy Chat settings. Responses, Decisions and Chat `provider_options` are rejected. |
+| `openai-compatible` | Chat at the configured API base. Native functions require `function_calling: true`. | `ChatClient` | Yes for existing Chat settings. SDK-only options are rejected. |
+| `anthropic` | Messages by default. With protocol omitted, `resilient: true` uses the legacy transport, which rejects signed Messages replay. | `MessagesClient` | Yes with protocol omitted and compatible settings. Explicit Messages is rejected. |
+| `anthropic-compatible` | Messages at the configured endpoint with its selected authentication and API version. Native functions require opt-in. | `MessagesClient::compatible` | Rejected |
+| `google` | First-party GenerateContent adapter with signed tool history. | No dedicated client | Yes, upstream Google backend |
+| `ollama` | Local native chat and text streaming without authentication. `resilient: true` selects upstream. | `OllamaLocalClient` | Yes for legacy settings. Native `provider_options` are rejected. |
+| `ollama-cloud` | Authenticated native chat, NDJSON text streams and single-tool turns. | `OllamaCloudClient` | Rejected |
+| `openrouter` | Gateway Chat. `resilient: true` or an explicit boolean `normalize_response` selects upstream. | `OpenRouterClient` | Yes with default settings. Pinned-route reasoning replay belongs to the framework adapter. |
+| `mistral` | Upstream Chat | No dedicated client | Yes |
+| `deepseek` | Upstream blocking Chat. The backend rejects streaming. | No dedicated client | Yes |
+| `xai` | Upstream Chat. Blocking requests can send search parameters. Streams omit them. | No dedicated client | Yes |
+| `groq` | Upstream Chat | No dedicated client | Yes |
+| `cohere` | Upstream compatibility endpoint | No dedicated client | Yes |
+| `phind` | Legacy upstream backend. Hosted availability is unverified. | No dedicated client | Yes, construction only verified |
+
+Model discovery is a separate operation. The SDK provides catalogs for OpenAI, Anthropic and Ollama Cloud. Raw callers can list models on local Ollama and OpenAI-compatible servers. YAML generation uses the configured model directly. [Model catalog APIs](@/docs/rust-api.md#direct-model-catalog-sdk-development)
+
+For tasks, use the protocol-specific limits for [native tool choice](@/docs/providers.md#tool-choice-support) and [cost admission](@/docs/providers.md#declared-priced-task-capabilities-development-only). The framework owns approval, tool execution and checkpoint recovery. For example, Google's adapter preserves signed parts on the follow-up tool request. CLI tests for Messages-compatible, Ollama Cloud and pinned-route OpenRouter additionally resume a file-backed SQLite task in a new process against a local HTTP fixture. The official OpenRouter gateway was also tested with `anthropic/claude-haiku-4.5` pinned to Anthropic for a streaming tool call and a follow-up request carrying the reasoning history and tool result. [Configured restart requirements](@/docs/compatibility.md#features-and-environments)
+
 ## First-party Chat Completions (development)
 
 The development checkout sends ordinary `openai` and `openai-compatible` requests to the Chat Completions endpoint through `ai-agents-llm`. The base URL includes the API prefix. A compatible server can accept unauthenticated requests when its optional key is absent. An explicitly selected key variable for the official OpenAI preset must be available. Select credentials explicitly for an OpenAI preset with a custom origin. The direct client disables redirects.
@@ -49,11 +74,11 @@ llm:
 
 `protocol` is optional. The first-party codec sends an ordinary request's nonempty effort string verbatim and omits it when absent. Choose a value and extensions supported by your server. The adapter combines explicit `provider_options` and legacy `extra_body` on distinct JSON paths. Conflicting values and overrides of messages, tools, model, stream controls, output ceilings, credentials or other owned fields fail before sending a request. Hard-priced calls require the audited option set. An existing `extra_body.response_format` with `text`, `json_object`, or `json_schema` maps to the owned Chat response format. An omitted format leaves the key absent. An explicit `extra_body.response_format: null` sends JSON null. Direct SDK callers can select `Some(ResponseFormat::Null)` for the same request.
 
-For `provider: openai`, an omitted temperature stays absent from the HTTP request. Existing legacy presets and `openai-compatible` resolve an omitted temperature to their historical `0.7` at provider construction. First-party Messages preserves omission. Both shorthand and named YAML configurations preserve omission on save. The output token default is `2000`.
+For ordinary YAML Chat, `openai` omits an unspecified temperature from the HTTP request and `openai-compatible` sends its historical `0.7`. Both shorthand and named YAML configurations preserve omission on save. The YAML output token default for these Chat presets is `2000`.
 
 The direct client on the official OpenAI origin and the framework OpenAI preset apply the same documented Chat restrictions to explicit sampling options and native tools. For example, GPT-6.2 Astra/Sol and GPT-6 Astra/6.1 Sol require Responses for native tools and reject explicit sampling. GPT-6 Sol/Luna allow Chat native tools and sampling with effort `none`. GPT-5.2/5.4 allow sampling with effort `none`, their default. Unknown model IDs pass through to the endpoint. A compatible server owns its own model rules. [GPT-6.2 guide](https://developers.openai.com/api/docs/guides/latest-model?model=gpt-6.2-astra) · [GPT-6 guide](https://developers.openai.com/api/docs/guides/latest-model?model=gpt-6-astra) · [GPT-5.4 guide](https://developers.openai.com/api/docs/guides/latest-model?model=gpt-5.4)
 
-Legacy transport settings such as resilience, deployment/API version and hosted web search select the upstream backend before dispatch. The same applies to legacy reasoning/budget and unsupported typed sampling overrides. Enabled legacy transport settings conflict with explicit SDK options. Disabled resilience and web search, including their inactive tuning fields, keep the SDK path. The public legacy `build_llm()` continues to use the upstream backend. The OpenRouter preset has its own Chat contract.
+Ordinary OpenAI and OpenAI-compatible Chat uses the SDK endpoint with legacy retry, deployment, search and reasoning settings. Earlier restrictions on combining legacy settings with explicit SDK options still apply before dispatch. A deployment field alone does not construct an Azure deployment URL, and the legacy search flag alone does not add hosted search to the request. [Transport-level retries](@/docs/providers.md#transport-level-resilience)
 
 The SDK reads text as it arrives. A successful stream requires a finish reason and a complete `[DONE]` event. A disconnect after visible text reports an error. The framework also reports explicit non-success text finishes such as `length` and `content_filter` as terminal errors. Previously published deltas remain provisional and cannot trigger tools or a successful final response. Native tool calls require distinct, nonempty IDs. Arguments are assembled by call index, parsed as JSON objects and checked against the requested function selection before delivery. Direct SDK consumers validate their application schema before acting on a call. Framework tool approval and execution use the existing executor. Incomplete calls never become executable. The direct client exposes the provider finish reason and complete token receipt. The framework continues to publish its own processed agent response.
 
@@ -115,7 +140,7 @@ Ordinary provider support is not hard-priced task support. The development stand
 | Google GenerateContent | Completion, native auto tool choice, stream | Signed native history and the normal first-party request builder are retained |
 | OpenRouter | Completion, native tools, stream | Routing and model-tier prices require a complete host contract; unknown native service options are rejected |
 | Groq, Cohere, Mistral | Completion, stream | Native tool requests retain their existing unsupported status |
-| Anthropic, Messages-compatible, DeepSeek, xAI, Phind, Ollama | Unsupported for the built-in hard-priced capability | The current upstream-specific dispatch/accounting contracts are not audited by this adapter; ordinary use is unchanged |
+| Anthropic, Messages-compatible, DeepSeek, xAI, Phind, local Ollama and Ollama Cloud | Unsupported for the built-in hard-priced capability | These adapters lack an audited dispatch and settlement contract for hard-priced tasks |
 | Custom/local Rust providers | Explicit host implementation of request bounds and settlement | Neither local execution nor a provider label implies free or conforming execution |
 
 `DeclaredPricing` binds `schedule_id`, exact `model`, normalized HTTP(S) `endpoint`, `server_input_token_limit`, `server_output_token_limit`, integer `input_micro_usd_per_million` and `output_micro_usd_per_million`. Optional fields are `request_fee_micro_usd` (default `0`), `max_internal_attempts` (default `1`, including the initial upstream call) and `complete_usage` (default `false`). Token ceilings are audited server-enforced maxima, not desired client limits or token estimates. Rates must cover the highest applicable input/output tiers, cached input and reasoning classes. A false host declaration is not made true by parsing it; hosts are responsible for verifying that external contract.
@@ -298,7 +323,18 @@ llm:
 
 In the development checkout, local chat and text streaming use the native `/api/chat` SDK. The preset sends no authorization header, even when `api_key_env` is present. The configured server root can include a path prefix. The SDK submits one request and does not follow redirects. A stream must end with a daemon completion record to produce a final response. Configured framework tools continue to use the prompt tool path. [Direct Rust SDK](@/docs/rust-api.md#direct-local-ollama-sdk-development)
 
-Existing YAML `top_p` is sent as `options.top_p`. A top-level YAML `top_k` leaves `options.top_k` null. Rust callers can use `LLMConfig::with_top_k` to send a numeric value. The old `num_ctx`, `num_gpu`, `keep_alive`, `temperature`, `max_tokens` and `extra_body` declarations still leave those fields out of local chat requests. Move values that should reach the daemon into native options.
+### Migrating local Ollama options
+
+Choose the native YAML field when you want a value to reach the daemon in both blocking and streaming chat. Moving a setting that was previously omitted changes the request. Remove the old declaration when moving it.
+
+| Existing field under `llm` | Existing local chat request | To send the value |
+|---|---|---|
+| `num_ctx`, `num_gpu`, `temperature` | Omitted | Place each key under `provider_options.options`. |
+| `max_tokens` | Omitted | Use `provider_options.options.num_predict`. |
+| `keep_alive` | Omitted | Use `provider_options.keep_alive`. |
+| `top_p` | Explicit value sent as `options.top_p` | Keep the existing declaration. |
+| `top_k` | Top-level YAML sends `options.top_k` as null. Rust's typed `LLMConfig::with_top_k` sends a number. | Use `provider_options.options.top_k` for a numeric YAML setting. |
+| `extra_body.options` | Legacy generation options omitted | Move the individual options you want into `provider_options.options`. |
 
 ```yaml
 llm:
@@ -314,7 +350,7 @@ llm:
 
 The local SDK checks documented option types before sending a request. Use integers for `num_ctx`, `num_gpu`, `num_predict`, `top_k` and `seed`, numbers for `temperature` and `top_p`, and a string array for `stop`. Daemon-specific extensions inside `options` pass through. The legacy `reasoning_effort` field accepts `low`, `medium` or `high` case-insensitively and leaves the daemon’s thinking mode at its default.
 
-Use `options.num_predict` for the output limit and `keep_alive` for model retention on the daemon. Remove any old declaration for the same setting before adding its native equivalent. `resilient: true` selects the existing upstream transport before generation and cannot be combined with native options. Ollama reports token usage when available. Hard-priced task admission remains unavailable for this preset.
+Duplicate declarations and invalid native option types fail before the request reaches the daemon. `resilient: true` selects the existing upstream transport before generation and cannot be combined with native options. Ollama reports token usage when available. Hard-priced task admission remains unavailable for this preset.
 
 To access Ollama through its OpenAI-compatible endpoint instead, use `provider: openai-compatible` and include `/v1` in the URL:
 
@@ -763,9 +799,9 @@ Any YAML field not recognized as a named parameter is captured as a provider-spe
 
 ### Transport-Level Resilience
 
-The `llm` crate supports HTTP-level retry with exponential backoff, complementary to the framework's agent-level `error_recovery`. Both can be active simultaneously.
+A direct Rust `ChatClient` call makes a single attempt. When the framework uses OpenAI or OpenAI-compatible Chat, the framework adapter applies the configured transport retry policy around the SDK call. A raw client returned by `build_llm()` uses its upstream backend's HTTP and retry policy.
 
-For OpenAI and OpenAI-compatible Chat, `resilient: true` enables retries at the configured endpoint for transport failures and HTTP 408, 429, 500, 502, 503, or 504. A successful stream opening ends retry admission. Redirects and invalid requests end the attempt immediately. The first-party Google adapter supports agent-level `error_recovery`. Local native-history and protocol integrity errors are terminal.
+For OpenAI and OpenAI-compatible Chat, `resilient: true` enables retries at the configured endpoint for transport failures and HTTP 408, 429, 500, 502, 503, or 504. A successful stream opening ends retry admission. Redirects and invalid requests end the attempt immediately. For a hard-priced multi-attempt contract the framework keeps the full reservation, even when the last attempt reports complete usage. A single-attempt Chat contract can settle the difference only with a complete receipt for the declared model. The first-party Google adapter supports agent-level `error_recovery`. Local native-history and protocol integrity errors are terminal.
 
 ```yaml
 llm:

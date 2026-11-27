@@ -332,7 +332,7 @@ metadata:
 
 ## LLM Configuration
 
-You can configure LLMs in three ways depending on complexity.
+Use the [1.2 provider support matrix](@/docs/providers.md#provider-support-in-1-2-development) to check the request path and available Rust clients for a preset.
 
 ### Single LLM - `llm` (shorthand)
 
@@ -350,8 +350,8 @@ The simplest form: one LLM for everything. Use `llm` as a flat object.
 | `timeout_seconds` | `u64` | `null` | Request timeout in seconds |
 | `reasoning` | `bool` | `null` | Enable extended thinking / reasoning mode |
 | `reasoning_effort` | `string` | `null` | Model-specific effort; the development first-party Chat adapter accepts open strings for ordinary calls |
-| `protocol` | `string` | omitted | Development OpenAI presets use `chat-completions` or `responses` for generation and `decisions` for structured orchestration routing. The Anthropic preset can select `messages`. Compatible presets choose their respective protocol. |
-| `provider_options` | object | omitted | Chat request extensions, OpenRouter `provider` and `reasoning`, Responses `reasoning`, or Messages `thinking` / `output_config.effort`. Conflicts and reserved fields are rejected. |
+| `protocol` | `string` | omitted | OpenAI defaults to Chat and also accepts `responses` for generation or `decisions` for routing. OpenAI-compatible uses Chat. Anthropic and Messages-compatible use Messages. |
+| `provider_options` | object | omitted | Chat request extensions, OpenRouter `provider` and `reasoning`, Responses `reasoning`, Messages `thinking` / `output_config.effort`, or native Ollama options. Conflicts and reserved fields are rejected. |
 | `reasoning_budget_tokens` | `u32` | `null` | Max token budget for reasoning |
 | `function_calling` | `bool` | `null` | Override `supports(FunctionCalling)`; `false` disables native tool selection and `true` opts an OpenAI-compatible server into it |
 | `tool_choice` | `auto`, `required`, `none`, or `{ specific: ID }` | `null` | Opt in to native or runtime-enforced tool selection; omission preserves the legacy prompt protocol |
@@ -371,9 +371,11 @@ llm:
   max_tokens: 4000
 ```
 
-Capability override fields (`function_calling`, `vision`, `json_mode`) are not sent as model parameters. They control framework capability checks; `function_calling: false` also disables native tool selection, while `function_calling: true` opts an OpenAI-compatible server into the native path. The GPT-6.2 OpenAI Chat models require Responses for native tools. For local Ollama chat, YAML `top_p` sets `options.top_p`. Top-level YAML `top_k` leaves `options.top_k` null, while a typed Rust `LLMConfig::with_top_k` sets its numeric value. The local Ollama backend accepts the named fields `num_ctx`, `num_gpu` and `keep_alive` at configuration time and omits them from its chat requests. [Chat model and option support](@/docs/providers.md#first-party-chat-completions-development)
+Capability override fields (`function_calling`, `vision`, `json_mode`) are not sent as model parameters. They control framework capability checks; `function_calling: false` also disables native tool selection, while `function_calling: true` opts an OpenAI-compatible server into the native path. The GPT-6.2 OpenAI Chat models require Responses for native tools. [Chat model and option support](@/docs/providers.md#first-party-chat-completions-development)
 
-Additional YAML keys are captured in an `extra` map. The selected backend determines their effect. For example, `openai_enable_web_search: true` selects the upstream backend for OpenAI and OpenAI-compatible Chat. Ordinary framework chat still sends a request without a hosted search tool. The xAI backend includes `search_parameters` in blocking chat requests and omits the field when streaming. The granted built-in `web_search` tool uses the framework’s own policy, approval and execution path. [Provider options and transport settings](@/docs/providers.md#extra-parameters)
+For a local Ollama daemon, move a legacy `num_ctx` declaration to `provider_options.options.num_ctx` to send it on the wire. Model retention uses `provider_options.keep_alive`. [Local Ollama option mappings and YAML example](@/docs/providers.md#migrating-local-ollama-options)
+
+Additional YAML keys are captured in an `extra` map. The selected backend determines their effect. OpenAI and OpenAI-compatible presets send ordinary Chat through the SDK, including configurations with the legacy `openai_enable_web_search` flag. That flag alone leaves the hosted search tool out of the request. The xAI backend includes `search_parameters` in blocking chat requests and omits the field when streaming. The granted built-in `web_search` tool uses the framework’s own policy, approval and execution path. [Provider options and transport settings](@/docs/providers.md#extra-parameters)
 
 OpenRouter accepts gateway routing under `provider_options.provider` and explicit reasoning under `provider_options.reasoning`. For OpenRouter, set the boolean `parallel_tool_calls` once in `extra_body` or `provider_options` to control parallel tool calls. Omission leaves the wire field absent. The top-level legacy `reasoning_effort` keeps its historical validation and omission. When replaying a native tool turn with private reasoning, configure one provider route with fallback disabled and use the exact model ID. [OpenRouter setup and limits](@/docs/providers.md#openrouter)
 
