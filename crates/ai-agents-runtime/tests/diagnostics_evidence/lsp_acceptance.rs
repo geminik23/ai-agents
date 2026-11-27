@@ -189,6 +189,7 @@ impl HostRevisionSource for InstalledRevision {
     }
 }
 
+#[derive(Clone)]
 struct Application {
     directory: PathBuf,
 }
@@ -244,7 +245,7 @@ impl TaskRestoreComponents for Application {
         saved: Option<&TaskRestoreBinding>,
         _: Option<&ai_agents_llm::LLMRegistry>,
     ) -> ai_agents_core::Result<(AgentBuilder, Arc<dyn TaskRestoreComponentState>)> {
-        let builder = document_builder(&self.directory, builder)?;
+        let (builder, _) = document_builder(&self.directory, builder)?;
         let target = self.directory.join("project").join(PATH);
         let cursor = Arc::new(AtomicU64::new(
             saved
@@ -271,7 +272,7 @@ impl TaskRestoreComponents for Application {
 fn document_builder(
     directory: &Path,
     builder: AgentBuilder,
-) -> ai_agents_core::Result<AgentBuilder> {
+) -> ai_agents_core::Result<(AgentBuilder, Arc<InstalledRevision>)> {
     let root = directory.join("project");
     let target = root.join(PATH);
     let guard = WorkspaceGuard::new(
@@ -303,8 +304,11 @@ fn document_builder(
         })?;
     tools.set_diagnostics_provider(Arc::new(diagnostics));
     let mut extensions = AutonomyExtensions::builtins();
-    extensions.register_validation_target("syntax", "selected-document", revision)?;
-    Ok(builder.tools(tools).autonomy_extensions(extensions))
+    extensions.register_validation_target("syntax", "selected-document", revision.clone())?;
+    Ok((
+        builder.tools(tools).autonomy_extensions(extensions),
+        revision,
+    ))
 }
 
 struct EditProgram {

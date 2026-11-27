@@ -2,6 +2,7 @@
 use super::*;
 use ai_agents_core::{PermissionOutcome, ToolApprovalStatus};
 use ai_agents_hitl::ApprovalResult;
+use std::sync::OnceLock;
 use tokio::{io::AsyncWriteExt, net::TcpListener};
 
 #[path = "../support/chat_http.rs"]
@@ -14,7 +15,11 @@ const OUTPUT_LIMIT: u64 = 512;
 const RESERVATION: u64 = INPUT_LIMIT + 2 * OUTPUT_LIMIT + 3;
 
 // The declaration binds the Chat provider and pricing schedule. Only the document host is custom.
-struct DocumentHost(Application);
+#[derive(Clone)]
+struct DocumentHost {
+    application: Application,
+    installed: Arc<OnceLock<Arc<InstalledRevision>>>,
+}
 
 impl TaskRestoreComponentState for DocumentHost {
     fn binding(&self) -> ai_agents_core::Result<TaskRestoreBinding> {
@@ -22,7 +27,7 @@ impl TaskRestoreComponentState for DocumentHost {
         Ok(TaskRestoreBinding {
             id,
             contract_version,
-            configuration: self.0.configuration(),
+            configuration: self.application.configuration(),
             state: Value::Null,
         })
     }
@@ -38,7 +43,7 @@ impl TaskRestoreComponents for DocumentHost {
         _: &PreparedAgentSpec,
         binding: &TaskRestoreBinding,
     ) -> ai_agents_core::Result<()> {
-        if binding.configuration != self.0.configuration() || !binding.state.is_null() {
+        if binding.configuration != self.application.configuration() || !binding.state.is_null() {
             return Err(AgentError::Config("document host binding changed".into()));
         }
         Ok(())
@@ -52,15 +57,13 @@ impl TaskRestoreComponents for DocumentHost {
         shared: Option<&ai_agents_llm::LLMRegistry>,
     ) -> ai_agents_core::Result<(AgentBuilder, Arc<dyn TaskRestoreComponentState>)> {
         assert!(shared.is_none(), "the consumer is a single root task");
-        let builder = document_builder(&self.0.directory, builder)?
-            .auto_configure_llms()?
-            .auto_configure_features()?;
-        Ok((
-            builder,
-            Arc::new(DocumentHost(Application {
-                directory: self.0.directory.clone(),
-            })),
-        ))
+        let (builder, source) = document_builder(&self.application.directory, builder)?;
+        let builder = builder.auto_configure_llms()?.auto_configure_features()?;
+        assert!(
+            self.installed.set(source).is_ok(),
+            "expected a single root installation"
+        );
+        Ok((builder, Arc::new(self.clone())))
     }
 }
 
@@ -305,6 +308,12 @@ async fn combined_worker() {
     let directory = std::env::current_dir().unwrap();
     let spec =
         PreparedAgentSpec::from_yaml_strict(&fs::read_to_string("agent.yaml").unwrap()).unwrap();
+    let components = Arc::new(DocumentHost {
+        application: Application {
+            directory: directory.clone(),
+        },
+        installed: Arc::default(),
+    });
     let host = Arc::new(
         ConfiguredTaskRestoreHost::new(spec, directory.clone(), None, Duration::from_secs(20))
             .unwrap()
@@ -312,16 +321,52 @@ async fn combined_worker() {
                 max_cost_usd: Some(UsdAmount::parse("0.1").unwrap()),
                 ..Default::default()
             })
-            .components(Arc::new(DocumentHost(Application {
-                directory: directory.clone(),
-            })))
+            .components(components.clone())
             .unwrap(),
     );
     if mode.starts_with("resume-") {
-        resume_document(&directory, host, &mode, || {
+        resume_document(&directory, host.clone(), &mode, || {
             fs::write("dispatch-stage", "resumed").unwrap()
         })
         .await;
+        // Sample the actual restored object independently of the persisted evidence.
+        let source = components
+            .installed
+            .get()
+            .expect("restored revision source");
+        let current = source.revision().unwrap();
+        let (_, payload) = checkpoint(host.scope()).await;
+        let controller = &payload
+            .evidence
+            .records
+            .iter()
+            .rev()
+            .find(|record| record.origin == "controller")
+            .expect("acknowledged controller decision")
+            .data;
+        assert_eq!(
+            controller["scope"]["target_revisions"]["selected-document"].as_str(),
+            Some(current.as_str())
+        );
+        let validation = controller["validations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|result| result["check_id"] == "syntax")
+            .expect("syntax validation from the same decision");
+        assert_eq!(
+            validation["outcome"],
+            if mode == "resume-current" {
+                "pass"
+            } else {
+                "fail"
+            }
+        );
+        assert_eq!(validation["identity"]["target"], "selected-document");
+        assert_eq!(
+            validation["identity"]["target_revision"].as_str(),
+            Some(current.as_str())
+        );
         return;
     }
     let agent = host.build().await.unwrap();
@@ -472,29 +517,6 @@ async fn combined_chat_edit_diagnostics_restart() {
             assert!(finished.revision > saved.revision);
             assert_eq!(endpoint.charges.len(), 6);
             endpoint.assert_settled(&payload);
-            let validation = payload
-                .evidence
-                .records
-                .iter()
-                .rev()
-                .filter_map(|record| record.data["validations"].as_array())
-                .flatten()
-                .find(|result| result["check_id"] == "syntax")
-                .expect("acknowledged task validation");
-            assert_eq!(
-                validation["outcome"],
-                if scenario == "resume-current" {
-                    "pass"
-                } else {
-                    "fail"
-                }
-            );
-            assert_eq!(validation["identity"]["target"], "selected-document");
-            assert!(
-                validation["identity"]["target_revision"]
-                    .as_str()
-                    .is_some_and(|rev| !rev.is_empty())
-            );
             assert_eq!(fs::read(&file).unwrap(), bytes);
             assert_eq!(fs::metadata(&file).unwrap().modified().unwrap(), modified);
         }
