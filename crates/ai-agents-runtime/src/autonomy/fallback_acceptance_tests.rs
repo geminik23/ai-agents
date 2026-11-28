@@ -613,111 +613,132 @@ impl AutonomyValidator for HostedValidator {
     }
 }
 
+struct FixedHostFixture {
+    runner: AutonomyRunner,
+    calls: Arc<AtomicUsize>,
+    rescue: Arc<AtomicUsize>,
+}
+
+// Finish agent construction and registration before polling the nested recovery path.
+async fn fixed_host_fixture(action: &str) -> FixedHostFixture {
+    let registry = Arc::new(AgentRegistry::new());
+    let question = ai_agents_core::encode_native_tool_call_markers(
+        &[ToolCall {
+            id: "question".into(),
+            name: "ask_user".into(),
+            arguments: json!({"question":"Choice","options":["yes"],"allow_other":false}),
+        }],
+        None,
+    )
+    .unwrap();
+    let child = support::FaultProvider::new(&[&question, "failed", "child done"], 1, "error");
+    let yaml = "name: HostChild\nsystem_prompt: test\ntools: [ask_user]\n";
+    let worker = AgentBuilder::from_yaml(yaml)
+        .unwrap()
+        .llm(child)
+        .auto_configure_features()
+        .unwrap()
+        .tool(Arc::new(ai_agents_tools::builtin::AskUserTool::new(
+            Arc::new(parking_lot::RwLock::new(None)),
+        )))
+        .build()
+        .unwrap();
+    registry
+        .register(SpawnedAgent::from_runtime(
+            "worker".into(),
+            worker,
+            crate::spec::AgentSpec::from_yaml_strict(yaml).unwrap(),
+        ))
+        .await
+        .unwrap();
+    let mut extensions = AutonomyExtensions::builtins();
+    extensions
+        .register_validator(Arc::new(HostedValidator(AdapterDescriptor {
+            id: "host.recovery".into(),
+            contract_version: 1,
+            tools: vec!["message_probe".into()],
+            ..Default::default()
+        })))
+        .unwrap();
+    extensions
+        .register_host_validation(HostValidationBinding {
+            id: "fixed-recovery".into(),
+            validator: "host.recovery".into(),
+            version: 1,
+            profile: None,
+            scope: "task".into(),
+            tool: "message_probe".into(),
+            arguments: json!({"to":"worker","message":"objective"}),
+            require_approval: false,
+        })
+        .unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let rescue = Arc::new(AtomicUsize::new(0));
+    let yaml = format!(
+        "name: HostRoot\nsystem_prompt: test\ntools: [rescue]\nerror_recovery:\n  tools:\n    message_probe:\n      max_retries: {}\n      on_failure: {{action: {}{}}}\n",
+        usize::from(action == "retry"),
+        if action == "retry" {
+            "report_error"
+        } else {
+            action
+        },
+        if action == "fallback" {
+            ", fallback_tool: rescue"
+        } else {
+            ""
+        }
+    );
+    let parent = Arc::new(
+        AgentBuilder::from_yaml(&yaml)
+            .unwrap()
+            .llm(super::runner_tests::RecordingProvider::new(&["done"]))
+            .auto_configure_features()
+            .unwrap()
+            .autonomy_extensions(extensions)
+            .tool(Arc::new(MessageProbe {
+                registry: registry.clone(),
+                calls: calls.clone(),
+                fail_first: false,
+                timeout_ms: None,
+            }))
+            .tool(Arc::new(Rescue(rescue.clone())))
+            .build()
+            .unwrap()
+            .with_spawner_handles(Arc::new(AgentSpawner::new()), registry),
+    );
+    let store = support::store(parent.info().id, "host-recovery.v1", false).await;
+    let mut config = super::runner_tests::config(8);
+    config.defaults.max_turns = Some(ai_agents_core::autonomy::AutonomyLimit::Finite(1));
+    config.defaults.validation=Some(serde_yaml::from_str("checks: [{id: check, adapter: host.recovery, schedule: each_cycle, config: {host_binding: fixed-recovery}}]").unwrap());
+    config.defaults.completion = Some(CompletionGate::ValidatorPassed("check".into()));
+    config.defaults.hitl = Some(AutonomyHitlConfig {
+        on_user_question: Some(InteractionAction::PauseRun),
+        on_approval_required: Some(InteractionAction::PauseRun),
+    });
+    let runner = AutonomyRunner::try_new(
+        parent,
+        config,
+        Default::default(),
+        store,
+        "host-recovery.v1".into(),
+    )
+    .unwrap();
+    FixedHostFixture {
+        runner,
+        calls,
+        rescue,
+    }
+}
+
+// Resume the same fixed operation under each policy and observe both real tool counters.
 #[tokio::test]
 async fn fallback_acceptance_fixed_host_operation_recovers_without_permit_transfer() {
     for action in ["retry", "skip", "fallback"] {
-        let registry = Arc::new(AgentRegistry::new());
-        let question = ai_agents_core::encode_native_tool_call_markers(
-            &[ToolCall {
-                id: "question".into(),
-                name: "ask_user".into(),
-                arguments: json!({"question":"Choice","options":["yes"],"allow_other":false}),
-            }],
-            None,
-        )
-        .unwrap();
-        let child = support::FaultProvider::new(&[&question, "failed", "child done"], 1, "error");
-        let yaml = "name: HostChild\nsystem_prompt: test\ntools: [ask_user]\n";
-        let worker = AgentBuilder::from_yaml(yaml)
-            .unwrap()
-            .llm(child.clone())
-            .auto_configure_features()
-            .unwrap()
-            .tool(Arc::new(ai_agents_tools::builtin::AskUserTool::new(
-                Arc::new(parking_lot::RwLock::new(None)),
-            )))
-            .build()
-            .unwrap();
-        registry
-            .register(SpawnedAgent::from_runtime(
-                "worker".into(),
-                worker,
-                crate::spec::AgentSpec::from_yaml_strict(yaml).unwrap(),
-            ))
-            .await
-            .unwrap();
-        let mut extensions = AutonomyExtensions::builtins();
-        extensions
-            .register_validator(Arc::new(HostedValidator(AdapterDescriptor {
-                id: "host.recovery".into(),
-                contract_version: 1,
-                tools: vec!["message_probe".into()],
-                ..Default::default()
-            })))
-            .unwrap();
-        extensions
-            .register_host_validation(HostValidationBinding {
-                id: "fixed-recovery".into(),
-                validator: "host.recovery".into(),
-                version: 1,
-                profile: None,
-                scope: "task".into(),
-                tool: "message_probe".into(),
-                arguments: json!({"to":"worker","message":"objective"}),
-                require_approval: false,
-            })
-            .unwrap();
-        let calls = Arc::new(AtomicUsize::new(0));
-        let rescue = Arc::new(AtomicUsize::new(0));
-        let yaml = format!(
-            "name: HostRoot\nsystem_prompt: test\ntools: [rescue]\nerror_recovery:\n  tools:\n    message_probe:\n      max_retries: {}\n      on_failure: {{action: {}{}}}\n",
-            usize::from(action == "retry"),
-            if action == "retry" {
-                "report_error"
-            } else {
-                action
-            },
-            if action == "fallback" {
-                ", fallback_tool: rescue"
-            } else {
-                ""
-            }
-        );
-        let parent = Arc::new(
-            AgentBuilder::from_yaml(&yaml)
-                .unwrap()
-                .llm(super::runner_tests::RecordingProvider::new(&["done"]))
-                .auto_configure_features()
-                .unwrap()
-                .autonomy_extensions(extensions)
-                .tool(Arc::new(MessageProbe {
-                    registry: registry.clone(),
-                    calls: calls.clone(),
-                    fail_first: false,
-                    timeout_ms: None,
-                }))
-                .tool(Arc::new(Rescue(rescue.clone())))
-                .build()
-                .unwrap()
-                .with_spawner_handles(Arc::new(AgentSpawner::new()), registry),
-        );
-        let store = support::store(parent.info().id, "host-recovery.v1", false).await;
-        let mut config = super::runner_tests::config(8);
-        config.defaults.max_turns = Some(ai_agents_core::autonomy::AutonomyLimit::Finite(1));
-        config.defaults.validation=Some(serde_yaml::from_str("checks: [{id: check, adapter: host.recovery, schedule: each_cycle, config: {host_binding: fixed-recovery}}]").unwrap());
-        config.defaults.completion = Some(CompletionGate::ValidatorPassed("check".into()));
-        config.defaults.hitl = Some(AutonomyHitlConfig {
-            on_user_question: Some(InteractionAction::PauseRun),
-            on_approval_required: Some(InteractionAction::PauseRun),
-        });
-        let runner = AutonomyRunner::try_new(
-            parent.clone(),
-            config,
-            Default::default(),
-            store,
-            "host-recovery.v1".into(),
-        )
-        .unwrap();
+        let FixedHostFixture {
+            runner,
+            calls,
+            rescue,
+        } = fixed_host_fixture(action).await;
         let first = runner.run("objective", None).await.unwrap();
         let done = runner
             .resume(
