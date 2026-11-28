@@ -321,8 +321,7 @@ jobs:
       matrix:
         os:
           - ubuntu-latest
-          # Windows is temporarily deferred due to CLI main-thread stack overflow.
-          # Restore native Windows coverage after the executable/profile investigation.
+          - windows-latest
           - macos-latest
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
@@ -332,8 +331,9 @@ jobs:
       - name: Install release Rust
         run: rustup toolchain install ${{ env.RELEASE_RUST }} --profile minimal
       - name: Verify platform tests and native clock admission
+        shell: bash
         env:
-          AI_AGENTS_REQUIRE_NATIVE_RESTORE_CLOCK: ${{ runner.os == 'Linux' && '1' || vars.AI_AGENTS_REQUIRE_NATIVE_RESTORE_CLOCK }}
+          AI_AGENTS_REQUIRE_NATIVE_RESTORE_CLOCK: ${{ runner.os == 'Linux' && '1' || runner.os == 'macOS' && vars.AI_AGENTS_REQUIRE_NATIVE_RESTORE_CLOCK || '' }}
         run: |
           if [ "$RUNNER_OS" = macOS ]; then
             set -- -- --show-output

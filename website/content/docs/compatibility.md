@@ -106,10 +106,11 @@ The facade retains `default`, `sqlite`, `redis-storage`, `http-context`, `full-s
 
 | Environment or integration | 1.2 support boundary |
 |---|---|
-| Linux and macOS configured restart | Configured restart requires file-backed SQLite, compatible bindings, fresh review and valid synchronized kernel time evidence. Linux process tests cover normal restart and failure recovery. The macOS hosted runner reported `STA_UNSYNC`. Hosted tests exercise safe refusal in that environment. Native macOS restart acceptance requires synchronized kernel time evidence and remains pending. |
+| Linux and macOS configured restart | Configured restart requires file-backed SQLite, compatible bindings, fresh review and valid synchronized kernel time evidence. Process tests on synchronized Linux and macOS hosts cover normal restart and failure recovery. On a macOS runner that reported `STA_UNSYNC`, tests exercised safe refusal before task creation. |
 | Reboot, suspend and clock correction | The same original deadlines and fresh OS evidence are required. Missing evidence or detected discontinuity blocks restoration. These lifecycle transitions have not been exercised in dedicated real-machine experiments. |
 | VM snapshot replay or host migration | No automatic certification of clock or external-state continuity; restoring a copied journal alone grants no execution authority. |
-| Windows CLI and configured restart | Deferred: the CLI stack-overflow investigation remains open and the native restoration clock/lease implementation is unavailable. This does not establish failure of every Windows library API. |
+| Windows CLI (x64 MSVC) | Supported for ordinary CLI use and task execution, including pause and resume in a live CLI session. Native CI covers the default workspace and MCP over stdio and Streamable HTTP. |
+| Windows configured restart | Unavailable. Restoring a saved SQLite task in a new process requires native clock evidence and an exclusive process lease. The configured host provides these on Linux and macOS. |
 | Custom domain or opaque service, including MCP state | Supported component-factory integration; the installed host supplies truthful state compatibility and interrupted-preparation evidence. The default CLI cannot infer opaque server state. |
 | Redis | Experimental snapshot storage; no task-run durability capability. |
 
