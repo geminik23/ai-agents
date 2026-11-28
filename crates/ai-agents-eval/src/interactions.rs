@@ -9,7 +9,7 @@ use crate::redaction::{RedactedString, redact_text};
 use crate::task::{TaskAction, TaskContext, TaskReport};
 use crate::{EvalError, Result};
 use ai_agents_runtime::autonomy::*;
-use futures::{StreamExt, future::BoxFuture, stream::FuturesUnordered};
+use futures::{FutureExt, StreamExt, future::BoxFuture, stream::FuturesUnordered};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{collections::BTreeSet, future::Future, sync::Arc};
@@ -102,13 +102,13 @@ pub(crate) fn service<'a, F: Future + Send + 'a>(
 where
     F::Output: Send + 'a,
 {
-    Box::pin(service_inner(
-        session,
-        work,
-        state,
-        redact,
-        foreground_runtime,
-    ))
+    // Scenario scripts are installed before the first turn. An empty script has no independent controls to service.
+    // The outer driver still owns the foreground deadline, cancellation and drain.
+    if state.lock().plan.is_empty() {
+        work.map(Ok).boxed()
+    } else {
+        service_inner(session, work, state, redact, foreground_runtime).boxed()
+    }
 }
 
 // Discovery, the parent and all started controls are polled together; storage reads cannot hold the other futures hostage.

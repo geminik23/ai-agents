@@ -20,14 +20,6 @@ pub fn serve(transport: &str, dir: &Path) -> Result<()> {
         .block_on(server::serve(transport, dir))
 }
 
-/// Build real YAML agents and compare runtime evidence with independent server effects.
-pub fn run(root: &Path) -> Result<()> {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?
-        .block_on(run_async(root))
-}
-
 struct OwnedServer(Child);
 impl Drop for OwnedServer {
     // Failure cleanup only touches the directly owned child; the caller still reports missing acknowledgement.
@@ -53,21 +45,75 @@ async fn wait_until(mut predicate: impl FnMut() -> Result<bool>) -> Result<()> {
     .context("MCP test deadline exceeded")?
 }
 
-// Process observation is limited to Unix, matching the currently enabled native CI matrix.
-fn process_exists(pid: u64) -> Result<bool> {
-    ensure!(
-        cfg!(unix),
-        "MCP integration process observation currently requires Unix"
-    );
-    Ok(Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .stderr(Stdio::null())
-        .status()?
-        .success())
+// The SDK owns the stdio child, so acquire its identity while the server is waiting for our acknowledgement.
+async fn observe_stdio(dir: &Path) -> Result<process::Observer> {
+    let ready = dir.join("ready.json");
+    wait_until(|| Ok(ready.is_file())).await?;
+    #[derive(serde::Deserialize)]
+    struct Ready {
+        pid: u32,
+    }
+    let ready: Ready = serde_json::from_slice(&std::fs::read(ready)?)?;
+    let observer = process::Observer::open(ready.pid)?;
+    std::fs::write(dir.join("observed"), b"ready")?;
+    Ok(observer)
 }
 
-// Only the model is replaced; EvalRunner retains the normal parser, MCP installer and shared tool executor.
-async fn run_async(root: &Path) -> Result<()> {
+#[cfg(unix)]
+mod process {
+    use super::*;
+    pub(super) struct Observer(u32);
+    impl Observer {
+        pub(super) fn open(pid: u32) -> Result<Self> {
+            ensure!(pid > 0, "invalid server PID");
+            Ok(Self(pid))
+        }
+        pub(super) fn exited(&self) -> Result<bool> {
+            Ok(!Command::new("kill")
+                .args(["-0", &self.0.to_string()])
+                .stderr(Stdio::null())
+                .status()?
+                .success())
+        }
+    }
+}
+
+#[cfg(windows)]
+mod process {
+    use super::*;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use windows_sys::Win32::{
+        Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT},
+        System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject},
+    };
+
+    pub(super) struct Observer(OwnedHandle);
+    impl Observer {
+        pub(super) fn open(pid: u32) -> Result<Self> {
+            // SAFETY: OpenProcess returns an owned, non-inheritable process handle on success.
+            let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
+            if handle.is_null() {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            Ok(Self(unsafe { OwnedHandle::from_raw_handle(handle) }))
+        }
+
+        pub(super) fn exited(&self) -> Result<bool> {
+            // SAFETY: the live OwnedHandle identifies the original process even after PID reuse.
+            match unsafe { WaitForSingleObject(self.0.as_raw_handle(), 0) } {
+                WAIT_OBJECT_0 => Ok(true),
+                WAIT_TIMEOUT => Ok(false),
+                _ => Err(std::io::Error::last_os_error().into()),
+            }
+        }
+    }
+}
+
+/// Drive each YAML evaluation on the same runtime as its transport, outside the synchronous test setup.
+pub fn run(root: &Path) -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
     let run = root.join("target/mcp-integration").join(format!(
         "{}-{}",
         std::process::id(),
@@ -95,14 +141,13 @@ async fn run_async(root: &Path) -> Result<()> {
             serde_yaml::from_str(include_str!("../tests/mcp/agent.yaml"))?;
         let config = spec["tools"][0].as_mapping_mut().unwrap();
         if let Some(server) = &mut owned {
-            wait_until(|| {
+            runtime.block_on(wait_until(|| {
                 ensure!(
                     server.0.try_wait()?.is_none(),
                     "HTTP MCP server exited before readiness"
                 );
                 Ok(dir.join("ready.json").is_file())
-            })
-            .await?;
+            }))?;
             let ready: Value = serde_json::from_slice(&std::fs::read(dir.join("ready.json"))?)?;
             config.insert("transport".into(), "http".into());
             config.insert("url".into(), ready["url"].as_str().unwrap().into());
@@ -131,7 +176,13 @@ async fn run_async(root: &Path) -> Result<()> {
                 ..Default::default()
             },
         )?;
-        let result = runner.run().await?;
+        // Keep the observer concurrent with SDK startup. Dropping the set cancels it on any eval error.
+        let mut observers = tokio::task::JoinSet::new();
+        if owned.is_none() {
+            let dir = dir.clone();
+            observers.spawn_on(async move { observe_stdio(&dir).await }, runtime.handle());
+        }
+        let result = runtime.block_on(runner.run())?;
         ai_agents_eval::write_outputs(&result, &dir.join("report"), true)?;
         ensure!(
             result.total == 1 && result.passed == 1 && result.failed == 0,
@@ -161,16 +212,20 @@ async fn run_async(root: &Path) -> Result<()> {
                 ],
             "unexpected server effects: {effects:?}"
         );
-        let ready: Value = serde_json::from_slice(&std::fs::read(dir.join("ready.json"))?)?;
         if let Some(server) = &mut owned {
             drop(server.0.stdin.take());
-            wait_until(|| Ok(server.0.try_wait()?.is_some())).await?;
+            runtime.block_on(wait_until(|| Ok(server.0.try_wait()?.is_some())))?;
             ensure!(
                 server.0.wait()?.success(),
                 "HTTP MCP server shutdown failed"
             );
+        } else {
+            let joined = runtime
+                .block_on(observers.join_next())
+                .context("missing stdio observer")?;
+            let observer = joined.context("stdio observer task failed")??;
+            runtime.block_on(wait_until(|| observer.exited()))?;
         }
-        wait_until(|| Ok(!process_exists(ready["pid"].as_u64().unwrap())?)).await?;
         ensure!(
             dir.join("closed").is_file(),
             "server exit had no orderly closure acknowledgement"
