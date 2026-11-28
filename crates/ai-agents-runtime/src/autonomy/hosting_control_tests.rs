@@ -617,7 +617,11 @@ async fn host_controls_sqlite_views_and_cleanup_use_the_same_scoped_contract() {
     drop(agent);
     drop(store);
     storage.close().await;
-    std::fs::remove_dir_all(directory).unwrap();
+    drop(storage);
+    // Windows may still report a sharing violation during removal of the closed fixture.
+    crate::remove_sqlite_test_directory(&directory)
+        .await
+        .unwrap();
 }
 
 #[test]

@@ -255,6 +255,11 @@ impl AutonomyValidator for RecordValidator {
 }
 struct FileReportValidator(AdapterDescriptor);
 impl AutonomyValidator for FileReportValidator {
+    // The report location is a file operand of this adapter's managed read observation.
+    fn config_filesystem_paths(&self) -> &[&str] {
+        &["/path"]
+    }
+
     fn descriptor(&self) -> &AdapterDescriptor {
         &self.0
     }

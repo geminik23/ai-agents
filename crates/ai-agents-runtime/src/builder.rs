@@ -94,7 +94,8 @@ struct PreparedTaskHosting {
 }
 
 pub struct AgentBuilder {
-    spec: Option<AgentSpec>,
+    // Fluent setup moves the builder through several async calls; keep its owned YAML spec in one allocation.
+    spec: Option<Box<AgentSpec>>,
     llm: Option<Arc<dyn LLMProvider>>,
     llm_registry: Option<LLMRegistry>,
     memory: Option<Arc<dyn Memory>>,
@@ -250,6 +251,29 @@ impl AgentBuilder {
         self
     }
 
+    /// Maps declared validator file operands against the configured adapters before task construction.
+    /// This does not change an adapter binding, execute an observation, or grant any tool.
+    pub fn map_validator_config_paths(&mut self, map: &dyn Fn(&str) -> Option<String>) {
+        let extensions = self
+            .autonomy_extensions
+            .get_or_insert_with(|| crate::autonomy::AutonomyExtensions::builtins().freeze());
+        let visit = |profile: &mut ai_agents_core::autonomy::AutonomyProfile| {
+            extensions.map_validation_paths(profile, map)
+        };
+        if let Some(spec) = &mut self.spec {
+            spec.visit_profiles_mut(visit);
+        }
+        if let Some(config) = &mut self.automatic_config {
+            visit(&mut config.defaults);
+            config.profiles.values_mut().for_each(visit);
+        }
+        for skill in &mut self.skills {
+            if let Some(settings) = &mut skill.autonomy {
+                visit(&mut settings.settings);
+            }
+        }
+    }
+
     /// Supplies programmatic defaults for the same state/skill declarations used by strict YAML loading.
     pub fn autonomy(mut self, config: ai_agents_core::autonomy::AutonomyConfig) -> Self {
         self.automatic_config = Some(config);
@@ -277,6 +301,7 @@ impl AgentBuilder {
     }
 
     /// Keeps typed source configuration while leaving restoration authority to explicit host construction.
+    /// Owns the parsed specification across all subsequent builder and transport stages.
     pub fn from_spec(spec: AgentSpec) -> Self {
         let system_prompt = spec.system_prompt.clone();
         let max_iterations = Some(spec.max_iterations);
@@ -285,7 +310,7 @@ impl AgentBuilder {
         let reflection = Some(spec.reflection.clone());
 
         Self {
-            spec: Some(spec),
+            spec: Some(Box::new(spec)),
             autonomy_extensions: None,
             automatic_config: None,
             automatic_options: Default::default(),
@@ -1116,7 +1141,7 @@ impl AgentBuilder {
         let Some(registry) = self.llm_registry.take() else {
             return Ok(());
         };
-        let model_by_alias = model_by_alias_from_spec(self.spec.as_ref());
+        let model_by_alias = model_by_alias_from_spec(self.spec.as_deref());
         let wrapped = wrap_registry_with_observability(registry, manager, &model_by_alias);
         let wrapped_arc = Arc::new(wrapped.clone());
         if let Some(processor) = self.process_processor.take() {
@@ -1557,7 +1582,7 @@ impl AgentBuilder {
                         Arc::clone(manager),
                         Some("default".to_string()),
                         llm.provider_name().to_string(),
-                        model_by_alias_from_spec(self.spec.as_ref())
+                        model_by_alias_from_spec(self.spec.as_deref())
                             .get("default")
                             .cloned()
                             .unwrap_or_else(|| "default".to_string()),
@@ -1584,7 +1609,7 @@ impl AgentBuilder {
         if let Some(ref manager) = observability_manager
             && !self.llm_registry_observed
         {
-            let model_by_alias = model_by_alias_from_spec(self.spec.as_ref());
+            let model_by_alias = model_by_alias_from_spec(self.spec.as_deref());
             llm_registry = wrap_registry_with_observability(
                 llm_registry,
                 Arc::clone(manager),
@@ -2310,7 +2335,7 @@ llm:
   provider: openai
   model: gpt-4
 "#;
-        let mut spec = AgentBuilder::from_yaml(yaml).unwrap().spec.unwrap();
+        let mut spec = *AgentBuilder::from_yaml(yaml).unwrap().spec.unwrap();
         spec.name = "RewrittenAgent".to_string();
         spec.system_prompt = "Rewritten prompt".to_string();
         spec.max_iterations = 37;
@@ -2369,7 +2394,7 @@ spawner:
     - id: child
       agent: agents/child.yaml
 "#;
-        let spec = AgentBuilder::from_yaml(yaml).unwrap().spec.unwrap();
+        let spec = *AgentBuilder::from_yaml(yaml).unwrap().spec.unwrap();
 
         let builder = AgentBuilder::from_spec_with_base_dir(spec, &base_dir)
             .llm(Arc::new(MockLLMProvider::new("test")))
@@ -2418,7 +2443,7 @@ spawner:
     - id: missing
       agent: missing.yaml
 "#;
-        let spec = AgentBuilder::from_yaml(yaml).unwrap().spec.unwrap();
+        let spec = *AgentBuilder::from_yaml(yaml).unwrap().spec.unwrap();
         let mut registry = LLMRegistry::new();
         registry.register("default", Arc::new(MockLLMProvider::new("test")));
         registry.set_default("default");

@@ -3,6 +3,24 @@ use super::*;
 #[path = "rc_controller_cleanup_tests.rs"]
 mod controller;
 
+// Setup has an ordinary finite wall allowance; the recovery host crosses its persisted expiry explicitly.
+const CLEANUP_WALL_SECONDS: u64 = 60;
+
+// Both hosts observe the same expired wall bound only after the exact cancelled checkpoint exists.
+fn expired_cleanup_proof(
+    source: &TaskRunSnapshot,
+    restore_clock: &parking_lot::Mutex<Option<chrono::DateTime<chrono::Utc>>>,
+) -> Arc<RecoveryProof> {
+    let expiry: chrono::DateTime<chrono::Utc> =
+        serde_json::from_value(source.payload["clocks"]["expires_at"].clone()).unwrap();
+    assert!(source.updated_at < expiry);
+    let expired = expiry + chrono::Duration::milliseconds(1);
+    let proof = RecoveryProof::new(source);
+    *proof.now.lock() = Some(expired);
+    *restore_clock.lock() = Some(expired);
+    proof
+}
+
 // Expiry prevents pending execution but cannot strand known-safe native history after explicit cancellation and recovery review.
 #[tokio::test]
 async fn rc_cancelled_interrupted_constructor_rebuilds_only_for_typed_cleanup_even_after_expiry() {
@@ -13,8 +31,9 @@ async fn rc_cancelled_interrupted_constructor_rebuilds_only_for_typed_cleanup_ev
             crate::autonomy::continuation_test_support::store(root.info().id, "restore.v1", sqlite)
                 .await;
         let mut config = config();
-        config.defaults.max_wall_time_seconds =
-            Some(ai_agents_core::autonomy::AutonomyLimit::Finite(1));
+        config.defaults.max_wall_time_seconds = Some(
+            ai_agents_core::autonomy::AutonomyLimit::Finite(CLEANUP_WALL_SECONDS),
+        );
         let runner = AutonomyRunner::try_new(
             root,
             config.clone(),
@@ -50,12 +69,11 @@ async fn rc_cancelled_interrupted_constructor_rebuilds_only_for_typed_cleanup_ev
             )
             .await
             .unwrap();
-        tokio::time::sleep(Duration::from_millis(1100)).await;
         let recovered = AutonomyRunner::reconcile_recovery(
             store.clone(),
             &source.key.run_id,
             decision(&source, TaskRecoveryDisposition::CancelPrepared),
-            RecoveryProof::new(&source),
+            expired_cleanup_proof(&source, &host.clock),
         )
         .await
         .unwrap();

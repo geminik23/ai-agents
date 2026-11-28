@@ -154,6 +154,14 @@ impl AutonomyValidator for BuiltinValidator {
     fn descriptor(&self) -> &AdapterDescriptor {
         &self.descriptor
     }
+    // These operands are passed to the command runner or filesystem observation tool.
+    fn config_filesystem_paths(&self) -> &[&str] {
+        match self.kind.as_str() {
+            "command" => &["/cwd"],
+            "diagnostics" | "artifact" => &["/path"],
+            _ => &[],
+        }
+    }
     /// Framework-owned built-in config remains strict; command timeouts must fit the shared executor's accepted range.
     fn validate_config(&self, config: &Value) -> Result<()> {
         bounded_value(config, 16_384)?;

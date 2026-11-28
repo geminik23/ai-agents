@@ -67,8 +67,9 @@ async fn rc_cancelled_controller_driver_cleanup_preserves_stored_bound_and_survi
             )
             .await;
             let mut config = f.config.clone();
-            config.defaults.max_wall_time_seconds =
-                Some(ai_agents_core::autonomy::AutonomyLimit::Finite(1));
+            config.defaults.max_wall_time_seconds = Some(
+                ai_agents_core::autonomy::AutonomyLimit::Finite(CLEANUP_WALL_SECONDS),
+            );
             let runner = AutonomyRunner::try_new(
                 f.agent.clone(),
                 config.clone(),
@@ -123,14 +124,13 @@ async fn rc_cancelled_controller_driver_cleanup_preserves_stored_bound_and_survi
                 )
                 .await
                 .unwrap();
-            tokio::time::sleep(Duration::from_millis(1100)).await;
             let mut cleanup = decision(&cancelled, TaskRecoveryDisposition::CancelPrepared);
             cleanup.interrupted_started_at = Some(claimed.updated_at);
             let recovered = AutonomyRunner::reconcile_recovery(
                 store.clone(),
                 &claimed.key.run_id,
                 cleanup,
-                RecoveryProof::new(&cancelled),
+                expired_cleanup_proof(&cancelled, &host.clock),
             )
             .await
             .unwrap();

@@ -22,5 +22,8 @@ rmcp = { workspace = true, features = ["server", "transport-io", "transport-stre
 tokio = { workspace = true, optional = true }
 tokio-util = { version = "0.7", features = ["rt"], optional = true }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Threading"], optional = true }
+
 [features]
-mcp-integration = ["dep:axum", "dep:rmcp", "dep:tokio", "dep:tokio-util"]
+mcp-integration = ["dep:axum", "dep:rmcp", "dep:tokio", "dep:tokio-util", "dep:windows-sys"]

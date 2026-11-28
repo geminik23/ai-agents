@@ -32,6 +32,10 @@ pub trait AutonomyValidator: Send + Sync {
     fn descriptor(&self) -> &AdapterDescriptor;
     /// Validates the adapter's opaque configuration before binding or replacing it.
     fn validate_config(&self, config: &Value) -> Result<()>;
+    /// Declares JSON pointers to filesystem operands in this adapter's configuration; other strings are opaque.
+    fn config_filesystem_paths(&self) -> &[&str] {
+        &[]
+    }
     /// Returns completion, typed observations or a typed host wait, not direct effects.
     fn evaluate(&self, input: &ValidationInput<'_>) -> Result<ValidationDecision>;
     /// Projects explicit host artifact observations from an acknowledged result without I/O or model-written authority.
@@ -537,6 +541,33 @@ pub struct FrozenAutonomyExtensions {
 }
 
 impl FrozenAutonomyExtensions {
+    // Resolve configuration roles against the installed version, including explicit host replacements.
+    pub(crate) fn map_validation_paths(
+        &self,
+        profile: &mut AutonomyProfile,
+        map: &dyn Fn(&str) -> Option<String>,
+    ) {
+        let validations = profile.validation.iter_mut().chain(
+            profile
+                .lifecycle
+                .iter_mut()
+                .flatten()
+                .filter_map(|stage| stage.validation.as_mut()),
+        );
+        for check in validations.flat_map(|validation| validation.checks.iter_mut().flatten()) {
+            let key = (check.adapter.clone(), check.contract_version.unwrap_or(1));
+            if let (Some(adapter), Some(config)) = (self.validators.get(&key), &mut check.config) {
+                for pointer in adapter.config_filesystem_paths() {
+                    if let Some(Value::String(path)) = config.pointer_mut(pointer)
+                        && let Some(mapped) = map(path)
+                    {
+                        *path = mapped;
+                    }
+                }
+            }
+        }
+    }
+
     /// Binding validates merged config and declaration-order dependencies before any observations execute.
     pub fn bind(
         self: &Arc<Self>,

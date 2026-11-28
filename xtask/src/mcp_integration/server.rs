@@ -140,6 +140,7 @@ pub(super) async fn serve(transport: &str, dir: &Path) -> Result<()> {
     match transport {
         "stdio" => {
             ready(dir, None)?;
+            super::wait_until(|| Ok(dir.join("observed").is_file())).await?;
             server
                 .serve(rmcp::transport::stdio())
                 .await

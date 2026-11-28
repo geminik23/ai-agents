@@ -225,6 +225,26 @@ pub struct ToolPolicyConfig {
     pub config: HashMap<String, serde_json::Value>,
 }
 
+impl ToolPolicyConfig {
+    /// Visits filesystem policy roots, including legacy restrictions and command working directories.
+    pub fn filesystem_paths_mut(&mut self) -> impl Iterator<Item = &mut String> {
+        [
+            &mut self.allowed_paths,
+            &mut self.blocked_paths,
+            &mut self.read_paths,
+            &mut self.write_paths,
+            &mut self.paths.allow,
+            &mut self.paths.deny,
+            &mut self.paths.requires_approval,
+            &mut self.paths.unavailable,
+            &mut self.working_dirs,
+            &mut self.commands.working_dirs,
+        ]
+        .into_iter()
+        .flatten()
+    }
+}
+
 impl Default for ToolPolicyConfig {
     fn default() -> Self {
         Self {

@@ -1,5 +1,6 @@
 //! Agent specification types
 
+mod filesystem_paths;
 mod llm;
 mod memory;
 mod provider;

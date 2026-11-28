@@ -14,6 +14,7 @@ const DISAMBIGUATION_STATE_GENERATION_KEY: &str = "_runtime.disambiguation_state
 const MAX_TOOL_FALLBACK_HOPS: usize = 16;
 
 tokio::task_local! {
+    static MODEL_CALL_TOOLS: Arc<ToolRegistry>;
     static TOOL_FALLBACK_REQUEST: std::cell::RefCell<Option<(ToolExecutionRequest, ToolFallbackState)>>;
 }
 
@@ -1320,6 +1321,23 @@ impl RuntimeAgent {
     ) -> Self {
         self.autonomy_extensions = extensions;
         self
+    }
+
+    /// Reports the installed implementation's path and policy metadata for the resolved name.
+    /// Metadata is descriptive; invocation still performs the normal grant and admission checks.
+    pub fn tool_policy_bindings(&self, name: &str) -> Option<ai_agents_core::ToolPolicyBindings> {
+        self.tools.get(name).map(|tool| tool.policy_bindings())
+    }
+
+    /// Looks up descriptive tool metadata while the caller requests a main response or opens its stream.
+    /// A shared provider sees the current caller only within that scope; the metadata grants no execution authority.
+    pub fn current_model_tool_policy_bindings(
+        name: &str,
+    ) -> Option<ai_agents_core::ToolPolicyBindings> {
+        MODEL_CALL_TOOLS
+            .try_with(|tools| tools.get(name).map(|tool| tool.policy_bindings()))
+            .ok()
+            .flatten()
     }
 
     /// Returns the canonical store for explicit host bindings, not another mutable task authority.
@@ -6041,6 +6059,15 @@ impl RuntimeAgent {
         messages
     }
 
+    // Bind the calling tool registry only while the generation future is polled, including stream opening and fallback.
+    // Shared provider handles keep their original identity and cannot retain this lookup across turns.
+    fn main_response<F: Future>(&self, future: F) -> impl Future<Output = F::Output> {
+        MODEL_CALL_TOOLS.scope(
+            self.tools.clone(),
+            self.observe_purpose(ObservationPurpose::MainResponse, future),
+        )
+    }
+
     // Preflights the actual native or prompt-protocol representation before retries and fallback can hide an oversized request.
     fn validate_main_work_budget(
         &self,
@@ -6091,19 +6118,13 @@ impl RuntimeAgent {
                     .clone()
                     .expect("native tool requests require an explicit choice"),
             };
-            self.observe_purpose(
-                ObservationPurpose::MainResponse,
-                llm.complete_with_tools(messages, None, &request),
-            )
-            .await?
+            self.main_response(llm.complete_with_tools(messages, None, &request))
+                .await?
         } else {
             let prompt_messages =
                 self.prompt_messages_for_tool_protocol(messages, protocol, corrective);
-            self.observe_purpose(
-                ObservationPurpose::MainResponse,
-                llm.complete(&prompt_messages, None),
-            )
-            .await?
+            self.main_response(llm.complete(&prompt_messages, None))
+                .await?
         };
         Ok(response)
     }
@@ -6317,11 +6338,8 @@ impl RuntimeAgent {
                 || {
                     let llm = Arc::clone(&llm);
                     async move {
-                        self.observe_purpose(
-                            ObservationPurpose::MainResponse,
-                            llm.complete_stream(messages, None),
-                        )
-                        .await
+                        self.main_response(llm.complete_stream(messages, None))
+                            .await
                     }
                 },
                 |error| llm.is_terminal_error(error),
@@ -6345,19 +6363,13 @@ impl RuntimeAgent {
                         protocol.select_fallback(fallback.as_ref())?;
                         if fallback.supports(LLMFeature::Streaming) {
                             let stream = self
-                                .observe_purpose(
-                                    ObservationPurpose::MainResponse,
-                                    fallback.complete_stream(messages, None),
-                                )
+                                .main_response(fallback.complete_stream(messages, None))
                                 .await
                                 .map_err(|error| AgentError::LLM(error.to_string()))?;
                             Ok(MainStreamSource::Stream(stream))
                         } else {
                             let response = self
-                                .observe_purpose(
-                                    ObservationPurpose::MainResponse,
-                                    fallback.complete(messages, None),
-                                )
+                                .main_response(fallback.complete(messages, None))
                                 .await
                                 .map_err(|error| AgentError::LLM(error.to_string()))?;
                             Ok(MainStreamSource::Complete(response))
