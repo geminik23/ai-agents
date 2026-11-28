@@ -9,11 +9,11 @@ use std::time::{Duration, Instant, SystemTime};
 #[derive(Debug, Clone, Copy)]
 pub struct InvocationBounds {
     native: Option<(SystemTime, Instant)>,
-    #[cfg(feature = "test-util")]
+    #[cfg(any(test, feature = "test-util"))]
     controlled: Option<Instant>,
 }
 
-#[cfg(feature = "test-util")]
+#[cfg(any(test, feature = "test-util"))]
 tokio::task_local! {
     static TEST_NOW: fn() -> Instant;
 }
@@ -23,13 +23,13 @@ impl InvocationBounds {
     pub fn new(utc: SystemTime, monotonic: Instant) -> Self {
         Self {
             native: Some((utc, monotonic)),
-            #[cfg(feature = "test-util")]
+            #[cfg(any(test, feature = "test-util"))]
             controlled: None,
         }
     }
 
     /// A test-only monotonic deadline, read inside the same scoped clock in every spawned task.
-    #[cfg(feature = "test-util")]
+    #[cfg(any(test, feature = "test-util"))]
     pub fn for_test_clock(at: Instant) -> Self {
         Self {
             native: None,
@@ -38,7 +38,7 @@ impl InvocationBounds {
     }
 
     /// Installs the test clock for controlled deadlines only. Native bounds keep both independent clocks.
-    #[cfg(feature = "test-util")]
+    #[cfg(any(test, feature = "test-util"))]
     pub async fn scope_test_clock<F: Future>(now: fn() -> Instant, future: F) -> F::Output {
         TEST_NOW.scope(now, future).await
     }
@@ -50,7 +50,7 @@ impl InvocationBounds {
                 .unwrap_or_default()
                 .min(monotonic.saturating_duration_since(Instant::now()))
         });
-        #[cfg(feature = "test-util")]
+        #[cfg(any(test, feature = "test-util"))]
         if let Some(test) = self.controlled {
             let remaining = TEST_NOW
                 .try_with(|now| test.saturating_duration_since(now()))
@@ -67,7 +67,7 @@ impl InvocationBounds {
                 (Some((a, b)), Some((c, d))) => Some((a.min(c), b.min(d))),
                 (a, b) => a.or(b),
             },
-            #[cfg(feature = "test-util")]
+            #[cfg(any(test, feature = "test-util"))]
             controlled: match (self.controlled, other.controlled) {
                 (Some(a), Some(b)) => Some(a.min(b)),
                 (a, b) => a.or(b),
