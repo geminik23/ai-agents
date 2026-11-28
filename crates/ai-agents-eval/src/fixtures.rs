@@ -613,12 +613,36 @@ impl AttemptFixtureContext {
         Ok(())
     }
 
-    // Only generated eval tokens are substituted in typed agent values; field names and all other templates remain unchanged.
-    pub(crate) fn interpolate_config<T: serde::Serialize + serde::de::DeserializeOwned>(
+    pub(crate) fn interpolate_agent_spec(&self, spec: &AgentSpec) -> Result<AgentSpec> {
+        let mut value = serde_json::to_value(spec)?;
+        // File context sources declare a filesystem path. A fixture's free-form context can have the same keys.
+        if let Some(sources) = value.get_mut("context").and_then(Value::as_object_mut) {
+            for source in sources.values_mut() {
+                if source["type"] == "file"
+                    && let Some(Value::String(text)) = source.get_mut("path")
+                    && let Some(path) = joined_workspace_path(text, &self.workspace)
+                {
+                    *text = path;
+                }
+            }
+        }
+        self.interpolate_config(value)
+    }
+
+    pub(crate) fn interpolate_tool_fixtures(
         &self,
-        config: &T,
-    ) -> Result<T> {
-        fn visit(context: &AttemptFixtureContext, value: &mut Value) -> Result<()> {
+        fixtures: &FixturesConfig,
+    ) -> Result<FixturesConfig> {
+        self.interpolate_config(serde_json::to_value(fixtures)?)
+    }
+
+    // Only generated eval tokens are substituted; typed configuration keys never change.
+    fn interpolate_config<T: serde::de::DeserializeOwned>(&self, mut value: Value) -> Result<T> {
+        fn visit<'a>(
+            context: &AttemptFixtureContext,
+            fields: &mut Vec<&'a str>,
+            value: &'a mut Value,
+        ) -> Result<()> {
             match value {
                 Value::String(text) => {
                     if text.contains("{{ mock_server.base_url }}")
@@ -628,28 +652,35 @@ impl AttemptFixtureContext {
                             "mock_server token requires an enabled fixture server".into(),
                         ));
                     }
-                    *text = interpolate_fixture_value(
-                        text,
-                        &context.workspace.display().to_string(),
-                        context.mock_server_base_url.as_deref(),
-                    );
+                    if config_filesystem_path(fields)
+                        && let Some(path) = joined_workspace_path(text, &context.workspace)
+                    {
+                        *text = path;
+                    } else {
+                        *text = interpolate_fixture_string(
+                            text,
+                            &context.workspace.display().to_string(),
+                            context.mock_server_base_url.as_deref(),
+                        );
+                    }
                 }
                 Value::Array(values) => {
                     for value in values {
-                        visit(context, value)?;
+                        visit(context, fields, value)?;
                     }
                 }
                 Value::Object(values) => {
-                    for value in values.values_mut() {
-                        visit(context, value)?;
+                    for (key, value) in values {
+                        fields.push(key);
+                        visit(context, fields, value)?;
+                        fields.pop();
                     }
                 }
                 _ => {}
             }
             Ok(())
         }
-        let mut value = serde_json::to_value(config)?;
-        visit(self, &mut value)?;
+        visit(self, &mut Vec::new(), &mut value)?;
         Ok(serde_json::from_value(value)?)
     }
 
@@ -677,26 +708,38 @@ impl AttemptFixtureContext {
     }
 
     pub fn interpolate_llm_fixture(&self, config: &LlmFixtureConfig) -> Result<LlmFixtureConfig> {
+        self.interpolate_llm_with_tools(config, &ai_agents_tools::builtin::get_builtin_tool)
+    }
+
+    pub(crate) fn interpolate_llm_with_tools(
+        &self,
+        config: &LlmFixtureConfig,
+        lookup: &dyn Fn(&str) -> Option<Arc<dyn Tool>>,
+    ) -> Result<LlmFixtureConfig> {
         let mut rewritten = config.clone();
         for response in &mut rewritten.responses {
-            *response = self.interpolate_response(response)?;
+            *response = self.interpolate_response(response, lookup)?;
         }
         for responses in rewritten.responses_by_alias.values_mut() {
             for response in responses {
-                *response = self.interpolate_response(response)?;
+                *response = self.interpolate_response(response, lookup)?;
             }
         }
         for outcomes in rewritten.outcomes_by_alias.values_mut() {
             for outcome in outcomes {
                 if let LlmFixtureOutcome::Response { content } = outcome {
-                    *content = self.interpolate_response(content)?;
+                    *content = self.interpolate_response(content, lookup)?;
                 }
             }
         }
         Ok(rewritten)
     }
 
-    fn interpolate_response(&self, response: &str) -> Result<String> {
+    fn interpolate_response(
+        &self,
+        response: &str,
+        lookup: &dyn Fn(&str) -> Option<Arc<dyn Tool>>,
+    ) -> Result<String> {
         const WORKSPACE_TOKEN: &str = "{{ eval.workspace }}";
         const MOCK_SERVER_TOKEN: &str = "{{ mock_server.base_url }}";
         if !response.contains(WORKSPACE_TOKEN) && !response.contains(MOCK_SERVER_TOKEN) {
@@ -711,6 +754,16 @@ impl AttemptFixtureContext {
         let workspace = self.workspace.display().to_string();
         let mock_server = self.mock_server_base_url.as_deref();
         if let Ok(mut value) = serde_json::from_str::<Value>(response) {
+            if response.contains(WORKSPACE_TOKEN) {
+                match &mut value {
+                    Value::Array(calls) => {
+                        for call in calls {
+                            join_mock_call_paths(call, &self.workspace, lookup);
+                        }
+                    }
+                    call => join_mock_call_paths(call, &self.workspace, lookup),
+                }
+            }
             interpolate_json_strings(&mut value, &workspace, mock_server);
             return serde_json::to_string(&value).map_err(EvalError::from);
         }
@@ -722,9 +775,93 @@ impl AttemptFixtureContext {
     }
 }
 
+// Only the declared filesystem arguments of a mock tool call are path operands.
+// In particular, arbitrary JSON payloads can themselves contain a property called "path".
+fn join_mock_call_paths(
+    call: &mut Value,
+    workspace: &Path,
+    lookup: &dyn Fn(&str) -> Option<Arc<dyn Tool>>,
+) {
+    let Some(tool) = call.get("tool").and_then(Value::as_str).and_then(lookup) else {
+        return;
+    };
+    let Some(args) = call.get_mut("arguments") else {
+        return;
+    };
+    for binding in tool.policy_bindings().path_fields {
+        let Some(field) = binding
+            .field
+            .split('.')
+            .try_fold(&mut *args, |value, segment| value.get_mut(segment))
+        else {
+            continue;
+        };
+        // Path policy bindings accept a string or a list of strings.
+        let paths = match field {
+            Value::Array(items) => items.as_mut_slice(),
+            single => std::slice::from_mut(single),
+        };
+        for path in paths {
+            if let Value::String(text) = path
+                && let Some(joined) = joined_workspace_path(text, workspace)
+            {
+                *text = joined;
+            }
+        }
+    }
+}
+
+// These positions belong to filesystem settings in the serialized agent and fixture schemas.
+// Free-form model, tool and HTTP payloads retain literal template substitution.
+fn config_filesystem_path(fields: &[&str]) -> bool {
+    match fields {
+        ["storage", "path"]
+        | ["spawner", "shared_storage", "path"]
+        | ["spawner", "templates", _, "path"]
+        | ["spawner", "auto_spawn", "agent"]
+        | ["skills", "file"]
+        | ["observability", "export", "path"]
+        | ["observability", "cost", "pricing_file"]
+        | ["context_file"]
+        | ["commands", "entries", "response", "cwd"]
+        | ["diagnostics", "items", "path"]
+        | [
+            "tool_security",
+            "tools",
+            _,
+            "read_paths" | "write_paths" | "allowed_paths" | "working_dirs",
+        ]
+        | [
+            "tool_security",
+            "tools",
+            _,
+            "paths",
+            "allow" | "deny" | "unavailable" | "requires_approval",
+        ]
+        | ["tool_security", "tools", _, "commands", "working_dirs"] => true,
+        [
+            "autonomy" | "states" | "skills",
+            ..,
+            "validation",
+            "checks",
+            "config",
+            "path",
+        ] => true,
+        [prefix @ .., "artifact_exists"] => {
+            prefix
+                .iter()
+                .rev()
+                .find(|key| !matches!(**key, "all" | "any" | "not"))
+                == Some(&"completion")
+                && matches!(prefix.first(), Some(&"autonomy" | &"states" | &"skills"))
+        }
+        _ => false,
+    }
+}
+
 fn interpolate_json_strings(value: &mut Value, workspace: &str, mock_server: Option<&str>) {
     match value {
-        Value::String(text) => *text = interpolate_fixture_value(text, workspace, mock_server),
+        Value::String(text) => *text = interpolate_fixture_string(text, workspace, mock_server),
         Value::Array(values) => {
             for value in values {
                 interpolate_json_strings(value, workspace, mock_server);
@@ -735,7 +872,7 @@ fn interpolate_json_strings(value: &mut Value, workspace: &str, mock_server: Opt
             for (key, mut value) in previous {
                 interpolate_json_strings(&mut value, workspace, mock_server);
                 values.insert(
-                    interpolate_fixture_value(&key, workspace, mock_server),
+                    interpolate_fixture_string(&key, workspace, mock_server),
                     value,
                 );
             }
@@ -746,18 +883,18 @@ fn interpolate_json_strings(value: &mut Value, workspace: &str, mock_server: Opt
 
 // Structured fixtures express workspace descendants with portable slash-separated paths.
 // Join only ordinary relative components so a token cannot replace the root with a drive or normalize traversal.
-fn interpolate_fixture_value(value: &str, workspace: &str, mock_server: Option<&str>) -> String {
+fn joined_workspace_path(value: &str, workspace: &Path) -> Option<String> {
     if let Some(suffix) = value.strip_prefix("{{ eval.workspace }}/")
         && !suffix.contains("{{")
         && suffix
             .split('/')
             .all(|part| Path::new(part).file_name() == Some(part.as_ref()))
     {
-        let mut path = PathBuf::from(workspace);
+        let mut path = workspace.to_owned();
         path.extend(suffix.split('/'));
-        return path.display().to_string();
+        return Some(path.display().to_string());
     }
-    interpolate_fixture_string(value, workspace, mock_server)
+    None
 }
 
 fn interpolate_fixture_string(value: &str, workspace: &str, mock_server: Option<&str>) -> String {
@@ -2814,20 +2951,83 @@ workspace_policy:
     fn structured_fixture_paths_join_native_components_and_preserve_embedded_text() {
         let context = AttemptWorkspace::create(None).unwrap();
         let expected = context.workspace.join("nested dir").join("example.rs");
-        let raw = r#"{"path":"{{ eval.workspace }}/nested dir/example.rs","note":"see {{ eval.workspace }}/example.rs"}"#;
-        let parsed: Value =
-            serde_json::from_str(&context.interpolate_response(raw).unwrap()).unwrap();
-        assert_eq!(parsed["path"], json!(expected));
+        let fixture = json!({
+            "name": "interpolation",
+            "context": {"source": {"type":"file","path":"{{ eval.workspace }}/nested dir/example.rs"}},
+            "storage": {"type":"file", "path":"{{ eval.workspace }}/nested dir/example.rs"},
+            "system_prompt": "see {{ eval.workspace }}/example.rs",
+            "metadata": {"path":"{{ eval.workspace }}/literal/key"}
+        });
+        let parsed = serde_json::to_value(
+            context
+                .interpolate_agent_spec(&serde_json::from_value(fixture).unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(parsed["context"]["source"]["path"], json!(expected));
+        assert_eq!(parsed["storage"]["path"], json!(expected));
         assert_eq!(
-            parsed["note"],
+            parsed["system_prompt"],
             format!("see {}/example.rs", context.workspace.display())
         );
         assert_eq!(
-            context
-                .interpolate_config(&serde_json::from_str::<Value>(raw).unwrap())
-                .unwrap(),
-            parsed
+            parsed["metadata"]["path"],
+            format!("{}/literal/key", context.workspace.display())
         );
+    }
+
+    #[test]
+    fn file_write_fixture_joins_only_the_path_and_preserves_content_slashes() {
+        let context = AttemptWorkspace::create(None).unwrap();
+        let write = json!({
+            "tool": "file_write",
+            "arguments": {
+                "path": "{{ eval.workspace }}/nested dir/report.md",
+                "content": "{{ eval.workspace }}/README.md (see docs/guide.md)"
+            }
+        });
+        let fixture = LlmFixtureConfig {
+            responses: vec![write.to_string()],
+            ..Default::default()
+        };
+        let rewritten = context.interpolate_llm_fixture(&fixture).unwrap();
+        let response: Value = serde_json::from_str(&rewritten.responses[0]).unwrap();
+        assert_eq!(
+            response["arguments"]["path"],
+            json!(context.workspace.join("nested dir").join("report.md"))
+        );
+        let content = format!(
+            "{}/README.md (see docs/guide.md)",
+            context.workspace.display()
+        );
+        assert_eq!(response["arguments"]["content"], content);
+        let fixtures = FixturesConfig {
+            context: Some(json!({"opaque":{"type":"file","path":write["arguments"]["content"]}})),
+            ..Default::default()
+        };
+        let fixtures = context.interpolate_tool_fixtures(&fixtures).unwrap();
+        assert_eq!(fixtures.context.unwrap()["opaque"]["path"], content);
+    }
+
+    #[test]
+    fn parallel_fixture_calls_use_each_tools_bindings_and_keep_json_data_literal() {
+        let context = AttemptWorkspace::create(None).unwrap();
+        let token = "{{ eval.workspace }}/a/b";
+        let literal = format!("{}/a/b", context.workspace.display());
+        let path = json!(context.workspace.join("a").join("b"));
+        let calls = json!([
+            {"tool":"copy_path", "arguments":{"source_path":token, "destination_path":token}},
+            {"tool":"json", "arguments":{"data":{token: {"path":token}}}}
+        ]);
+        let fixture = LlmFixtureConfig {
+            responses: vec![calls.to_string()],
+            ..Default::default()
+        };
+        let rewritten = context.interpolate_llm_fixture(&fixture).unwrap();
+        let rendered: Value = serde_json::from_str(&rewritten.responses[0]).unwrap();
+        assert_eq!(rendered[0]["arguments"]["source_path"], path);
+        assert_eq!(rendered[0]["arguments"]["destination_path"], path);
+        assert_eq!(rendered[1]["arguments"]["data"][&literal]["path"], literal);
     }
 
     #[test]

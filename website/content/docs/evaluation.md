@@ -559,7 +559,7 @@ Each scenario attempt receives an opaque absolute workspace. Runtime context inc
 
 When scenario retries are enabled, `timeout_per_scenario_ms` is applied independently to each attempt. Retry delay begins only after the completed attempt timeout has ended, so it does not consume that prior attempt's timeout budget, but it remains part of the scenario runner's total wall time.
 
-Mock response strings can interpolate only `{{ eval.workspace }}` and `{{ mock_server.base_url }}`. JSON tool calls are rewritten as parsed JSON, so native path separators remain valid. Other template expressions remain unchanged, and a mock-server token without an enabled server is a configuration error.
+Mock response strings can interpolate only `{{ eval.workspace }}` and `{{ mock_server.base_url }}`. In a JSON tool call, a workspace descendant such as `{{ eval.workspace }}/notes/report.md` uses native separators in declared filesystem arguments such as `file_write.path`. In `file_write.content` and other text, substitution preserves every slash after the token. Other template expressions remain unchanged, and a mock-server token without an enabled server is a configuration error.
 
 ```yaml
 fixtures:

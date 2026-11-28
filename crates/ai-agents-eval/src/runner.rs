@@ -1110,7 +1110,7 @@ impl EvalRunner {
         let content = std::fs::read_to_string(agent_path)?;
         let prepared = ai_agents_runtime::spec::PreparedAgentSpec::from_yaml_strict(&content)?;
         let (parsed, task_policy) = prepared.into_parts();
-        let mut spec = attempt_context.interpolate_config(&parsed)?;
+        let mut spec = attempt_context.interpolate_agent_spec(&parsed)?;
         apply_eval_llm_settings(&mut spec, &self.suite.settings);
         isolate_spec_storage(&mut spec, attempt_context);
         apply_workspace_policy(
@@ -1121,7 +1121,19 @@ impl EvalRunner {
         spec.validate()
             .map_err(|error| EvalError::Config(error.to_string()))?;
         self.suite.validate_agent(&spec)?;
-        let llm_fixture = attempt_context.interpolate_llm_fixture(&self.suite.fixtures.llm)?;
+        // Tool fixture values are typed JSON; LLM content keeps its dedicated JSON-aware interpolation path.
+        let mut tool_fixtures = self.suite.fixtures.clone();
+        tool_fixtures.llm = Default::default();
+        let tool_fixtures = attempt_context.interpolate_tool_fixtures(&tool_fixtures)?;
+        let tool_registry = crate::fixtures::build_tool_registry_for_routing(
+            &tool_fixtures,
+            tool_log.clone(),
+            spec.llm.router_roles().is_some(),
+        )?;
+        let llm_fixture = attempt_context
+            .interpolate_llm_with_tools(&self.suite.fixtures.llm, &|name| {
+                tool_registry.get(name)
+            })?;
         let (llm_registry, _) =
             build_llm_registry_with(&spec, &llm_fixture, base_dir, |config, provider| {
                 let observed: Arc<dyn ai_agents_core::LLMProvider> = Arc::new(RecordingProvider {
@@ -1141,15 +1153,6 @@ impl EvalRunner {
                 }
             })?;
 
-        // Tool fixture values are typed JSON; LLM content keeps its dedicated JSON-aware interpolation path.
-        let mut tool_fixtures = self.suite.fixtures.clone();
-        tool_fixtures.llm = Default::default();
-        let tool_fixtures = attempt_context.interpolate_config(&tool_fixtures)?;
-        let tool_registry = crate::fixtures::build_tool_registry_for_routing(
-            &tool_fixtures,
-            tool_log.clone(),
-            spec.llm.router_roles().is_some(),
-        )?;
         let agent_base_dir = agent_path.parent().unwrap_or_else(|| Path::new("."));
         if let Some(host) = &self.host {
             host.validate(&spec)?;
