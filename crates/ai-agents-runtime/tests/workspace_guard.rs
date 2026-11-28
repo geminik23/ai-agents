@@ -124,6 +124,7 @@ async fn denied_checker_inputs_and_outside_paths_never_reach_a_mutation() {
     assert!(!guard.requires_reconciliation());
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn guarded_creation_advances_the_validation_target_revision() {
     let fixture = Fixture::new();
@@ -167,6 +168,25 @@ async fn guarded_creation_advances_the_validation_target_revision() {
     assert!(guard.requires_reconciliation());
 }
 
+#[cfg(not(unix))]
+#[tokio::test]
+async fn unsupported_new_file_ownership_refuses_creation_without_effect() {
+    let fixture = Fixture::new();
+    let guard = WorkspaceGuard::new(fixture.root.clone(), WorkspaceScope::Root, vec![]).unwrap();
+    let agent = agent(&fixture, &guard);
+    let path = fixture.root.join("new.rs");
+    let denied = write(&agent, "create", &path, false).await;
+    assert!(denied.executed && !denied.success);
+    assert!(
+        denied.output.contains("new-file ownership"),
+        "{}",
+        denied.output
+    );
+    assert!(!path.exists());
+    assert_eq!(guard.revision().as_deref(), Some("0"));
+    assert!(!guard.requires_reconciliation());
+}
+
 #[tokio::test]
 async fn ordinary_tool_rejections_settle_without_effect_on_both_layers() {
     let fixture = Fixture::new();
@@ -191,8 +211,18 @@ async fn ordinary_tool_rejections_settle_without_effect_on_both_layers() {
     assert!(!guard.requires_reconciliation());
 
     // The same session continues and a real mutation still advances the validation target.
-    let created = fixture.root.join("src").join("feature.rs");
-    let record = write(&agent, "create", &created, false).await;
+    let read = agent
+        .invoke_tool(ToolExecutionRequest::new(
+            "read",
+            "file_read",
+            json!({"path":existing}),
+            ToolCallSource::Manual,
+        ))
+        .await
+        .unwrap();
+    assert!(read.executed && read.success, "{}", read.output);
+    let record = write(&agent, "overwrite", &existing, true).await;
     assert!(record.executed && record.success, "{}", record.output);
+    assert_eq!(std::fs::read_to_string(&existing).unwrap(), "agent");
     assert_eq!(source.revision().unwrap(), "2");
 }
