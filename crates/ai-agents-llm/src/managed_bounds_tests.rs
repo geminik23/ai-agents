@@ -5,16 +5,40 @@ mod stream_tests;
 use ai_agents_core::autonomy::InvocationAdmission;
 use async_trait::async_trait;
 use futures::StreamExt;
+use std::cell::Cell;
+use std::ops::AsyncFnOnce;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant, SystemTime};
 
+const TEST_INVOCATION_WINDOW: Duration = Duration::from_millis(30);
+
+tokio::task_local! {
+    static INVOCATION_NOW: Cell<Instant>;
+}
+
+// Keep the clock active so returned streams can sample their captured bound outside the opening scope.
+async fn with_test_deadline<T>(work: impl AsyncFnOnce(InvocationBounds) -> T) -> T {
+    let now = Instant::now();
+    let bounds = InvocationBounds::for_test_clock(now + TEST_INVOCATION_WINDOW);
+    INVOCATION_NOW
+        .scope(
+            Cell::new(now),
+            InvocationBounds::scope_test_clock(|| INVOCATION_NOW.with(Cell::get), work(bounds)),
+        )
+        .await
+}
+
+fn expire_invocation() {
+    INVOCATION_NOW.with(|now| now.set(now.get() + TEST_INVOCATION_WINDOW));
+}
+
 #[derive(Default)]
 struct Admission {
-    delay: bool,
-    delay_remaining: bool,
+    expire_on_admission: bool,
+    expire_on_remaining: bool,
     priced: bool,
     admissions: AtomicUsize,
     settlements: AtomicUsize,
@@ -32,9 +56,8 @@ impl InvocationAdmission for Admission {
     }
     async fn admit_llm(&self) -> Result<String, LLMError> {
         self.admissions.fetch_add(1, Ordering::SeqCst);
-        if self.delay {
-            let remaining = current_invocation_bounds().unwrap().remaining();
-            std::thread::sleep(remaining + Duration::from_millis(2));
+        if self.expire_on_admission {
+            expire_invocation();
         }
         Ok("attempt".into())
     }
@@ -52,10 +75,8 @@ impl InvocationAdmission for Admission {
         self.stop.load(Ordering::SeqCst)
     }
     fn remaining_duration(&self) -> Option<Duration> {
-        if self.delay_remaining {
-            std::thread::sleep(
-                current_invocation_bounds().unwrap().remaining() + Duration::from_millis(2),
-            );
+        if self.expire_on_remaining {
+            expire_invocation();
         }
         Some(Duration::from_secs(60))
     }
@@ -154,23 +175,22 @@ async fn invocation_bounds_late_admission_never_polls_provider() {
     for mode in 0..3 {
         let delayed = mode != 0;
         let admission = Arc::new(Admission {
-            delay: mode == 1,
-            delay_remaining: mode == 2,
+            expire_on_admission: mode == 1,
+            expire_on_remaining: mode == 2,
             ..Default::default()
         });
         let provider = Arc::new(Provider::default());
         let managed = managed_provider(provider.clone());
-        let bounds = InvocationBounds::new(
-            SystemTime::now() + Duration::from_secs(10),
-            Instant::now() + Duration::from_millis(30),
-        );
-        let result = scope_invocation_bounds(
-            Some(bounds),
-            scope_invocation_admission(
-                admission.clone(),
-                managed.complete(&[ChatMessage::user("test")], None),
-            ),
-        )
+        let result = with_test_deadline(async |bounds| {
+            scope_invocation_bounds(
+                Some(bounds),
+                scope_invocation_admission(
+                    admission.clone(),
+                    managed.complete(&[ChatMessage::user("test")], None),
+                ),
+            )
+            .await
+        })
         .await;
         assert_eq!(result.is_ok(), !delayed);
         assert_eq!(provider.0.load(Ordering::SeqCst), usize::from(!delayed));
@@ -190,28 +210,27 @@ async fn invocation_bounds_stream_lifetime_retains_accounting_and_independent_li
         let provider = Arc::new(Provider::default());
         let managed = managed_provider(provider.clone());
         let admission = Arc::new(Admission::default());
-        let bounds = InvocationBounds::new(
-            SystemTime::now() + Duration::from_secs(10),
-            Instant::now() + Duration::from_millis(30),
-        );
-        let work = async {
-            if ledger {
-                scope_invocation_admission(
-                    admission.clone(),
-                    managed.complete_stream(&[ChatMessage::user("test")], None),
-                )
-                .await
-            } else {
-                managed
-                    .complete_stream(&[ChatMessage::user("test")], None)
+        with_test_deadline(async |bounds| {
+            let work = async {
+                if ledger {
+                    scope_invocation_admission(
+                        admission.clone(),
+                        managed.complete_stream(&[ChatMessage::user("test")], None),
+                    )
                     .await
-            }
-        };
-        let mut stream = scope_invocation_bounds(Some(bounds), work).await.unwrap();
-        assert_eq!(provider.0.load(Ordering::SeqCst), 1);
-        std::thread::sleep(bounds.remaining() + Duration::from_millis(2));
-        assert!(stream.next().await.unwrap().is_err());
-        drop(stream);
+                } else {
+                    managed
+                        .complete_stream(&[ChatMessage::user("test")], None)
+                        .await
+                }
+            };
+            let mut stream = scope_invocation_bounds(Some(bounds), work).await.unwrap();
+            assert_eq!(provider.0.load(Ordering::SeqCst), 1);
+            expire_invocation();
+            assert!(stream.next().await.unwrap().is_err());
+            drop(stream);
+        })
+        .await;
         assert_eq!(admission.refunds.load(Ordering::SeqCst), 0);
         assert_eq!(admission.settlements.load(Ordering::SeqCst), 0);
         assert_eq!(
@@ -278,15 +297,13 @@ async fn invocation_bounds_synchronous_overrun_rejects_late_success() {
 #[derive(Debug)]
 struct LastPollProof {
     checks: AtomicUsize,
-    slow: bool,
+    expires: bool,
 }
 impl ai_agents_core::autonomy::TaskFinalAdmission for LastPollProof {
     fn validate(&self) -> ai_agents_core::Result<()> {
         if self.checks.fetch_add(1, Ordering::SeqCst) == 1 {
-            if self.slow {
-                std::thread::sleep(
-                    current_invocation_bounds().unwrap().remaining() + Duration::from_millis(2),
-                );
+            if self.expires {
+                expire_invocation();
             } else {
                 return Err(ai_agents_core::AgentError::Other(
                     "last pre-poll rejection".into(),
@@ -297,31 +314,30 @@ impl ai_agents_core::autonomy::TaskFinalAdmission for LastPollProof {
     }
 }
 
-// A rejected or slow last proof sample cannot mark an unpolled provider dispatched or lose its proven non-invocation refund.
+// A rejected or expired last proof sample cannot mark an unpolled provider dispatched or lose its proven non-invocation refund.
 #[tokio::test]
 async fn invocation_bounds_last_proof_precedes_actual_first_poll() {
-    for slow in [false, true] {
+    for expires in [false, true] {
         let admission = Arc::new(Admission::default());
         let raw = Arc::new(Provider::default());
         let provider = managed_provider(raw.clone());
-        let bounds = InvocationBounds::new(
-            SystemTime::now() + Duration::from_secs(10),
-            Instant::now() + Duration::from_millis(30),
-        );
         let proof = Arc::new(LastPollProof {
             checks: AtomicUsize::new(0),
-            slow,
+            expires,
         });
-        let result = scope_invocation_evidence(
-            vec![proof],
-            scope_invocation_bounds(
-                Some(bounds),
-                scope_invocation_admission(
-                    admission.clone(),
-                    provider.complete(&[ChatMessage::user("test")], None),
+        let result = with_test_deadline(async |bounds| {
+            scope_invocation_evidence(
+                vec![proof],
+                scope_invocation_bounds(
+                    Some(bounds),
+                    scope_invocation_admission(
+                        admission.clone(),
+                        provider.complete(&[ChatMessage::user("test")], None),
+                    ),
                 ),
-            ),
-        )
+            )
+            .await
+        })
         .await;
         assert!(result.is_err());
         assert_eq!(raw.0.load(Ordering::SeqCst), 0);
