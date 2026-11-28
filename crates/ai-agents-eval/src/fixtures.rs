@@ -628,7 +628,7 @@ impl AttemptFixtureContext {
                             "mock_server token requires an enabled fixture server".into(),
                         ));
                     }
-                    *text = interpolate_fixture_string(
+                    *text = interpolate_fixture_value(
                         text,
                         &context.workspace.display().to_string(),
                         context.mock_server_base_url.as_deref(),
@@ -724,7 +724,7 @@ impl AttemptFixtureContext {
 
 fn interpolate_json_strings(value: &mut Value, workspace: &str, mock_server: Option<&str>) {
     match value {
-        Value::String(text) => *text = interpolate_fixture_string(text, workspace, mock_server),
+        Value::String(text) => *text = interpolate_fixture_value(text, workspace, mock_server),
         Value::Array(values) => {
             for value in values {
                 interpolate_json_strings(value, workspace, mock_server);
@@ -735,13 +735,29 @@ fn interpolate_json_strings(value: &mut Value, workspace: &str, mock_server: Opt
             for (key, mut value) in previous {
                 interpolate_json_strings(&mut value, workspace, mock_server);
                 values.insert(
-                    interpolate_fixture_string(&key, workspace, mock_server),
+                    interpolate_fixture_value(&key, workspace, mock_server),
                     value,
                 );
             }
         }
         _ => {}
     }
+}
+
+// Structured fixtures express workspace descendants with portable slash-separated paths.
+// Join only ordinary relative components so a token cannot replace the root with a drive or normalize traversal.
+fn interpolate_fixture_value(value: &str, workspace: &str, mock_server: Option<&str>) -> String {
+    if let Some(suffix) = value.strip_prefix("{{ eval.workspace }}/")
+        && !suffix.contains("{{")
+        && suffix
+            .split('/')
+            .all(|part| Path::new(part).file_name() == Some(part.as_ref()))
+    {
+        let mut path = PathBuf::from(workspace);
+        path.extend(suffix.split('/'));
+        return path.display().to_string();
+    }
+    interpolate_fixture_string(value, workspace, mock_server)
 }
 
 fn interpolate_fixture_string(value: &str, workspace: &str, mock_server: Option<&str>) -> String {
@@ -2791,6 +2807,26 @@ workspace_policy:
             LlmFixtureOutcome::Response {
                 content: r"review C:\eval\attempt".to_string(),
             }
+        );
+    }
+
+    #[test]
+    fn structured_fixture_paths_join_native_components_and_preserve_embedded_text() {
+        let context = AttemptWorkspace::create(None).unwrap();
+        let expected = context.workspace.join("nested dir").join("example.rs");
+        let raw = r#"{"path":"{{ eval.workspace }}/nested dir/example.rs","note":"see {{ eval.workspace }}/example.rs"}"#;
+        let parsed: Value =
+            serde_json::from_str(&context.interpolate_response(raw).unwrap()).unwrap();
+        assert_eq!(parsed["path"], json!(expected));
+        assert_eq!(
+            parsed["note"],
+            format!("see {}/example.rs", context.workspace.display())
+        );
+        assert_eq!(
+            context
+                .interpolate_config(&serde_json::from_str::<Value>(raw).unwrap())
+                .unwrap(),
+            parsed
         );
     }
 
