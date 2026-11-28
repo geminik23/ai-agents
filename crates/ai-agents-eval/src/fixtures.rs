@@ -529,7 +529,7 @@ impl Drop for MockServerHandle {
 }
 
 /// Generated values shared by every agent build and reset in one attempt.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttemptFixtureContext {
     /// Opaque identifier used to isolate non-file persistence.
     pub isolation_id: String,
@@ -1759,7 +1759,10 @@ struct CassetteRecord {
 
 #[derive(Clone)]
 pub(crate) enum SequenceOutcome {
-    Template(Arc<OnceLock<String>>),
+    Template {
+        context: Arc<AttemptFixtureContext>,
+        text: String,
+    },
     Response(LLMResponse),
     Error {
         message: String,
@@ -1773,11 +1776,10 @@ impl SequenceOutcome {
     }
 }
 
-// A fresh construction owns these cells. Providers keep only rendered strings, never a runtime or tool handle.
-#[derive(Default)]
-pub(crate) struct PendingFixtureText(HashMap<String, Arc<OnceLock<String>>>);
+// Shared sequences own only the attempt values. Tool path roles belong to the runtime consuming each response.
+pub(crate) struct FixtureTemplates(Arc<AttemptFixtureContext>);
 
-impl PendingFixtureText {
+impl FixtureTemplates {
     pub(crate) fn new(
         context: &AttemptFixtureContext,
         fixtures: &LlmFixtureConfig,
@@ -1792,39 +1794,24 @@ impl PendingFixtureText {
                     _ => None,
                 },
             ));
-        let mut pending = Self::default();
         for text in texts {
             if text.contains("{{ mock_server.base_url }}") && context.mock_server_base_url.is_none()
             {
                 return Err(EvalError::Config("mock LLM response uses {{ mock_server.base_url }} without an enabled fixtures.mock_server".into()));
             }
-            if text.contains("{{ eval.workspace }}") || text.contains("{{ mock_server.base_url }}")
-            {
-                pending.0.entry(text.clone()).or_default();
-            }
         }
-        Ok(pending)
+        Ok(Self(Arc::new(context.clone())))
     }
 
     pub(crate) fn prepare(&self, text: &str) -> SequenceOutcome {
-        match self.0.get(text) {
-            Some(slot) => SequenceOutcome::Template(slot.clone()),
-            None => SequenceOutcome::text(text),
+        if text.contains("{{ eval.workspace }}") || text.contains("{{ mock_server.base_url }}") {
+            SequenceOutcome::Template {
+                context: self.0.clone(),
+                text: text.to_owned(),
+            }
+        } else {
+            SequenceOutcome::text(text)
         }
-    }
-
-    pub(crate) fn bind(
-        self,
-        context: &AttemptFixtureContext,
-        agent: &ai_agents_runtime::RuntimeAgent,
-    ) -> Result<()> {
-        for (template, slot) in self.0 {
-            let rendered = context
-                .interpolate_response(&template, &|name| agent.tool_policy_bindings(name))?;
-            slot.set(rendered)
-                .expect("an attempt binds each fixture template once");
-        }
-        Ok(())
     }
 }
 
@@ -1920,15 +1907,15 @@ impl SequenceLLMProvider {
         if *index + 1 < self.outcomes.len() {
             *index += 1;
         }
+        drop(index);
         match outcome {
-            Some(SequenceOutcome::Template(text)) => text
-                .get()
-                .map(|content| LLMResponse::new(content.clone(), FinishReason::Stop))
-                .ok_or_else(|| {
-                    LLMError::Config(
-                        "mock fixture requested before tool configuration finished".into(),
-                    )
-                }),
+            Some(SequenceOutcome::Template { context, text }) => context
+                .interpolate_response(
+                    text,
+                    &ai_agents_runtime::RuntimeAgent::current_model_tool_policy_bindings,
+                )
+                .map(|content| LLMResponse::new(content, FinishReason::Stop))
+                .map_err(|error| LLMError::Config(error.to_string())),
             Some(SequenceOutcome::Response(response)) => Ok(response.clone()),
             Some(SequenceOutcome::Error { message, status }) => Err(LLMError::API {
                 message: message.clone(),

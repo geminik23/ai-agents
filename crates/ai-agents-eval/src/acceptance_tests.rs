@@ -70,47 +70,52 @@ async fn formal_acceptance_worker() {
     std::fs::remove_dir_all(context.workspace).unwrap();
 }
 
+use crate::fixtures::{AttemptFixtureContext, AttemptWorkspace};
+use ai_agents_core::{
+    PathPolicyBinding, Tool, ToolExecutionContext, ToolPolicyBindings, ToolResult,
+};
+use ai_agents_runtime::AgentBuilder;
+use ai_agents_tools::ToolRegistry;
+use serde_json::{Value, json};
+use std::sync::{Arc, Mutex};
+
+struct Probe {
+    id: &'static str,
+    path_field: &'static str,
+    calls: Arc<Mutex<Vec<Value>>>,
+}
+#[async_trait::async_trait]
+impl Tool for Probe {
+    fn id(&self) -> &str {
+        self.id
+    }
+    fn name(&self) -> &str {
+        self.id
+    }
+    fn description(&self) -> &str {
+        "Capture interpolated arguments"
+    }
+    fn input_schema(&self) -> Value {
+        json!({"type":"object"})
+    }
+    fn policy_bindings(&self) -> ToolPolicyBindings {
+        ToolPolicyBindings {
+            path_fields: vec![PathPolicyBinding::read(self.path_field)],
+            ..Default::default()
+        }
+    }
+    async fn execute(&self, args: Value, _: ToolExecutionContext) -> ToolResult {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(json!({"tool":self.id,"args":args}));
+        ToolResult::ok("captured")
+    }
+}
+
 // Both a new host tool and the host's replacement for file_write declare resource as their only filesystem input.
 #[tokio::test]
 async fn workspace_paths_follow_the_host_installed_tools() {
-    use crate::fixtures::{AttemptFixtureContext, AttemptWorkspace};
-    use ai_agents_core::{
-        PathPolicyBinding, Tool, ToolExecutionContext, ToolPolicyBindings, ToolResult,
-    };
-    use ai_agents_runtime::AgentBuilder;
-    use ai_agents_tools::ToolRegistry;
-    use serde_json::{Value, json};
-    use std::sync::{Arc, Mutex};
-
-    struct Probe(&'static str, Arc<Mutex<Vec<Value>>>);
-    #[async_trait::async_trait]
-    impl Tool for Probe {
-        fn id(&self) -> &str {
-            self.0
-        }
-        fn name(&self) -> &str {
-            self.0
-        }
-        fn description(&self) -> &str {
-            "Capture interpolated arguments"
-        }
-        fn input_schema(&self) -> Value {
-            json!({"type":"object"})
-        }
-        fn policy_bindings(&self) -> ToolPolicyBindings {
-            ToolPolicyBindings {
-                path_fields: vec![PathPolicyBinding::read("resource")],
-                ..Default::default()
-            }
-        }
-        async fn execute(&self, args: Value, _: ToolExecutionContext) -> ToolResult {
-            self.1
-                .lock()
-                .unwrap()
-                .push(json!({"tool":self.0,"args":args}));
-            ToolResult::ok("captured")
-        }
-    }
     #[derive(Default)]
     struct Host {
         expected: Mutex<Option<Value>>,
@@ -129,11 +134,17 @@ async fn workspace_paths_follow_the_host_installed_tools() {
             }));
             let mut tools = ToolRegistry::new();
             tools
-                .register(Arc::new(Probe("file_write", self.calls.clone())))
+                .register(Arc::new(Probe {
+                    id: "file_write",
+                    path_field: "resource",
+                    calls: self.calls.clone(),
+                }))
                 .unwrap();
-            Ok(builder
-                .tools(tools)
-                .tool(Arc::new(Probe("host_probe", self.calls.clone()))))
+            Ok(builder.tools(tools).tool(Arc::new(Probe {
+                id: "host_probe",
+                path_field: "resource",
+                calls: self.calls.clone(),
+            })))
         }
     }
     let dir = AttemptWorkspace::create(None).unwrap();
@@ -284,4 +295,110 @@ scenarios:
         .await
         .unwrap();
     assert_eq!(result.passed, 1, "{:?}", result.scenarios);
+}
+
+#[tokio::test]
+async fn shared_llm_uses_the_calling_agents_tool_bindings() {
+    #[derive(Default)]
+    struct Host {
+        calls: Arc<Mutex<Vec<Value>>>,
+        root: Mutex<std::path::PathBuf>,
+    }
+    impl crate::EvalHost for Host {
+        fn configure(
+            &self,
+            builder: AgentBuilder,
+            context: &AttemptFixtureContext,
+        ) -> crate::Result<AgentBuilder> {
+            *self.root.lock().unwrap() = context.workspace.clone();
+            Ok(builder.tools(ToolRegistry::new()).tool(Arc::new(Probe {
+                id: "file",
+                path_field: "content",
+                calls: self.calls.clone(),
+            })))
+        }
+    }
+    let dir = AttemptWorkspace::create(None).unwrap();
+    std::fs::write(
+        dir.workspace.join("child.yaml"),
+        "name: Worker\nsystem_prompt: test\ntools: [file]\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.workspace.join("agent.yaml"),
+        r#"
+name: Coordinator
+system_prompt: test
+tools: [file, send_agent_message]
+spawner:
+  shared_llms: true
+  management_tools: [send_agent_message]
+  auto_spawn: [{id: worker, agent: child.yaml}]
+"#,
+    )
+    .unwrap();
+    let suite = dir.workspace.join("suite.yaml");
+    std::fs::write(&suite, r#"
+name: shared fixture caller
+agent: agent.yaml
+fixtures:
+  files: {child.txt: child-read-proof}
+  llm:
+    mode: mock
+    responses:
+      - '{"tool":"send_agent_message","arguments":{"to":"worker","message":"read the artifact"}}'
+      - &file_call '{"tool":"file","arguments":{"operation":"read","path":"{{ eval.workspace }}/child.txt","content":"{{ eval.workspace }}/literal/body"}}'
+      - read
+      - *file_call
+      - inspected
+scenarios:
+  - id: shared
+    turns:
+      - input: read and inspect
+        stream: true
+        assert: {response_contains: inspected}
+"#).unwrap();
+    let host = Arc::new(Host::default());
+    let result = EvalRunner::from_file(suite, Default::default())
+        .unwrap()
+        .with_host(host.clone())
+        .run()
+        .await
+        .unwrap();
+    assert_eq!(result.passed, 1, "{:?}", result.scenarios);
+    let root = host.root.lock().unwrap();
+    assert_eq!(
+        *host.calls.lock().unwrap(),
+        [json!({"tool":"file","args":{
+            "operation":"read", "path":format!("{}/child.txt",root.display()), "content":root.join("literal").join("body")
+        }})]
+    );
+    let requests = &result.scenarios[0].attempts[0].turns[0]
+        .evidence
+        .llm_requests;
+    let child = requests
+        .iter()
+        .find(|request| {
+            request.messages.iter().any(|message| {
+                message.role == ai_agents_core::Role::Function
+                    && serde_json::from_str::<Value>(&message.content)
+                        .is_ok_and(|result| result["content"] == "child-read-proof")
+            })
+        })
+        .expect("child received the actual file contents");
+    let expected_call = json!({"tool":"file","arguments":{
+        "operation":"read","path":root.join("child.txt"),"content":format!("{}/literal/body",root.display())
+    }});
+    assert!(
+        child
+            .messages
+            .iter()
+            .any(|message| message.role == ai_agents_core::Role::Assistant
+                && serde_json::from_str::<Value>(&message.content)
+                    .ok()
+                    .as_ref()
+                    == Some(&expected_call)),
+        "{:?}",
+        child.messages
+    );
 }

@@ -1130,13 +1130,13 @@ impl EvalRunner {
             tool_log.clone(),
             spec.llm.router_roles().is_some(),
         )?;
-        let pending_text =
-            crate::fixtures::PendingFixtureText::new(attempt_context, &self.suite.fixtures.llm)?;
+        let templates =
+            crate::fixtures::FixtureTemplates::new(attempt_context, &self.suite.fixtures.llm)?;
         let (llm_registry, _) = build_llm_registry_with(
             &spec,
             &self.suite.fixtures.llm,
             base_dir,
-            |text| pending_text.prepare(text),
+            |text| templates.prepare(text),
             |config, provider| {
                 let observed: Arc<dyn ai_agents_core::LLMProvider> = Arc::new(RecordingProvider {
                     inner: provider,
@@ -1209,7 +1209,6 @@ impl EvalRunner {
             .build_task_host()
             .await
             .map_err(|error| EvalError::Config(error.to_string()))?;
-        pending_text.bind(attempt_context, &agent)?;
         agent.init_storage().await?;
         Ok(agent)
     }
