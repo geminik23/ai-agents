@@ -1,6 +1,7 @@
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use ai_agents_core::{AgentError, Result};
+use ai_agents_core::{AgentError, ChoiceCandidate, ChoiceRequest, Result};
 use ai_agents_llm::{ChatMessage, LLMProvider};
 use ai_agents_observability::{ObservationPurpose, with_observation_purpose};
 use tracing::{debug, info};
@@ -10,7 +11,8 @@ use crate::Agent;
 use crate::spawner::AgentRegistry;
 use crate::turn_context::current_turn_actor_context;
 
-/// Route input to the best agent from candidates.
+/// Routes input using the configured selector before actor-scoped child entry.
+/// Inherited task execution pins the selected registration before waiting for the child's root gate.
 pub async fn route(
     registry: &AgentRegistry,
     llm: &dyn LLMProvider,
@@ -19,95 +21,169 @@ pub async fn route(
     method: RoutingMethod,
     rr_counter: Option<&AtomicUsize>,
 ) -> Result<RouteResult> {
-    if candidates.is_empty() {
-        return Err(AgentError::Config("No candidates for routing".into()));
-    }
-
-    match method {
-        RoutingMethod::Llm => route_via_llm(registry, llm, input, candidates).await,
-        RoutingMethod::RoundRobin => {
-            let idx = rr_counter
-                .map(|c| c.fetch_add(1, Ordering::Relaxed))
-                .unwrap_or(0)
-                % candidates.len();
-            let selected = &candidates[idx];
-            let agent = registry.get(selected).ok_or_else(|| {
-                AgentError::Other(format!("Agent not found in registry: {}", selected))
-            })?;
-            let response = if let Some(context) = current_turn_actor_context() {
-                agent.chat_with_actor_context(input, context).await?
-            } else {
-                agent.chat(input).await?
-            };
-            Ok(RouteResult {
-                response,
-                selected_agent: selected.clone(),
-                reason: "round_robin".into(),
-                confidence: None,
-            })
+    let (selected, reason) =
+        select_route(registry, llm, input, candidates, method, rr_counter).await?;
+    let agent = registry.get(&selected).ok_or_else(|| {
+        AgentError::Other(format!("Routed agent not found in registry: {selected}"))
+    })?;
+    let _target_pin = registry.capture_task_target(&selected, &agent)?;
+    // Retain this selected route while a hosted automatic child awaits its explicit host response.
+    let response = crate::autonomy::automatic::scope_composing(async {
+        if let Some(context) = current_turn_actor_context() {
+            agent.chat_with_actor_context(input, context).await
+        } else {
+            agent.chat(input).await
         }
-    }
+    })
+    .await?;
+    info!(agent = %selected, "Route completed");
+    Ok(RouteResult {
+        response,
+        selected_agent: selected,
+        reason,
+        confidence: None,
+    })
 }
 
-/// Use LLM to pick the best candidate agent for the input.
-async fn route_via_llm(
+/// Task selection completes once before an exact parent-child frame is installed.
+/// Provider callbacks cannot consume the dispatch capability while the selector is running.
+pub(crate) async fn route_task(
+    registry: &Arc<AgentRegistry>,
+    llm: &dyn LLMProvider,
+    input: &str,
+    candidates: &[String],
+    method: RoutingMethod,
+    rr_counter: Option<&AtomicUsize>,
+) -> Result<RouteResult> {
+    let invocation = crate::autonomy::message::take_message();
+    let (selected, reason) = crate::autonomy::message::scope_message(
+        None,
+        Box::pin(select_route(
+            registry, llm, input, candidates, method, rr_counter,
+        )),
+    )
+    .await?;
+
+    let actor = current_turn_actor_context();
+    let response = crate::autonomy::message::scope_message(
+        invocation,
+        registry.route_task_message(&selected, input, actor, &reason),
+    )
+    .await?;
+    Ok(RouteResult {
+        response,
+        selected_agent: selected,
+        reason,
+        confidence: None,
+    })
+}
+
+/// Selects a label without invoking a child and keeps the legacy text fallback local to its original mode.
+async fn select_route(
     registry: &AgentRegistry,
     llm: &dyn LLMProvider,
     input: &str,
     candidates: &[String],
-) -> Result<RouteResult> {
+    method: RoutingMethod,
+    rr_counter: Option<&AtomicUsize>,
+) -> Result<(String, String)> {
+    if candidates.is_empty() {
+        return Err(AgentError::Config("No candidates for routing".into()));
+    }
+    if llm.uses_choice_for_routing() {
+        if matches!(method, RoutingMethod::RoundRobin) {
+            return Err(AgentError::Config(
+                "round robin cannot override a structured route".into(),
+            ));
+        }
+        return select_structured_route(registry, llm, input, candidates).await;
+    }
+    if matches!(method, RoutingMethod::RoundRobin) {
+        let index = rr_counter
+            .map(|counter| counter.fetch_add(1, Ordering::Relaxed))
+            .unwrap_or(0)
+            % candidates.len();
+        return Ok((candidates[index].clone(), "round_robin".into()));
+    }
     let agent_list = candidates
         .iter()
         .enumerate()
-        .map(|(i, id)| format!("{}. {}", i + 1, id))
+        .map(|(index, id)| format!("{}. {}", index + 1, id))
         .collect::<Vec<_>>()
         .join("\n");
-
-    let system_msg = format!(
+    let system = format!(
         "You are a routing assistant. Given a user message, select the best agent to handle it.\n\
          Available agents:\n{}\n\n\
          Respond with ONLY the agent ID (exact text) that best matches the user's request.",
         agent_list
     );
-
-    let messages = vec![ChatMessage::system(&system_msg), ChatMessage::user(input)];
-
-    let llm_response = with_observation_purpose(
+    let messages = vec![ChatMessage::system(&system), ChatMessage::user(input)];
+    let response = with_observation_purpose(
         ObservationPurpose::OrchestrationRouting,
-        llm.complete(&messages, None),
+        Box::pin(ai_agents_llm::managed_completion(llm, &messages, None)),
     )
     .await
-    .map_err(|e| AgentError::LLM(format!("Routing LLM failed: {}", e)))?;
-
-    let selected_raw = llm_response.content.trim().to_string();
-
-    // Match the LLM output to one of the candidates.
+    .map_err(|error| AgentError::LLM(format!("Routing LLM failed: {error}")))?;
+    let selected_raw = response.content.trim();
     let selected = candidates
         .iter()
-        .find(|c| selected_raw.contains(c.as_str()))
+        .find(|candidate| selected_raw.contains(candidate.as_str()))
         .cloned()
         .unwrap_or_else(|| candidates[0].clone());
-
     debug!(selected = %selected, "LLM routed to agent");
+    Ok((selected, "LLM selected based on input analysis".into()))
+}
 
-    let agent = registry.get(&selected).ok_or_else(|| {
-        AgentError::Other(format!("Routed agent not found in registry: {}", selected))
-    })?;
-
-    let response = if let Some(context) = current_turn_actor_context() {
-        agent.chat_with_actor_context(input, context).await?
-    } else {
-        agent.chat(input).await?
-    };
-
-    info!(agent = %selected, "Route completed");
-
-    Ok(RouteResult {
-        response,
-        selected_agent: selected,
-        reason: "LLM selected based on input analysis".into(),
-        confidence: None,
-    })
+// Validate candidate membership before paying for selection; the existing dispatch paths bind and check the actual child afterward.
+async fn select_structured_route(
+    registry: &AgentRegistry,
+    llm: &dyn LLMProvider,
+    input: &str,
+    candidates: &[String],
+) -> Result<(String, String)> {
+    let mut unique = std::collections::HashSet::with_capacity(candidates.len());
+    for id in candidates {
+        if id.trim().is_empty() || !unique.insert(id.as_str()) || registry.get(id).is_none() {
+            return Err(AgentError::Config(
+                "structured routing requires distinct registered candidate IDs".into(),
+            ));
+        }
+    }
+    if let [only] = candidates {
+        return Ok((only.clone(), "Only eligible candidate".into()));
+    }
+    let options: Vec<_> = candidates
+        .iter()
+        .map(|id| ChoiceCandidate {
+            id,
+            description: None,
+        })
+        .collect();
+    let decision = with_observation_purpose(
+        ObservationPurpose::OrchestrationRouting,
+        ai_agents_llm::managed_choice(
+            llm,
+            &ChoiceRequest {
+                input,
+                question: "Which candidate should handle this request?",
+                candidates: &options,
+            },
+        ),
+    )
+    .await
+    .map_err(|error| AgentError::LLM(format!("Routing decision failed: {error}")))?;
+    let selected = decision
+        .selected
+        .ok_or_else(|| AgentError::LLM("Routing decision refused".into()))?;
+    if !unique.contains(selected.as_str()) {
+        return Err(AgentError::LLM(
+            "Routing decision returned an unknown candidate".into(),
+        ));
+    }
+    Ok((
+        selected,
+        "Structured decision selected an exact candidate".into(),
+    ))
 }
 
 #[cfg(test)]

@@ -46,6 +46,10 @@ pub struct WebFetchTransportResponse {
 /// Implementations that open sockets must enforce approved addresses and `max_response_bytes` while reading each response.
 #[async_trait]
 pub trait WebFetchTransport: Send + Sync {
+    /// Trusted implementations may attest that GET transport performs no model-selected local writes, including cache tails.
+    fn has_no_local_writes(&self) -> bool {
+        false
+    }
     async fn send(
         &self,
         request: WebFetchTransportRequest,
@@ -65,6 +69,10 @@ pub trait WebFetchTransport: Send + Sync {
 /// Resolves hostnames for SSRF validation before each request.
 #[async_trait]
 pub trait WebFetchResolver: Send + Sync {
+    /// DNS implementations used under a logical-write cap must explicitly exclude local mutation side effects.
+    fn has_no_local_writes(&self) -> bool {
+        false
+    }
     async fn resolve(&self, host: &str, port: u16) -> Result<Vec<IpAddr>, String>;
 }
 
@@ -72,6 +80,9 @@ struct ReqwestWebFetchTransport;
 
 #[async_trait]
 impl WebFetchTransport for ReqwestWebFetchTransport {
+    fn has_no_local_writes(&self) -> bool {
+        true
+    }
     async fn send(
         &self,
         _request: WebFetchTransportRequest,
@@ -160,6 +171,9 @@ struct TokioWebFetchResolver;
 
 #[async_trait]
 impl WebFetchResolver for TokioWebFetchResolver {
+    fn has_no_local_writes(&self) -> bool {
+        true
+    }
     async fn resolve(&self, host: &str, port: u16) -> Result<Vec<IpAddr>, String> {
         tokio::net::lookup_host((host, port))
             .await
@@ -450,6 +464,19 @@ enum UrlPolicyTarget {
 
 #[async_trait]
 impl Tool for WebFetchTool {
+    // The fixed transport/resolver handles, not read-only metadata, establish this local-write-free GET contract.
+    fn declared_write_footprint(
+        &self,
+        _: &Value,
+        _: &ToolExecutionContext,
+        _: usize,
+    ) -> ai_agents_core::Result<Option<ai_agents_core::autonomy::ToolWriteFootprint>> {
+        Ok(
+            (self.transport.has_no_local_writes() && self.resolver.has_no_local_writes()).then(
+                || ai_agents_core::autonomy::ToolWriteFootprint::empty("builtin.web_fetch.read.v1"),
+            ),
+        )
+    }
     fn id(&self) -> &str {
         "web_fetch"
     }

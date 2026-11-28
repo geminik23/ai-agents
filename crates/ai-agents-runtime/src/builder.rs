@@ -86,8 +86,16 @@ fn wrap_registry_with_observability(
     })
 }
 
+// This unpublished configuration accompanies the finalized runtime so storage preparation cannot duplicate component construction.
+struct PreparedTaskHosting {
+    config: ai_agents_core::autonomy::AutonomyConfig,
+    options: crate::autonomy::AutomaticTaskOptions,
+    interaction_delivery: bool,
+}
+
 pub struct AgentBuilder {
-    spec: Option<AgentSpec>,
+    // Fluent setup moves the builder through several async calls; keep its owned YAML spec in one allocation.
+    spec: Option<Box<AgentSpec>>,
     llm: Option<Arc<dyn LLMProvider>>,
     llm_registry: Option<LLMRegistry>,
     memory: Option<Arc<dyn Memory>>,
@@ -99,6 +107,7 @@ pub struct AgentBuilder {
     tools_prompt: Option<String>,
     auto_tools_prompt: bool,
     max_iterations: Option<u32>,
+    task_iteration_policy: crate::spec::TaskIterationPolicy,
     max_context_tokens: Option<u32>,
     recovery_manager: Option<RecoveryManager>,
     tool_security: Option<ToolSecurityEngine>,
@@ -125,11 +134,66 @@ pub struct AgentBuilder {
     skills_prepared: bool,
     routing_frozen: Option<LLMRegistry>,
     routing_dirty: bool,
+    autonomy_extensions: Option<Arc<crate::autonomy::FrozenAutonomyExtensions>>,
+    automatic_config: Option<ai_agents_core::autonomy::AutonomyConfig>,
+    automatic_options: crate::autonomy::AutomaticTaskOptions,
+    task_hosting_requested: bool,
+    task_interaction_delivery: bool,
+    bound_task_scope: Option<crate::autonomy::TaskHostScope>,
+    configured_task_source: Option<Box<crate::autonomy::ConfiguredTaskSource>>,
+    configured_route: Option<Arc<crate::orchestration::tools::RouteToAgentTool>>,
 }
 
 impl AgentBuilder {
+    // Component installers may extend behavior but cannot silently replace the configured host's namespace, ceilings or storage authority.
+    pub(crate) fn verify_configured_host(
+        &self,
+        options: &crate::autonomy::AutomaticTaskOptions,
+        scope: &crate::autonomy::TaskHostScope,
+        prepared: &crate::spec::PreparedAgentSpec,
+    ) -> Result<()> {
+        let same_host = match (&self.automatic_options.restore_host, &options.restore_host) {
+            (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+            (None, None) => true,
+            _ => false,
+        };
+        let expected_storage = serde_json::to_value(&prepared.spec().storage)?;
+        let current_storage = self
+            .storage_config
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()?;
+        if !same_host
+            || self.automatic_options.store.is_some()
+            || self.storage.is_some()
+            || self.automatic_options.config_identity != options.config_identity
+            || self.automatic_options.ceilings != options.ceilings
+            || self.bound_task_scope.as_ref().is_none_or(|bound| {
+                bound.identity() != scope.identity() || bound.actor_id() != scope.actor_id()
+            })
+            || self
+                .automatic_config
+                .as_ref()
+                .is_some_and(|config| config != &prepared.spec().autonomy)
+            || current_storage.is_some_and(|storage| storage != expected_storage)
+        {
+            return Err(AgentError::Config(
+                "component installer replaced configured task hosting or storage".into(),
+            ));
+        }
+        Ok(())
+    }
+    /// Starts ordinary construction without installing a restoration factory or changing task defaults.
     pub fn new() -> Self {
         Self {
+            autonomy_extensions: None,
+            automatic_config: None,
+            automatic_options: Default::default(),
+            task_hosting_requested: false,
+            task_interaction_delivery: true,
+            bound_task_scope: None,
+            configured_task_source: None,
+            configured_route: None,
             reasoning: None,
             reflection: None,
             spec: None,
@@ -144,6 +208,7 @@ impl AgentBuilder {
             tools_prompt: None,
             auto_tools_prompt: true,
             max_iterations: None,
+            task_iteration_policy: crate::spec::TaskIterationPolicy::unbounded(),
             max_context_tokens: None,
             recovery_manager: None,
             tool_security: None,
@@ -171,6 +236,72 @@ impl AgentBuilder {
         }
     }
 
+    // Only first-party construction paths mint this receipt; serialized names cannot mark a custom builder as reconstructible.
+    pub(crate) fn configured_task_source(
+        mut self,
+        source: crate::autonomy::ConfiguredTaskSource,
+    ) -> Self {
+        self.configured_task_source = Some(Box::new(source));
+        self
+    }
+
+    /// Freezes host adapters before runtime construction without granting or exposing their observation tools.
+    pub fn autonomy_extensions(mut self, registry: crate::autonomy::AutonomyExtensions) -> Self {
+        self.autonomy_extensions = Some(registry.freeze());
+        self
+    }
+
+    /// Maps declared validator file operands against the configured adapters before task construction.
+    /// This does not change an adapter binding, execute an observation, or grant any tool.
+    pub fn map_validator_config_paths(&mut self, map: &dyn Fn(&str) -> Option<String>) {
+        let extensions = self
+            .autonomy_extensions
+            .get_or_insert_with(|| crate::autonomy::AutonomyExtensions::builtins().freeze());
+        let visit = |profile: &mut ai_agents_core::autonomy::AutonomyProfile| {
+            extensions.map_validation_paths(profile, map)
+        };
+        if let Some(spec) = &mut self.spec {
+            spec.visit_profiles_mut(visit);
+        }
+        if let Some(config) = &mut self.automatic_config {
+            visit(&mut config.defaults);
+            config.profiles.values_mut().for_each(visit);
+        }
+        for skill in &mut self.skills {
+            if let Some(settings) = &mut skill.autonomy {
+                visit(&mut settings.settings);
+            }
+        }
+    }
+
+    /// Supplies programmatic defaults for the same state/skill declarations used by strict YAML loading.
+    pub fn autonomy(mut self, config: ai_agents_core::autonomy::AutonomyConfig) -> Self {
+        self.automatic_config = Some(config);
+        self
+    }
+
+    /// Requests shared explicit and automatic task hosting with trusted ceilings, scoped storage and reconstruction bindings.
+    /// Disabled profiles stay disabled; installing infrastructure never grants tools or starts execution.
+    pub fn automatic_task_options(
+        mut self,
+        options: crate::autonomy::AutomaticTaskOptions,
+    ) -> Self {
+        self.automatic_options = options;
+        self.task_hosting_requested = true;
+        self
+    }
+
+    /// Declares whether the host exposes a usable task-response endpoint, including explicit manual resume.
+    /// False selects unavailable policies and acknowledged cleanup of unserviceable volatile pauses; silence is not delivery loss.
+    /// Ordinary HITL is unchanged, and persistent reconstruction still requires explicitly installed host capabilities.
+    pub fn task_interaction_delivery(mut self, available: bool) -> Self {
+        self.task_interaction_delivery = available;
+        self.task_hosting_requested = true;
+        self
+    }
+
+    /// Keeps typed source configuration while leaving restoration authority to explicit host construction.
+    /// Owns the parsed specification across all subsequent builder and transport stages.
     pub fn from_spec(spec: AgentSpec) -> Self {
         let system_prompt = spec.system_prompt.clone();
         let max_iterations = Some(spec.max_iterations);
@@ -179,7 +310,15 @@ impl AgentBuilder {
         let reflection = Some(spec.reflection.clone());
 
         Self {
-            spec: Some(spec),
+            spec: Some(Box::new(spec)),
+            autonomy_extensions: None,
+            automatic_config: None,
+            automatic_options: Default::default(),
+            task_hosting_requested: false,
+            task_interaction_delivery: true,
+            bound_task_scope: None,
+            configured_task_source: None,
+            configured_route: None,
             llm: None,
             llm_registry: None,
             memory: None,
@@ -191,6 +330,7 @@ impl AgentBuilder {
             tools_prompt: None,
             auto_tools_prompt: true,
             max_iterations,
+            task_iteration_policy: crate::spec::TaskIterationPolicy::configured(),
             max_context_tokens,
             recovery_manager: None,
             tool_security: None,
@@ -227,10 +367,34 @@ impl AgentBuilder {
         builder
     }
 
+    /// Builds from a source-aware specification without changing the stable typed schema or ordinary chat defaults.
+    pub fn from_prepared_spec(prepared: crate::spec::PreparedAgentSpec) -> Self {
+        let (spec, policy) = prepared.into_parts();
+        let mut builder = Self::from_spec(spec);
+        builder.task_iteration_policy = policy;
+        builder
+    }
+
+    /// Resolves relative resources while retaining the source-aware task loop policy.
+    pub fn from_prepared_spec_with_base_dir(
+        prepared: crate::spec::PreparedAgentSpec,
+        base_dir: impl Into<PathBuf>,
+    ) -> Self {
+        let mut builder = Self::from_prepared_spec(prepared);
+        builder.yaml_dir = Some(base_dir.into());
+        builder
+    }
+
+    /// Explicitly sets task-loop semantics for typed callers; numeric chat settings and host resource ceilings are unchanged.
+    pub fn task_iteration_policy(mut self, policy: crate::spec::TaskIterationPolicy) -> Self {
+        self.task_iteration_policy = policy;
+        self
+    }
+
     pub fn from_yaml(yaml_content: &str) -> Result<Self> {
-        let spec = AgentSpec::from_yaml_strict(yaml_content)?;
-        spec.validate()?;
-        Ok(Self::from_spec(spec))
+        let prepared = crate::spec::PreparedAgentSpec::from_yaml_strict(yaml_content)?;
+        prepared.spec().validate()?;
+        Ok(Self::from_prepared_spec(prepared))
     }
 
     pub(crate) fn shared_resource_locks(&mut self) -> ToolResourceLocks {
@@ -247,11 +411,11 @@ impl AgentBuilder {
     pub fn from_yaml_file(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         let content = std::fs::read_to_string(path).map_err(AgentError::IoError)?;
-        let spec = AgentSpec::from_yaml_strict(&content)?;
-        spec.validate()?;
+        let prepared = crate::spec::PreparedAgentSpec::from_yaml_strict(&content)?;
+        prepared.spec().validate()?;
         Ok(match path.parent() {
-            Some(parent) => Self::from_spec_with_base_dir(spec, parent),
-            None => Self::from_spec(spec),
+            Some(parent) => Self::from_prepared_spec_with_base_dir(prepared, parent),
+            None => Self::from_prepared_spec(prepared),
         })
     }
 
@@ -271,12 +435,14 @@ impl AgentBuilder {
 
         let rendered_root = load_and_render(template_name)?;
         let processed = TemplateInheritance::process(&rendered_root, load_and_render)?;
-        let spec = AgentSpec::from_yaml_strict(&processed)?;
-        spec.validate()?;
-        Ok(Self::from_spec(spec))
+        let prepared = crate::spec::PreparedAgentSpec::from_yaml_strict(&processed)?;
+        prepared.spec().validate()?;
+        Ok(Self::from_prepared_spec(prepared))
     }
 
     /// Constructs declared providers without consuming auxiliary routing until registrations are complete.
+    /// An explicitly selected Chat credential is resolved before binding the provider to its configured endpoint.
+    /// Uses the same preset defaults as eval while preserving omission where the model requires it.
     pub fn auto_configure_llms(mut self) -> Result<Self> {
         if self.routing_frozen.is_some() {
             self.routing_dirty = true;
@@ -293,20 +459,7 @@ impl AgentBuilder {
                 let provider_type = ProviderType::from_str(&config.provider)
                     .map_err(|e| AgentError::Config(e.to_string()))?;
 
-                let core_config = ai_agents_core::LLMConfig {
-                    temperature: Some(config.temperature),
-                    max_tokens: Some(config.max_tokens),
-                    top_p: config.top_p,
-                    top_k: None,
-                    frequency_penalty: None,
-                    presence_penalty: None,
-                    stop_sequences: None,
-                    timeout_seconds: config.timeout_seconds,
-                    reasoning: config.reasoning,
-                    reasoning_effort: config.reasoning_effort.clone(),
-                    reasoning_budget_tokens: config.reasoning_budget_tokens,
-                    extra: config.extra.clone(),
-                };
+                let core_config = config.to_provider_config(provider_type);
                 // base_url: first-class field, fallback to extra for backward compat
                 let base_url = config.base_url.clone().or_else(|| {
                     config
@@ -317,10 +470,16 @@ impl AgentBuilder {
                 });
 
                 // api_key: resolve from api_key_env if specified
-                let api_key = config
-                    .api_key_env
-                    .as_ref()
-                    .and_then(|env_var| std::env::var(env_var).ok());
+                let api_key = provider_type
+                    .configured_api_key_at(
+                        config.api_key_env.as_deref(),
+                        config
+                            .extra
+                            .get("protocol")
+                            .and_then(serde_json::Value::as_str),
+                        base_url.as_deref(),
+                    )
+                    .map_err(|error| AgentError::LLM(error.to_string()))?;
 
                 let mut provider = UnifiedLLMProvider::from_spec_config(
                     provider_type,
@@ -332,10 +491,12 @@ impl AgentBuilder {
                 .map_err(|e| AgentError::LLM(e.to_string()))?
                 .with_feature_overrides(feature_overrides_from_config(config));
                 if let Some(choice) = config.tool_choice.clone() {
-                    provider = provider.with_tool_choice(choice);
+                    provider = provider
+                        .with_validated_tool_choice(choice)
+                        .map_err(|error| AgentError::LLM(error.to_string()))?;
                 }
 
-                registry.register(alias, Arc::new(provider));
+                registry.register(alias, ai_agents_llm::managed_provider(Arc::new(provider)));
             }
 
             let default_alias = spec.llm.get_default_alias();
@@ -352,20 +513,7 @@ impl AgentBuilder {
             let provider_type = ProviderType::from_str(&config.provider)
                 .map_err(|e| AgentError::Config(e.to_string()))?;
 
-            let core_config = ai_agents_core::LLMConfig {
-                temperature: Some(config.temperature),
-                max_tokens: Some(config.max_tokens),
-                top_p: config.top_p,
-                top_k: None,
-                frequency_penalty: None,
-                presence_penalty: None,
-                stop_sequences: None,
-                timeout_seconds: config.timeout_seconds,
-                reasoning: config.reasoning,
-                reasoning_effort: config.reasoning_effort.clone(),
-                reasoning_budget_tokens: config.reasoning_budget_tokens,
-                extra: config.extra.clone(),
-            };
+            let core_config = config.to_provider_config(provider_type);
             // base_url: first-class field, fallback to extra for backward compat
             let base_url = config.base_url.clone().or_else(|| {
                 config
@@ -376,10 +524,16 @@ impl AgentBuilder {
             });
 
             // api_key: resolve from api_key_env if specified
-            let api_key = config
-                .api_key_env
-                .as_ref()
-                .and_then(|env_var| std::env::var(env_var).ok());
+            let api_key = provider_type
+                .configured_api_key_at(
+                    config.api_key_env.as_deref(),
+                    config
+                        .extra
+                        .get("protocol")
+                        .and_then(serde_json::Value::as_str),
+                    base_url.as_deref(),
+                )
+                .map_err(|error| AgentError::LLM(error.to_string()))?;
 
             let mut provider = UnifiedLLMProvider::from_spec_config(
                 provider_type,
@@ -391,10 +545,12 @@ impl AgentBuilder {
             .map_err(|e| AgentError::LLM(e.to_string()))?
             .with_feature_overrides(feature_overrides_from_config(config));
             if let Some(choice) = config.tool_choice.clone() {
-                provider = provider.with_tool_choice(choice);
+                provider = provider
+                    .with_validated_tool_choice(choice)
+                    .map_err(|error| AgentError::LLM(error.to_string()))?;
             }
 
-            self.llm = Some(Arc::new(provider));
+            self.llm = Some(ai_agents_llm::managed_provider(Arc::new(provider)));
             self.llm_registry_observed = false;
         }
 
@@ -546,7 +702,7 @@ impl AgentBuilder {
         if self.routing_frozen.is_some() {
             self.routing_dirty = true;
         }
-        self.llm = Some(llm);
+        self.llm = Some(ai_agents_llm::managed_provider(llm));
         self
     }
 
@@ -559,7 +715,7 @@ impl AgentBuilder {
             self.llm_registry = Some(LLMRegistry::new());
         }
         if let Some(ref mut registry) = self.llm_registry {
-            registry.register(alias, provider);
+            registry.register(alias, ai_agents_llm::managed_provider(provider));
         }
         self
     }
@@ -569,7 +725,8 @@ impl AgentBuilder {
         if self.routing_frozen.is_some() {
             self.routing_dirty = true;
         }
-        self.llm_registry = Some(registry);
+        self.llm_registry =
+            Some(registry.map_providers(|_, provider| ai_agents_llm::managed_provider(provider)));
         self.llm_registry_observed = false;
         self
     }
@@ -668,6 +825,7 @@ impl AgentBuilder {
     }
 
     pub fn max_iterations(mut self, max: u32) -> Self {
+        self.task_iteration_policy = self.task_iteration_policy.with_root_limit(true);
         self.max_iterations = Some(max);
         self
     }
@@ -719,6 +877,7 @@ impl AgentBuilder {
         if self.routing_frozen.is_some() {
             self.routing_dirty = true;
         }
+        self.task_iteration_policy.forget_state_sources();
         self.state_machine = Some(machine);
         self
     }
@@ -766,6 +925,7 @@ impl AgentBuilder {
         if self.routing_frozen.is_some() {
             self.routing_dirty = true;
         }
+        self.task_iteration_policy = self.task_iteration_policy.with_reasoning_limit(true);
         self.reasoning = Some(config);
         self
     }
@@ -981,7 +1141,7 @@ impl AgentBuilder {
         let Some(registry) = self.llm_registry.take() else {
             return Ok(());
         };
-        let model_by_alias = model_by_alias_from_spec(self.spec.as_ref());
+        let model_by_alias = model_by_alias_from_spec(self.spec.as_deref());
         let wrapped = wrap_registry_with_observability(registry, manager, &model_by_alias);
         let wrapped_arc = Arc::new(wrapped.clone());
         if let Some(processor) = self.process_processor.take() {
@@ -1004,8 +1164,20 @@ impl AgentBuilder {
 
     /// Wire spawner tools when the spec has a `spawner:` section.
     /// Call after `auto_configure_llms()` and `auto_configure_features()`.
-    pub async fn auto_configure_spawner(mut self) -> Result<Self> {
+    pub async fn auto_configure_spawner(self) -> Result<Self> {
+        self.configure_spawner(true).await
+    }
+
+    /// Prepares the same configured spawner and tools without creating or registering its initial children.
+    /// The restoration driver alone installs validated saved membership after claiming the prepared checkpoint.
+    pub(crate) async fn prepare_restore_spawner(self) -> Result<Self> {
+        self.configure_spawner(false).await
+    }
+
+    // Construction is shared; only an ordinary fresh start runs declarative auto-spawn and checks its live membership.
+    async fn configure_spawner(mut self, start_children: bool) -> Result<Self> {
         self.prepare_routing(false)?;
+        let configured_restoration = self.configured_task_source.is_some();
         let spawner_config = match self.spec.as_ref().and_then(|s| s.spawner.as_ref()) {
             Some(c) => c.clone(),
             None => return Ok(self),
@@ -1035,6 +1207,17 @@ impl AgentBuilder {
         };
 
         let mut spawner = AgentSpawner::new();
+        if self.configured_task_source.is_some() {
+            spawner = spawner.with_configured_restoration();
+        }
+
+        if let Some(components) = self
+            .configured_task_source
+            .as_ref()
+            .and_then(|source| source.components.as_ref())
+        {
+            spawner = spawner.with_restore_components(components.clone());
+        }
 
         if let Some(ref manager) = observability_manager {
             spawner = spawner.with_observability(Arc::clone(manager));
@@ -1114,26 +1297,55 @@ impl AgentBuilder {
 
         let tool_registry = self.tools.get_or_insert_with(create_builtin_registry);
         for tool in tools {
-            let _ = tool_registry.register(tool);
+            let registered = tool_registry.register(tool);
+            if configured_restoration {
+                registered.map_err(|error| {
+                    AgentError::Config(format!("configured spawner tool conflict: {error}"))
+                })?;
+            }
         }
 
         tracing::info!("Spawner tools registered");
 
         // Register orchestration tools if configured.
         if spawner_config.orchestration_tools.is_enabled() {
-            let orch_tools = crate::orchestration::tools::configure_orchestration_tools(
+            let position = self
+                .configured_task_source
+                .as_ref()
+                .and_then(|source| source.state.as_ref())
+                .and_then(|state| state.route_position);
+            let route = Arc::new(
+                crate::orchestration::tools::RouteToAgentTool::new(
+                    registry.clone(),
+                    llm_for_tools.clone(),
+                )
+                .with_round_robin_position(position.unwrap_or_default()),
+            );
+            if spawner_config
+                .orchestration_tools
+                .includes("route_to_agent")
+            {
+                self.configured_route = Some(route.clone());
+            }
+            let orch_tools = crate::orchestration::tools::configure_tools_with_route(
                 &spawner_config.orchestration_tools,
                 Arc::clone(&registry),
                 Arc::clone(&llm_for_tools),
+                route,
             );
             let tool_registry = self.tools.get_or_insert_with(create_builtin_registry);
             for tool in orch_tools {
-                let _ = tool_registry.register(tool);
+                let registered = tool_registry.register(tool);
+                if configured_restoration {
+                    registered.map_err(|error| {
+                        AgentError::Config(format!("configured spawner tool conflict: {error}"))
+                    })?;
+                }
             }
             tracing::info!("Orchestration tools registered");
         }
 
-        for entry in &spawner_config.auto_spawn {
+        for entry in spawner_config.auto_spawn.iter().filter(|_| start_children) {
             let yaml_path = if let Some(ref dir) = self.yaml_dir {
                 dir.join(&entry.agent)
             } else {
@@ -1162,7 +1374,8 @@ impl AgentBuilder {
         }
 
         // Validate that all orchestration state references have matching agents.
-        if let Some(ref spec) = self.spec
+        if start_children
+            && let Some(ref spec) = self.spec
             && let Some(ref state_config) = spec.states
         {
             let refs = collect_orchestration_refs(&state_config.states);
@@ -1192,9 +1405,103 @@ impl AgentBuilder {
         Ok(self)
     }
 
-    /// Finalizes one consistent hierarchy before runtime components capture selected handles.
-    pub fn build(mut self) -> Result<RuntimeAgent> {
+    /// Finalizes one consistent hierarchy and installs shared automatic hosting only after enabled declarations pass actual capability preflight.
+    /// Default-off agents retain ordinary construction and invocation behavior.
+    pub fn build(self) -> Result<RuntimeAgent> {
+        let (agent, hosting) = self.build_prepared()?;
+        match hosting {
+            Some(hosting) => agent.install_automatic_tasks(
+                hosting.config,
+                hosting.options,
+                None,
+                hosting.interaction_delivery,
+            ),
+            None => Ok(agent),
+        }
+    }
+
+    /// Binds an authorized declarative namespace to the definitions actually prepared by this builder, without constructing providers or starting work.
+    /// Definitions are loaded once and retained for final construction; this is not opaque implementation binding, caller authentication or restart authority.
+    pub fn task_host_scope(mut self, scope: crate::autonomy::TaskHostScope) -> Result<Self> {
+        if !self.skills_prepared {
+            if let Some(spec) = &self.spec {
+                let mut loader = self.skill_loader.take().unwrap_or_default();
+                if let Some(dir) = &self.yaml_dir {
+                    loader.set_base_dir(dir);
+                }
+                self.skills.extend(loader.load_refs(&spec.skills)?);
+            }
+            self.skills_prepared = true;
+        }
+        let spec = self.spec.as_ref().ok_or_else(|| {
+            AgentError::Config("declarative task scope requires an agent spec".into())
+        })?;
+        self.automatic_options.config_identity =
+            Some(scope.validate_prepared(spec, &self.skills, &self.task_iteration_policy)?);
+        self.bound_task_scope = Some(scope);
+        self.task_hosting_requested = true;
+        Ok(self)
+    }
+
+    /// Builds the same runtime after validating final components, then explicitly prepares configured task-capable storage.
+    /// This may open the configured SQLite backend but never constructs a restore host, invokes semantic work or promises process restart.
+    /// Explicit task stores take precedence; session-only backends retain volatile task hosting without being opened here.
+    pub async fn build_task_host(mut self) -> Result<RuntimeAgent> {
+        self.task_hosting_requested = true;
+        let (agent, hosting) = self.build_prepared()?;
+        let hosting = hosting.expect("task hosting was explicitly requested");
+        agent.preflight_task_hosting(&hosting.config, &hosting.options, None)?;
+        let storage = if hosting.options.store.is_some() {
+            None
+        } else {
+            agent.prepare_task_storage().await?
+        };
+        agent.install_automatic_tasks(
+            hosting.config,
+            hosting.options,
+            storage,
+            hosting.interaction_delivery,
+        )
+    }
+
+    // Both public construction paths consume this exact finalized runtime; asynchronous preparation never replays builder effects.
+    fn build_prepared(mut self) -> Result<(RuntimeAgent, Option<PreparedTaskHosting>)> {
         self.prepare_routing(false)?;
+        // Late fluent overrides must not reuse a namespace bound to different task-loop semantics or skills.
+        if let Some(scope) = &self.bound_task_scope {
+            let spec = self.spec.as_ref().ok_or_else(|| {
+                AgentError::Config("declarative task scope requires an agent spec".into())
+            })?;
+            scope.validate_prepared(spec, &self.skills, &self.task_iteration_policy)?;
+            let reasoning_matches = self
+                .reasoning
+                .as_ref()
+                .map(serde_json::to_value)
+                .transpose()?
+                .is_none_or(|reasoning| {
+                    serde_json::to_value(&spec.reasoning)
+                        .is_ok_and(|expected| reasoning == expected)
+                });
+            let state_matches = self
+                .state_machine
+                .as_ref()
+                .map(|machine| serde_json::to_value(machine.config()))
+                .transpose()?
+                .is_none_or(|state| {
+                    spec.states
+                        .as_ref()
+                        .and_then(|expected| serde_json::to_value(expected).ok())
+                        == Some(state)
+                });
+            if self.max_iterations.unwrap_or(10) != spec.max_iterations
+                || !reasoning_matches
+                || !state_matches
+            {
+                return Err(AgentError::Config(
+                    "bound task declaration differs from effective loop configuration".into(),
+                ));
+            }
+        }
         let resource_locks = self.shared_resource_locks();
         // Capture actor memory and facts configs before partial moves of spec consume fields.
         let actor_memory_config = self
@@ -1246,6 +1553,22 @@ impl AgentBuilder {
             let loaded_skills = loader.load_refs(&spec.skills)?;
             self.skills.extend(loaded_skills);
         }
+        // Validate the machine actually installed by the builder; it can replace spec.states.
+        let automatic_config = self
+            .automatic_config
+            .clone()
+            .or_else(|| self.spec.as_ref().map(|spec| spec.autonomy.clone()))
+            .unwrap_or_default();
+        let config = &automatic_config;
+        let states = self
+            .state_machine
+            .as_ref()
+            .map(|machine| machine.config())
+            .or_else(|| self.spec.as_ref().and_then(|spec| spec.states.as_ref()));
+        crate::autonomy::validate_agent_config(config, states, &[])?;
+        crate::autonomy::validate_loaded_skills(config, &self.skills)?;
+        let install_automatic = self.task_hosting_requested
+            || crate::autonomy::has_enabled_declaration(config, states, &self.skills);
 
         let mut llm_registry = self.llm_registry.unwrap_or_default();
 
@@ -1259,7 +1582,7 @@ impl AgentBuilder {
                         Arc::clone(manager),
                         Some("default".to_string()),
                         llm.provider_name().to_string(),
-                        model_by_alias_from_spec(self.spec.as_ref())
+                        model_by_alias_from_spec(self.spec.as_deref())
                             .get("default")
                             .cloned()
                             .unwrap_or_else(|| "default".to_string()),
@@ -1286,7 +1609,7 @@ impl AgentBuilder {
         if let Some(ref manager) = observability_manager
             && !self.llm_registry_observed
         {
-            let model_by_alias = model_by_alias_from_spec(self.spec.as_ref());
+            let model_by_alias = model_by_alias_from_spec(self.spec.as_deref());
             llm_registry = wrap_registry_with_observability(
                 llm_registry,
                 Arc::clone(manager),
@@ -1538,6 +1861,10 @@ impl AgentBuilder {
             }
         }
 
+        let extensions = self
+            .autonomy_extensions
+            .take()
+            .unwrap_or_else(|| crate::autonomy::AutonomyExtensions::builtins().freeze());
         let mut agent = RuntimeAgent::try_new(
             info,
             llm_registry_arc.clone(),
@@ -1547,6 +1874,7 @@ impl AgentBuilder {
             system_prompt,
             max_iterations,
         )?
+        .with_autonomy_extensions(extensions)
         .with_shared_resource_locks(resource_locks)
         .with_declared_tool_ids(declared_tool_ids);
 
@@ -1745,7 +2073,17 @@ impl AgentBuilder {
             agent = agent.with_facts_config(actor_memory_config, facts_config);
         }
 
-        Ok(agent)
+        // Install the source policy after typed component setters, which conservatively mark their numeric inputs explicit.
+        agent = agent.with_task_iteration_policy(self.task_iteration_policy);
+        if let Some(source) = self.configured_task_source {
+            agent = agent.with_configured_task_source(source, self.configured_route)?;
+        }
+        let hosting = install_automatic.then_some(PreparedTaskHosting {
+            config: automatic_config,
+            options: self.automatic_options,
+            interaction_delivery: self.task_interaction_delivery,
+        });
+        Ok((agent, hosting))
     }
 }
 
@@ -1997,7 +2335,7 @@ llm:
   provider: openai
   model: gpt-4
 "#;
-        let mut spec = AgentBuilder::from_yaml(yaml).unwrap().spec.unwrap();
+        let mut spec = *AgentBuilder::from_yaml(yaml).unwrap().spec.unwrap();
         spec.name = "RewrittenAgent".to_string();
         spec.system_prompt = "Rewritten prompt".to_string();
         spec.max_iterations = 37;
@@ -2056,7 +2394,7 @@ spawner:
     - id: child
       agent: agents/child.yaml
 "#;
-        let spec = AgentBuilder::from_yaml(yaml).unwrap().spec.unwrap();
+        let spec = *AgentBuilder::from_yaml(yaml).unwrap().spec.unwrap();
 
         let builder = AgentBuilder::from_spec_with_base_dir(spec, &base_dir)
             .llm(Arc::new(MockLLMProvider::new("test")))
@@ -2105,7 +2443,7 @@ spawner:
     - id: missing
       agent: missing.yaml
 "#;
-        let spec = AgentBuilder::from_yaml(yaml).unwrap().spec.unwrap();
+        let spec = *AgentBuilder::from_yaml(yaml).unwrap().spec.unwrap();
         let mut registry = LLMRegistry::new();
         registry.register("default", Arc::new(MockLLMProvider::new("test")));
         registry.set_default("default");
@@ -2140,6 +2478,7 @@ spawner:
         use ai_agents_skills::{SkillDefinition, SkillStep};
 
         let skill = SkillDefinition {
+            autonomy: None,
             id: "test".to_string(),
             description: "Test skill".to_string(),
             trigger: "When testing".to_string(),

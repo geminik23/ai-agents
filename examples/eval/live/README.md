@@ -1,6 +1,6 @@
 # Live Eval Suites
 
-This directory contains intentional live-provider evaluation suites. They use the normal `ai-agents-cli eval` path with real model behavior, structural assertions, deterministic response checks, and fixture-backed external dependencies where needed.
+This directory contains intentional live-provider evaluation suites. They use the normal `ai-agents-cli eval` path or the documented repository-owned domain host with real model behavior, structural assertions, deterministic response checks, and fixture-backed external dependencies where needed.
 
 Live suites are release smoke tests, not the default no-key CI path. Prefer `examples/eval/mocked/**/*.yaml` for exact tool-call regression coverage and fast local checks.
 
@@ -128,6 +128,10 @@ live real-llm examples yaml basic context disambiguation error-recovery memory o
 
 | Example | Primary tools or behavior | Status | Suite or follow-up | Reason |
 |---------|---------------------------|--------|--------------------|--------|
+| `examples/yaml/autonomy/tool_free_analysis.yaml` | No tools; actual task quality gate | `fixture-live` | `examples/eval/live/examples/autonomy/tool_free_analysis_live.yaml` | Fixed task-domain-evals host; explicit live selection and detailed acceptance. |
+| `examples/yaml/autonomy/research_corpus_task.yaml` | Actual synthetic corpus reads and grounded comparison | `fixture-live` | `examples/eval/live/examples/autonomy/research_corpus_task_live.yaml` | Fixed task-domain-evals host; explicit live selection and detailed acceptance. |
+| `examples/yaml/autonomy/support_resolution.yaml` | Exact retained question and ticket resolution | `fixture-live` | `examples/eval/live/examples/autonomy/support_resolution_live.yaml` | Fixed task-domain-evals host; explicit live selection and detailed acceptance. |
+| `examples/yaml/autonomy/ops_remediation.yaml` | Required stages and truthful incident escalation | `fixture-live` | `examples/eval/live/examples/autonomy/ops_remediation_live.yaml` | Fixed task-domain-evals host; explicit live selection and detailed acceptance. |
 | `examples/yaml/basic/simple_tools.yaml` | minimal built-in tools | `live-auto` | `examples/eval/live/examples/basic/simple_tools_live.yaml` | Verifies a minimal safe tool grant. |
 | `examples/yaml/state-machine/state_with_tools.yaml` | state-level tool narrowing | `live-auto` | `examples/eval/live/examples/state-machine/state_with_tools_live.yaml` | Verifies state transition evidence and scoped tool execution. |
 | `examples/yaml/state-machine/two_state_greeting.yaml` | minimal conversational state loop | `live-auto` | `examples/eval/live/examples/state-machine/two_state_greeting_live.yaml` | Verifies real-model routing into help and back to greeting. |
@@ -221,6 +225,10 @@ live real-llm examples yaml basic context disambiguation error-recovery memory o
 | `examples/fixtures/tool_examples/edit_target.txt` | dry-run edit fixture | `support-file` | fixture | Used by `examples/eval/live/examples/tools/file_edit_review_live.yaml`. |
 | `examples/fixtures/tool_examples/patch_target.txt` | dry-run patch fixture | `support-file` | fixture | Used by `examples/eval/live/examples/tools/patch_review_live.yaml`. |
 
+## Manual Code Agent repair evaluation
+
+The [Code Agent example](../../README.md) uses a disposable Rust project, individual operator approvals and an isolated behavioral checker. Its [campaign entry](../../rust/code-agent/repair-eval/campaign.py) has separate configuration, offline fixture and paid modes. Before the first model call in each trial, the checker must run all four named Rust tests and reproduce a behavioral failure in the original project. A checker setup error or incomplete test run stops the campaign during preflight. It runs outside the unattended live suite helper. Each of three fresh trials must produce an approved edit, a changed selected file, a later passing checker and a completed task within the trial budget. Record failures and unexecuted slots when reporting the campaign.
+
 ## Quality suites
 
 Quality suites use live providers and semantic or judge-style assertions. Keep them separate from runnable example smoke checks.
@@ -269,3 +277,11 @@ examples/eval/mocked/basic/no_tools_explicit_empty_mocked.yaml
 - Assert exact canonical tool IDs, `executed`, `success`, known state names, and dry-run flags.
 - Avoid exact full-response text, tiny substrings such as `-`, and exact random values.
 - Do not run real commands, public HTTP, MCP child processes, or actual file writes from these suites.
+
+## Task domain host
+
+The helper recognizes only `# Eval host: task-domain-evals` as a fixed repository-owned host. It passes `--dry-config-check` or `--real-llm` explicitly; unknown host markers fail instead of running arbitrary programs. These reviewed in-memory fixtures are classified as `fixture-live`; arbitrary custom Rust hosts still require their own review.
+
+Task suites use the same installer as `task-domain-live`. Their main and internal judge use `gpt-5.4-mini-2026-03-17`. Domain examples opt into native tool selection with `tool_choice: auto`; the operations review also checks the final structured report against the actual incident. Each scenario reserves calls/tokens/cost before dispatch, with $0.25 scenario cost limit, no automatic scenario retries and a 600-second timeout. The shared source examples allow 16,384 output tokens for main and 8,192 for judge per request; the scenario budget still controls cumulative evaluation use. Ordinary application runs do not inherit the scenario budgets or an implicit price ceiling. Check current provider pricing before reusing these costs. The helper does not enforce an aggregate campaign budget; allocate a unique output root and a separate total budget before running repeated suites. Default output paths can overwrite previous reports.
+
+`acceptance.json` supplements the standard reports with bounded structural checks. The binary succeeds only when both the suite and these checks pass. In-memory details remain private to assertion-time processing. A task marked completed may represent a verified escalation while health remains down; it does not imply service recovery. A semantic judge score is not independent quality certification.

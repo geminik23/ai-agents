@@ -87,7 +87,8 @@ impl ChatState {
 
     /// Scroll to the bottom if auto-scroll is enabled.
     pub fn scroll_to_bottom(&mut self, visible_height: u16, content_height: u16) {
-        if self.auto_scroll && content_height > visible_height {
+        if self.auto_scroll {
+            // Authoritative final content can be shorter than its provisional task timeline.
             self.scroll_offset = content_height.saturating_sub(visible_height);
         }
     }

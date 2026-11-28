@@ -79,7 +79,8 @@ scenarios:
                 - llm_request:
                     user_contains: "EMBER-224"
                     same_request: true
-                    count: 1
+                    # The main request and actual fact-extraction request both carry this actor's current input.
+                    count: 2
                 - not:
                     llm_request:
                       system_contains: "TIDE-908"

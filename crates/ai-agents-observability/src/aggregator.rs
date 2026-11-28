@@ -104,6 +104,24 @@ impl MetricsAggregator {
         window.events.iter().skip(offset).cloned().collect()
     }
 
+    /// Atomically captures a window cut and its completeness; a rolling eviction must not masquerade as an empty successful observation.
+    pub(crate) fn checkpoint_since(&self, cursor: u64) -> (u64, Vec<ObservationEvent>, bool) {
+        let window = self.window.read();
+        let start = window
+            .ingested_events
+            .saturating_sub(window.events.len() as u64);
+        let complete = cursor >= start && cursor <= window.ingested_events;
+        let offset = cursor
+            .max(start)
+            .min(window.ingested_events)
+            .saturating_sub(start) as usize;
+        (
+            window.ingested_events,
+            window.events.iter().skip(offset).cloned().collect(),
+            complete,
+        )
+    }
+
     /// Aggregates using the dimensions from AggregationConfig.
     pub fn aggregate_configured(&self) -> Vec<AggregatedMetrics> {
         self.aggregate_by(&self.config.dimensions)

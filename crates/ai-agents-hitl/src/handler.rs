@@ -42,8 +42,8 @@ impl Default for RejectAllHandler {
 impl ApprovalHandler for RejectAllHandler {
     async fn request_approval(&self, request: ApprovalRequest) -> ApprovalResult {
         tracing::warn!(
-            "[HITL] Auto-rejecting: {} (no handler configured)",
-            request.message
+            "[HITL] Auto-rejecting approval [{}] (no handler configured)",
+            request.id
         );
         ApprovalResult::rejected_with_reason("No approval handler configured")
     }
@@ -67,7 +67,7 @@ impl Default for AutoApproveHandler {
 #[async_trait]
 impl ApprovalHandler for AutoApproveHandler {
     async fn request_approval(&self, request: ApprovalRequest) -> ApprovalResult {
-        tracing::info!("[HITL] Auto-approving: {}", request.message);
+        tracing::info!("[HITL] Auto-approving approval [{}]", request.id);
         ApprovalResult::approved()
     }
 }

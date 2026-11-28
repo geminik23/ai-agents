@@ -4,9 +4,10 @@ use crate::event::{
 use crate::manager::ObservabilityManager;
 use crate::span::SpanGuard;
 use ai_agents_core::{
-    ChatMessage, LLMChunk, LLMConfig, LLMError, LLMFeature, LLMProvider, LLMResponse,
-    LLMToolRequest, Tool, ToolCallClassification, ToolChoice, ToolExecutionContext,
-    ToolPolicyBindings, ToolResult, ToolSafetyMetadata, native_observation_projection,
+    ChatMessage, ChoiceDecision, ChoiceRequest, LLMChunk, LLMConfig, LLMError, LLMFeature,
+    LLMProvider, LLMResponse, LLMToolRequest, Tool, ToolCallClassification, ToolChoice,
+    ToolExecutionContext, ToolPolicyBindings, ToolResult, ToolSafetyMetadata,
+    native_observation_projection,
 };
 use async_trait::async_trait;
 use futures::Stream;
@@ -94,6 +95,45 @@ impl ObservedLLMProvider {
 
 #[async_trait]
 impl LLMProvider for ObservedLLMProvider {
+    fn uses_choice_for_routing(&self) -> bool {
+        self.inner.uses_choice_for_routing()
+    }
+
+    fn validate_choice(&self, request: &ChoiceRequest<'_>) -> Result<(), LLMError> {
+        self.inner.validate_choice(request)
+    }
+
+    fn manages_choice_admission(&self) -> bool {
+        self.inner.manages_choice_admission()
+    }
+
+    async fn choose(&self, request: &ChoiceRequest<'_>) -> Result<ChoiceDecision, LLMError> {
+        if !self.manager.config().latency.track_llm {
+            return self.inner.choose(request).await;
+        }
+        // Choice payloads may contain application-specific labels and user input.
+        let mut span = self
+            .manager
+            .start_span(self.event_type(false), current_purpose());
+        let result = self.inner.choose(request).await;
+        match &result {
+            Ok(decision) => {
+                if let Some(tokens) = decision.usage {
+                    span.set_tokens(ObservationTokenUsage::new(
+                        tokens.prompt_tokens.into(),
+                        tokens.completion_tokens.into(),
+                        TokenUsageSource::Provider,
+                    ));
+                }
+            }
+            Err(error) => span.set_error(ObservationError::new(
+                llm_error_kind(error),
+                error.to_string(),
+            )),
+        }
+        result
+    }
+
     async fn complete(
         &self,
         messages: &[ChatMessage],
@@ -180,6 +220,41 @@ impl LLMProvider for ObservedLLMProvider {
         }
     }
 
+    fn manages_invocation_admission(&self) -> bool {
+        self.inner.manages_invocation_admission()
+    }
+
+    fn priced_capability_identity(&self) -> Option<String> {
+        self.inner.priced_capability_identity()
+    }
+    fn request_cost_bound(
+        &self,
+        request: &ai_agents_core::autonomy::ProviderRequest<'_>,
+    ) -> std::result::Result<Option<ai_agents_core::autonomy::ProviderCostBound>, LLMError> {
+        self.inner.request_cost_bound(request)
+    }
+    fn settle_request_cost(
+        &self,
+        bound: &ai_agents_core::autonomy::ProviderCostBound,
+        response: &LLMResponse,
+    ) -> std::result::Result<Option<ai_agents_core::autonomy::ProviderCostSettlement>, LLMError>
+    {
+        self.inner.settle_request_cost(bound, response)
+    }
+
+    fn settle_stream_request_cost(
+        &self,
+        bound: &ai_agents_core::autonomy::ProviderCostBound,
+        usage: Option<&ai_agents_core::TokenUsage>,
+    ) -> std::result::Result<Option<ai_agents_core::autonomy::ProviderCostSettlement>, LLMError>
+    {
+        self.inner.settle_stream_request_cost(bound, usage)
+    }
+
+    fn allows_prompt_tools(&self) -> bool {
+        self.inner.allows_prompt_tools()
+    }
+
     fn configured_tool_choice(&self) -> Option<ToolChoice> {
         self.inner.configured_tool_choice()
     }
@@ -246,6 +321,19 @@ impl ObservedTool {
     pub fn new(inner: Arc<dyn Tool>, manager: Arc<ObservabilityManager>) -> Self {
         Self { inner, manager }
     }
+
+    // Apply output permission consistently before any error/payload reaches retention or export, without changing the actual result.
+    fn record_result(&self, span: &mut crate::SpanGuard, result: &ToolResult) {
+        if !result.success {
+            span.set_error(ObservationError::new(
+                "tool_error",
+                crate::redaction::tool_error_text(&self.manager.config().privacy, &result.output),
+            ));
+        }
+        if self.manager.config().privacy.include_tool_outputs {
+            span.set_payload(serde_json::json!({"output": result.output.clone()}));
+        }
+    }
 }
 
 #[async_trait]
@@ -274,8 +362,113 @@ impl Tool for ObservedTool {
         self.inner.classify_call(args)
     }
 
+    fn task_question(&self, args: &Value) -> ai_agents_core::Result<Option<Value>> {
+        self.inner.task_question(args)
+    }
+
+    fn task_question_result(
+        &self,
+        args: &Value,
+        answer: &Value,
+    ) -> ai_agents_core::Result<ToolResult> {
+        self.inner.task_question_result(args, answer)
+    }
+
+    /// Resumed answers retain execution timing without creating observations during pure answer preflight.
+    async fn execute_task_question(
+        &self,
+        args: Value,
+        answer: Value,
+        ctx: ToolExecutionContext,
+    ) -> ToolResult {
+        if !self.manager.config().latency.track_tools {
+            return self.inner.execute_task_question(args, answer, ctx).await;
+        }
+        let mut span = self.manager.start_span(
+            EventType::ToolCall {
+                tool_id: self.inner.id().to_string(),
+            },
+            current_purpose(),
+        );
+        if self.manager.config().privacy.include_tool_args {
+            span.set_payload(serde_json::json!({"args":args.clone()}));
+        }
+        let result = self.inner.execute_task_question(args, answer, ctx).await;
+        self.record_result(&mut span, &result);
+        result
+    }
+
+    fn manages_task_todos(&self) -> bool {
+        self.inner.manages_task_todos()
+    }
+
+    fn prepare_write_footprint(
+        &self,
+        args: &Value,
+        ctx: &ToolExecutionContext,
+        max_targets: usize,
+    ) -> ai_agents_core::Result<Option<ai_agents_core::autonomy::ToolWriteAdmission>> {
+        self.inner.prepare_write_footprint(args, ctx, max_targets)
+    }
+
+    fn prepare_question_write_footprint(
+        &self,
+        args: &Value,
+        ctx: &ToolExecutionContext,
+        max_targets: usize,
+    ) -> ai_agents_core::Result<Option<ai_agents_core::autonomy::ToolWriteAdmission>> {
+        self.inner
+            .prepare_question_write_footprint(args, ctx, max_targets)
+    }
+
+    fn declared_write_footprint(
+        &self,
+        args: &Value,
+        ctx: &ToolExecutionContext,
+        max_targets: usize,
+    ) -> ai_agents_core::Result<Option<ai_agents_core::autonomy::ToolWriteFootprint>> {
+        self.inner.declared_write_footprint(args, ctx, max_targets)
+    }
+
     fn policy_bindings(&self) -> ToolPolicyBindings {
         self.inner.policy_bindings()
+    }
+
+    fn supports_task_messages(&self) -> bool {
+        self.inner.supports_task_messages()
+    }
+
+    /// Task transfer retains instrumentation without turning a safe suspension into a tool error.
+    async fn execute_task(
+        &self,
+        args: Value,
+        ctx: ToolExecutionContext,
+    ) -> ai_agents_core::Result<ToolResult> {
+        if !self.manager.config().latency.track_tools {
+            return self.inner.execute_task(args, ctx).await;
+        }
+        let mut span = self.manager.start_span(
+            EventType::ToolCall {
+                tool_id: self.inner.id().to_string(),
+            },
+            current_purpose(),
+        );
+        if self.manager.config().privacy.include_tool_args {
+            span.set_payload(serde_json::json!({"args":args.clone()}));
+        }
+        let result = self.inner.execute_task(args, ctx).await;
+        match &result {
+            Ok(output) => self.record_result(&mut span, output),
+            Err(ai_agents_core::AgentError::TaskSuspended(_)) => {}
+            Err(error) => span.set_error(ObservationError::new(
+                "tool_error",
+                crate::redaction::tool_error_text(
+                    &self.manager.config().privacy,
+                    &error.to_string(),
+                ),
+            )),
+        }
+        result
     }
 
     async fn execute(&self, args: Value, ctx: ToolExecutionContext) -> ToolResult {
@@ -292,12 +485,7 @@ impl Tool for ObservedTool {
             span.set_payload(serde_json::json!({"args": args.clone()}));
         }
         let result = self.inner.execute(args, ctx).await;
-        if !result.success {
-            span.set_error(ObservationError::new("tool_error", result.output.clone()));
-        }
-        if self.manager.config().privacy.include_tool_outputs {
-            span.set_payload(serde_json::json!({"output": result.output.clone()}));
-        }
+        self.record_result(&mut span, &result);
         result
     }
 }

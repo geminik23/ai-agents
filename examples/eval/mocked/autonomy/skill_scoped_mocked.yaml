@@ -1,0 +1,23 @@
+name: Selected Skill Task Continuation
+agent: ../../../yaml/autonomy/skill_task.yaml
+settings: {timeout_per_turn_ms: 10000, retries: 0}
+fixtures:
+  llm:
+    mode: mock
+    responses_by_alias:
+      router: [research]
+      main: [Draft report., verified report]
+scenarios:
+  - id: selected-script-is-not-rerun-on-resume
+    turns:
+      - input: Research a report.
+        stream: true
+        assert: {task: {status: paused, counters: {path: llm_attempts, eq: 1}, event_result_parity: true}}
+    steps:
+      - !task
+        operation: {action: resume, response: {kind: answer, value: Continue the report.}}
+        assert:
+          all:
+            - task: {status: completed, same_run: true, counters: {path: llm_attempts, eq: 2}, event_result_parity: true}
+            - response_contains: verified report
+            - tool_not_called: todo

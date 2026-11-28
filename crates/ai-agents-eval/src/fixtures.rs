@@ -40,6 +40,9 @@ use crate::{EvalError, Result};
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct FixturesConfig {
+    /// UTF-8 files created only inside a fresh attempt workspace; reset preserves them unless persistence is explicitly deleted.
+    #[serde(default)]
+    pub files: std::collections::BTreeMap<String, String>,
     /// Runtime or fixture context value.
     #[serde(default)]
     pub context: Option<Value>,
@@ -467,6 +470,25 @@ struct MockRoute {
 
 impl FixturesConfig {
     pub(crate) fn validate(&self) -> Result<()> {
+        if self.files.len() > 256
+            || self.files.values().map(String::len).sum::<usize>() > 8 * 1024 * 1024
+        {
+            return Err(EvalError::Config(
+                "fixtures.files exceeds its bounded workspace size".into(),
+            ));
+        }
+        for path in self.files.keys() {
+            if path.is_empty()
+                || path.contains(['\\', ':'])
+                || path
+                    .split('/')
+                    .any(|part| part.is_empty() || matches!(part, "." | ".."))
+            {
+                return Err(EvalError::Config(
+                    "fixtures.files paths must be relative normal components".into(),
+                ));
+            }
+        }
         if let Some(mock_server) = &self.mock_server {
             for (index, route) in mock_server.routes.iter().cloned().enumerate() {
                 serde_json::from_value::<MockRoute>(route).map_err(|error| {
@@ -507,7 +529,7 @@ impl Drop for MockServerHandle {
 }
 
 /// Generated values shared by every agent build and reset in one attempt.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttemptFixtureContext {
     /// Opaque identifier used to isolate non-file persistence.
     pub isolation_id: String,
@@ -520,13 +542,24 @@ pub struct AttemptFixtureContext {
 /// Runner-owned attempt context that removes its temporary workspace on drop.
 pub(crate) struct AttemptWorkspace {
     context: AttemptFixtureContext,
+    retained: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl AttemptWorkspace {
     pub(crate) fn create(mock_server: Option<&MockServerHandle>) -> Result<Self> {
         Ok(Self {
             context: AttemptFixtureContext::create(mock_server)?,
+            retained: Default::default(),
         })
+    }
+}
+
+impl AttemptWorkspace {
+    // The attempt holds files until foreground task cleanup is acknowledged, including early-return/drop paths.
+    pub(crate) fn hold_for_tasks(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        self.retained
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.retained.clone()
     }
 }
 
@@ -540,6 +573,12 @@ impl std::ops::Deref for AttemptWorkspace {
 
 impl Drop for AttemptWorkspace {
     fn drop(&mut self) {
+        if self.retained.load(std::sync::atomic::Ordering::Acquire) {
+            tracing::warn!(
+                "eval attempt workspace retained because task cleanup was not acknowledged"
+            );
+            return;
+        }
         if let Err(error) = std::fs::remove_dir_all(&self.context.workspace)
             && error.kind() != std::io::ErrorKind::NotFound
         {
@@ -553,6 +592,106 @@ impl Drop for AttemptWorkspace {
 }
 
 impl AttemptFixtureContext {
+    // Fixture installation happens before runtime construction and never overwrites an existing effect or follows a fixture-created symlink.
+    pub(crate) fn materialize_files(&self, fixtures: &FixturesConfig) -> Result<()> {
+        fixtures.validate()?;
+        for (relative, content) in &fixtures.files {
+            let path = self.workspace.join(relative);
+            let parent = path.parent().expect("relative fixture path");
+            std::fs::create_dir_all(parent)?;
+            if !parent.canonicalize()?.starts_with(&self.workspace) {
+                return Err(EvalError::Config(
+                    "fixture parent escapes its attempt workspace".into(),
+                ));
+            }
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)?;
+            std::io::Write::write_all(&mut file, content.as_bytes())?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn interpolate_agent_spec(&self, spec: &AgentSpec) -> Result<AgentSpec> {
+        let mut spec: AgentSpec = self.interpolate_config(serde_json::to_value(spec)?)?;
+        spec.map_filesystem_paths(&|path| self.join_expanded_path(path));
+        Ok(spec)
+    }
+
+    // Generic substitution preserves the literal suffix. Only a field's owner may ask for a native join.
+    pub(crate) fn join_expanded_path(&self, value: &str) -> Option<String> {
+        let root = self.workspace.to_str()?;
+        let suffix = value.strip_prefix(root)?.strip_prefix('/')?;
+        join_workspace_descendant(suffix, &self.workspace)
+    }
+
+    pub(crate) fn interpolate_tool_fixtures(
+        &self,
+        fixtures: &FixturesConfig,
+    ) -> Result<FixturesConfig> {
+        let mut fixtures: FixturesConfig =
+            self.interpolate_config(serde_json::to_value(fixtures)?)?;
+        if let Some(path) = &mut fixtures.context_file
+            && let Some(mapped) = path.to_str().and_then(|p| self.join_expanded_path(p))
+        {
+            *path = mapped.into();
+        }
+        if let Some(diagnostics) = &mut fixtures.diagnostics {
+            for item in &mut diagnostics.items {
+                if let Some(mapped) = self.join_expanded_path(&item.path) {
+                    item.path = mapped;
+                }
+            }
+        }
+        if let Some(commands) = &mut fixtures.commands {
+            for entry in &mut commands.entries {
+                if let Some(path) = &mut entry.response.cwd
+                    && let Some(mapped) = self.join_expanded_path(path)
+                {
+                    *path = mapped;
+                }
+            }
+        }
+        Ok(fixtures)
+    }
+
+    // Keys and opaque data retain their configuration identity; only literal fixture tokens are substituted.
+    fn interpolate_config<T: serde::de::DeserializeOwned>(&self, mut value: Value) -> Result<T> {
+        fn visit(context: &AttemptFixtureContext, value: &mut Value) -> Result<()> {
+            match value {
+                Value::String(text) => {
+                    if text.contains("{{ mock_server.base_url }}")
+                        && context.mock_server_base_url.is_none()
+                    {
+                        return Err(EvalError::Config(
+                            "mock_server token requires an enabled fixture server".into(),
+                        ));
+                    }
+                    *text = interpolate_fixture_string(
+                        text,
+                        &context.workspace.display().to_string(),
+                        context.mock_server_base_url.as_deref(),
+                    );
+                }
+                Value::Array(values) => {
+                    for value in values {
+                        visit(context, value)?;
+                    }
+                }
+                Value::Object(values) => {
+                    for value in values.values_mut() {
+                        visit(context, value)?;
+                    }
+                }
+                _ => {}
+            }
+            Ok(())
+        }
+        visit(self, &mut value)?;
+        Ok(serde_json::from_value(value)?)
+    }
+
     pub fn create(mock_server: Option<&MockServerHandle>) -> Result<Self> {
         let isolation_id = uuid::Uuid::new_v4().to_string();
         let workspace = std::env::temp_dir().join(format!("ai_agents_eval_{}", isolation_id));
@@ -577,26 +716,40 @@ impl AttemptFixtureContext {
     }
 
     pub fn interpolate_llm_fixture(&self, config: &LlmFixtureConfig) -> Result<LlmFixtureConfig> {
+        self.interpolate_llm_with_tools(config, &|name| {
+            ai_agents_tools::builtin::get_builtin_tool(name).map(|tool| tool.policy_bindings())
+        })
+    }
+
+    pub(crate) fn interpolate_llm_with_tools(
+        &self,
+        config: &LlmFixtureConfig,
+        lookup: &dyn Fn(&str) -> Option<ToolPolicyBindings>,
+    ) -> Result<LlmFixtureConfig> {
         let mut rewritten = config.clone();
         for response in &mut rewritten.responses {
-            *response = self.interpolate_response(response)?;
+            *response = self.interpolate_response(response, lookup)?;
         }
         for responses in rewritten.responses_by_alias.values_mut() {
             for response in responses {
-                *response = self.interpolate_response(response)?;
+                *response = self.interpolate_response(response, lookup)?;
             }
         }
         for outcomes in rewritten.outcomes_by_alias.values_mut() {
             for outcome in outcomes {
                 if let LlmFixtureOutcome::Response { content } = outcome {
-                    *content = self.interpolate_response(content)?;
+                    *content = self.interpolate_response(content, lookup)?;
                 }
             }
         }
         Ok(rewritten)
     }
 
-    fn interpolate_response(&self, response: &str) -> Result<String> {
+    fn interpolate_response(
+        &self,
+        response: &str,
+        lookup: &dyn Fn(&str) -> Option<ToolPolicyBindings>,
+    ) -> Result<String> {
         const WORKSPACE_TOKEN: &str = "{{ eval.workspace }}";
         const MOCK_SERVER_TOKEN: &str = "{{ mock_server.base_url }}";
         if !response.contains(WORKSPACE_TOKEN) && !response.contains(MOCK_SERVER_TOKEN) {
@@ -611,6 +764,16 @@ impl AttemptFixtureContext {
         let workspace = self.workspace.display().to_string();
         let mock_server = self.mock_server_base_url.as_deref();
         if let Ok(mut value) = serde_json::from_str::<Value>(response) {
+            if response.contains(WORKSPACE_TOKEN) {
+                match &mut value {
+                    Value::Array(calls) => {
+                        for call in calls {
+                            join_mock_call_paths(call, &self.workspace, lookup);
+                        }
+                    }
+                    call => join_mock_call_paths(call, &self.workspace, lookup),
+                }
+            }
             interpolate_json_strings(&mut value, &workspace, mock_server);
             return serde_json::to_string(&value).map_err(EvalError::from);
         }
@@ -619,6 +782,42 @@ impl AttemptFixtureContext {
             &workspace,
             mock_server,
         ))
+    }
+}
+
+// Only the declared filesystem arguments of a mock tool call are path operands.
+// In particular, arbitrary JSON payloads can themselves contain a property called "path".
+fn join_mock_call_paths(
+    call: &mut Value,
+    workspace: &Path,
+    lookup: &dyn Fn(&str) -> Option<ToolPolicyBindings>,
+) {
+    let Some(bindings) = call.get("tool").and_then(Value::as_str).and_then(lookup) else {
+        return;
+    };
+    let Some(args) = call.get_mut("arguments") else {
+        return;
+    };
+    for binding in bindings.path_fields {
+        let Some(field) = binding
+            .field
+            .split('.')
+            .try_fold(&mut *args, |value, segment| value.get_mut(segment))
+        else {
+            continue;
+        };
+        // Path policy bindings accept a string or a list of strings.
+        let paths = match field {
+            Value::Array(items) => items.as_mut_slice(),
+            single => std::slice::from_mut(single),
+        };
+        for path in paths {
+            if let Value::String(text) = path
+                && let Some(joined) = joined_workspace_path(text, workspace)
+            {
+                *text = joined;
+            }
+        }
     }
 }
 
@@ -642,6 +841,25 @@ fn interpolate_json_strings(value: &mut Value, workspace: &str, mock_server: Opt
         }
         _ => {}
     }
+}
+
+// Structured fixtures express workspace descendants with portable slash-separated paths.
+// Join only ordinary relative components so a token cannot replace the root with a drive or normalize traversal.
+fn joined_workspace_path(value: &str, workspace: &Path) -> Option<String> {
+    join_workspace_descendant(value.strip_prefix("{{ eval.workspace }}/")?, workspace)
+}
+
+fn join_workspace_descendant(suffix: &str, workspace: &Path) -> Option<String> {
+    if !suffix.contains("{{")
+        && suffix
+            .split('/')
+            .all(|part| Path::new(part).file_name() == Some(part.as_ref()))
+    {
+        let mut path = workspace.to_owned();
+        path.extend(suffix.split('/'));
+        return Some(path.display().to_string());
+    }
+    None
 }
 
 fn interpolate_fixture_string(value: &str, workspace: &str, mock_server: Option<&str>) -> String {
@@ -669,8 +887,8 @@ impl From<&ai_agents_core::ToolCallSource> for ToolExecutionSource {
             ai_agents_core::ToolCallSource::Orchestration => Self::Orchestration,
             ai_agents_core::ToolCallSource::Spawner => Self::Spawner,
             ai_agents_core::ToolCallSource::EvalFixture => Self::Mock,
+            ai_agents_core::ToolCallSource::Task => Self::Task,
             ai_agents_core::ToolCallSource::Fallback { .. }
-            | ai_agents_core::ToolCallSource::Task
             | ai_agents_core::ToolCallSource::Manual => Self::Llm,
         }
     }
@@ -1198,12 +1416,73 @@ impl Tool for RecordingTool {
     async fn execute(&self, args: Value, ctx: ToolExecutionContext) -> ToolResult {
         self.inner.execute(args, ctx).await
     }
+
+    // Recording remains in shared executor hooks; forwarding must not erase the wrapped implementation's task protocol.
+    async fn execute_task(
+        &self,
+        args: Value,
+        ctx: ToolExecutionContext,
+    ) -> ai_agents_core::Result<ToolResult> {
+        self.inner.execute_task(args, ctx).await
+    }
+    fn supports_task_messages(&self) -> bool {
+        self.inner.supports_task_messages()
+    }
+    fn manages_task_todos(&self) -> bool {
+        self.inner.manages_task_todos()
+    }
+    fn task_question(&self, args: &Value) -> ai_agents_core::Result<Option<Value>> {
+        self.inner.task_question(args)
+    }
+    fn task_question_result(
+        &self,
+        args: &Value,
+        answer: &Value,
+    ) -> ai_agents_core::Result<ToolResult> {
+        self.inner.task_question_result(args, answer)
+    }
+    async fn execute_task_question(
+        &self,
+        args: Value,
+        answer: Value,
+        ctx: ToolExecutionContext,
+    ) -> ToolResult {
+        self.inner.execute_task_question(args, answer, ctx).await
+    }
+    fn declared_write_footprint(
+        &self,
+        args: &Value,
+        ctx: &ToolExecutionContext,
+        max_targets: usize,
+    ) -> ai_agents_core::Result<Option<ai_agents_core::autonomy::ToolWriteFootprint>> {
+        self.inner.declared_write_footprint(args, ctx, max_targets)
+    }
 }
 
 pub fn build_llm_registry(
     spec: &AgentSpec,
     fixtures: &LlmFixtureConfig,
     base_dir: &Path,
+) -> Result<(LLMRegistry, Option<Arc<dyn LLMProvider>>)> {
+    build_llm_registry_with(
+        spec,
+        fixtures,
+        base_dir,
+        SequenceOutcome::text,
+        |_, provider| provider,
+    )
+}
+
+// Install scenario recording and budget layers only around providers that can actually dispatch.
+pub(crate) fn build_llm_registry_with(
+    spec: &AgentSpec,
+    fixtures: &LlmFixtureConfig,
+    base_dir: &Path,
+    mut mock_text: impl FnMut(&str) -> SequenceOutcome,
+    prepare_generation: impl Fn(
+        &ai_agents_runtime::spec::LLMConfig,
+        Arc<dyn LLMProvider>,
+    ) -> Arc<dyn LLMProvider>,
 ) -> Result<(LLMRegistry, Option<Arc<dyn LLMProvider>>)> {
     let mut registry = LLMRegistry::new();
     let aliases = if spec.llms.is_empty() {
@@ -1236,16 +1515,21 @@ pub fn build_llm_registry(
     let mut judge_provider = None;
 
     for (alias, config) in aliases {
+        if ai_agents_llm::providers::unified::is_choice_protocol(
+            config.extra.get("protocol").and_then(Value::as_str),
+        ) {
+            // Keep role resolution exact without opening a paid client or consuming a text fixture.
+            registry.register(alias, Arc::new(UnavailableChoiceFixture));
+            continue;
+        }
         let fixture_delay_ms = fixtures.delays_by_alias.get(&alias).copied().unwrap_or(0);
         let provider = match fixtures.mode {
             LlmFixtureMode::Mock => {
-                let fixture_responses =
-                    load_fixture_responses_for_alias(fixtures, base_dir, &alias)?;
                 let fixture_outcomes =
-                    load_fixture_outcomes_for_alias(fixtures, &alias, &fixture_responses);
+                    load_mock_outcomes(fixtures, base_dir, &alias, &mut mock_text)?;
                 Arc::new(
                     SequenceLLMProvider::new(fixture_outcomes, fixture_delay_ms)
-                        .with_tool_choice(config.tool_choice.clone()),
+                        .with_tools(FixtureTools::from_spec(&config)?),
                 ) as Arc<dyn LLMProvider>
             }
             LlmFixtureMode::Replay => Arc::new(
@@ -1255,7 +1539,7 @@ pub fn build_llm_registry(
                     cassette_records.clone(),
                     fixture_delay_ms,
                 )
-                .with_tool_choice(config.tool_choice.clone()),
+                .with_tools(FixtureTools::from_spec(&config)?),
             ) as Arc<dyn LLMProvider>,
             LlmFixtureMode::Real => build_real_provider(&config)?,
             LlmFixtureMode::Record => {
@@ -1275,7 +1559,7 @@ pub fn build_llm_registry(
         if judge_provider.is_none() {
             judge_provider = Some(provider.clone());
         }
-        registry.register(alias, provider);
+        registry.register(alias, prepare_generation(&config, provider));
     }
 
     let default_alias = spec.llm.get_default_alias();
@@ -1289,26 +1573,67 @@ pub fn build_llm_registry(
     Ok((registry, judge_provider))
 }
 
+/// Reserves a choice-only alias in every fixture mode until evaluation supports typed decisions.
+struct UnavailableChoiceFixture;
+
+impl UnavailableChoiceFixture {
+    fn error() -> LLMError {
+        LLMError::Config("scenario evaluation does not support structured choice calls".into())
+    }
+}
+
+#[async_trait]
+impl LLMProvider for UnavailableChoiceFixture {
+    fn uses_choice_for_routing(&self) -> bool {
+        true
+    }
+
+    fn validate_choice(
+        &self,
+        _: &ai_agents_core::ChoiceRequest<'_>,
+    ) -> std::result::Result<(), LLMError> {
+        Err(Self::error())
+    }
+
+    async fn complete(
+        &self,
+        _: &[ChatMessage],
+        _: Option<&LLMConfig>,
+    ) -> std::result::Result<LLMResponse, LLMError> {
+        Err(Self::error())
+    }
+
+    async fn complete_stream(
+        &self,
+        _: &[ChatMessage],
+        _: Option<&LLMConfig>,
+    ) -> std::result::Result<
+        Box<dyn Stream<Item = std::result::Result<LLMChunk, LLMError>> + Unpin + Send>,
+        LLMError,
+    > {
+        Err(Self::error())
+    }
+
+    fn is_terminal_error(&self, _: &LLMError) -> bool {
+        true
+    }
+
+    fn provider_name(&self) -> &str {
+        "eval-unavailable-choice"
+    }
+
+    fn supports(&self, _: LLMFeature) -> bool {
+        false
+    }
+}
+
 fn build_real_provider(
     config: &ai_agents_runtime::spec::LLMConfig,
 ) -> Result<Arc<dyn LLMProvider>> {
     use std::str::FromStr;
     let provider_type = ProviderType::from_str(&config.provider)
         .map_err(|error| EvalError::Config(error.to_string()))?;
-    let core_config = ai_agents_core::LLMConfig {
-        temperature: Some(config.temperature),
-        max_tokens: Some(config.max_tokens),
-        top_p: config.top_p,
-        top_k: None,
-        frequency_penalty: None,
-        presence_penalty: None,
-        stop_sequences: None,
-        timeout_seconds: config.timeout_seconds,
-        reasoning: config.reasoning,
-        reasoning_effort: config.reasoning_effort.clone(),
-        reasoning_budget_tokens: config.reasoning_budget_tokens,
-        extra: config.extra.clone(),
-    };
+    let core_config = config.to_provider_config(provider_type);
     let base_url = config.base_url.clone().or_else(|| {
         config
             .extra
@@ -1316,10 +1641,16 @@ fn build_real_provider(
             .and_then(Value::as_str)
             .map(str::to_string)
     });
-    let api_key = config
-        .api_key_env
-        .as_ref()
-        .and_then(|env| std::env::var(env).ok());
+    let api_key = provider_type
+        .configured_api_key_at(
+            config.api_key_env.as_deref(),
+            config
+                .extra
+                .get("protocol")
+                .and_then(serde_json::Value::as_str),
+            base_url.as_deref(),
+        )
+        .map_err(|error| EvalError::Config(error.to_string()))?;
     let mut provider = UnifiedLLMProvider::from_spec_config(
         provider_type,
         &config.model,
@@ -1332,7 +1663,9 @@ fn build_real_provider(
         provider = provider.with_feature_override(LLMFeature::FunctionCalling, value);
     }
     if let Some(choice) = config.tool_choice.clone() {
-        provider = provider.with_tool_choice(choice);
+        provider = provider
+            .with_validated_tool_choice(choice)
+            .map_err(|error| EvalError::Config(error.to_string()))?;
     }
     if let Some(value) = config.vision {
         provider = provider.with_feature_override(LLMFeature::Vision, value);
@@ -1343,62 +1676,52 @@ fn build_real_provider(
     Ok(Arc::new(provider))
 }
 
-fn load_fixture_responses_for_alias(
+fn load_mock_outcomes(
     config: &LlmFixtureConfig,
     base_dir: &Path,
     alias: &str,
-) -> Result<Vec<LLMResponse>> {
-    let configured = config
-        .responses_by_alias
+    mock_text: &mut impl FnMut(&str) -> SequenceOutcome,
+) -> Result<Vec<SequenceOutcome>> {
+    let records = load_cassette_records(config, base_dir)?;
+    if let Some(outcomes) = config
+        .outcomes_by_alias
         .get(alias)
-        .unwrap_or(&config.responses);
-    let mut responses = Vec::new();
-    for content in configured {
-        responses.push(LLMResponse::new(content.clone(), FinishReason::Stop));
-    }
-    for record in load_cassette_records(config, base_dir)? {
-        if record.alias == alias {
-            responses.push(record.response);
-        }
-    }
-    if responses.is_empty() {
-        responses.push(LLMResponse::new("Mock response", FinishReason::Stop));
-    }
-    Ok(responses)
-}
-
-fn load_fixture_outcomes_for_alias(
-    config: &LlmFixtureConfig,
-    alias: &str,
-    responses: &[LLMResponse],
-) -> Vec<SequenceOutcome> {
-    if let Some(outcomes) = config.outcomes_by_alias.get(alias)
-        && !outcomes.is_empty()
+        .filter(|v| !v.is_empty())
     {
-        return outcomes
+        return Ok(outcomes
             .iter()
             .map(|outcome| match outcome {
-                LlmFixtureOutcome::Response { content } => {
-                    SequenceOutcome::Response(LLMResponse::new(content.clone(), FinishReason::Stop))
-                }
+                LlmFixtureOutcome::Response { content } => mock_text(content),
                 LlmFixtureOutcome::Error { message, status } => SequenceOutcome::Error {
                     message: message.clone(),
                     status: *status,
                 },
             })
-            .collect();
+            .collect());
     }
     if let Some(message) = config.errors_by_alias.get(alias) {
-        return vec![SequenceOutcome::Error {
+        return Ok(vec![SequenceOutcome::Error {
             message: message.clone(),
             status: None,
-        }];
+        }]);
     }
-    responses
+    let mut outcomes: Vec<_> = config
+        .responses_by_alias
+        .get(alias)
+        .unwrap_or(&config.responses)
         .iter()
-        .cloned()
-        .map(SequenceOutcome::Response)
-        .collect()
+        .map(|content| mock_text(content))
+        .collect();
+    outcomes.extend(
+        records
+            .into_iter()
+            .filter(|record| record.alias == alias)
+            .map(|record| SequenceOutcome::Response(record.response)),
+    );
+    if outcomes.is_empty() {
+        outcomes.push(SequenceOutcome::text("Mock response"));
+    }
+    Ok(outcomes)
 }
 
 fn load_cassette_records(
@@ -1435,12 +1758,102 @@ struct CassetteRecord {
 }
 
 #[derive(Clone)]
-enum SequenceOutcome {
+pub(crate) enum SequenceOutcome {
+    Template {
+        context: Arc<AttemptFixtureContext>,
+        text: String,
+    },
     Response(LLMResponse),
     Error {
         message: String,
         status: Option<u16>,
     },
+}
+
+impl SequenceOutcome {
+    fn text(text: &str) -> Self {
+        Self::Response(LLMResponse::new(text, FinishReason::Stop))
+    }
+}
+
+// Shared sequences own only the attempt values. Tool path roles belong to the runtime consuming each response.
+pub(crate) struct FixtureTemplates(Arc<AttemptFixtureContext>);
+
+impl FixtureTemplates {
+    pub(crate) fn new(
+        context: &AttemptFixtureContext,
+        fixtures: &LlmFixtureConfig,
+    ) -> Result<Self> {
+        let texts = fixtures
+            .responses
+            .iter()
+            .chain(fixtures.responses_by_alias.values().flatten())
+            .chain(fixtures.outcomes_by_alias.values().flatten().filter_map(
+                |outcome| match outcome {
+                    LlmFixtureOutcome::Response { content } => Some(content),
+                    _ => None,
+                },
+            ));
+        for text in texts {
+            if text.contains("{{ mock_server.base_url }}") && context.mock_server_base_url.is_none()
+            {
+                return Err(EvalError::Config("mock LLM response uses {{ mock_server.base_url }} without an enabled fixtures.mock_server".into()));
+            }
+        }
+        Ok(Self(Arc::new(context.clone())))
+    }
+
+    pub(crate) fn prepare(&self, text: &str) -> SequenceOutcome {
+        if text.contains("{{ eval.workspace }}") || text.contains("{{ mock_server.base_url }}") {
+            SequenceOutcome::Template {
+                context: self.0.clone(),
+                text: text.to_owned(),
+            }
+        } else {
+            SequenceOutcome::text(text)
+        }
+    }
+}
+
+// Keep fixture transport offline while using the preset's real request capabilities.
+#[derive(Default)]
+struct FixtureTools {
+    preset: Option<ProviderType>,
+    model: String,
+    config: LLMConfig,
+    enabled: Option<bool>,
+    choice: Option<ToolChoice>,
+}
+
+impl FixtureTools {
+    fn from_spec(config: &ai_agents_runtime::spec::LLMConfig) -> Result<Self> {
+        let preset = config.provider.parse::<ProviderType>().ok();
+        let tools = Self {
+            preset,
+            model: config.model.clone(),
+            config: preset
+                .map(|p| config.to_provider_config(p))
+                .unwrap_or_default(),
+            enabled: config.function_calling,
+            choice: config.tool_choice.clone(),
+        };
+        if let (Some(preset), Some(choice)) = (tools.preset, &tools.choice) {
+            preset
+                .validate_declared_tool_choice(&tools.model, &tools.config, tools.enabled, choice)
+                .map_err(|error| EvalError::Config(error.to_string()))?;
+        }
+        Ok(tools)
+    }
+
+    fn allows_prompt(&self) -> bool {
+        self.preset.is_none_or(ProviderType::allows_prompt_tools)
+    }
+
+    fn supports_native(&self, choice: &ToolChoice, synthetic_default: bool) -> bool {
+        self.preset.map_or(synthetic_default, |preset| {
+            preset.supports_native_tool_choice(&self.model, &self.config, self.enabled, choice)
+        })
+    }
 }
 
 /// Deterministic LLM provider returning fixture outcomes in order.
@@ -1451,7 +1864,7 @@ struct SequenceLLMProvider {
     index: Mutex<usize>,
     /// Fixed delay before returning a response.
     delay_ms: u64,
-    tool_choice: Option<ToolChoice>,
+    tools: FixtureTools,
 }
 
 /// LLM provider replaying cassette records by request hash.
@@ -1464,7 +1877,7 @@ struct ReplayLLMProvider {
     records: Arc<Vec<CassetteRecord>>,
     /// Fixed delay before returning a replayed response.
     delay_ms: u64,
-    tool_choice: Option<ToolChoice>,
+    tools: FixtureTools,
 }
 
 impl SequenceLLMProvider {
@@ -1473,12 +1886,12 @@ impl SequenceLLMProvider {
             outcomes: Arc::new(outcomes),
             index: Mutex::new(0),
             delay_ms,
-            tool_choice: None,
+            tools: FixtureTools::default(),
         }
     }
 
-    fn with_tool_choice(mut self, tool_choice: Option<ToolChoice>) -> Self {
-        self.tool_choice = tool_choice;
+    fn with_tools(mut self, tools: FixtureTools) -> Self {
+        self.tools = tools;
         self
     }
 
@@ -1494,7 +1907,15 @@ impl SequenceLLMProvider {
         if *index + 1 < self.outcomes.len() {
             *index += 1;
         }
+        drop(index);
         match outcome {
+            Some(SequenceOutcome::Template { context, text }) => context
+                .interpolate_response(
+                    text,
+                    &ai_agents_runtime::RuntimeAgent::current_model_tool_policy_bindings,
+                )
+                .map(|content| LLMResponse::new(content, FinishReason::Stop))
+                .map_err(|error| LLMError::Config(error.to_string())),
             Some(SequenceOutcome::Response(response)) => Ok(response.clone()),
             Some(SequenceOutcome::Error { message, status }) => Err(LLMError::API {
                 message: message.clone(),
@@ -1512,12 +1933,12 @@ impl ReplayLLMProvider {
             model,
             records: Arc::new(records),
             delay_ms,
-            tool_choice: None,
+            tools: FixtureTools::default(),
         }
     }
 
-    fn with_tool_choice(mut self, tool_choice: Option<ToolChoice>) -> Self {
-        self.tool_choice = tool_choice;
+    fn with_tools(mut self, tools: FixtureTools) -> Self {
+        self.tools = tools;
         self
     }
 
@@ -1589,15 +2010,16 @@ impl LLMProvider for ReplayLLMProvider {
         self.response_for_tools(messages, config, request)
     }
 
+    fn allows_prompt_tools(&self) -> bool {
+        self.tools.allows_prompt()
+    }
+
     fn configured_tool_choice(&self) -> Option<ToolChoice> {
-        self.tool_choice.clone()
+        self.tools.choice.clone()
     }
 
     fn supports_tool_choice(&self, choice: &ToolChoice) -> bool {
-        matches!(
-            choice,
-            ToolChoice::Auto | ToolChoice::Required | ToolChoice::Specific(_) | ToolChoice::None
-        )
+        self.tools.supports_native(choice, true)
     }
 
     async fn complete_stream(
@@ -1635,8 +2057,30 @@ impl LLMProvider for SequenceLLMProvider {
         self.next_outcome()
     }
 
+    fn supports_tool_choice(&self, choice: &ToolChoice) -> bool {
+        self.tools.supports_native(choice, false)
+    }
+
+    async fn complete_with_tools(
+        &self,
+        messages: &[ChatMessage],
+        config: Option<&LLMConfig>,
+        request: &LLMToolRequest,
+    ) -> std::result::Result<LLMResponse, LLMError> {
+        if !self.supports_tool_choice(&request.choice) {
+            return Err(LLMError::Config(
+                "fixture cannot perform requested native tool choice".into(),
+            ));
+        }
+        self.complete(messages, config).await
+    }
+
+    fn allows_prompt_tools(&self) -> bool {
+        self.tools.allows_prompt()
+    }
+
     fn configured_tool_choice(&self) -> Option<ToolChoice> {
-        self.tool_choice.clone()
+        self.tools.choice.clone()
     }
 
     async fn complete_stream(
@@ -1853,6 +2297,10 @@ impl LLMProvider for RecordingLLMProvider {
         Ok(response)
     }
 
+    fn allows_prompt_tools(&self) -> bool {
+        self.inner.allows_prompt_tools()
+    }
+
     fn configured_tool_choice(&self) -> Option<ToolChoice> {
         self.inner.configured_tool_choice()
     }
@@ -2015,7 +2463,7 @@ mod tests {
                 },
                 ToolExecutionSource::Llm,
             ),
-            (ToolCallSource::Task, ToolExecutionSource::Llm),
+            (ToolCallSource::Task, ToolExecutionSource::Task),
             (ToolCallSource::Manual, ToolExecutionSource::Llm),
             (ToolCallSource::EvalFixture, ToolExecutionSource::Mock),
         ];
@@ -2078,13 +2526,14 @@ outcomes_by_alias:
 "#,
         )
         .unwrap();
-        let fallback = vec![LLMResponse::new("fallback", FinishReason::Stop)];
         let alpha = SequenceLLMProvider::new(
-            load_fixture_outcomes_for_alias(&config, "alpha", &fallback),
+            load_mock_outcomes(&config, Path::new("."), "alpha", &mut SequenceOutcome::text)
+                .unwrap(),
             0,
         );
         let beta = SequenceLLMProvider::new(
-            load_fixture_outcomes_for_alias(&config, "beta", &fallback),
+            load_mock_outcomes(&config, Path::new("."), "beta", &mut SequenceOutcome::text)
+                .unwrap(),
             0,
         );
 
@@ -2152,16 +2601,24 @@ outcomes_by_alias:
             )]),
             ..Default::default()
         };
-        let worker_responses =
-            load_fixture_responses_for_alias(&config, Path::new("."), "worker").unwrap();
-        let failing_responses =
-            load_fixture_responses_for_alias(&config, Path::new("."), "failing").unwrap();
         let worker = SequenceLLMProvider::new(
-            load_fixture_outcomes_for_alias(&config, "worker", &worker_responses),
+            load_mock_outcomes(
+                &config,
+                Path::new("."),
+                "worker",
+                &mut SequenceOutcome::text,
+            )
+            .unwrap(),
             0,
         );
         let failing = SequenceLLMProvider::new(
-            load_fixture_outcomes_for_alias(&config, "failing", &failing_responses),
+            load_mock_outcomes(
+                &config,
+                Path::new("."),
+                "failing",
+                &mut SequenceOutcome::text,
+            )
+            .unwrap(),
             0,
         );
 
@@ -2517,6 +2974,130 @@ workspace_policy:
     }
 
     #[test]
+    fn structured_fixture_paths_join_native_components_and_preserve_embedded_text() {
+        let context = AttemptWorkspace::create(None).unwrap();
+        let expected = context.workspace.join("nested dir").join("example.rs");
+        let fixture = json!({
+            "name": "interpolation",
+            "context": {"source": {"type":"file","path":"{{ eval.workspace }}/nested dir/example.rs"}},
+            "storage": {"type":"file", "path":"{{ eval.workspace }}/nested dir/example.rs"},
+            "system_prompt": "see {{ eval.workspace }}/example.rs",
+            "metadata": {"path":"{{ eval.workspace }}/literal/key"}
+        });
+        let parsed = serde_json::to_value(
+            context
+                .interpolate_agent_spec(&serde_json::from_value(fixture).unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(parsed["context"]["source"]["path"], json!(expected));
+        assert_eq!(parsed["storage"]["path"], json!(expected));
+        assert_eq!(
+            parsed["system_prompt"],
+            format!("see {}/example.rs", context.workspace.display())
+        );
+        assert_eq!(
+            parsed["metadata"]["path"],
+            format!("{}/literal/key", context.workspace.display())
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_policy_preserves_both_allowed_and_blocked_roots() {
+        use ai_agents_tools::{SecurityCheckResult, ToolSecurityEngine};
+        let context = AttemptWorkspace::create(None).unwrap();
+        let source = json!({
+            "name":"policy",
+            "system_prompt":"{{ eval.workspace }}/literal/text",
+            "tool_security":{"enabled":true,"fail_closed":true,"tools":{"file_read":{
+                "read_paths":["{{ eval.workspace }}/docs"],
+                "blocked_paths":["{{ eval.workspace }}/docs/private"],
+                "allow_without_confirmation":true
+            }}}
+        });
+        let spec = context
+            .interpolate_agent_spec(&serde_json::from_value(source).unwrap())
+            .unwrap();
+        let docs = context.workspace.join("docs");
+        let private = docs.join("private");
+        std::fs::create_dir_all(&private).unwrap();
+        assert_eq!(
+            spec.tool_security.tools["file_read"].blocked_paths,
+            [private.display().to_string()]
+        );
+        assert_eq!(
+            spec.system_prompt,
+            format!("{}/literal/text", context.workspace.display())
+        );
+        let security = ToolSecurityEngine::try_new(spec.tool_security).unwrap();
+        let check = |path| json!({"path":path});
+        assert!(matches!(
+            security
+                .check_tool_execution("file_read", &check(docs.join("notes")))
+                .await
+                .unwrap(),
+            SecurityCheckResult::Allow
+        ));
+        assert!(
+            matches!(security.check_tool_execution("file_read", &check(private.join("notes"))).await.unwrap(), SecurityCheckResult::Block { reason } if reason.contains("blocked"))
+        );
+    }
+
+    #[test]
+    fn file_write_fixture_joins_only_the_path_and_preserves_content_slashes() {
+        let context = AttemptWorkspace::create(None).unwrap();
+        let write = json!({
+            "tool": "file_write",
+            "arguments": {
+                "path": "{{ eval.workspace }}/nested dir/report.md",
+                "content": "{{ eval.workspace }}/README.md (see docs/guide.md)"
+            }
+        });
+        let fixture = LlmFixtureConfig {
+            responses: vec![write.to_string()],
+            ..Default::default()
+        };
+        let rewritten = context.interpolate_llm_fixture(&fixture).unwrap();
+        let response: Value = serde_json::from_str(&rewritten.responses[0]).unwrap();
+        assert_eq!(
+            response["arguments"]["path"],
+            json!(context.workspace.join("nested dir").join("report.md"))
+        );
+        let content = format!(
+            "{}/README.md (see docs/guide.md)",
+            context.workspace.display()
+        );
+        assert_eq!(response["arguments"]["content"], content);
+        let fixtures = FixturesConfig {
+            context: Some(json!({"opaque":{"type":"file","path":write["arguments"]["content"]}})),
+            ..Default::default()
+        };
+        let fixtures = context.interpolate_tool_fixtures(&fixtures).unwrap();
+        assert_eq!(fixtures.context.unwrap()["opaque"]["path"], content);
+    }
+
+    #[test]
+    fn parallel_fixture_calls_use_each_tools_bindings_and_keep_json_data_literal() {
+        let context = AttemptWorkspace::create(None).unwrap();
+        let token = "{{ eval.workspace }}/a/b";
+        let literal = format!("{}/a/b", context.workspace.display());
+        let path = json!(context.workspace.join("a").join("b"));
+        let calls = json!([
+            {"tool":"copy_path", "arguments":{"source_path":token, "destination_path":token}},
+            {"tool":"json", "arguments":{"data":{token: {"path":token}}}}
+        ]);
+        let fixture = LlmFixtureConfig {
+            responses: vec![calls.to_string()],
+            ..Default::default()
+        };
+        let rewritten = context.interpolate_llm_fixture(&fixture).unwrap();
+        let rendered: Value = serde_json::from_str(&rewritten.responses[0]).unwrap();
+        assert_eq!(rendered[0]["arguments"]["source_path"], path);
+        assert_eq!(rendered[0]["arguments"]["destination_path"], path);
+        assert_eq!(rendered[1]["arguments"]["data"][&literal]["path"], literal);
+    }
+
+    #[test]
     fn attempt_context_rejects_mock_server_token_without_server() {
         let context = AttemptFixtureContext {
             isolation_id: "attempt-one".to_string(),
@@ -2697,6 +3278,67 @@ web_fetch_transport:
                 .unwrap_err()
                 .to_string();
         assert!(error.contains("resposes"));
+    }
+
+    #[tokio::test]
+    async fn tool_contract_mock_and_replay_keep_native_only_text_inert() {
+        use ai_agents_llm::mock::MockLLMProvider;
+        use ai_agents_runtime::{Agent, AgentBuilder};
+
+        let text = r#"{"tool":"echo","arguments":{"message":"sample"}}"#;
+        for choice in [None, Some(ToolChoice::Auto)] {
+            let mut yaml = String::from(
+                "name: Contract\nsystem_prompt: Answer.\ntools: [echo]\nllm:\n  provider: ollama-cloud\n  model: fixture\n",
+            );
+            if choice.is_some() {
+                yaml.push_str("  tool_choice: auto\n");
+            }
+            let spec = serde_yaml::from_str(&yaml).unwrap();
+            let dir = std::env::temp_dir()
+                .join(format!("ai_agents_eval_contract_{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("cassette.jsonl");
+            let mut wire = MockLLMProvider::new("recorded native-only provider");
+            wire.set_prompt_tool_support(false);
+            wire.set_tool_choice(choice.clone());
+            wire.set_response(text);
+            let recorded = Arc::new(RecordingLLMProvider::new(
+                Arc::new(wire.clone()),
+                "default".into(),
+                "fixture".into(),
+                CassetteWriter::shared(path.clone()).unwrap(),
+            ));
+            let agent = AgentBuilder::from_yaml(&yaml)
+                .unwrap()
+                .tools(create_builtin_registry())
+                .llm(recorded)
+                .build()
+                .unwrap();
+            assert_eq!(agent.chat("question").await.unwrap().content, text);
+            let call = wire.last_call().unwrap();
+            assert_eq!(call.request.is_some(), choice.is_some());
+            assert!(!call.messages[0].content.contains("echo"));
+
+            for mode in [LlmFixtureMode::Mock, LlmFixtureMode::Replay] {
+                let fixtures = LlmFixtureConfig {
+                    mode,
+                    responses: vec![text.to_owned()],
+                    cassette: (mode == LlmFixtureMode::Replay).then(|| path.clone()),
+                    ..Default::default()
+                };
+                let (registry, _) = build_llm_registry(&spec, &fixtures, &dir).unwrap();
+                let agent = AgentBuilder::from_yaml(&yaml)
+                    .unwrap()
+                    .tools(create_builtin_registry())
+                    .llm_registry(registry)
+                    .build()
+                    .unwrap();
+                let response = agent.chat("question").await.unwrap();
+                assert_eq!(response.content, text);
+                assert!(agent.tool_call_history().is_empty());
+            }
+            std::fs::remove_dir_all(dir).unwrap();
+        }
     }
 
     #[tokio::test]

@@ -1,0 +1,22 @@
+name: RustMcpIntegration
+system_prompt: Use the configured MCP tools for this isolated integration test.
+# The eval replaces only this model. MCP processes and tool effects remain real.
+llm: {provider: openai, model: mocked-integration}
+tools:
+  - name: sdk
+    type: mcp
+    transport: stdio
+    # The harness supplies the actual executable and its isolated artifact directory.
+    security:
+      blocked_functions: [blocked]
+    views:
+      sdk_math:
+        functions: [accumulate]
+      sdk_review:
+        functions: [accumulate]
+  - sdk_math
+  - sdk_review
+hitl:
+  tools:
+    sdk_review:
+      require_approval: true

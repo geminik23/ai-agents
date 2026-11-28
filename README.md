@@ -21,13 +21,13 @@ A Rust framework for building AI agents from a single YAML specification. No cod
 
 ## Features
 
-- **Multi-LLM with fallback** - 12 providers (OpenAI, Anthropic, Google, Ollama, DeepSeek, Groq, Mistral, Cohere, xAI, Phind, OpenRouter, any OpenAI-compatible); first-party Google GenerateContent preserves signed native tool history; named aliases (default, router); auto-fallback on failure
+- **Multi-LLM with fallback** - 14 provider presets (OpenAI, Anthropic, Google, Ollama, Ollama Cloud, DeepSeek, Groq, Mistral, Cohere, xAI, Phind, OpenRouter, any OpenAI-compatible and explicitly configured Messages-compatible endpoints); first-party Google GenerateContent preserves signed native tool history; named aliases (default, router); auto-fallback on failure
 - **State machine + skills** - hierarchical states, LLM-evaluated transitions, guard-based routing, entry/exit actions, reusable multi-step skills
 - **Built-in tools + MCP** - 30 canonical built-in IDs: `calculator`, `echo`, `datetime`, `json`, `random`, `file`, `glob`, `grep`, `file_read`, `file_write`, `file_edit`, `patch`, `copy_path`, `move_path`, `delete_path`, `file_list`, `file_info`, `git_status`, `git_diff`, `diagnostics`, `ask_user`, `todo`, `sleep`, `web_fetch`, `web_search`, `command`, `text`, `template`, `math`, and `http`; connect any MCP server for hundreds more
 - **Tool scoping, selection, policy, and context** - explicit top-level grants, state-level narrowing, opt-in `auto`/`required`/`specific`/`none` tool choice, policy bindings, review modes for filesystem mutation, post-approval final authorization, atomic rate admission, conservative mutation locking, read-before-write guards, command allowlists, and context-aware custom tools
 - **Input/output process pipeline** - deterministic normalization and formatting plus optional LLM-backed detection, extraction, sanitization, validation, and transformation
-- **Dynamic context** - runtime, file, HTTP, env, and callback sources with Jinja2 templates in prompts; required runtime keys are checked before each turn
-- **Memory stack** - CompactingMemory and token budgeting; file and Redis snapshot persistence; SQLite snapshots, session metadata/filtering/cleanup, actor facts, and relationship memory
+- **Dynamic context** - runtime, file, HTTP, env, and callback sources with Jinja2 templates in prompts; required runtime keys are checked before each turn; development-only host-bound instructions can refresh for supported work requests
+- **Memory stack** - CompactingMemory and token budgeting; file and Redis snapshot persistence; SQLite snapshots, session metadata/filtering/cleanup, actor facts, and relationship memory; development retention treats incomplete native-history observations as advisory data, not proof
 - **Agent persona** - structured identity, traits, goals, secrets, evolution, and reusable templates
 - **Dynamic agent spawning + multi-agent systems** - fail-closed child admission, bounded managed capacity, optional shared LLMs and namespaced storage, agent registry, actor-aware messaging, and router/pipeline/concurrent/group chat/handoff orchestration; active nested spawners are rejected in v1
 - **CLI + TUI** - interactive REPL, ratatui terminal UI, streaming with authoritative final responses, context injection, and actor/relationship inspection
@@ -37,13 +37,21 @@ A Rust framework for building AI agents from a single YAML specification. No cod
 
 Ordinary model-callable tools are fail-closed through explicit grants. Optional tool security adds path, command, domain, approval, timeout, and result-limit enforcement. These controls are not an OS sandbox; hosts remain responsible for deployment isolation, filesystem ownership, network egress, credentials, custom integrations, and provider-internal I/O.
 
+The development checkout includes a direct Rust Chat Completions client with ordered text, image and audio inputs, streamed text and assembled function calls. The OpenAI preset can also select the Responses API for stateless text and native function calls. Anthropic uses native Messages with existing defaults, text streaming and signed tool replay. Explicit Messages settings provide native thinking options. OpenAI Decisions supports typed single-choice classification in Rust and opt-in selection in `route_to_agent`. Local Ollama uses native chat and text streaming with explicit daemon options. Ollama Cloud adds native chat, text streaming, and single-tool turns. OpenRouter uses its own Chat integration for existing YAML and can resume native tool calls with reasoning history on a pinned route. Rust applications can also list models from OpenAI, Anthropic, and Ollama Cloud without creating an agent. See the [provider guide](https://ai-agents.rs/docs/providers/) for framework integration.
+
 ## Feature Status
 
 ai-agents.rs 1.1 includes YAML and Rust agent construction, blocking and streaming chat, tools, state machines, skills, memory, storage, evaluation, observability, spawning, orchestration, and the CLI/TUI.
 
 Redis storage is experimental and currently supports snapshots only. Noop storage does not persist data.
 
-Retrieval/RAG, generalized background scheduling, Python bindings, and the Generalized Autonomy Runner are planned but are not currently available.
+Retrieval/RAG, generalized background scheduling and Python bindings remain unavailable.
+
+The development checkout provides task execution for research, support, reports, code, operations, world-state and tool-free analysis. Explicit Rust/CLI tasks and enabled YAML state/skill tasks use the same controller, with per-run settings, verified completion gates, retained questions and approvals, composition, task events, CLI/TUI hosting and shared application/evaluation integrations. Ordinary chat remains unchanged when autonomy is omitted or disabled. Task profiles have no implicit cumulative count/time budget; explicit limits and host ceilings remain effective, and evaluation budgets are separate.
+
+Configured safe-pause reconstruction is supported on Linux and macOS using file-backed SQLite, an explicit restoration work timeout, OS time evidence and fresh review. The CLI supplies this host for declarative tasks; Rust component factories preserve application-specific state. Arbitrary in-flight stack restoration, automatic abandoned-owner takeover and exactly-once external effects remain unsupported. Final integration and release are separate from these development contracts.
+
+These additions are not part of published 1.1.2. Existing public Rust structs, enum matches and mutation return types also have migration requirements. See [Support and compatibility](https://ai-agents.rs/docs/compatibility/) for the supported development paths, host prerequisites and migration details; the development target is 1.2.
 
 See [Concepts](https://ai-agents.rs/docs/concepts/) for architecture details and [Providers](https://ai-agents.rs/docs/providers/) for per-provider setup.
 
@@ -158,7 +166,7 @@ ai-agents-cli eval --agent agent.yaml --scenarios eval/suite.yaml --output eval_
 
 Use `eval` to run YAML or JSONL scenario suites with strict fail-closed assertions, exact replay, synchronized record fixtures, optional LLM judge checks, retries, strict default redaction, JSON/Markdown/JUnit outputs, and observability reports when enabled. Real and record modes require explicit `--real-llm` or `--record` authorization.
 
-See the [CLI Guide](https://ai-agents.rs/docs/cli/) for REPL commands, evaluation options, metadata configuration, and full reference.
+In the development checkout, `cargo run -p ai-agents-cli -- task run agent.yaml "objective"` starts an explicit task; `run agent.yaml` also services automatic state/skill tasks in the interactive TUI, or in the plain REPL with `--plain`. These commands are unreleased. Configured restart preserves prepared pauses and still requires current bindings, clock evidence and separate restoration review. See the [CLI Guide](https://ai-agents.rs/docs/cli/) for task commands and limitations, REPL controls, evaluation options, metadata configuration, and full reference.
 
 ## Roadmap
 
@@ -172,10 +180,13 @@ See the [full roadmap](https://ai-agents.rs/roadmap/) for what's shipped, what's
 | [YAML Reference](https://ai-agents.rs/docs/yaml-reference/) | Complete spec for agent definition files |
 | [Built-in Tools](https://ai-agents.rs/docs/built-in-tools/) | Inputs, outputs, policy, and host requirements for all built-ins |
 | [CLI Guide](https://ai-agents.rs/docs/cli/) | All commands, flags, and REPL features |
+| [Task hosting and evaluation](https://ai-agents.rs/docs/task-autonomy/) | Development YAML profiles, domain integration, typed control and the same eval host |
+| [Support and compatibility](https://ai-agents.rs/docs/compatibility/) | Development support boundaries and migration from 1.1.2 |
 | [Rust API](https://ai-agents.rs/docs/rust-api/) | Embedding agents in your Rust application |
-| [Providers](https://ai-agents.rs/docs/providers/) | Setup for all 12 LLM providers |
+| [Providers](https://ai-agents.rs/docs/providers/) | Setup for the provider presets |
 | [Concepts](https://ai-agents.rs/docs/concepts/) | Architecture, lifecycle, and core ideas |
 | [Examples](https://ai-agents.rs/examples/) | YAML and Rust examples for every feature |
+| [Developer MCP checks](xtask/tests/mcp/README.md) | Explicit YAML integration against a local Rust MCP server |
 | [API Docs](https://docs.rs/ai-agents) | Auto-generated Rust API reference |
 
 ## Key Dependencies

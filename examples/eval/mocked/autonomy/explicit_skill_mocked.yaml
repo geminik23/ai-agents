@@ -1,0 +1,27 @@
+name: Explicit Skill Task
+agent: ../../../yaml/autonomy/skill_task.yaml
+# An explicit installed skill skips semantic selection, but still uses the ordinary script and controller.
+# Flow: script once -> typed guidance -> ordinary continuation; no completed prompt step is replayed.
+settings: {timeout_per_turn_ms: 10000, retries: 0}
+fixtures:
+  llm:
+    mode: mock
+    responses_by_alias:
+      main: [Draft report., verified report]
+      router: [This alias must not be called.]
+scenarios:
+  - id: explicit-skill-retains-its-script-and-objective
+    steps:
+      - !task
+        operation: {action: skill, skill: research, objective: Research a report.}
+        assert:
+          all:
+            - task: {status: paused, counters: {path: llm_attempts, eq: 1}}
+            - llm_request: {count: 1, user_contains: Research a report.}
+      - !task
+        operation: {action: resume, response: {kind: answer, value: Continue the report.}}
+        assert:
+          all:
+            - task: {status: completed, same_run: true, counters: {path: llm_attempts, eq: 2}, event_result_parity: true}
+            - llm_request: {count: 1}
+            - response_contains: verified report

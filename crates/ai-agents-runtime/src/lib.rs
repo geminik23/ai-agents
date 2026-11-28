@@ -1,5 +1,6 @@
 //! Runtime agent and builder for AI Agents framework
 
+pub mod autonomy;
 mod builder;
 pub mod optimization;
 mod runtime;

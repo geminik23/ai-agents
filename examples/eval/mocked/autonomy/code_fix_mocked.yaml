@@ -1,0 +1,37 @@
+name: Code Task with Isolated Real Mutation
+agent: ../../../yaml/autonomy/code_fix.yaml
+settings: {timeout_per_turn_ms: 10000, retries: 0}
+fixtures:
+  files: {code.rs: "return 1\n"}
+  workspace_policy:
+    read_tools: [grep, file_read, file_edit, diagnostics]
+    write_tools: [file_edit]
+  llm:
+    mode: mock
+    responses:
+      - '{"tool":"grep","arguments":{"pattern":"return 1","path":"{{ eval.workspace }}","output_mode":"files_with_matches"}}'
+      - '{"tool":"file_read","arguments":{"path":"{{ eval.workspace }}/code.rs"}}'
+      - '{"tool":"file_edit","arguments":{"path":"{{ eval.workspace }}/code.rs","old_text":"return 1","new_text":"return 2","dry_run":false}}'
+      - '{"tool":"file_read","arguments":{"path":"{{ eval.workspace }}/code.rs"}}'
+      - Changed the isolated source to return 2; mocked command and diagnostics checks passed.
+  commands:
+    available: true
+    entries:
+      - argv: [cargo, test]
+        response: {success: true, exit_code: 0, termination: exited, stdout: fixture tests passed, stderr: '', combined_output: fixture tests passed, truncated: false, timed_out: false, cwd: '{{ eval.workspace }}', argv_redacted: [cargo, test]}
+  diagnostics: {available: true, items: []}
+scenarios:
+  - id: actual-read-and-edit-before-mocked-validation
+    steps:
+      - !task
+        operation: {action: run, objective: Fix the isolated source and validate it.}
+        assert:
+          all:
+            - task: {status: completed, checks: [{id: tests, outcome: pass}, {id: diagnostics, outcome: pass}], event_result_parity: true}
+            - tool_called: {id: grep, count: 1, executed: true, success: true}
+            - tool_called: {id: file_edit, count: 1, executed: true, success: true, args_executed: {path: dry_run, eq: false}}
+            - tool_called: {id: file_read, count: 2, executed: true, success: true}
+            - tool_called: {id: file_read, result_path: {path: content, eq: "return 2\n"}, executed: true, success: true}
+            - tool_called: {id: command, source_in: [task], count: 1, executed: true, success: true, result_path: {path: exit_code, eq: 0}}
+            - tool_called: {id: diagnostics, source_in: [task], count: 1, executed: true, success: true}
+            - response_contains: isolated source

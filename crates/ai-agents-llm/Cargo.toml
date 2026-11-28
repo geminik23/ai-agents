@@ -13,6 +13,8 @@ categories = ["asynchronous"]
 
 [dependencies]
 ai-agents-core = { workspace = true }
+base64 = "0.22"
+thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 async-trait = { workspace = true }
@@ -25,6 +27,10 @@ parking_lot = { workspace = true }
 minijinja = { workspace = true }
 reqwest = { workspace = true }
 uuid = { workspace = true }
+sha2 = { workspace = true }
+
+[features]
+test-util = []
 
 [dev-dependencies]
 chrono = { workspace = true }

@@ -13,7 +13,7 @@ use anyhow::{Context, Result};
 use crate::approval::CliApprovalHandler;
 use crate::cli::{Cli, Command as CliCommand, RunArgs};
 use crate::metadata::{CliOverrides, ResolvedCliMetadata};
-use crate::question::CliQuestionHandler;
+
 use crate::repl::{CliRepl, CliReplConfig, PromptStyle, ReplMode};
 
 #[derive(Debug, Clone)]
@@ -75,6 +75,7 @@ impl RunOptions {
 pub async fn run(cli: Cli) -> Result<()> {
     match cli.command {
         CliCommand::Run(args) => run_agent(RunOptions::from_run_args(&args)).await,
+        CliCommand::Task(args) => crate::task::run(args).await,
         CliCommand::Eval(args) => crate::eval::run_eval(args).await,
         CliCommand::Validate(args) => {
             crate::init_tracing();
@@ -84,7 +85,8 @@ pub async fn run(cli: Cli) -> Result<()> {
 }
 
 pub async fn run_agent(options: RunOptions) -> Result<()> {
-    let spec = load_spec(&options.agent_path)?;
+    let prepared = load_prepared_spec(&options.agent_path)?;
+    let spec = prepared.spec().clone();
     let metadata = ResolvedCliMetadata::from_metadata_value(spec.metadata.as_ref())
         .merge_overrides(options.to_overrides());
 
@@ -97,36 +99,115 @@ pub async fn run_agent(options: RunOptions) -> Result<()> {
     // Tracing calls during build_agent() are silently dropped.
     // The TUI installs a channel-based subscriber inside run_tui().
 
-    let agent = build_agent_from_spec(&options.agent_path, spec.clone()).await?;
-    agent.set_command_runner(Arc::new(ProcessCommandRunner));
-    if !is_tui && std::io::stdin().is_terminal() {
-        agent.set_question_handler(Some(CliQuestionHandler::new()));
-    }
-
-    // Initialize storage before entering either frontend so configuration failures remain visible.
-    agent
-        .init_storage()
-        .await
-        .context("failed to initialize agent storage")?;
-
-    // Inject context from --context and --context-file
-    inject_context(&agent, &options)?;
-
-    let config = resolve_cli_config(&spec, &metadata);
-
-    // Dispatch: plain REPL for piped/--plain, TUI for interactive TTY.
     if !is_tui {
-        CliRepl::new(agent)
+        let io = crate::session::FrontendSession::terminal(false, true);
+        let namespace = ai_agents::TaskHostScope::from_prepared_spec(
+            &prepared,
+            options.agent_path.parent().unwrap_or(Path::new(".")),
+            options.actor.clone(),
+        )?;
+        if let Some(restored) =
+            restore_startup(&options, &prepared, io.bridge(), namespace.clone()).await?
+        {
+            let config = resolve_cli_config(&spec, &metadata);
+            return CliRepl::from_restored(restored)
+                .with_config(config)
+                .run_with_io(io)
+                .await;
+        }
+        let agent = build_frontend_agent(
+            &options.agent_path,
+            prepared.clone(),
+            io.bridge(),
+            Some(namespace),
+        )
+        .await?;
+        prepare_frontend(&agent, &options).await?;
+        let config = resolve_cli_config(&spec, &metadata);
+        return CliRepl::new(agent)
             .with_config(config)
-            .run()
-            .await
-            .context("failed to run interactive session")
-    } else {
-        let theme_name = metadata.theme.clone();
-        crate::tui::run_tui(agent, config, theme_name)
-            .await
-            .context("failed to run TUI session")
+            .run_with_io(io)
+            .await;
     }
+
+    let (io, input, output) = crate::session::FrontendSession::embedded();
+    let namespace = ai_agents::TaskHostScope::from_prepared_spec(
+        &prepared,
+        options.agent_path.parent().unwrap_or(Path::new(".")),
+        options.actor.clone(),
+    )?;
+    if let Some(restored) =
+        restore_startup(&options, &prepared, io.bridge(), namespace.clone()).await?
+    {
+        let agent = restored.0.runtime().clone();
+        let config = resolve_cli_config(&spec, &metadata);
+        return crate::tui::run_prepared_shared(
+            agent,
+            config,
+            metadata.theme.clone(),
+            io,
+            input,
+            output,
+            Some(restored),
+        )
+        .await;
+    }
+    let agent =
+        build_frontend_agent(&options.agent_path, prepared, io.bridge(), Some(namespace)).await?;
+    prepare_frontend(&agent, &options).await?;
+    let config = resolve_cli_config(&spec, &metadata);
+    crate::tui::run_prepared(agent, config, metadata.theme.clone(), io, input, output)
+        .await
+        .map_err(|error| anyhow::anyhow!("failed to run TUI session: {error:#}"))
+}
+
+/// Selects persisted startup work before constructing an ordinary runtime or replaying auto-spawn preparation.
+async fn restore_startup(
+    options: &RunOptions,
+    prepared: &ai_agents::spec::PreparedAgentSpec,
+    bridge: Arc<crate::session::InputBridge>,
+    namespace: ai_agents::TaskHostScope,
+) -> Result<Option<crate::session::RestoredTask>> {
+    let startup_requested = root_startup_requested(prepared.spec())?;
+    let Some(timeout) = prepared.spec().autonomy.restoration_timeout_ms else {
+        if startup_requested {
+            anyhow::bail!("resume_on_start requires autonomy.restoration_timeout_ms");
+        }
+        return Ok(None);
+    };
+    if !matches!(
+        prepared.spec().storage,
+        ai_agents::spec::StorageConfig::Sqlite(_)
+    ) {
+        if startup_requested {
+            anyhow::bail!("resume_on_start requires SQLite task storage");
+        }
+        return Ok(None);
+    }
+    let host = configured_restore_host(
+        &options.agent_path,
+        prepared.clone(),
+        bridge,
+        Some(namespace),
+        timeout,
+    )?;
+    let Some(candidate) = host.startup_candidate().await? else {
+        return Ok(None);
+    };
+    if !options.contexts.is_empty() || options.context_file.is_some() {
+        anyhow::bail!(
+            "startup restoration preserves saved context; use an explicit new task for replacement context"
+        );
+    }
+    host.restore(candidate.key.run_id, candidate.revision)
+        .await
+        .map(Some)
+        .map_err(Into::into)
+}
+
+// Ordinary/default-off input does not resolve task-only requirements merely because the CLI can host tasks.
+fn root_startup_requested(spec: &AgentSpec) -> Result<bool> {
+    ai_agents::autonomy::declares_startup_resume(&spec.autonomy).map_err(Into::into)
 }
 
 /// Parse "key=value" where key supports dotted paths and value is auto-typed.
@@ -140,7 +221,7 @@ fn parse_context_pair(pair: &str) -> Result<(String, serde_json::Value)> {
 }
 
 /// Inject context values from --context flags and --context-file into the agent.
-fn inject_context(agent: &RuntimeAgent, options: &RunOptions) -> Result<()> {
+pub(crate) fn inject_context(agent: &RuntimeAgent, options: &RunOptions) -> Result<()> {
     // Load context file first (--context overrides file values).
     if let Some(ref path) = options.context_file {
         let content = std::fs::read_to_string(path)
@@ -188,30 +269,61 @@ pub async fn validate_agent(path: &Path) -> Result<()> {
 }
 
 pub fn load_spec(path: &Path) -> Result<AgentSpec> {
+    Ok(load_prepared_spec(path)?.into_parts().0)
+}
+
+// Keep source presence beside the typed spec across CLI namespace construction and runtime preparation.
+pub(crate) fn load_prepared_spec(path: &Path) -> Result<ai_agents::spec::PreparedAgentSpec> {
     let content = fs::read_to_string(path)
         .with_context(|| format!("failed to read agent file: {}", path.display()))?;
 
-    let spec = AgentSpec::from_yaml_strict(&content).map_err(|error| {
-        anyhow::anyhow!(
-            "failed to parse YAML agent file: {}: {error}",
-            path.display()
-        )
-    })?;
+    let prepared =
+        ai_agents::spec::PreparedAgentSpec::from_yaml_strict(&content).map_err(|error| {
+            anyhow::anyhow!(
+                "failed to parse YAML agent file: {}: {error}",
+                path.display()
+            )
+        })?;
 
-    spec.validate()
+    prepared
+        .spec()
+        .validate()
         .with_context(|| format!("agent spec validation failed: {}", path.display()))?;
 
-    Ok(spec)
+    Ok(prepared)
 }
 
 pub async fn build_agent(path: &Path) -> Result<RuntimeAgent> {
-    let spec = load_spec(path)?;
-    build_agent_from_spec(path, spec).await
+    let prepared = load_prepared_spec(path)?;
+    build_agent_from_spec(path, prepared).await
 }
 
-async fn build_agent_from_spec(path: &Path, spec: AgentSpec) -> Result<RuntimeAgent> {
+async fn build_agent_from_spec(
+    path: &Path,
+    prepared: ai_agents::spec::PreparedAgentSpec,
+) -> Result<RuntimeAgent> {
+    configured_builder(path, prepared, None, None)
+        .await?
+        .build()
+        .context("failed to build runtime agent")
+}
+
+// Both ordinary and task hosting finalize this same configured builder; neither path reinterprets YAML or repeats preparation.
+async fn configured_builder(
+    path: &Path,
+    prepared: ai_agents::spec::PreparedAgentSpec,
+    bridge: Option<Arc<crate::session::InputBridge>>,
+    scope: Option<ai_agents::TaskHostScope>,
+) -> Result<AgentBuilder> {
     let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let mut builder = AgentBuilder::from_spec_with_base_dir(spec.clone(), base_dir)
+    let spec = prepared.spec().clone();
+    let builder = AgentBuilder::from_prepared_spec_with_base_dir(prepared, base_dir);
+    let builder = if let Some(scope) = scope {
+        builder.task_host_scope(scope)?
+    } else {
+        builder
+    };
+    let mut builder = builder
         .auto_configure_llms()
         .context("failed to auto-configure LLMs from environment")?
         .auto_configure_features()
@@ -238,10 +350,108 @@ async fn build_agent_from_spec(path: &Path, spec: AgentSpec) -> Result<RuntimeAg
             .and_then(|m| m.get("cli"))
             .and_then(|c| serde_json::from_value::<ai_agents::spec::CliMetadata>(c.clone()).ok())
             .and_then(|m| m.hitl);
-        builder = builder.approval_handler(CliApprovalHandler::from_metadata(hitl_meta.as_ref()));
+        if let Some(bridge) = &bridge {
+            bridge.set_show_context(
+                hitl_meta
+                    .as_ref()
+                    .and_then(|meta| meta.show_context)
+                    .unwrap_or(true),
+            );
+        }
+        builder = if let Some(bridge) = bridge {
+            bridge.set_auto_approval(
+                match hitl_meta.as_ref().and_then(|meta| meta.style.as_ref()) {
+                    Some(ai_agents::spec::CliHitlStyle::AutoApprove) => Some(true),
+                    Some(ai_agents::spec::CliHitlStyle::AutoReject) => Some(false),
+                    _ => None,
+                },
+            );
+            builder.approval_handler(bridge)
+        } else {
+            builder.approval_handler(CliApprovalHandler::from_metadata(hitl_meta.as_ref()))
+        };
     }
 
-    builder.build().context("failed to build runtime agent")
+    Ok(builder)
+}
+
+/// Prepares the same ordinary storage/context/actor contract before foreground task admission.
+pub(crate) async fn prepare_frontend(agent: &RuntimeAgent, options: &RunOptions) -> Result<()> {
+    if !agent.has_configured_task_restoration() {
+        agent.set_command_runner(Arc::new(ProcessCommandRunner));
+    }
+    agent
+        .init_storage()
+        .await
+        .context("failed to initialize agent storage")?;
+    inject_context(agent, options)
+}
+
+/// Reuses the production builder chain; the bridge changes ordinary input delivery, never task approval authority.
+pub(crate) async fn build_frontend_agent(
+    path: &Path,
+    prepared: ai_agents::spec::PreparedAgentSpec,
+    bridge: Arc<crate::session::InputBridge>,
+    scope: Option<ai_agents::TaskHostScope>,
+) -> Result<RuntimeAgent> {
+    if let Some(timeout) = prepared.spec().autonomy.restoration_timeout_ms {
+        let host = configured_restore_host(path, prepared, bridge, scope, timeout)?;
+        return host.build().await.map_err(Into::into);
+    }
+    let builder = configured_builder(path, prepared, Some(bridge.clone()), scope).await?;
+    let agent = builder.build_task_host().await?;
+    agent.set_question_handler(Some(bridge));
+    Ok(agent)
+}
+
+/// Prepares declarative restoration authority and current UI endpoints without constructing providers or consuming a task.
+pub(crate) fn configured_restore_host(
+    path: &Path,
+    prepared: ai_agents::spec::PreparedAgentSpec,
+    bridge: Arc<crate::session::InputBridge>,
+    scope: Option<ai_agents::TaskHostScope>,
+    timeout: std::num::NonZeroU64,
+) -> Result<Arc<ai_agents::autonomy::ConfiguredTaskRestoreHost>> {
+    if prepared.spec().hitl.is_some() {
+        let metadata = prepared
+            .spec()
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("cli"))
+            .and_then(|cli| {
+                serde_json::from_value::<ai_agents::spec::CliMetadata>(cli.clone()).ok()
+            })
+            .and_then(|cli| cli.hitl);
+        bridge.set_show_context(
+            metadata
+                .as_ref()
+                .and_then(|metadata| metadata.show_context)
+                .unwrap_or(true),
+        );
+        bridge.set_auto_approval(
+            match metadata
+                .as_ref()
+                .and_then(|metadata| metadata.style.as_ref())
+            {
+                Some(ai_agents::spec::CliHitlStyle::AutoApprove) => Some(true),
+                Some(ai_agents::spec::CliHitlStyle::AutoReject) => Some(false),
+                _ => None,
+            },
+        );
+    }
+    let actor = scope
+        .as_ref()
+        .and_then(|scope| scope.actor_id())
+        .map(str::to_owned);
+    let host = ai_agents::autonomy::ConfiguredTaskRestoreHost::new(
+        prepared,
+        path.parent().unwrap_or(Path::new(".")).into(),
+        actor,
+        std::time::Duration::from_millis(timeout.get()),
+    )?
+    .approval_handler(bridge.clone())
+    .question_handler(bridge);
+    Ok(Arc::new(host))
 }
 
 pub fn resolve_cli_config(spec: &AgentSpec, metadata: &ResolvedCliMetadata) -> CliReplConfig {

@@ -1,0 +1,50 @@
+name: Task Host Controls
+agent: ../../../yaml/autonomy/controlled_analysis.yaml
+# Each scenario has a fresh runtime; within one scenario controls retain the original run and usage.
+# Flow: pause -> revision-bound control -> separately admitted continuation or acknowledged termination.
+settings: {timeout_per_turn_ms: 10000, retries: 0}
+fixtures:
+  llm: {mode: mock, responses: [draft, verified report]}
+scenarios:
+  - id: objective-change-requires-continue-without-refunding-usage
+    steps:
+      - !task
+        operation: {action: run, objective: Original objective.}
+        assert: {task: {status: paused, pending_kind: user_question, counters: {path: llm_attempts, eq: 1}}}
+      - !task
+        operation: {action: objective, objective: Revised objective., reason: Authenticated host correction.}
+        assert: {task: {status: paused, pending_kind: host_continue, same_run: true, counters: {path: llm_attempts, eq: 1}}}
+      - !task
+        operation: {action: resume, response: {kind: continue}}
+        assert: {task: {status: completed, same_run: true, counters: {path: llm_attempts, eq: 2}, event_result_parity: true}}
+  - id: capacity-change-does-not-execute-or-refill
+    steps:
+      - !task
+        operation: {action: run, objective: Complete within revised capacity., profile: capacity}
+        assert: {task: {status: paused, pending_kind: limit, counters: {path: llm_attempts, eq: 1}}}
+      - !task
+        operation:
+          action: limits
+          reason: Permit exactly one additional call.
+          # Runtime units are explicit: time in seconds, cost in micro-USD, unlike quoted YAML USD caps.
+          limits: {max_turns: 4, max_active_time_seconds: 900, max_wall_time_seconds: null, max_llm_calls: 2, max_tool_calls: 120, max_command_calls: 10, max_micro_usd: null, max_declared_write_paths: null}
+        assert: {task: {status: paused, same_run: true, counters: {path: llm_attempts, eq: 1}}}
+      - !task
+        operation: {action: resume, response: {kind: continue}}
+        assert: {task: {status: completed, same_run: true, counters: {path: llm_attempts, eq: 2}, event_result_parity: true}}
+  - id: cancellation-is-acknowledged-without-answering-the-question
+    steps:
+      - !task
+        operation: {action: run, objective: Cancellable objective.}
+        assert: {task: {status: paused}}
+      - !task
+        operation: {action: cancel}
+        assert: {task: {status: cancelled, same_run: true, counters: {path: llm_attempts, eq: 1}, event_result_parity: true}}
+  - id: stop-preserves-usage-and-structured-reason
+    steps:
+      - !task
+        operation: {action: run, objective: Stoppable objective.}
+        assert: {task: {status: paused}}
+      - !task
+        operation: {action: stop, reason: Host stopped this objective.}
+        assert: {task: {status: incomplete, stop_reason: user_stopped, same_run: true, counters: {path: llm_attempts, eq: 1}}}

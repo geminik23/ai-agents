@@ -6,7 +6,29 @@ use std::collections::HashMap;
 use thiserror::Error;
 
 use crate::message::ChatMessage;
-use crate::types::{LLMChunk, LLMConfig, LLMFeature, LLMResponse, LLMToolRequest, ToolChoice};
+use crate::types::{
+    LLMChunk, LLMConfig, LLMFeature, LLMResponse, LLMToolRequest, TokenUsage, ToolChoice,
+};
+
+/// A caller-owned candidate label and its optional selection guidance.
+pub struct ChoiceCandidate<'a> {
+    pub id: &'a str,
+    pub description: Option<&'a str>,
+}
+
+/// A single selection operation, independent of the provider's wire format.
+pub struct ChoiceRequest<'a> {
+    pub input: &'a str,
+    pub question: &'a str,
+    pub candidates: &'a [ChoiceCandidate<'a>],
+}
+
+/// One exact label or a refusal, with usage when the backend supplies it.
+#[derive(Debug)]
+pub struct ChoiceDecision {
+    pub selected: Option<String>,
+    pub usage: Option<TokenUsage>,
+}
 
 /// Core LLM provider trait.
 ///
@@ -15,6 +37,35 @@ use crate::types::{LLMChunk, LLMConfig, LLMFeature, LLMResponse, LLMToolRequest,
 /// out of the box.
 #[async_trait]
 pub trait LLMProvider: Send + Sync {
+    /// Reports that this handle is explicitly configured for structured routing.
+    /// Transparent wrappers must preserve this selection even when they reject the call.
+    fn uses_choice_for_routing(&self) -> bool {
+        false
+    }
+
+    /// Checks any provider-specific choice limits before admission, without dispatching.
+    fn validate_choice(&self, _request: &ChoiceRequest<'_>) -> Result<(), LLMError> {
+        if self.uses_choice_for_routing() {
+            Ok(())
+        } else {
+            Err(LLMError::Config(
+                "provider is not configured for structured choice".into(),
+            ))
+        }
+    }
+
+    /// Returns a typed decision, with no fallback to text generation.
+    async fn choose(&self, _request: &ChoiceRequest<'_>) -> Result<ChoiceDecision, LLMError> {
+        Err(LLMError::Config(
+            "provider does not implement structured choice".into(),
+        ))
+    }
+
+    /// Reports an installed admission layer for this specific operation.
+    fn manages_choice_admission(&self) -> bool {
+        false
+    }
+
     /// Send messages and get a complete response.
     async fn complete(
         &self,
@@ -33,6 +84,11 @@ pub trait LLMProvider: Send + Sync {
             "provider '{}' does not support native tool completion",
             self.provider_name()
         )))
+    }
+
+    /// Whether the runtime may expose or parse the compatibility prompt tool protocol.
+    fn allows_prompt_tools(&self) -> bool {
+        true
     }
 
     /// Returns a provider-level tool choice override when configured.
@@ -57,6 +113,45 @@ pub trait LLMProvider: Send + Sync {
 
     /// Check if this provider supports a given feature.
     fn supports(&self, feature: LLMFeature) -> bool;
+
+    /// Reports an installed invocation layer so consumer preparation never double-wraps shared handles.
+    fn manages_invocation_admission(&self) -> bool {
+        false
+    }
+
+    /// Identifies a prepared priced capability; absent means hard priced execution is unsupported.
+    /// A stable identity is not an execution permit and every actual request must still be bounded.
+    fn priced_capability_identity(&self) -> Option<String> {
+        None
+    }
+
+    /// Bounds the complete request that this implementation will dispatch under its pinned schedule.
+    /// Implementations must preserve the quoted configuration through dispatch, including cached clients and internal retries.
+    fn request_cost_bound(
+        &self,
+        _request: &crate::autonomy::ProviderRequest<'_>,
+    ) -> Result<Option<crate::autonomy::ProviderCostBound>, LLMError> {
+        Ok(None)
+    }
+
+    /// Returns trustworthy matching billable usage; unknown usage keeps the full admitted bound.
+    fn settle_request_cost(
+        &self,
+        _bound: &crate::autonomy::ProviderCostBound,
+        _response: &LLMResponse,
+    ) -> Result<Option<crate::autonomy::ProviderCostSettlement>, LLMError> {
+        Ok(None)
+    }
+
+    /// Settles only complete final stream usage from this implementation after normal EOF.
+    /// The unsupported default retains the complete bound; errors, partial streams and drop never infer a refund.
+    fn settle_stream_request_cost(
+        &self,
+        _bound: &crate::autonomy::ProviderCostBound,
+        _usage: Option<&crate::TokenUsage>,
+    ) -> Result<Option<crate::autonomy::ProviderCostSettlement>, LLMError> {
+        Ok(None)
+    }
 
     /// Reports whether a provider error is terminal for this exact attempt.
     ///

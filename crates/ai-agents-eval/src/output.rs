@@ -58,6 +58,56 @@ fn render_summary(result: &EvalResult) -> String {
             scenario.duration_ms
         ));
     }
+    if result.metrics.observed_task_runs > 0 {
+        out.push_str("\n## Task observations\n\nThese are acknowledged operation snapshots, not inferred cleanup or current completion permits.\n\n| Scenario | Attempt | Operation | Status | Revision | Events complete |\n|---|---|---|---|---|---|\n");
+        for scenario in &result.scenarios {
+            for attempt in &scenario.attempts {
+                for turn in &attempt.turns {
+                    for (operation, task) in turn
+                        .task
+                        .iter()
+                        .map(|task| (turn.index.to_string(), task))
+                        .chain(turn.interactions.iter().filter_map(|interaction| {
+                            interaction.task.as_ref().map(|task| {
+                                (
+                                    format!("{}:control:{}", turn.index, interaction.index),
+                                    task,
+                                )
+                            })
+                        }))
+                    {
+                        out.push_str(&format!(
+                            "| `{}` | {} | {} | {:?} | {} | {} |\n",
+                            scenario.id,
+                            attempt.attempt,
+                            operation,
+                            task.display.summary.status,
+                            task.display.summary.revision,
+                            task.events_complete
+                        ));
+                    }
+                    for interaction in turn
+                        .interactions
+                        .iter()
+                        .filter(|interaction| interaction.task.is_none())
+                    {
+                        if let Some(outcome) = &interaction.outcome {
+                            out.push_str(&format!(
+                                "| `{}` | {} | {}:control:{}:ack | {:?} | {} | {} |\n",
+                                scenario.id,
+                                attempt.attempt,
+                                turn.index,
+                                interaction.index,
+                                outcome.status,
+                                outcome.revision,
+                                interaction.events_complete
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
     out
 }
 
@@ -138,6 +188,30 @@ fn render_junit(result: &EvalResult) -> String {
                 ));
             }
         }
+        let tasks: Vec<_> = scenario
+            .attempts
+            .iter()
+            .flat_map(|attempt| &attempt.turns)
+            .filter_map(|turn| turn.task.as_ref())
+            .collect();
+        if !tasks.is_empty() {
+            let text = tasks
+                .iter()
+                .map(|task| {
+                    format!(
+                        "task status={:?} revision={} events_complete={}",
+                        task.display.summary.status,
+                        task.display.summary.revision,
+                        task.events_complete
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            out.push_str(&format!(
+                "    <system-out>{}</system-out>\n",
+                escape_xml(&text)
+            ));
+        }
         out.push_str("  </testcase>\n");
     }
     out.push_str("</testsuite>\n");
@@ -190,6 +264,8 @@ mod tests {
                 attempts: vec![AttemptResult {
                     attempt: 0,
                     turns: vec![TurnResult {
+                        interactions: Vec::new(),
+                        task: None,
                         index: 0,
                         input: RedactedString::redacted("[redacted]"),
                         response: RedactedString::redacted("[redacted]"),
@@ -198,6 +274,7 @@ mod tests {
                         state: None,
                         metadata: None,
                         evidence: crate::evidence::TurnEvidence {
+                            task: None,
                             response_metadata: Some(
                                 serde_json::json!({"secret":"should-not-serialize"}),
                             ),

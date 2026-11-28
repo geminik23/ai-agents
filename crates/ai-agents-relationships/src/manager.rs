@@ -44,6 +44,15 @@ impl RelationshipManager {
         })
     }
 
+    /// Exposes only providers used by enabled automatic maintenance; names and configuration flags alone do not certify a custom evaluator.
+    pub fn task_providers(&self) -> Option<Vec<Arc<dyn ai_agents_core::LLMProvider>>> {
+        if self.config.auto_update.enabled {
+            self.evaluator.as_ref()?.task_providers()
+        } else {
+            Some(vec![])
+        }
+    }
+
     /// Return the effective relationship-memory configuration.
     pub fn config(&self) -> &RelationshipConfig {
         &self.config
@@ -320,6 +329,25 @@ impl RelationshipManager {
             changes,
             event,
         })
+    }
+
+    /// Computes a relationship proposal without committing changes, allowing managed callers to separate model admission from effect custody.
+    pub async fn propose_update(
+        &self,
+        actor_id: &str,
+        messages: &[ChatMessage],
+    ) -> Result<RelationshipEvaluation> {
+        let relationship = self.get(actor_id).unwrap_or_else(|| {
+            Relationship::new(actor_id, None, &self.definitions, self.config.model)
+        });
+        match &self.evaluator {
+            Some(evaluator) => {
+                evaluator
+                    .evaluate_turn(&relationship, messages, &self.definitions)
+                    .await
+            }
+            None => Ok(RelationshipEvaluation::default()),
+        }
     }
 
     /// Run the configured evaluator for a recent turn and apply the resulting relationship update.

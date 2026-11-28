@@ -1,0 +1,45 @@
+name: RestartableAnalysis
+version: "1.0.0"
+description: "Resume a prepared clarification question in a new process"
+
+# Ask for the audience, save the pending question, then continue in another CLI process.
+# Flow: objective -> clarification -> prepared SQLite checkpoint -> fresh review -> answer -> verified response.
+# Requires a provider key, file-backed SQLite and usable OS synchronization evidence.
+# Run from the same working directory for both invocations. Provider calls incur normal provider costs.
+# Usage: cargo run -p ai-agents-cli -- task run examples/yaml/autonomy/restartable_analysis.yaml "Explain database checkpoints" --non-interactive --json
+# A saved pause exits with code 3 and reports its run_id and revision; it is not task completion.
+# Resume: cargo run -p ai-agents-cli -- task resume examples/yaml/autonomy/restartable_analysis.yaml RUN_ID --revision REVISION
+# Review the reconstructed work first, then answer the original clarification. These are separate decisions.
+system_prompt: |
+  Ask the user which audience the explanation should target before drafting the answer.
+  After their reply, explain the requested topic for that audience and incorporate any clarification.
+  Revise the answer when the configured quality check requests improvement.
+llms:
+  main: {provider: openai, model: gpt-5.4-mini-2026-03-17, max_tokens: 16384, tool_choice: auto}
+  judge: {provider: openai, model: gpt-5.4-mini-2026-03-17, max_tokens: 8192}
+llm: {default: main}
+# This example needs only the question tool, not workspace or command execution authority.
+tools: [ask_user]
+# This ignored example directory holds sensitive recovery state. Choose a private persistent location for your application.
+storage: {type: sqlite, path: data/restartable-analysis.sqlite}
+autonomy:
+  enabled: true
+  # Positive host-wide bound for each capture/restore/review transaction; omitted by default.
+  # The whole bound is charged conservatively. It is separate from cumulative task limits, which remain unset here.
+  restoration_timeout_ms: 5000
+  persistence:
+    enabled: true  # Prepare acknowledged pauses; omit the whole block for volatile hosting.
+    resume_on_start: true  # `run agent.yaml` selects one compatible saved task; default: false.
+  hitl: {on_user_question: pause_run, on_approval_required: pause_run}
+  validation:
+    checks:
+      - id: answer
+        adapter: builtin.judge
+        config:
+          llm: judge
+          pass_threshold: 0.8  # Customize the acceptance threshold together with the criteria.
+          criteria: [The answer explains the requested topic for the audience selected by the user.]
+  completion:
+    all:
+      - tool_called: {id: ask_user, count_gte: 1, executed: true, success: true}
+      - validator_passed: answer

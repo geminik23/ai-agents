@@ -1,3 +1,5 @@
+#[cfg(feature = "mcp-integration")]
+pub mod mcp_integration;
 pub mod release;
 
 use std::collections::{BTreeMap, BTreeSet};

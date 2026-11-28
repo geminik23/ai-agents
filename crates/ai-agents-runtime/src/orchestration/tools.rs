@@ -25,17 +25,70 @@ pub struct RouteToAgentTool {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-#[allow(dead_code)]
 struct RouteToAgentInput {
     /// The message to route to the best-matched agent.
     input: String,
     /// Agent IDs to consider for routing.
     candidates: Vec<String>,
-    /// Routing method: "llm" or "round_robin". Defaults to "llm".
+    /// Routing method: "llm" uses the configured selector. "round_robin" is available with legacy routing.
     method: Option<String>,
 }
 
+impl RouteToAgentInput {
+    // Enforce structured arguments in both entry points while preserving legacy input interpretation.
+    fn from_tool_args(args: Value, structured: bool) -> ai_agents_core::Result<Self> {
+        use ai_agents_core::AgentError;
+        if structured {
+            let input: Self = serde_json::from_value(args)
+                .map_err(|_| AgentError::Tool("invalid structured routing arguments".into()))?;
+            if !matches!(input.method.as_deref(), None | Some("llm")) {
+                return Err(AgentError::Tool(
+                    "structured routing uses the configured selector".into(),
+                ));
+            }
+            return Ok(input);
+        }
+        let input = args
+            .get("input")
+            .and_then(Value::as_str)
+            .ok_or_else(|| AgentError::Tool("missing required field: input".into()))?;
+        let candidates = args
+            .get("candidates")
+            .and_then(Value::as_array)
+            .ok_or_else(|| AgentError::Tool("missing required field: candidates".into()))?;
+        Ok(Self {
+            input: input.into(),
+            candidates: candidates
+                .iter()
+                .filter_map(Value::as_str)
+                .map(String::from)
+                .collect(),
+            method: args.get("method").and_then(Value::as_str).map(String::from),
+        })
+    }
+
+    // Only a legacy route can reach round-robin selection.
+    fn routing_method(&self) -> RoutingMethod {
+        match self.method.as_deref() {
+            Some("round_robin") => RoutingMethod::RoundRobin,
+            _ => RoutingMethod::Llm,
+        }
+    }
+}
+
 impl RouteToAgentTool {
+    /// Captures the next round-robin position for an installed host's opaque reconstruction-state binding.
+    pub fn round_robin_position(&self) -> usize {
+        self.counter.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Seeds only an unpublished tool instance; a frozen registered Arc cannot be moved here to reset live selection state.
+    pub fn with_round_robin_position(self, position: usize) -> Self {
+        self.counter
+            .store(position, std::sync::atomic::Ordering::Release);
+        self
+    }
+
     pub fn new(registry: Arc<AgentRegistry>, llm: Arc<LLMRegistry>) -> Self {
         Self {
             registry,
@@ -63,35 +116,46 @@ impl Tool for RouteToAgentTool {
         generate_schema::<RouteToAgentInput>()
     }
 
-    // Resolves captured auxiliary roles without widening tool grants or changing participant ownership.
-    async fn execute(&self, args: Value, _ctx: ai_agents_core::ToolExecutionContext) -> ToolResult {
-        let input = match args.get("input").and_then(|v| v.as_str()) {
-            Some(s) => s,
-            None => return ToolResult::error("missing required field: input"),
-        };
-        let candidates: Vec<String> = match args.get("candidates").and_then(|v| v.as_array()) {
-            Some(arr) => arr
-                .iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect(),
-            None => return ToolResult::error("missing required field: candidates"),
-        };
-        let method = match args.get("method").and_then(|v| v.as_str()) {
-            Some("round_robin") => RoutingMethod::RoundRobin,
-            _ => RoutingMethod::Llm,
-        };
+    /// Selection and dispatch participate in the exact framework message continuation rather than generic tool replay.
+    fn supports_task_messages(&self) -> bool {
+        true
+    }
 
+    /// Task routing preserves the selected target and propagates typed suspension without repeating selection on resume.
+    async fn execute_task(
+        &self,
+        args: Value,
+        _ctx: ai_agents_core::ToolExecutionContext,
+    ) -> ai_agents_core::Result<ToolResult> {
+        let Some(llm) = super::role_provider(&self.llm, LLMRole::OrchestrationRouting, None)?
+        else {
+            return Ok(ToolResult::error("no router LLM configured"));
+        };
+        let args = RouteToAgentInput::from_tool_args(args, llm.uses_choice_for_routing())?;
+        match Box::pin(super::route::route_task(&self.registry, llm.as_ref(), &args.input, &args.candidates, args.routing_method(), Some(&self.counter))).await {
+            Ok(result) => Ok(ToolResult::ok(json!({"selected_agent":result.selected_agent,"response":result.response.content,"reason":result.reason}).to_string())),
+            Err(error @ ai_agents_core::AgentError::TaskSuspended(_)) => Err(error),
+            Err(error) => Ok(ToolResult::error(format!("routing failed: {error}"))),
+        }
+    }
+
+    // Resolves the captured selector before parsing the method so tool arguments cannot downgrade it.
+    async fn execute(&self, args: Value, _ctx: ai_agents_core::ToolExecutionContext) -> ToolResult {
         let llm = match super::role_provider(&self.llm, LLMRole::OrchestrationRouting, None) {
             Ok(Some(p)) => p,
             _ => return ToolResult::error("no router LLM configured"),
+        };
+        let args = match RouteToAgentInput::from_tool_args(args, llm.uses_choice_for_routing()) {
+            Ok(args) => args,
+            Err(error) => return ToolResult::error(error.to_string()),
         };
 
         let route_future = super::route(
             &self.registry,
             llm.as_ref(),
-            input,
-            &candidates,
-            method,
+            &args.input,
+            &args.candidates,
+            args.routing_method(),
             Some(&self.counter),
         );
         let route_result = if let Some(context) = current_turn_actor_context() {
@@ -141,6 +205,22 @@ impl PipelineProcessTool {
 
 #[async_trait]
 impl Tool for PipelineProcessTool {
+    /// Typed task dispatch retains the actual pipeline cursor rather than converting suspension into failure.
+    async fn execute_task(
+        &self,
+        args: Value,
+        ctx: ai_agents_core::ToolExecutionContext,
+    ) -> ai_agents_core::Result<ToolResult> {
+        if crate::autonomy::suspension::message_request().is_some() {
+            super::task_tools::dispatch(self.registry.clone(), None, args, false).await
+        } else {
+            Ok(self.execute(args, ctx).await)
+        }
+    }
+    /// Capability enables capture only under the shared executor's live final-invocation permit.
+    fn supports_task_messages(&self) -> bool {
+        true
+    }
     fn id(&self) -> &str {
         "pipeline_process"
     }
@@ -245,6 +325,23 @@ impl ConcurrentAskTool {
 
 #[async_trait]
 impl Tool for ConcurrentAskTool {
+    /// Typed task dispatch retains admitted sibling results and propagates suspension after draining.
+    async fn execute_task(
+        &self,
+        args: Value,
+        ctx: ai_agents_core::ToolExecutionContext,
+    ) -> ai_agents_core::Result<ToolResult> {
+        if crate::autonomy::suspension::message_request().is_some() {
+            super::task_tools::dispatch(self.registry.clone(), Some(self.llm.clone()), args, true)
+                .await
+        } else {
+            Ok(self.execute(args, ctx).await)
+        }
+    }
+    /// Capability enables capture only under the shared executor's live final-invocation permit.
+    fn supports_task_messages(&self) -> bool {
+        true
+    }
     fn id(&self) -> &str {
         "concurrent_ask"
     }
@@ -373,6 +470,28 @@ impl GroupDiscussionTool {
 
 #[async_trait]
 impl Tool for GroupDiscussionTool {
+    /// Typed group discussion resumes acknowledged transcript and speaker positions without repeating completed rounds.
+    async fn execute_task(
+        &self,
+        args: Value,
+        ctx: ai_agents_core::ToolExecutionContext,
+    ) -> ai_agents_core::Result<ToolResult> {
+        if crate::autonomy::suspension::message_request().is_some() {
+            super::task_tools::dispatch_kind(
+                self.registry.clone(),
+                Some(self.llm.clone()),
+                args,
+                crate::autonomy::message::MessageResponse::Group,
+            )
+            .await
+        } else {
+            Ok(self.execute(args, ctx).await)
+        }
+    }
+    /// The final executor captures the actual group tool and selected catalogue.
+    fn supports_task_messages(&self) -> bool {
+        true
+    }
     fn id(&self) -> &str {
         "group_discussion"
     }
@@ -514,6 +633,28 @@ impl HandoffConversationTool {
 
 #[async_trait]
 impl Tool for HandoffConversationTool {
+    /// Typed handoff preserves the selected specialist and evaluator decisions at each acknowledged position.
+    async fn execute_task(
+        &self,
+        args: Value,
+        ctx: ai_agents_core::ToolExecutionContext,
+    ) -> ai_agents_core::Result<ToolResult> {
+        if crate::autonomy::suspension::message_request().is_some() {
+            super::task_tools::dispatch_kind(
+                self.registry.clone(),
+                Some(self.llm.clone()),
+                args,
+                crate::autonomy::message::MessageResponse::Handoff,
+            )
+            .await
+        } else {
+            Ok(self.execute(args, ctx).await)
+        }
+    }
+    /// The final executor captures the actual handoff tool and selected catalogue.
+    fn supports_task_messages(&self) -> bool {
+        true
+    }
     fn id(&self) -> &str {
         "handoff_conversation"
     }
@@ -600,13 +741,21 @@ pub fn configure_orchestration_tools(
     registry: Arc<AgentRegistry>,
     llm: Arc<LLMRegistry>,
 ) -> Vec<Arc<dyn Tool>> {
+    let route = Arc::new(RouteToAgentTool::new(registry.clone(), llm.clone()));
+    configure_tools_with_route(config, registry, llm, route)
+}
+
+// The configured builder retains the actual route cursor for restoration instead of identifying a tool by its public name.
+pub(crate) fn configure_tools_with_route(
+    config: &crate::spec::OrchestrationToolsConfig,
+    registry: Arc<AgentRegistry>,
+    llm: Arc<LLMRegistry>,
+    route: Arc<RouteToAgentTool>,
+) -> Vec<Arc<dyn Tool>> {
     let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
 
     if config.includes("route_to_agent") {
-        tools.push(Arc::new(RouteToAgentTool::new(
-            Arc::clone(&registry),
-            Arc::clone(&llm),
-        )));
+        tools.push(route);
     }
     if config.includes("pipeline_process") {
         tools.push(Arc::new(PipelineProcessTool::new(Arc::clone(&registry))));

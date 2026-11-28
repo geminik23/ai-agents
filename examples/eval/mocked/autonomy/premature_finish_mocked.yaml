@@ -1,0 +1,18 @@
+name: Premature Finish Continues
+agent: ../../../yaml/autonomy/tool_free_analysis.yaml
+settings: {timeout_per_turn_ms: 10000, retries: 0}
+fixtures:
+  llm:
+    mode: mock
+    responses_by_alias:
+      main: [I am done., Revised answer satisfying the criteria.]
+      judge: ['{"overall_score":0.1}', '{"overall_score":0.95}']
+scenarios:
+  - id: completion-claim-is-only-a-candidate
+    steps:
+      - !task
+        operation: {action: run, objective: Meet the requested criteria.}
+        assert:
+          all:
+            - task: {status: completed, counters: {path: turns, eq: 2}, events_include: [continuation_forced], event_result_parity: true}
+            - response_contains: Revised answer

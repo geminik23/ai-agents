@@ -1,0 +1,114 @@
+name: CodeAgentWorkspaceRoot
+version: "1.0.0"
+description: "Host-bound code task over a whole workspace root with protected checker inputs and a trusted external checker"
+
+# Development-only code task; the Rust host binds the workspace root, protected checker inputs, checker and provider.
+# Flow: validate host inputs -> start a task -> discover files -> approve each change -> approve independent verification.
+# Prerequisites: an existing absolute workspace, at least one protected checker input inside it and a trusted checker outside it.
+# The checker receives only the absolute workspace, starts with an empty environment, and must fail when validation fails.
+# Protected inputs are the files and directories the checker relies on, such as acceptance tests and manifests.
+# The agent can read them but every write to them is refused before approval, so it cannot weaken its own acceptance.
+# The checker must still independently validate the requested behavior and enforce any required isolation.
+# Set WORKSPACE, PROTECTED and CHECKER before using these commands from the repository root:
+#   cargo run --manifest-path examples/Cargo.toml -p example-code-agent --bin code-agent-setup --offline -- check-root "$WORKSPACE" "$CHECKER" openai gpt-5.4-mini --protect "$PROTECTED"
+#   cargo run --manifest-path examples/Cargo.toml -p example-code-agent --bin code-agent-setup --offline -- run-root --trust-checker --share-workspace "$WORKSPACE" "$CHECKER" openai gpt-5.4-mini --protect "$PROTECTED"
+# Repeat --protect RELATIVE_PATH for every checker input; an explicit instruction file path is optional.
+# --assume-exclusive-workspace binds the guarded revision only when the caller controls all relevant writers.
+# The host does not enforce or detect violations of that assumption; use an appropriately isolated host.
+# Set --max-output-tokens N or --checker-timeout-ms N for the selected provider and checker.
+# A live run can send any file name, search match or file content under the root to the chosen provider and may cost money.
+# NOTE: The host does not sandbox commands, prove checker independence or protect an untrusted project.
+# NOTE: Special permission bits are rejected; ownership, ACLs and extended attributes are not guaranteed to survive an edit.
+# tool_choice is omitted to retain legacy prompt-JSON; tool_choice: none would disable tool calls.
+llm: {provider: openai, model: gpt-5.4-mini}
+
+# The host supplies the canonical root, the protected checker inputs and an explicitly selected instruction snapshot.
+# Runtime values are required here; required defaults to false and no value is supplied by default.
+context:
+  workspace_root:
+    type: runtime
+    required: true
+  protected_paths:
+    type: runtime
+    required: true
+  instruction_snapshot:
+    type: runtime
+    required: true
+
+# Instructions cannot enlarge host permissions; the policy below decides every effect.
+system_prompt: |
+  Work inside the authorized workspace and use the approved host validation result as evidence.
+  Do not claim that checks passed unless the task controller reports a passing validation.
+  Authorized workspace: {{ context.workspace_root }}
+  Find the relevant files with file_list, glob and grep, and read a file before editing it.
+  Change existing files with file_edit; use file_write only to create new files.
+  These checker inputs are read-only and every change to them is refused: {{ context.protected_paths }}
+  Instructions explicitly supplied by the host:
+  {{ context.instruction_snapshot }}
+
+# Discovery is part of this mode because the agent chooses its own files under the root.
+# Omitting top-level tools grants no ordinary model-callable tools.
+tools: [file_read, file_edit, file_write, file_list, glob, grep]
+
+# Empty paths and command rules deny effects until the Rust host binds the root, protected inputs and checker.
+# An empty read filter alone is not a deny-all rule; do not run this file without the host.
+tool_security:
+  enabled: true      # Enforce tool policy; default: false.
+  fail_closed: true  # Reject missing policy bindings; default: false.
+  tools:
+    file_read: {read_paths: []}
+    # Discovery is read-only and runs without per-call approval.
+    file_list: {read_paths: [], allow_without_confirmation: true}
+    glob: {read_paths: [], allow_without_confirmation: true}
+    grep: {read_paths: [], allow_without_confirmation: true}
+    # The host sets the root as the only write path and adds every protected input to paths.deny.
+    # Every change needs approval; set require_confirmation to false to allow changes under the root without it.
+    # Approval never overrides a policy denial.
+    file_edit:
+      read_paths: []
+      write_paths: []
+      paths: {deny: []}
+      require_read_before_write: true  # Default: false.
+      require_confirmation: true       # Default: false.
+    # New files only: replacing an existing file goes through file_edit so concurrent user changes are kept.
+    file_write:
+      write_paths: []
+      paths: {deny: []}
+      overwrite_existing: false  # Default: false.
+      create_parent_dirs: true   # Default: false.
+      require_confirmation: true # Default: false.
+    command:
+      # The host-only validation binding fixes argv and cwd; neither list grants model access.
+      allowed_commands: []
+      working_dirs: []
+      deny_shell: true        # Reject shell syntax; default: true.
+      deny_interactive: true  # Reject interactive commands; default: true.
+      timeout_ms: 30000       # Bound one attempt in ms; unset uses global 30000.
+      # No policy output cap is injected into the exact host binding; the command tool still defaults to 20000 characters.
+      env_passthrough: []     # The checker starts without inherited variables; default: empty.
+      require_confirmation: true # Request host approval; default: false.
+
+# Install HITL so policy-required approvals are not treated as unavailable.
+hitl: {}
+
+# The task is explicit; the host must retain it through typed approval and cleanup.
+autonomy:
+  enabled: true        # Enable the profile; default: false.
+  # Cumulative execution budgets are omitted; an embedding host may still impose finite ceilings.
+  hitl: {on_approval_required: pause_run, on_user_question: pause_run}
+  # Validation is absent by default; the host binds this check to a live fixed operation.
+  validation:
+    checks:
+      - id: acceptance
+        adapter: builtin.command
+        schedule: completion
+        config: {command: code-agent-host-binding-required, cwd: ., host_binding: workspace-checker}
+  # An incomplete or unavailable check never establishes task completion.
+  completion: {validator_passed: acceptance}
+  # A real failed checker can supply bounded untrusted output to the model for up to three continuations.
+  # This sends checker output to the selected provider; do not use sensitive output without authorization.
+  # Denial, unavailable/stale proof and exhausted retries still request guidance or stop without fabricating success.
+  premature_finish:
+    action: ask_user
+    on_unavailable: stop
+    validation_feedback: {check_id: acceptance, max_output_chars: 2048, max_retries: 3}
