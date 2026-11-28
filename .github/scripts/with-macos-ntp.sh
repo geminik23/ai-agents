@@ -18,6 +18,7 @@ kernel_reports_time_ok() {
 }
 
 if kernel_reports_time_ok; then
+  echo "Kernel already synchronized; running strict tests directly."
   cat "$clock_dir/kernel.log"
   exec "$@"
 fi
@@ -29,6 +30,8 @@ server=${server_setting#Network Time Server: }
   echo "No usable OS-configured NTP server: $server_setting" >&2
   exit 1
 }
+comparison_server=time.windows.com
+printf 'NTP sources: OS=%s comparison=%s\n' "$server" "$comparison_server"
 previous=$(sudo -n "$setup" -getusingnetworktime)
 case "$previous" in
   'Network Time: On'|'Network Time: Off') ;;
@@ -48,14 +51,29 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 if [[ $previous == 'Network Time: On' ]]; then sudo -n "$setup" -setusingnetworktime off; fi
 
-cat > "$clock_dir/ntp.conf" <<EOF
-server $server iburst
+printf 'server %s iburst\n' "$server" > "$clock_dir/ntp.conf"
+if [[ $(printf '%s' "${server%.}" | tr '[:upper:]' '[:lower:]') != "$comparison_server" ]]; then
+  printf 'server %s iburst\n' "$comparison_server" >> "$clock_dir/ntp.conf"
+else
+  echo "OS and comparison source are the same hostname; using one association."
+fi
+cat >> "$clock_dir/ntp.conf" <<EOF
 restrict default ignore
 restrict -6 default ignore
 restrict source nomodify noquery notrap
 restrict 127.0.0.1
 restrict ::1
 EOF
+# Link the selected numeric peer to its configured hostname and its own send/receive counters.
+log_associations() {
+  local associations id
+  associations=$(ntpq -n -c associations) || return 0
+  printf '%s\n' "$associations"
+  while read -r id; do
+    ntpq -n -c "rv $id srchost,srcadr,reach,stratum" -c "pstats $id" || true
+  done < <(awk '$1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ {print $2}' <<< "$associations")
+}
+
 # Continuous ntpd maintains kernel discipline while the producer and consumer run.
 sudo -n "$(command -v ntpd)" -n -g -c "$clock_dir/ntp.conf" > "$clock_dir/ntpd.log" 2>&1 &
 clock_pid=$!
@@ -64,6 +82,7 @@ while (( SECONDS < deadline )); do
   if ! sudo -n kill -0 "$clock_pid" 2>/dev/null; then break; fi
   if ntpq -pn > "$clock_dir/peers.log" && grep -q '^\*' "$clock_dir/peers.log" && kernel_reports_time_ok; then
     cat "$clock_dir/peers.log" "$clock_dir/kernel.log"
+    log_associations
     "$@"
     exit 0
   fi
@@ -71,6 +90,7 @@ while (( SECONDS < deadline )); do
 done
 echo "::error::NTP preparation did not establish a selected peer and synchronized kernel clock."
 ntpq -pn || true
+log_associations
 ntptime || true
 tail -40 "$clock_dir/ntpd.log" || true
 exit 1
