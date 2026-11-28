@@ -12,13 +12,20 @@ ntp_prefix=$(brew --prefix ntp)
 export PATH="$ntp_prefix/sbin:$ntp_prefix/bin:$PATH"
 clock_dir=$(mktemp -d "${RUNNER_TEMP:?}/restore-clock.XXXXXX")
 
+# ntpd may correct wall time. Use UTC for correlation and a monotonic clock for elapsed time and deadlines.
+monotonic_seconds() { python3 -c 'import time; print(time.monotonic_ns() // 10**9)'; }
+started=$(monotonic_seconds)
+log_event() {
+  printf '%s elapsed=%ss %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$(( $(monotonic_seconds) - started ))" "$*"
+}
+
 kernel_reports_time_ok() {
-  ntptime > "$clock_dir/kernel.log" &&
+  ntptime > "$clock_dir/kernel.log" 2>&1 &&
     grep -Fq 'ntp_adjtime() returns code 0 (OK)' "$clock_dir/kernel.log"
 }
 
 if kernel_reports_time_ok; then
-  echo "Kernel already synchronized; running strict tests directly."
+  log_event "first kernel TIME_OK; already synchronized, starting strict tests"
   cat "$clock_dir/kernel.log"
   exec "$@"
 fi
@@ -51,13 +58,16 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 if [[ $previous == 'Network Time: On' ]]; then sudo -n "$setup" -setusingnetworktime off; fi
 
-printf 'server %s iburst\n' "$server" > "$clock_dir/ntp.conf"
+# Keep the steady polling interval bounded at the 64 seconds observed in CI #3.
+poll_exponent=6
+printf 'server %s iburst maxpoll %s\n' "$server" "$poll_exponent" > "$clock_dir/ntp.conf"
 if [[ $(printf '%s' "${server%.}" | tr '[:upper:]' '[:lower:]') != "$comparison_server" ]]; then
-  printf 'server %s iburst\n' "$comparison_server" >> "$clock_dir/ntp.conf"
+  printf 'server %s iburst maxpoll %s\n' "$comparison_server" "$poll_exponent" >> "$clock_dir/ntp.conf"
 else
   echo "OS and comparison source are the same hostname; using one association."
 fi
 cat >> "$clock_dir/ntp.conf" <<EOF
+logconfig +sysevents +peerevents
 restrict default ignore
 restrict -6 default ignore
 restrict source nomodify noquery notrap
@@ -74,23 +84,72 @@ log_associations() {
   done < <(awk '$1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ {print $2}' <<< "$associations")
 }
 
-# Continuous ntpd maintains kernel discipline while the producer and consumer run.
+# Acquisition is bounded independently of training. Start the training allowance only once,
+# at the first observed system peer, the observable proxy for the first discipline update.
+acquisition_seconds=300
+training_seconds=300  # ntpd 4.2.8p18 default stepout
+poll_seconds=$((1 << poll_exponent))
+deadline=$(( $(monotonic_seconds) + acquisition_seconds ))
+first_selection_seen=false
+kernel_ok_seen=false
+responders=" "
+previous_peer=
+failure="no system peer selected within the acquisition window"
+log_event "starting ntpd; peer acquisition budget=${acquisition_seconds}s"
 sudo -n "$(command -v ntpd)" -n -g -c "$clock_dir/ntp.conf" > "$clock_dir/ntpd.log" 2>&1 &
 clock_pid=$!
-deadline=$((SECONDS + 300))
-while (( SECONDS < deadline )); do
-  if ! sudo -n kill -0 "$clock_pid" 2>/dev/null; then break; fi
-  if ntpq -pn > "$clock_dir/peers.log" && grep -q '^\*' "$clock_dir/peers.log" && kernel_reports_time_ok; then
-    cat "$clock_dir/peers.log" "$clock_dir/kernel.log"
-    log_associations
-    "$@"
-    exit 0
+while (( $(monotonic_seconds) < deadline )); do
+  if ! sudo -n kill -0 "$clock_pid" 2>/dev/null; then
+    failure="ntpd exited during clock preparation"
+    break
+  fi
+  peer=
+  if ntpq -pn > "$clock_dir/peers.log"; then
+    # A nonzero octal reach register records a usable reply; raw receive counters alone do not.
+    while read -r address reach selected; do
+      if [[ $responders != *" $address "* ]]; then
+        log_event "first valid response observed peer=$address reach=$reach"
+        responders+="$address "
+      fi
+      if [[ $selected == yes ]]; then peer=$address; fi
+    done < <(awk 'NF == 10 && $4 == "u" && $7 ~ /^[0-7]+$/ && $7+0 > 0 {
+      address=$1; sub(/^[*+x#.~o-]/, "", address)
+      print address, $7, ($1 ~ /^\*/ ? "yes" : "no")
+    }' "$clock_dir/peers.log")
+  fi
+  observed_at=$(monotonic_seconds)
+  if (( observed_at >= deadline )); then break; fi
+  if [[ $peer != "$previous_peer" ]]; then
+    log_event "system peer=${peer:-none}"
+    previous_peer=$peer
+  fi
+  if [[ -n $peer && $first_selection_seen == false ]]; then
+    first_selection_seen=true
+    # One update can finish frequency training and another can publish synchronized kernel state.
+    deadline=$((observed_at + training_seconds + 2 * poll_seconds))
+    failure="kernel TIME_OK and a current system peer did not coincide within the training window"
+    log_event "training budget=${training_seconds}s plus two ${poll_seconds}s polls"
+  fi
+  if kernel_reports_time_ok; then
+    if [[ $kernel_ok_seen == false ]]; then
+      log_event "first kernel TIME_OK observed"
+      kernel_ok_seen=true
+    fi
+    if [[ -n $peer ]] && (( $(monotonic_seconds) < deadline )); then
+      cat "$clock_dir/peers.log" "$clock_dir/kernel.log"
+      log_associations
+      cat "$clock_dir/ntpd.log" || true
+      log_event "kernel TIME_OK with peer=$peer; starting strict tests"
+      "$@"
+      exit 0
+    fi
   fi
   sleep 2
 done
-echo "::error::NTP preparation did not establish a selected peer and synchronized kernel clock."
+log_event "clock preparation stopped"
+echo "::error::NTP preparation failed: $failure"
 ntpq -pn || true
 log_associations
 ntptime || true
-tail -40 "$clock_dir/ntpd.log" || true
+cat "$clock_dir/ntpd.log" || true
 exit 1
