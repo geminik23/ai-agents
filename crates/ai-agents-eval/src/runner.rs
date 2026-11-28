@@ -1130,12 +1130,14 @@ impl EvalRunner {
             tool_log.clone(),
             spec.llm.router_roles().is_some(),
         )?;
-        let llm_fixture = attempt_context
-            .interpolate_llm_with_tools(&self.suite.fixtures.llm, &|name| {
-                tool_registry.get(name)
-            })?;
-        let (llm_registry, _) =
-            build_llm_registry_with(&spec, &llm_fixture, base_dir, |config, provider| {
+        let pending_text =
+            crate::fixtures::PendingFixtureText::new(attempt_context, &self.suite.fixtures.llm)?;
+        let (llm_registry, _) = build_llm_registry_with(
+            &spec,
+            &self.suite.fixtures.llm,
+            base_dir,
+            |text| pending_text.prepare(text),
+            |config, provider| {
                 let observed: Arc<dyn ai_agents_core::LLMProvider> = Arc::new(RecordingProvider {
                     inner: provider,
                     log: llm_log.clone(),
@@ -1151,7 +1153,8 @@ impl EvalRunner {
                     ),
                     None => observed,
                 }
-            })?;
+            },
+        )?;
 
         let agent_base_dir = agent_path.parent().unwrap_or_else(|| Path::new("."));
         if let Some(host) = &self.host {
@@ -1167,11 +1170,12 @@ impl EvalRunner {
             tool_log,
             approval_log,
         }));
-        let builder = if let Some(host) = &self.host {
+        let mut builder = if let Some(host) = &self.host {
             host.configure(builder, attempt_context)?
         } else {
             builder
         };
+        builder.map_validator_config_paths(&|path| attempt_context.join_expanded_path(path));
         let mut builder = builder
             .auto_configure_features()
             .map_err(|error| EvalError::Config(error.to_string()))?
@@ -1205,6 +1209,7 @@ impl EvalRunner {
             .build_task_host()
             .await
             .map_err(|error| EvalError::Config(error.to_string()))?;
+        pending_text.bind(attempt_context, &agent)?;
         agent.init_storage().await?;
         Ok(agent)
     }

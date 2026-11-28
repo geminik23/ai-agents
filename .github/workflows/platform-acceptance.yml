@@ -50,7 +50,9 @@ jobs:
           sw_vers
           rustc "+$RELEASE_RUST" -Vv
       - name: Require native SQLite restart and recovery
+        env:
+          CLOCK_RUNNER_ENVIRONMENT: ${{ runner.environment }}
         run: |
-          cargo "+$RELEASE_RUST" test --locked -p ai-agents-cli --test task_cli -- --exact --show-output \
+          bash .github/scripts/with-macos-ntp.sh cargo "+$RELEASE_RUST" test --locked -p ai-agents-cli --test task_cli -- --exact --show-output \
             task_subprocess_configured_restart_preserves_attempts_and_requires_fresh_review \
             task_subprocess_configured_constructor_crash_recovers_without_replay

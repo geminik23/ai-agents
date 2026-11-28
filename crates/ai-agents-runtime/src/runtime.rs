@@ -1322,6 +1322,12 @@ impl RuntimeAgent {
         self
     }
 
+    /// Reports the installed implementation's path and policy metadata for the resolved name.
+    /// Metadata is descriptive; invocation still performs the normal grant and admission checks.
+    pub fn tool_policy_bindings(&self, name: &str) -> Option<ai_agents_core::ToolPolicyBindings> {
+        self.tools.get(name).map(|tool| tool.policy_bindings())
+    }
+
     /// Returns the canonical store for explicit host bindings, not another mutable task authority.
     pub fn todo_store(&self) -> ai_agents_tools::TodoStore {
         self.tools.todo_store()

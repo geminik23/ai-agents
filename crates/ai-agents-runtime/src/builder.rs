@@ -251,6 +251,29 @@ impl AgentBuilder {
         self
     }
 
+    /// Maps declared validator file operands against the configured adapters before task construction.
+    /// This does not change an adapter binding, execute an observation, or grant any tool.
+    pub fn map_validator_config_paths(&mut self, map: &dyn Fn(&str) -> Option<String>) {
+        let extensions = self
+            .autonomy_extensions
+            .get_or_insert_with(|| crate::autonomy::AutonomyExtensions::builtins().freeze());
+        let visit = |profile: &mut ai_agents_core::autonomy::AutonomyProfile| {
+            extensions.map_validation_paths(profile, map)
+        };
+        if let Some(spec) = &mut self.spec {
+            spec.visit_profiles_mut(visit);
+        }
+        if let Some(config) = &mut self.automatic_config {
+            visit(&mut config.defaults);
+            config.profiles.values_mut().for_each(visit);
+        }
+        for skill in &mut self.skills {
+            if let Some(settings) = &mut skill.autonomy {
+                visit(&mut settings.settings);
+            }
+        }
+    }
+
     /// Supplies programmatic defaults for the same state/skill declarations used by strict YAML loading.
     pub fn autonomy(mut self, config: ai_agents_core::autonomy::AutonomyConfig) -> Self {
         self.automatic_config = Some(config);
